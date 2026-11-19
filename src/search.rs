@@ -2112,6 +2112,20 @@ impl TextSearcher {
         };
         crate::stop::check()?;
         let first_query = first_plan.text();
+        let stated = first_plan
+            .context
+            .iter()
+            .map(|part| part.label)
+            .collect::<Vec<_>>();
+        // A reading with its street trimmed, or one that reads fewer parts,
+        // judges only the parts it holds. A part the best reading states that
+        // the answer's reading did not judge is not one it matched.
+        let finish = |(query, mut hits): (String, Vec<TextSearchHit>)| {
+            for hit in &mut hits {
+                unjudged_unmatched(&stated, &mut hit.matched);
+            }
+            (query, hits)
+        };
         NAMED.with(|named| named.replace(Some(choose::Named::of(first_plan))));
         // Where the best reading says the record is holds in every reading:
         // a later one that reads "Christchurch" of "Ponsonby Road
@@ -2188,7 +2202,7 @@ impl TextSearcher {
             let answer = self.structured_stage(&cx, &mut accept, &mut declined)?;
             let spent = start.elapsed();
             match answer {
-                Some(answer) if answer.1.len() >= wanted => return Ok(answer),
+                Some(answer) if answer.1.len() >= wanted => return Ok(finish(answer)),
                 // Fewer answers than asked for: they come first, and the text
                 // search gives the rest.
                 Some(answer) => first = Some(answer),
@@ -2256,9 +2270,9 @@ impl TextSearcher {
         {
             let (hits, _) =
                 self.structured_judged(&declined.plan, declined.hits, &search, &session)?;
-            return Ok((declined.text, hits));
+            return Ok(finish((declined.text, hits)));
         }
-        Ok(match first {
+        Ok(finish(match first {
             Some((query, mut first)) => {
                 for hit in hits {
                     if !first.iter().any(|held| held.record_id == hit.record_id) {
@@ -2269,7 +2283,7 @@ impl TextSearcher {
                 (query, first)
             }
             None => (query, hits),
-        })
+        }))
     }
 
     /// Answer an address or a street from the structured index `structured`, before any
@@ -4553,7 +4567,8 @@ impl TextSearcher {
                 .filter(|layer| !layer.is_empty())
                 .is_none_or(|layer| layer == Layer::Address.as_str());
         if estimated
-            && let Some(estimate) = self.place_between_neighbours(plan, pass, &ranking, &areas)?
+            && let Some(estimate) =
+                self.place_between_neighbours(plan, pass, &ranking, &areas, &filters)?
             && keep(&estimate)?
         {
             candidates.insert(0, estimate);
@@ -5039,6 +5054,14 @@ impl TextSearcher {
                 true => area.names.names.iter().any(|words| names_one(words, names)),
                 false => area.names.names.iter().all(|words| names_one(words, names)),
             };
+            // "Warwick" is a word of "West Warwick", another town: only the
+            // whole name of an area it lies in is its own.
+            let whole = area.names.names.iter().any(|words| {
+                let words = words.iter().map(String::as_str).collect::<HashSet<_>>();
+                names
+                    .iter()
+                    .any(|name| name.split_whitespace().collect::<HashSet<_>>() == words)
+            });
             let named = agrees_with(&names);
             let mut agrees = named;
             if !agrees && area.label == Label::Locality {
@@ -5055,7 +5078,7 @@ impl TextSearcher {
             if !agrees {
                 return Ok(Some(Standing::Contradicts));
             }
-            standing = Some(match (named, standing) {
+            standing = Some(match (named && whole, standing) {
                 (true, None | Some(Standing::Own)) => Standing::Own,
                 _ => Standing::Taken,
             });
@@ -5273,13 +5296,24 @@ impl TextSearcher {
         let Some(context) = self.pack.boundary_context(record_id)? else {
             return Ok(areas);
         };
+        // A county or other district holds many towns, and its name often
+        // is one of theirs ("Providence County" holds Woonsocket). It names
+        // the town only of a record no town-tier area holds.
+        let mut districts = Vec::new();
         for entry in context.admin_context.entries() {
             let region = entry
                 .tiers
                 .iter()
                 .any(|tier| matches!(tier, PlaceLayer::Region | PlaceLayer::SubRegion));
-            let below_region = entry.tiers.iter().any(|tier| tier > PlaceLayer::SubRegion);
-            if !(region || below_region) {
+            let town = entry
+                .tiers
+                .iter()
+                .any(|tier| tier > PlaceLayer::SubDistrict);
+            let district = entry
+                .tiers
+                .iter()
+                .any(|tier| matches!(tier, PlaceLayer::District | PlaceLayer::SubDistrict));
+            if !(region || town || district) {
                 continue;
             }
             areas.chain.push(entry.record_id);
@@ -5290,9 +5324,16 @@ impl TextSearcher {
                 if region {
                     areas.add_region(Some(name));
                 }
-                if below_region {
+                if town {
                     areas.add_locality(name);
+                } else if district {
+                    districts.push(name.clone());
                 }
+            }
+        }
+        if areas.localities.is_empty() {
+            for name in &districts {
+                areas.add_locality(name);
             }
         }
         Ok(areas)
@@ -6586,11 +6627,12 @@ impl TextSearcher {
         pass: Pass,
         ranking: &Ranking,
         areas: &AreaWords,
+        filters: &Filters<'_>,
     ) -> Result<Option<TextSearchHit>> {
         let Some(number) = plan.house_number.as_ref().map(|number| number.base) else {
             return Ok(None);
         };
-        let (lower, higher) = self.neighbours(plan, pass, ranking, areas, number)?;
+        let (lower, higher) = self.neighbours(plan, pass, ranking, areas, filters, number)?;
         self.place_between(number, &lower, &higher, NEIGHBOUR_STREET_RADIUS_M)
     }
 
@@ -6669,11 +6711,16 @@ impl TextSearcher {
         pass: Pass,
         ranking: &Ranking,
         areas: &AreaWords,
+        filters: &Filters<'_>,
         number: u32,
     ) -> Result<(Vec<Neighbour>, Vec<Neighbour>)> {
         let searcher = self.reader.searcher();
         let mut clauses = self.subject_clauses(plan, pass, areas);
         clauses.push((Occur::Must, self.layer_query(Layer::Address.as_str())));
+        // Neighbours in another country would place the house there.
+        if let Some(countries) = self.countries_query(filters.countries) {
+            clauses.push((Occur::Must, countries));
+        }
         let docs = searcher.search(
             &BooleanQuery::new(clauses),
             &TopDocs::with_limit(NEIGHBOUR_DOCUMENTS),
@@ -7774,6 +7821,19 @@ fn area_layers(label: Label) -> &'static [Layer] {
 
 /// The part of `matched` that says how the words the parser labelled
 /// `label` matched, `None` for a label that is no address part.
+/// Marks unmatched each part of `stated` a hit's match leaves unjudged. A
+/// hit judged on no part, found by its name, is left so.
+fn unjudged_unmatched(stated: &[Label], matched: &mut QueryMatch) {
+    if matched.is_empty() {
+        return;
+    }
+    for label in stated {
+        if let Some(slot) = part_of(matched, *label) {
+            slot.get_or_insert(PartMatch::Unmatched);
+        }
+    }
+}
+
 fn part_of(matched: &mut QueryMatch, label: Label) -> Option<&mut Option<PartMatch>> {
     match label {
         Label::HouseNumber => Some(&mut matched.housenumber),
@@ -14134,6 +14194,18 @@ mod tests {
             geocode(&searcher, "14 Bayview Avenue", None, None).as_deref(),
             Some("derived:estimate:14:osm:node:10:osm:node:11")
         );
+        // Neighbours outside the countries asked for place nothing.
+        let in_france = searcher
+            .search(&TextSearchOptions {
+                query: "14 Bayview Ave".to_string(),
+                limit: 5,
+                layer: None,
+                countries: vec!["FR".to_string()],
+                focus: None,
+                bbox: None,
+            })
+            .expect("search");
+        assert!(in_france.is_empty(), "{in_france:?}");
         // No odd number is stated: the nearest of either parity.
         let odd = top("25 Bayview Ave").point.expect("point");
         assert!((odd.lat - 43.0025).abs() < 1e-9, "{odd:?}");
@@ -14959,6 +15031,129 @@ mod tests {
         assert_eq!(
             geocode(&searcher, "18 Main Street South", Some("Goderich"), None),
             None
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_word_of_a_town_name_is_a_partial_match_and_the_whole_name_its_own() {
+        let temp_dir = temp_pack_path("search-partial-town");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &address_record(
+                    "osm:node:1",
+                    "",
+                    "60",
+                    "Crompton Avenue",
+                    Some("West Warwick"),
+                    None,
+                )
+                .into(),
+                None,
+            )
+            .expect("address");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let locality = |query: &str| {
+            searcher
+                .search(&TextSearchOptions {
+                    query: query.to_string(),
+                    limit: 1,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("search")
+                .first()
+                .and_then(|hit| hit.matched.locality)
+        };
+        assert_eq!(
+            locality("60 Crompton Avenue, West Warwick"),
+            Some(PartMatch::Matched)
+        );
+        assert_eq!(
+            locality("60 Crompton Avenue, Warwick"),
+            Some(PartMatch::Partial)
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_county_names_the_town_only_of_a_record_no_town_holds() {
+        use crate::{
+            context::AdminContextTuple,
+            pack::RecordContext,
+            record::{PlaceLayer, PlaceRecord, Record},
+        };
+
+        let temp_dir = temp_pack_path("geocode-county");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut area = |layer: PlaceLayer, name: &str, object_id: i64| {
+            let id = writer
+                .write(
+                    &Record::Place(
+                        layer,
+                        PlaceRecord {
+                            alt_names: Vec::new(),
+                            name: name.to_string(),
+                            place_type: "admin_level:6".to_string(),
+                            geometry: point_geometry(-71.5, 41.9),
+                            source: SourceProvenance::osm(ObjectType::Relation, object_id),
+                            prominence: Default::default(),
+                            wikidata: None,
+                        },
+                    ),
+                    None,
+                )
+                .expect("area");
+            (id, name.to_string())
+        };
+        let (county, county_name) = area(PlaceLayer::District, "Providence County", 1);
+        let (town, town_name) = area(PlaceLayer::Locality, "Woonsocket", 2);
+        writer.set_context_names(
+            [(county, vec![county_name]), (town, vec![town_name])]
+                .into_iter()
+                .collect(),
+        );
+        let context = |tiers: &[(PlaceLayer, RecordId)]| {
+            Some(RecordContext {
+                admin_context: AdminContextTuple::from_tiers(tiers.iter().copied()),
+                flags: 0,
+                zone: None,
+            })
+        };
+        writer
+            .write(
+                &address_record("osm:node:3", "", "1", "Main Street", None, None).into(),
+                context(&[(PlaceLayer::District, county), (PlaceLayer::Locality, town)]),
+            )
+            .expect("in a town");
+        writer
+            .write(
+                &address_record("osm:node:4", "", "7", "Farm Lane", None, None).into(),
+                context(&[(PlaceLayer::District, county)]),
+            )
+            .expect("in no town");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            geocode(&searcher, "1 Main Street", Some("Woonsocket"), None).as_deref(),
+            Some("osm:node:3")
+        );
+        // The county itself, as the area the query names, is the fallback.
+        assert_eq!(
+            geocode(&searcher, "1 Main Street", Some("Providence"), None).as_deref(),
+            Some("osm:relation:1"),
+            "Woonsocket is in Providence County, not in Providence"
+        );
+        assert_eq!(
+            geocode(&searcher, "7 Farm Lane", Some("Providence"), None).as_deref(),
+            Some("osm:node:4")
         );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
