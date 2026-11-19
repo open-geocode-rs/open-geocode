@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    compat::{encode_id, iso},
+    compat::{encode_parts, iso},
     record::Layer,
     spatial_index::haversine_m,
 };
@@ -215,7 +215,7 @@ pub(super) fn item(feature: &Feature) -> Item {
     let [lon, lat] = feature.geometry.coordinates;
     Item {
         title,
-        id: encode_id(&properties.id, &properties.label),
+        id: encode_parts(&properties.id, Some(properties.layer), &properties.label),
         result_type,
         house_number_type,
         locality_type,

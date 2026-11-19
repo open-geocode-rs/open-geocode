@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::match_code::{Holds, Judged, MatchCode, QueryMatch};
-use crate::compat::{encode_id, iso};
+use crate::{
+    compat::{encode_parts, iso},
+    record::Layer,
+};
 
 /// The real-time or bulk product a result answers. Verify standardizes an
 /// address, so its result has no location; geocode places it.
@@ -36,7 +39,7 @@ struct Geometry {
 #[derive(Debug, Deserialize)]
 struct Properties {
     id: String,
-    layer: String,
+    layer: Layer,
     accuracy: String,
     name: String,
     label: String,
@@ -383,7 +386,7 @@ impl Feature {
             },
             custom_fields: BTreeMap::from([(
                 ID_FIELD,
-                encode_id(&properties.id, &properties.label),
+                encode_parts(&properties.id, Some(properties.layer), &properties.label),
             )]),
         };
         if product == Product::Verify {
