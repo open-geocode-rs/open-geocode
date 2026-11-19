@@ -131,6 +131,17 @@ pub(crate) mod native {
             .map(|json| json.0)
     }
 
+    /// The places of `categories`, as the catalog writes each one.
+    pub(crate) async fn of_categories(
+        state: &AppState,
+        categories: Vec<&'static str>,
+        args: Args,
+    ) -> Result<ForwardCollection, Problem> {
+        runtime::of_categories(State(state.clone()), categories, args.query())
+            .await
+            .map(|json| json.0)
+    }
+
     /// The record an og id names, or `None` when no record has it. An id
     /// `/places` cannot look up, such as an imported address row's, is
     /// `None` too, since those renumber every release.

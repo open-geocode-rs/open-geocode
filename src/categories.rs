@@ -292,6 +292,21 @@ pub fn strong_words() -> impl Iterator<Item = &'static str> {
     table().strong.keys().map(String::as_str)
 }
 
+/// Whether the catalog has `category`, written as it writes one
+/// (`amenity pharmacy`, or a bare key).
+pub fn is_known(category: &str) -> bool {
+    let table = table();
+    table
+        .categories
+        .binary_search_by(|known| known.as_str().cmp(category))
+        .is_ok()
+        || table.categories.iter().any(|known| {
+            known
+                .split_once(' ')
+                .is_some_and(|(key, _)| key == category)
+        })
+}
+
 /// Whether a record's category (`amenity:pharmacy`) is one of `categories`,
 /// where a bare key (`shop`) holds every value of that key.
 pub fn holds(categories: &[&str], category: &str) -> bool {

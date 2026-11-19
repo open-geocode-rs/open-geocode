@@ -783,12 +783,14 @@ impl TextSearcher {
         Ok(count)
     }
 
-    /// The POIs of `categories` nearest `focus`, by the near-first order.
-    /// For a category too rare for a walk outward from the focus to reach.
-    pub fn nearest_of_categories(
+    /// The POIs of `categories`. With a `focus` they are the ones within
+    /// `radius_m` of it, by the near-first order, for a category too rare for
+    /// a walk outward from the focus to reach. Without one they are the best
+    /// known of the whole Pack.
+    pub fn of_categories(
         &self,
         categories: &[&str],
-        focus: [f64; 2],
+        focus: Option<([f64; 2], f64)>,
         limit: usize,
         countries: &[String],
         bbox: Option<BoundingBox>,
@@ -823,8 +825,8 @@ impl TextSearcher {
         );
         query.extend(bbox.map(|bbox| (Occur::Must, self.bbox_query(bbox))));
         let ranking = Ranking {
-            focus: Some(focus),
-            near_first: true,
+            focus: focus.map(|(point, _)| point),
+            near_first: focus.is_some(),
             ..Ranking::default()
         };
         let filters = Filters::new(None, countries, bbox);
@@ -834,7 +836,9 @@ impl TextSearcher {
             Ok(hit.record.layer == Layer::Poi.as_str()
                 && filters.admit(hit)
                 && hit.record.point.is_some_and(|point| {
-                    haversine_m(focus[0], focus[1], point.lon, point.lat) <= BIAS_RADIUS_M
+                    focus.is_none_or(|([lon, lat], radius_m)| {
+                        haversine_m(lon, lat, point.lon, point.lat) <= radius_m
+                    })
                 })
                 && records.poi_category_is(hit.record_id, |category| {
                     crate::categories::holds(categories, category)
@@ -12961,7 +12965,13 @@ mod tests {
         );
         let ids = |bbox| {
             places
-                .nearest_of_categories(&["amenity pharmacy"], [4.89, 52.37], 5, &[], bbox)
+                .of_categories(
+                    &["amenity pharmacy"],
+                    Some(([4.89, 52.37], BIAS_RADIUS_M)),
+                    5,
+                    &[],
+                    bbox,
+                )
                 .expect("nearest")
                 .into_iter()
                 .map(|hit| hit.record.id)
@@ -12984,7 +12994,13 @@ mod tests {
         );
         assert_eq!(
             places
-                .nearest_of_categories(&["amenity fast_food"], [4.89, 52.37], 5, &[], None)
+                .of_categories(
+                    &["amenity fast_food"],
+                    Some(([4.89, 52.37], BIAS_RADIUS_M)),
+                    5,
+                    &[],
+                    None,
+                )
                 .expect("nearest")
                 .into_iter()
                 .map(|hit| hit.record.id)

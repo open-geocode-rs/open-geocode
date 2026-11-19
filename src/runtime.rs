@@ -48,9 +48,9 @@ use crate::{
     resources::Resources,
     reverse::{GeocodeOptions, PackReverseGeocoder},
     search::{
-        AddressGeocodeOptions, BIAS_RADIUS_M, TextAutocompleteOptions, TextSearchHit,
-        TextSearchOptions, TextSearcher, autocomplete_tokens, category_typo,
-        effective_autocomplete_limit, name_starts_as, suggest,
+        AddressGeocodeOptions, BIAS_RADIUS_M, BoundingBox, DEFAULT_SEARCH_LIMIT,
+        TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher,
+        autocomplete_tokens, category_typo, effective_autocomplete_limit, name_starts_as, suggest,
     },
     spatial_index::haversine_m,
     stop::{self, CancelOnDrop, Stop},
@@ -1043,6 +1043,67 @@ pub(crate) async fn autocomplete(
     Ok(Json(collection))
 }
 
+/// A search for places by their kind. No route of og's own answers one.
+/// `/compat` answers a vendor's category search from it.
+#[derive(Debug, Deserialize)]
+pub(crate) struct CategoryParams {
+    #[serde(default)]
+    limit: usize,
+    /// See [`parse_countries`].
+    country: Param,
+    /// The point to search around, as `lon,lat`.
+    focus: Param,
+    /// How many metres from `focus` a place may lie. [`BIAS_RADIUS_M`] when
+    /// not given.
+    radius: Option<f64>,
+    bbox: Param,
+    /// See [`parse_lang`].
+    lang: Param,
+}
+
+/// The places of `categories`, each written as the catalog writes it
+/// (`amenity pharmacy`, or a bare key). With `focus` they are the ones
+/// around it, nearest first. Without one they are the best known of the
+/// Pack, or of `bbox` and `country`.
+pub(crate) async fn of_categories(
+    State(state): State<AppState>,
+    categories: Vec<&'static str>,
+    params: Result<Query<CategoryParams>, QueryRejection>,
+) -> Result<Json<ForwardCollection>, Problem> {
+    let Query(params) = params.map_err(malformed_parameters)?;
+    bounds::validate_search_limit(params.limit)?;
+    let limit = match params.limit {
+        0 => DEFAULT_SEARCH_LIMIT,
+        limit => limit,
+    };
+    let languages = parse_lang(&params.lang)?;
+    let countries = parse_countries(&params.country)?;
+    let focus = bounds::parse_focus(&params.focus)?;
+    let bbox = bounds::parse_bbox(&params.bbox)?;
+    if params
+        .radius
+        .is_some_and(|radius| !radius.is_finite() || radius <= 0.0)
+    {
+        return Err(
+            Problem::malformed_parameter("radius must be a number of metres above 0")
+                .with_invalid_params(vec![InvalidParam::new("radius", "not above 0")]),
+        );
+    }
+    let around = focus.map(|point| (point, params.radius.unwrap_or(BIAS_RADIUS_M)));
+
+    let worker = state.clone();
+    let collection = lookup(&state, move || {
+        let hits = pois_of_categories(&worker, &categories, around, limit, &countries, bbox)?;
+        let mut collection = api::forward_collection(&worker.pack, String::new(), hits)?;
+        api::measure_from(&mut collection, focus);
+        api::localize_forward(&worker.pack, &mut collection, &languages);
+        Ok(collection)
+    })
+    .await?;
+
+    Ok(Json(collection))
+}
+
 /// A query that only names a kind of place ("pharmacy", "apotheek") means
 /// the nearest ones, whatever their names. A place near the caller named as
 /// typed ("Subway") still answers, so a brand that is also a category word
@@ -1096,41 +1157,14 @@ fn nearest_of_category(
         return Ok(named);
     };
     let limit = effective_autocomplete_limit(options.limit);
-    // Past the categories' own count, reading them from the index costs less.
-    let count = state.places.category_count(&categories)?;
-    if count == 0 {
-        return Ok(named);
-    }
-    // The walk knows no country, so a country filter reads the index.
-    let walked = match options.countries.is_empty() {
-        true => state.reverse_geocoder.nearest_pois(
-            focus,
-            BIAS_RADIUS_M,
-            limit,
-            count,
-            |lon, lat| options.bbox.is_none_or(|bbox| bbox.contains(lon, lat)),
-            |category| categories::holds(&categories, category),
-        )?,
-        false => None,
-    };
-    let mut hits = match walked {
-        Some(nearest) => nearest
-            .into_iter()
-            .map(|record_id| {
-                Ok(TextSearchHit::of_record(
-                    record_id,
-                    state.pack.record_summary(record_id)?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?,
-        None => state.places.nearest_of_categories(
-            &categories,
-            focus,
-            limit,
-            &options.countries,
-            options.bbox,
-        )?,
-    };
+    let mut hits = pois_of_categories(
+        state,
+        &categories,
+        Some((focus, BIAS_RADIUS_M)),
+        limit,
+        &options.countries,
+        options.bbox,
+    )?;
     if hits.is_empty() {
         return Ok(named);
     }
@@ -1143,6 +1177,50 @@ fn nearest_of_category(
         }
     }
     Ok(hits)
+}
+
+/// The POIs of `categories`, as many as `limit`. With a focus and its radius
+/// in metres they are the ones inside it, nearest first. Without one they are
+/// the best known of the Pack.
+fn pois_of_categories(
+    state: &AppState,
+    categories: &[&str],
+    focus: Option<([f64; 2], f64)>,
+    limit: usize,
+    countries: &[String],
+    bbox: Option<BoundingBox>,
+) -> Result<Vec<TextSearchHit>> {
+    // Past the categories' own count, reading them from the index costs less.
+    let count = state.places.category_count(categories)?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    // The walk knows no country, so a country filter reads the index.
+    let walked = match focus {
+        Some((point, radius_m)) if countries.is_empty() => state.reverse_geocoder.nearest_pois(
+            point,
+            radius_m,
+            limit,
+            count,
+            |lon, lat| bbox.is_none_or(|bbox| bbox.contains(lon, lat)),
+            |category| categories::holds(categories, category),
+        )?,
+        _ => None,
+    };
+    match walked {
+        Some(nearest) => nearest
+            .into_iter()
+            .map(|record_id| {
+                Ok(TextSearchHit::of_record(
+                    record_id,
+                    state.pack.record_summary(record_id)?,
+                ))
+            })
+            .collect(),
+        None => state
+            .places
+            .of_categories(categories, focus, limit, countries, bbox),
+    }
 }
 
 /// The point of the place `words` name, a town, a street or a POI.
