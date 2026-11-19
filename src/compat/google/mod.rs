@@ -4,6 +4,7 @@
 //! `places.googleapis.com` or `geocode.googleapis.com` needs only its base
 //! URL changed. The two hosts share one prefix, as their paths never collide.
 
+mod destinations;
 mod geocode;
 mod language;
 mod model;
@@ -46,9 +47,7 @@ pub(crate) fn router() -> Router<AppState> {
         )
         .route(
             "/v1/places/{place_id}/photos/{photo}/media",
-            only(MethodFilter::GET, || {
-                unimplemented("places.photos.getMedia")
-            }),
+            only(MethodFilter::GET, places::photo_media),
         )
         .route(
             "/v4/geocode/address",
@@ -72,7 +71,7 @@ pub(crate) fn router() -> Router<AppState> {
         )
         .route(
             "/v4/geocode/destinations",
-            only(MethodFilter::POST, || unimplemented("searchDestinations")),
+            only(MethodFilter::POST, destinations::search),
         )
         .fallback(|| async { method_not_found() })
 }
@@ -141,13 +140,6 @@ pub(super) fn invalid(message: impl Into<String>) -> VendorError {
 
 fn method_not_found() -> VendorError {
     error(Code::NotFound, "Method not found.")
-}
-
-async fn unimplemented(method: &str) -> VendorError {
-    error(
-        Code::Unimplemented,
-        format!("{method} is not implemented by this server."),
-    )
 }
 
 /// og's failure as Google reports it. og's own detail is kept as the

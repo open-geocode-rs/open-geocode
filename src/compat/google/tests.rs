@@ -14,8 +14,8 @@ use crate::{
     limits::Limits,
     pack::Writer,
     record::{
-        AddressComponents, AddressRecord, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord,
-        PoiRecord, Record, SourceProvenance, point_geometry,
+        AddressComponents, AddressRecord, Entrance, LocationPrecision, ObjectType, PlaceLayer,
+        PlaceRecord, PoiRecord, Record, SourceProvenance, point_geometry,
     },
     runtime::{AppState, build_router},
 };
@@ -122,7 +122,16 @@ fn write_pack(dir: &Path) {
     writer
         .write(
             &AddressRecord {
-                access: Vec::new(),
+                access: vec![
+                    Entrance {
+                        at: [-790_001_000, 430_001_000],
+                        kind: "main".to_string(),
+                    },
+                    Entrance {
+                        at: [-790_002_000, 429_999_000],
+                        kind: "service".to_string(),
+                    },
+                ],
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: address.clone(),
@@ -951,40 +960,9 @@ async fn search_nearby_refuses_what_google_refuses() {
 }
 
 #[tokio::test]
-async fn unserved_methods_unknown_paths_and_wrong_methods() {
+async fn unknown_paths_and_wrong_methods() {
     let fixture = fixture();
     let router = &fixture.router;
-    for (method, uri, name) in [
-        (
-            "GET",
-            "/compat/google/v1/places/abc/photos/def/media",
-            "places.photos.getMedia",
-        ),
-        (
-            "POST",
-            "/compat/google/v4/geocode/destinations",
-            "searchDestinations",
-        ),
-    ] {
-        let reply = send(
-            router,
-            Request::builder()
-                .method(method)
-                .uri(uri)
-                .body(Body::from("{}"))
-                .expect("request"),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::NOT_IMPLEMENTED, "{uri}");
-        assert_eq!(
-            reply.body,
-            google_error(
-                501,
-                "UNIMPLEMENTED",
-                &format!("{name} is not implemented by this server.")
-            )
-        );
-    }
     let not_found = google_error(404, "NOT_FOUND", "Method not found.");
     for (method, uri) in [
         ("GET", "/compat/google/v1/places:searchText"),
@@ -1087,6 +1065,36 @@ async fn every_og_value_lands_in_its_google_slot() {
             assert_eq!(place["location"], result["location"]);
             assert_eq!(place["addressComponents"], result["addressComponents"]);
             assert_eq!(place["postalAddress"], result["postalAddress"]);
+        }
+
+        let destination = match &place_uri {
+            Some(_) => json!({"place": format!("places/{id}")}),
+            None => json!({"addressQuery": {"addressQuery": name}}),
+        };
+        let destinations = post(router, DESTINATIONS, destination).await.body;
+        let destination = &destinations["destinations"][0];
+        let primary = &destination["primary"];
+        assert_eq!(primary["placeId"], id);
+        assert_eq!(primary["place"], format!("places/{id}"));
+        assert_eq!(primary["displayName"]["text"], name);
+        assert_eq!(primary["formattedAddress"], label);
+        assert_eq!(primary["location"], result["location"]);
+        assert_eq!(primary["addressComponents"], result["addressComponents"]);
+        assert_eq!(primary["postalAddress"], result["postalAddress"]);
+        let access = properties["access"].as_array().cloned().unwrap_or_default();
+        let entrances = destination["entrances"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(entrances.len(), access.len(), "{og_id}");
+        for (entrance, access) in entrances.iter().zip(&access) {
+            assert_eq!(entrance["location"]["longitude"], access["lon"]);
+            assert_eq!(entrance["location"]["latitude"], access["lat"]);
+            assert_eq!(entrance["place"], format!("places/{id}"));
+            assert_eq!(
+                entrance["tags"] == json!(["PREFERRED"]),
+                access["kind"] == "main"
+            );
         }
 
         let components = result["addressComponents"].as_array().expect("components");
@@ -1330,6 +1338,254 @@ async fn language_code_names_areas_og_holds_in_that_language() {
                 "languageCode \"fr,de\" is not a language code, such as de or zh-Hant"
             ),
             "{path}"
+        );
+    }
+}
+
+const PHOTO: &str = "photos/AbC123/media";
+
+#[tokio::test]
+async fn photo_media_checks_the_size_then_finds_no_photo_og_holds() {
+    let fixture = fixture();
+    let router = &fixture.router;
+    let id = bakery_id();
+    let photo =
+        |place: &str, query: &str| format!("/compat/google/v1/places/{place}/{PHOTO}{query}");
+
+    let reply = get(router, &photo(&id, "?maxWidthPx=400&skipHttpRedirect=true")).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reply.body,
+        google_error(
+            400,
+            "INVALID_ARGUMENT",
+            &format!("The photo resource 'places/{id}/photos/AbC123' is invalid.")
+        )
+    );
+
+    let unknown = encode_id("osm:way:999");
+    let reply = get(router, &photo(&unknown, "?maxHeightPx=400")).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        reply.body,
+        google_error(
+            404,
+            "NOT_FOUND",
+            &format!("Place 'places/{unknown}' was not found.")
+        )
+    );
+
+    // The size is checked before the place, so an unknown place with a bad
+    // size is a bad size.
+    for (query, message) in [
+        (
+            "",
+            "Neither maxWidthPx nor maxHeightPx is set, and at least one is required",
+        ),
+        (
+            "?maxWidthPx=0",
+            "maxWidthPx must be within [1, 4800], got 0",
+        ),
+        (
+            "?maxWidthPx=10&maxHeightPx=4801",
+            "maxHeightPx must be within [1, 4800], got 4801",
+        ),
+        (
+            "?maxWidthPx=wide",
+            "Invalid value at 'maxWidthPx' (TYPE_INT32), \"wide\"",
+        ),
+    ] {
+        let reply = get(router, &photo(&unknown, query)).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{query}");
+        assert_eq!(
+            reply.body,
+            google_error(400, "INVALID_ARGUMENT", message),
+            "{query}"
+        );
+    }
+}
+
+const DESTINATIONS: &str = "/compat/google/v4/geocode/destinations";
+
+fn address_destination() -> Value {
+    let id = address_id();
+    let place = format!("places/{id}");
+    let mut primary = address_result();
+    let fields = primary.as_object_mut().expect("a result");
+    for field in ["granularity", "types"] {
+        fields.remove(field);
+    }
+    fields.insert("place".to_string(), json!(place));
+    fields.insert("displayName".to_string(), json!({"text": "10 King Street"}));
+    fields.insert("primaryType".to_string(), json!("street_address"));
+    fields.insert("types".to_string(), json!(["street_address"]));
+    fields.insert("structureType".to_string(), json!("POINT"));
+    json!({
+        "primary": primary,
+        "entrances": [
+            {
+                "location": {"latitude": 43.0001, "longitude": -79.0001},
+                "tags": ["PREFERRED"],
+                "place": place,
+            },
+            {
+                "location": {"latitude": 42.9999, "longitude": -79.0002},
+                "place": place,
+            },
+        ],
+    })
+}
+
+fn bakery_destination() -> Value {
+    let id = bakery_id();
+    let mut primary = bakery_place();
+    let fields = primary.as_object_mut().expect("a place");
+    for field in ["name", "id"] {
+        fields.remove(field);
+    }
+    fields.insert("place".to_string(), json!(format!("places/{id}")));
+    fields.insert("placeId".to_string(), json!(id));
+    fields.insert(
+        "formattedAddress".to_string(),
+        json!("Queen Bakery, 12 King Street, Toronto, M5V 1A1"),
+    );
+    fields.insert("structureType".to_string(), json!("POINT"));
+    json!({"primary": primary})
+}
+
+#[tokio::test]
+async fn destinations_by_place_address_and_location() {
+    let fixture = fixture();
+    let router = &fixture.router;
+
+    let by_place = post(
+        router,
+        DESTINATIONS,
+        json!({"place": format!("places/{}", bakery_id())}),
+    )
+    .await;
+    assert_eq!(by_place.status, StatusCode::OK);
+    assert_eq!(
+        by_place.body,
+        json!({"destinations": [bakery_destination()]})
+    );
+
+    let by_text = post(
+        router,
+        DESTINATIONS,
+        json!({"addressQuery": {"addressQuery": "10 King Street"}}),
+    )
+    .await;
+    assert_eq!(by_text.status, StatusCode::OK);
+    assert_eq!(
+        by_text.body["destinations"][0],
+        address_destination(),
+        "{}",
+        by_text.body
+    );
+
+    let by_parts = post(
+        router,
+        DESTINATIONS,
+        json!({"addressQuery": {"address": {
+            "addressLines": ["10 King Street"],
+            "locality": "Toronto",
+            "regionCode": "CA",
+        }}}),
+    )
+    .await;
+    assert_eq!(by_parts.status, StatusCode::OK);
+    assert_eq!(by_parts.body["destinations"][0], address_destination());
+
+    let by_location = post(
+        router,
+        DESTINATIONS,
+        json!({"locationQuery": {"location": {"latitude": 43.0, "longitude": -79.0001}}}),
+    )
+    .await;
+    assert_eq!(by_location.status, StatusCode::OK);
+    assert_eq!(
+        by_location.body,
+        json!({"destinations": [address_destination()]})
+    );
+
+    let masked = post_with(
+        router,
+        DESTINATIONS,
+        &[("x-goog-fieldmask", "destinations.primary.place")],
+        json!({"place": format!("places/{}", bakery_id())}),
+    )
+    .await;
+    assert_eq!(
+        masked.body,
+        json!({"destinations": [{"primary": {"place": format!("places/{}", bakery_id())}}]})
+    );
+}
+
+#[tokio::test]
+async fn destinations_leave_out_areas_and_refuse_what_google_refuses() {
+    let fixture = fixture();
+    let router = &fixture.router;
+
+    // A town is no destination, by id or by name.
+    for request in [
+        json!({"place": format!("places/{}", encode_id("osm:relation:5"))}),
+        json!({"addressQuery": {"addressQuery": "Toronto"}}),
+    ] {
+        let reply = post(router, DESTINATIONS, request.clone()).await;
+        assert_eq!(reply.status, StatusCode::OK, "{request}");
+        assert_eq!(reply.body, json!({}), "{request}");
+    }
+
+    let unknown = encode_id("osm:way:999");
+    let reply = post(
+        router,
+        DESTINATIONS,
+        json!({"place": format!("places/{unknown}")}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        reply.body,
+        google_error(
+            404,
+            "NOT_FOUND",
+            &format!("Place 'places/{unknown}' was not found.")
+        )
+    );
+
+    for (request, message) in [
+        (
+            json!({}),
+            "One of place, addressQuery or locationQuery is required",
+        ),
+        (
+            json!({"place": "places/x", "addressQuery": {"addressQuery": "10 King Street"}}),
+            "Give only one of place, addressQuery or locationQuery",
+        ),
+        (
+            json!({"place": "x"}),
+            "Invalid place \"x\": expected places/PLACE_ID",
+        ),
+        (
+            json!({"addressQuery": {}}),
+            "addressQuery or address is required",
+        ),
+        (
+            json!({"locationQuery": {}}),
+            "locationQuery.location is required",
+        ),
+        (
+            json!({"locationQuery": {"location": {"latitude": 91, "longitude": 0}}}),
+            "locationQuery.location.latitude must be within [-90, 90], got 91",
+        ),
+    ] {
+        let reply = post(router, DESTINATIONS, request.clone()).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{request}");
+        assert_eq!(
+            reply.body,
+            google_error(400, "INVALID_ARGUMENT", message),
+            "{request}"
         );
     }
 }
