@@ -396,6 +396,11 @@ fn bakery(distance: Option<i64>) -> Value {
             "houseNumber": "12",
         },
         "position": {"lat": 43.0, "lng": -79.005},
+        "categories": [{
+            "id": "600-6300-0244",
+            "name": "Bakery and Baked Goods Store",
+            "primary": true,
+        }],
     });
     if let Some(distance) = distance {
         item["distance"] = distance.into();
@@ -771,6 +776,73 @@ async fn autosuggest_autocomplete_and_discover() {
 }
 
 #[tokio::test]
+async fn browse_answers_the_places_around_a_point_by_kind_and_name() {
+    let pack = pack("browse");
+    let router = pack.router();
+    let base = "/compat/here/v1/browse";
+    let found = json!({"items": [bakery(Some(407))]});
+    for query in [
+        "at=43,-79",
+        "at=43,-79&categories=600-6300-0244",
+        "at=43,-79&categories=600-6300,100",
+        "at=43,-79&categories=600,!100-1000-0009&limit=100",
+        "at=43,-79&name=queen%20bak",
+        "at=43,-79&in=countryCode:CAN",
+        "at=43,-79&in=circle:43,-79.005;r=100",
+        "at=43,-79&in=bbox:-79.1,42.9,-78.9,43.1",
+        "at=43,-79&chains=!1566&foodTypes=!800-067",
+    ] {
+        let reply = get(&router, &format!("{base}?{query}")).await;
+        assert_eq!(reply.status, StatusCode::OK, "{query}");
+        assert_eq!(reply.json(), found, "{query}");
+    }
+    let reply = send(&router, "POST", &format!("{base}?at=43,-79"), None).await;
+    assert_eq!(reply.json(), found);
+
+    // Another kind, a kind og has none of, the kind left out, another name,
+    // another country, outside the area, and a chain or food type asked for.
+    for query in [
+        "at=43,-79&categories=100-1000-0000",
+        "at=43,-79&categories=999-9999-9999",
+        "at=43,-79&categories=600,!600-6300-0244",
+        "at=43,-79&name=pharmacy",
+        "at=43,-79&in=countryCode:FRA",
+        "at=43,-79&in=circle:43,-79;r=100",
+        "at=43,-79&in=bbox:0,0,1,1",
+        "at=43,-79&chains=1566",
+        "at=43,-79&foodTypes=800-067",
+    ] {
+        let reply = get(&router, &format!("{base}?{query}")).await;
+        assert_eq!(reply.status, StatusCode::OK, "{query}");
+        assert_eq!(reply.json(), json!({"items": []}), "{query}");
+    }
+
+    let reply = get(&router, &format!("{base}?at=43,-79&offset=0&limit=1")).await;
+    assert_eq!(
+        reply.json(),
+        json!({"items": [bakery(Some(407))], "offset": 0, "count": 1, "limit": 1})
+    );
+
+    let reply = get(&router, &format!("{base}?categories=100")).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reply.json(),
+        here_error(400, "Missing parameter 'at'", None, Some("Provide 'at'"))
+    );
+    let reply = get(&router, &format!("{base}?at=43,-79&categories=coffee")).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reply.json(),
+        here_error(
+            400,
+            "Illegal input for parameter 'categories'",
+            Some("Actual parameter value: 'coffee'"),
+            Some("'coffee' is not a category id, such as 100-1000-0009"),
+        )
+    );
+}
+
+#[tokio::test]
 async fn lookup_finds_what_a_search_returned() {
     let pack = pack("lookup");
     let router = pack.router();
@@ -870,18 +942,14 @@ async fn errors_take_here_shapes() {
     assert_eq!(reply.json()["title"], "Illegal input for parameter 'q'");
     assert_eq!(reply.json()["requestId"], "rid-1");
 
-    let reply = get(
-        &router,
-        "/compat/here/v1/browse?at=43,-79&categories=100-1000-0000",
-    )
-    .await;
+    let reply = send(&router, "POST", "/compat/here/v1/signals", None).await;
     assert_eq!(reply.status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(
         reply.json(),
         here_error(
             501,
             "Not Implemented",
-            Some("This server does not serve /compat/here/v1/browse"),
+            Some("This server does not serve /compat/here/v1/signals"),
             None,
         )
     );

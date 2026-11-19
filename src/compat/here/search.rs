@@ -1,6 +1,6 @@
 //! Geocoding and Search v7: `/v1/geocode`, `/v1/revgeocode`,
 //! `/v1/multi-revgeocode`, `/v1/autosuggest`, `/v1/autocomplete`,
-//! `/v1/discover` and `/v1/lookup`.
+//! `/v1/discover`, `/v1/browse` and `/v1/lookup`.
 
 use axum::{
     body::Bytes,
@@ -15,10 +15,12 @@ use crate::{
     compat::{Args, decode_id, native},
     http::{bounds::MAX_SEARCH_LIMIT, problem::Problem},
     runtime::AppState,
+    util::fold::search_key,
 };
 
 use super::{
     Area, Gs7Error, LatLng, Params, Rid,
+    category::{Filter, Listed},
     item::{Feature, Item, item},
     media_type, respond,
 };
@@ -791,6 +793,78 @@ pub(super) async fn discover(
             .map(|feature| item(feature).without_scoring().distance_from(near.center))
             .filter(|item| near.admits(item))
             .collect();
+        Ok(page(items, offset, limit, false))
+    };
+    respond(&request_id, answer.await)
+}
+
+/// Places around a point, by kind and by name (HERE Browse)
+///
+/// The answer is the places around `at`, nearest first, as far as og looks
+/// around a point. `in=circle` searches that circle instead, and `in=bbox`
+/// that box. `categories` keeps the kinds og has under a HERE id, and `name`
+/// the places whose name holds its words. og's places carry no HERE chain or
+/// food type, so asking for one finds none.
+pub(super) async fn browse(
+    State(state): State<AppState>,
+    Rid(request_id): Rid,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let answer = async {
+        let params = Params::parse(query.as_deref())?;
+        let at = params.get("at").ok_or_else(|| {
+            Gs7Error::new(StatusCode::BAD_REQUEST, "Missing parameter 'at'").action("Provide 'at'")
+        })?;
+        let at = LatLng::parse("at", at)?;
+        let area = params.get("in").map(Area::parse).transpose()?;
+        let limit = params.limit(20, 100)?;
+        let offset = params.int("offset", 0, 99)?;
+        let filter = Filter::parse(params.get("categories"))?;
+        let name = params.get("name").and_then(search_key);
+        let unheld = ["chains", "foodTypes"]
+            .iter()
+            .any(|list| !Listed::parse(params.get(list)).included.is_empty());
+        let categories = filter.og_categories();
+        if unheld || categories.is_empty() {
+            return Ok(page(Vec::new(), offset, limit, false));
+        }
+        // What the filters drop comes out of og's answer, so og is asked for
+        // all one search gives.
+        let mut fields = vec![("limit", MAX_SEARCH_LIMIT.to_string())];
+        match area {
+            Some(Area::Countries(countries)) => {
+                fields.push(("country", countries.join(",")));
+                fields.push(("focus", at.og_point()));
+            }
+            Some(Area::Circle { center, radius_m }) => {
+                fields.push(("focus", center.og_point()));
+                fields.push(("radius", radius_m.to_string()));
+            }
+            Some(Area::Bbox([west, south, east, north])) => {
+                fields.push(("bbox", format!("{west},{south},{east},{north}")));
+            }
+            None => fields.push(("focus", at.og_point())),
+        }
+        let collection = native::of_categories(
+            &state,
+            categories,
+            args(fields).maybe("lang", og_lang(&params)),
+        )
+        .await
+        .map_err(Gs7Error::of)?;
+        let mut items = features(&collection)?
+            .iter()
+            .map(|feature| item(feature).without_scoring().distance_from(Some(at)))
+            .filter(|item| filter.admits(&item.categories))
+            .filter(|item| {
+                name.as_deref().is_none_or(|name| {
+                    search_key(&item.title).is_some_and(|title| title.contains(name))
+                })
+            })
+            .collect::<Vec<_>>();
+        // A circle or a box is searched from its own middle, and Browse ranks
+        // by the distance from `at`.
+        items.sort_by_key(|item| item.distance);
         Ok(page(items, offset, limit, false))
     };
     respond(&request_id, answer.await)
