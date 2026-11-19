@@ -47,17 +47,38 @@ pub(crate) fn router() -> Router<AppState> {
 }
 
 /// og's id as a vendor id: URL-safe base64, so it survives a path segment and
-/// a query string unescaped.
-pub(crate) fn encode_id(og_id: &str) -> String {
-    URL_SAFE_NO_PAD.encode(og_id)
+/// a query string unescaped. An id og's catalogue cannot look up (an
+/// imported row, an estimate, an interpolation, a derived postcode) carries
+/// `label` after it, which finds the record again (see [`native::by_id`]).
+pub(crate) fn encode_id(og_id: &str, label: &str) -> String {
+    match crate::ids::parse(og_id) {
+        Ok(Some(_)) => URL_SAFE_NO_PAD.encode(og_id),
+        _ => URL_SAFE_NO_PAD.encode(format!("{og_id}{LABEL_SEPARATOR}{label}")),
+    }
+}
+
+/// Between an og id and the label a vendor id carries with it. No id or
+/// label holds a line break.
+const LABEL_SEPARATOR: char = '\n';
+
+/// What a vendor id names: an og id, and the label of a record the
+/// catalogue cannot look up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OgRef {
+    pub(crate) id: String,
+    pub(crate) label: Option<String>,
 }
 
 /// The og id a vendor id stands for, or `None` for one og never issued.
-pub(crate) fn decode_id(vendor_id: &str) -> Option<String> {
+pub(crate) fn decode_id(vendor_id: &str) -> Option<OgRef> {
     let bytes = URL_SAFE_NO_PAD.decode(vendor_id.trim()).ok()?;
-    let id = String::from_utf8(bytes).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let (id, label) = match text.split_once(LABEL_SEPARATOR) {
+        Some((id, label)) => (id.to_string(), Some(label.to_string())),
+        None => (text, None),
+    };
     // Every og id is `dataset:kind:number`; anything else is not one of ours.
-    (id.split(':').count() >= 3).then_some(id)
+    (id.split(':').count() >= 3).then_some(OgRef { id, label })
 }
 
 /// The parameters of one native lookup, as its query string would carry them.
@@ -206,21 +227,74 @@ pub(crate) mod native {
             .map(|json| json.0)
     }
 
-    /// The record an og id names, or `None` when no record has it. An id
-    /// `/places` cannot look up, such as an imported address row's, is
-    /// `None` too, since those renumber every release.
-    /// The record is named in `lang` when it is given.
+    /// The record a vendor id names, or `None` when no record has it,
+    /// named in `lang` when it is given.
     pub(crate) async fn by_id(
         state: &AppState,
-        og_id: &str,
+        named: &OgRef,
         lang: Option<&str>,
     ) -> Result<Option<ForwardFeature>, Problem> {
-        match places(state, Args::new().set("ids", og_id).maybe("lang", lang)).await {
-            Ok(collection) => Ok(collection.features.into_iter().next()),
-            Err(problem) if problem.status() == 400 => Ok(None),
-            Err(problem) => Err(problem),
-        }
+        Ok(lookup(state, named, lang)
+            .await?
+            .and_then(|collection| collection.features.into_iter().next()))
     }
+
+    /// The answer holding the record a vendor id names, named in `lang`
+    /// when it is given: none when og could never have issued the id, no
+    /// feature when no record has it. The catalogue looks up an OSM id.
+    /// Any other is found by geocoding the label it carries: the record
+    /// with that id, or else the one with that very label, since an
+    /// imported row's id renumbers with each release of its data.
+    pub(crate) async fn lookup(
+        state: &AppState,
+        named: &OgRef,
+        lang: Option<&str>,
+    ) -> Result<Option<ForwardCollection>, Problem> {
+        let Some(label) = &named.label else {
+            return match places(state, Args::new().set("ids", &named.id).maybe("lang", lang)).await
+            {
+                Ok(collection) => Ok(Some(collection)),
+                Err(problem) if problem.status() == 400 => Ok(None),
+                Err(problem) => Err(problem),
+            };
+        };
+        let args = Args::new()
+            .set("q", label)
+            .set("limit", LABEL_CANDIDATES.to_string())
+            .maybe("lang", lang);
+        let mut collection = match geocode(state, args).await {
+            Ok(collection) => collection,
+            Err(problem) if problem.status() == 400 => return Ok(None),
+            Err(problem) => return Err(problem),
+        };
+        keep_named(&mut collection, named);
+        Ok(Some(collection))
+    }
+
+    /// Keeps of the answers to a vendor id's label only the record it
+    /// names: the one with its id and label, else its id, else its label.
+    /// An id alone can be read otherwise: a range the label names whole is
+    /// also the house its last number names.
+    pub(crate) fn keep_named(collection: &mut ForwardCollection, named: &OgRef) {
+        let same_id = |feature: &ForwardFeature| feature.properties.common.id == named.id;
+        let same_label = |feature: &ForwardFeature| {
+            Some(&feature.properties.common.label) == named.label.as_ref()
+        };
+        let features = std::mem::take(&mut collection.features);
+        let at = features
+            .iter()
+            .position(|feature| same_id(feature) && same_label(feature))
+            .or_else(|| features.iter().position(same_id))
+            .or_else(|| features.iter().position(same_label));
+        collection.features = at
+            .and_then(|at| features.into_iter().nth(at))
+            .into_iter()
+            .collect();
+    }
+
+    /// Answers read for the record a label names: enough that the record
+    /// is among them though the label also names its neighbours.
+    pub(crate) const LABEL_CANDIDATES: usize = 10;
 }
 
 /// What a vendor route answers with on failure: the vendor's body and

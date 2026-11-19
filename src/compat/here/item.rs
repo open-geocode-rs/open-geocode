@@ -215,7 +215,7 @@ pub(super) fn item(feature: &Feature) -> Item {
     let [lon, lat] = feature.geometry.coordinates;
     Item {
         title,
-        id: encode_id(&properties.id),
+        id: encode_id(&properties.id, &properties.label),
         result_type,
         house_number_type,
         locality_type,

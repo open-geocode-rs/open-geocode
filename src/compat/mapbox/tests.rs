@@ -223,8 +223,9 @@ async fn get(router: &Router, uri: &str) -> (StatusCode, Value) {
 const OSM: &str =
     "© OpenStreetMap contributors, ODbL 1.0 (https://www.openstreetmap.org/copyright)";
 
+/// The `mapbox_id` of an OSM record, which carries no label.
 fn id(og_id: &str) -> String {
-    encode_id(og_id)
+    encode_id(og_id, "")
 }
 
 /// The Geocoding context every Toronto record has.
@@ -330,7 +331,10 @@ async fn every_og_value_lands_in_its_mapbox_slot() {
         for (og, feature) in og_features.iter().zip(features) {
             let og = &og["properties"];
             let properties = &feature["properties"];
-            let own = id(og["id"].as_str().expect("id"));
+            let own = encode_id(
+                og["id"].as_str().expect("id"),
+                og["label"].as_str().expect("label"),
+            );
             assert_eq!(feature["id"], own);
             assert_eq!(properties["mapbox_id"], own);
             assert_eq!(properties["name"], og["name"]);

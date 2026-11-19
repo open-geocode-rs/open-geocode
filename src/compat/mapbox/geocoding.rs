@@ -170,9 +170,12 @@ impl Feature {
         ]
         .into_iter()
         .flatten()
-        .map(|area| (encode_id(&area.id), Names::of_area(area)))
+        .map(|area| (encode_id(&area.id, &area.name), Names::of_area(area)))
         .collect::<HashMap<_, _>>();
-        areas.insert(encode_id(&common.id), Names::of_result(common));
+        areas.insert(
+            encode_id(&common.id, &common.label),
+            Names::of_result(common),
+        );
         let translated = Translated::of(common, coordinates);
         let layer = |key: &str, area: super::Area| {
             let (mapbox_id, fields) = area.split();
@@ -254,9 +257,10 @@ impl Collection {
 enum Lookup {
     Geocode(Args),
     /// A `mapbox_id` sent as `q`, looked up by its og id. `text` is `q` as
-    /// a plain search, for an id `/places` cannot look up.
+    /// a plain search, for an id og could never have issued.
     Id {
-        ids: Args,
+        named: crate::compat::OgRef,
+        lang: Option<String>,
         text: Args,
     },
     Reverse(Args),
@@ -327,14 +331,16 @@ async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compa
             .await
             .map(|collection| Collection::forward(&collection, types, naming))
             .map_err(failed),
-        Lookup::Id { ids, text } => match native::places(state, ids).await {
-            Ok(collection) => Ok(Collection::forward(&collection, types, naming)),
-            Err(problem) if problem.status() == 400 => native::geocode(state, text)
-                .await
-                .map(|collection| Collection::forward(&collection, types, naming))
-                .map_err(failed),
-            Err(problem) => Err(failed(problem)),
-        },
+        Lookup::Id { named, lang, text } => {
+            match native::lookup(state, &named, lang.as_deref()).await {
+                Ok(Some(collection)) => Ok(Collection::forward(&collection, types, naming)),
+                Ok(None) => native::geocode(state, text)
+                    .await
+                    .map(|collection| Collection::forward(&collection, types, naming))
+                    .map_err(failed),
+                Err(problem) => Err(failed(problem)),
+            }
+        }
         Lookup::Reverse(args) => native::reverse(state, args)
             .await
             .map(|collection| Collection::reverse(&collection, types, naming))
@@ -376,8 +382,9 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
     };
     if let Some(q) = params.get("q") {
         let lookup = match decode_id(q) {
-            Some(og_id) => Lookup::Id {
-                ids: Args::new().set("ids", og_id).maybe("lang", lang.clone()),
+            Some(named) => Lookup::Id {
+                named,
+                lang: lang.clone(),
                 text: text(q),
             },
             None => Lookup::Geocode(text(q)),
@@ -499,6 +506,9 @@ pub(super) struct Batch {
 enum Checked {
     Places(Named<PlacesRequest>),
     Geocode(Named<GeocodeRequest>),
+    /// The geocode of the label a vendor id carries, kept to the record the
+    /// id names (see [`native::keep_named`]).
+    Labelled(Named<GeocodeRequest>, crate::compat::OgRef),
     Reverse(Named<GeocodeOptions>),
 }
 
@@ -626,7 +636,17 @@ fn check(state: &AppState, lookup: Lookup) -> Result<Checked, crate::compat::Ven
             prepared(og_batch::prepare(state, runtime::GEOCODE, &[], item(args)))
                 .map(Checked::Geocode)
         }
-        Lookup::Id { ids, text } => {
+        Lookup::Id { named, lang, text } => {
+            if let Some(label) = &named.label {
+                let args = Args::new()
+                    .set("q", label.clone())
+                    .set("limit", native::LABEL_CANDIDATES.to_string())
+                    .maybe("lang", lang);
+                return prepared(og_batch::prepare(state, runtime::GEOCODE, &[], item(args)))
+                    .map(|request| Checked::Labelled(request, named))
+                    .map_err(|problem| Api::Geocoding.failed(problem));
+            }
+            let ids = Args::new().set("ids", named.id).maybe("lang", lang);
             match prepared(og_batch::prepare(state, runtime::PLACES, &[], item(ids))) {
                 Ok(request) => Ok(Checked::Places(request)),
                 Err(problem) if problem.status() == 400 => {
@@ -656,7 +676,9 @@ fn item(args: Args) -> RawItem {
 fn place(query: &Checked) -> Place {
     match query {
         Checked::Places(request) => Place::Places((runtime::PLACES.place)(request)),
-        Checked::Geocode(request) => Place::Geocode((runtime::GEOCODE.place)(request)),
+        Checked::Geocode(request) | Checked::Labelled(request, _) => {
+            Place::Geocode((runtime::GEOCODE.place)(request))
+        }
         Checked::Reverse(options) => Place::Reverse((runtime::REVERSE.place)(options)),
     }
 }
@@ -679,6 +701,17 @@ fn look_up(state: &AppState, query: &Checked, cancel: &Arc<AtomicBool>) -> Resul
             cancel,
         ))
         .map(Answer::Forward),
+        Checked::Labelled(request, named) => outcome(og_batch::look_up(
+            state,
+            runtime::GEOCODE,
+            None,
+            request.clone(),
+            cancel,
+        ))
+        .map(|mut collection| {
+            native::keep_named(&mut collection, named);
+            Answer::Forward(collection)
+        }),
         Checked::Reverse(options) => outcome(og_batch::look_up(
             state,
             runtime::REVERSE,

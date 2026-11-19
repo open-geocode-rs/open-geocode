@@ -381,7 +381,10 @@ impl Feature {
                     description: Vec::new(),
                 },
             },
-            custom_fields: BTreeMap::from([(ID_FIELD, encode_id(&properties.id))]),
+            custom_fields: BTreeMap::from([(
+                ID_FIELD,
+                encode_id(&properties.id, &properties.label),
+            )]),
         };
         if product == Product::Verify {
             self.as_verified(&mut candidate);

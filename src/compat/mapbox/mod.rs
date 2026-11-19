@@ -332,7 +332,7 @@ impl Area {
     /// letters; any other area's is its subdivision code, written on the
     /// region only.
     fn of(area: &crate::api::ContextArea) -> Self {
-        let mut layer = Self::named(Some(encode_id(&area.id)), &area.name);
+        let mut layer = Self::named(Some(encode_id(&area.id, &area.name)), &area.name);
         if let Some(code) = area.code.as_deref().filter(|code| !code.contains('-')) {
             layer.country_code_alpha_3 = iso::alpha3(code);
             layer.country_code = Some(code.to_string());
@@ -485,7 +485,7 @@ struct Translated {
 
 impl Translated {
     fn of(common: &Common, [longitude, latitude]: [f64; 2]) -> Self {
-        let mapbox_id = encode_id(&common.id);
+        let mapbox_id = encode_id(&common.id, &common.label);
         let feature_type = feature_type(common);
         let parts = &common.address;
         let is_address = is_address(common);
