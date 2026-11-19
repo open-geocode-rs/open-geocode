@@ -271,6 +271,31 @@ async fn search_text_answers_every_field_without_a_mask() {
 }
 
 #[tokio::test]
+async fn search_text_answers_an_address_before_the_places_at_it() {
+    let fixture = fixture();
+    let reply = post_with(
+        &fixture.router,
+        SEARCH_TEXT,
+        &[("X-Goog-FieldMask", "places.id,places.types")],
+        json!({"textQuery": "10 King Street"}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        reply.body["places"][0],
+        json!({"id": address_id(), "types": ["street_address"]})
+    );
+    let reply = post_with(
+        &fixture.router,
+        SEARCH_TEXT,
+        &[("X-Goog-FieldMask", "places.id")],
+        json!({"textQuery": "Queen Bakery"}),
+    )
+    .await;
+    assert_eq!(reply.body["places"][0], json!({"id": bakery_id()}));
+}
+
+#[tokio::test]
 async fn search_text_reads_the_mask_from_header_then_dollar_fields_then_fields() {
     let fixture = fixture();
     let router = &fixture.router;

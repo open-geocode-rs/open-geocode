@@ -785,7 +785,7 @@ pub(super) async fn discover(
             ("limit", fetch(offset, limit, MAX_SEARCH_LIMIT).to_string()),
         ];
         fields.extend(near.fields.iter().cloned());
-        let collection = native::places(&state, args(fields).maybe("lang", og_lang(&params)))
+        let collection = native::search(&state, args(fields).maybe("lang", og_lang(&params)))
             .await
             .map_err(Gs7Error::of)?;
         let items = features(&collection)?

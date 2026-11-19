@@ -79,7 +79,7 @@ pub(super) async fn search_text(
             .maybe("focus", focus)
             .maybe("bbox", bbox)
             .maybe("lang", language.code());
-        let found = native::places(&state, args).await.map_err(from_problem)?;
+        let found = native::search(&state, args).await.map_err(from_problem)?;
         let answer = SearchTextResponse {
             places: found
                 .features
