@@ -691,9 +691,6 @@ impl Plan {
                             "must be geocode or reverse",
                         )])
                 })?);
-            } else if name == "lang" {
-                // Jobs keep their old behaviour: a language belongs to a
-                // lookup, not to a file of rows.
             } else if input == Format::Csv && COLUMN_PARAMETERS.contains(&name.as_str()) {
                 plan.named.push((name, value));
             } else {
@@ -727,6 +724,9 @@ pub(crate) struct JobQuery {
     /// Comma-separated ISO 3166-1 alpha-2 codes every row is limited to.
     #[param(example = "CA")]
     country: Option<String>,
+    /// ISO 639 language tag, such as `es`, every row's names come in. The Pack must have been built with `--lang`.
+    #[param(example = "es")]
+    lang: Option<String>,
 }
 
 /// Geocode a file
@@ -1322,16 +1322,7 @@ impl Rows {
                 Ok(_) if self.line.trim().is_empty() => continue,
                 Ok(_) => {
                     let item = serde_json::from_str::<RawItem>(&self.line)
-                        .map_err(|_| Problem::malformed_body("the line is not JSON"))
-                        .map(|item| match item {
-                            RawItem::Fields(mut fields) => {
-                                // Keep a job's rows as they were: a language
-                                // belongs to a lookup, not to an upload.
-                                fields.retain(|(name, _)| name != "lang");
-                                RawItem::Fields(fields)
-                            }
-                            other => other,
-                        });
+                        .map_err(|_| Problem::malformed_body("the line is not JSON"));
                     return Ok(Some((None, item)));
                 }
                 Err(error) => return Err(format!("the upload failed: {error}")),

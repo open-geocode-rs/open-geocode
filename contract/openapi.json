@@ -1985,6 +1985,16 @@
             }
           },
           {
+            "description": "ISO 639 language tag, such as `es`, every row's names come in. The Pack must have been built with `--lang`.",
+            "example": "es",
+            "in": "query",
+            "name": "lang",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "`respond-async` to be answered with the job's status once the upload is in.",
             "example": "respond-async",
             "in": "header",
