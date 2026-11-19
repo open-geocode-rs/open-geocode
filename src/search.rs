@@ -894,24 +894,33 @@ impl TextSearcher {
         }
         let as_typed =
             self.autocomplete_reading(options, completion, None, &tokens, true, &filters)?;
-        let [street @ .., last] = tokens.as_slice() else {
+        // The house number after the street, last ("Kerkstraat 12") or
+        // before the town ("Pariser Straße 2 Frankfurt").
+        let Some(at) = tokens
+            .iter()
+            .skip(1)
+            .position(|token| is_address_number_token(token))
+            .map(|index| index + 1)
+        else {
             return Ok(as_typed);
         };
-        if street.is_empty() || !is_address_number_token(last) {
-            return Ok(as_typed);
-        }
+        let number = &tokens[at];
         // "Pier 39" names a place, "Kerkstraat 12" a house, "1211CK" neither.
         let names_it = |hit: &TextSearchHit| {
             search_key(&hit.record.name).is_some_and(|name| {
                 name.split_whitespace()
-                    .any(|word| types_word(last, word, true))
+                    .any(|word| types_word(number, word, true))
             })
         };
         if as_typed.iter().any(names_it) {
             return Ok(as_typed);
         }
+        let words = [&tokens[..at], &tokens[at + 1..]].concat();
+        // A number typed last ends the street's last word; words after it
+        // are still being typed.
+        let typing = at + 1 < tokens.len();
         let numbered =
-            self.autocomplete_reading(options, completion, Some(last), street, false, &filters)?;
+            self.autocomplete_reading(options, completion, Some(number), &words, typing, &filters)?;
         Ok(if numbered.is_empty() {
             as_typed
         } else {
@@ -12549,6 +12558,13 @@ mod tests {
 
         assert_eq!(first("kerkstraat 12").as_deref(), Some("osm:node:1"));
         assert_eq!(first("12 kerkstraat").as_deref(), Some("osm:node:1"));
+        // The number between the street and the town, the town typed or
+        // half typed.
+        assert_eq!(
+            first("kerkstraat 12 amsterdam").as_deref(),
+            Some("osm:node:1")
+        );
+        assert_eq!(first("kerkstraat 29 amst").as_deref(), Some("osm:node:2"));
         assert_eq!(first("pier 39").as_deref(), Some("osm:node:3"));
 
         let _ = std::fs::remove_dir_all(temp_dir);
