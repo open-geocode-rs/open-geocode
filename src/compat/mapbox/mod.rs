@@ -3,9 +3,11 @@
 //! Geocoding v6 answers `/search/geocode/v6/{forward,reverse,batch}` from
 //! og's `/geocode`, `/places?ids` and `/reverse`. Search Box v1 answers
 //! `/search/searchbox/v1/{suggest,retrieve,forward,reverse}` from
-//! `/autocomplete`, `/places`, `/geocode` and `/reverse`. Its category
-//! endpoints answer 501: og has no category search to serve them from.
+//! `/autocomplete`, `/places`, `/geocode` and `/reverse`, and
+//! `/search/searchbox/v1/category/{id}` and `/list/category` from og's
+//! places by kind.
 
+mod category;
 mod geocoding;
 mod searchbox;
 #[cfg(test)]
@@ -40,8 +42,8 @@ pub(crate) fn router() -> Router<AppState> {
         )
         .route("/search/searchbox/v1/forward", get(searchbox::forward))
         .route("/search/searchbox/v1/reverse", get(searchbox::reverse))
-        .route("/search/searchbox/v1/category/{id}", any(not_implemented))
-        .route("/search/searchbox/v1/list/category", any(not_implemented))
+        .route("/search/searchbox/v1/category/{id}", get(category::search))
+        .route("/search/searchbox/v1/list/category", get(category::list))
         .route("/", any(not_found))
         // Mapbox documents no 405: a wrong method is an unknown endpoint.
         .method_not_allowed_fallback(not_found)
@@ -50,12 +52,6 @@ pub(crate) fn router() -> Router<AppState> {
 
 async fn not_found() -> VendorError {
     error(StatusCode::NOT_FOUND, "Not Found")
-}
-
-// og's categories are OSM tags with no canonical id list to serve
-// `list/category` from, and no search that returns only one category.
-async fn not_implemented() -> VendorError {
-    error(StatusCode::NOT_IMPLEMENTED, "Not Implemented")
 }
 
 /// Mapbox's error body, `{"message": ...}`.
