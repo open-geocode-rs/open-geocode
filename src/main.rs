@@ -103,6 +103,18 @@ enum Commands {
         #[command(flatten)]
         limits: Limits,
 
+        /// A host a job may call back when it ends, as `name` or `name:port`.
+        /// Repeat it, or comma-separate it, for more. None by default: a
+        /// callback URL a client stores would otherwise make the server
+        /// reach any address it can, internal ones included.
+        #[arg(
+            long = "hook-host",
+            env = "OG_HOOK_HOSTS",
+            value_name = "HOST",
+            value_delimiter = ','
+        )]
+        hook_hosts: Vec<String>,
+
         /// Longest, in seconds, the server takes to stop after Ctrl-C or
         /// SIGTERM; what is still open then is dropped. 0 drops it at once.
         #[arg(long, value_name = "SECS", default_value_t = DEFAULT_SHUTDOWN_TIMEOUT_SECS)]
@@ -808,6 +820,7 @@ async fn main() -> Result<()> {
             basemap,
             job_dir,
             limits,
+            hook_hosts,
             shutdown_timeout,
         } => {
             serve(ServeOptions {
@@ -817,6 +830,7 @@ async fn main() -> Result<()> {
                 basemap: Some(basemap),
                 job_dir,
                 limits,
+                hook_hosts,
                 shutdown_timeout: Duration::from_secs(shutdown_timeout),
             })
             .await?;
