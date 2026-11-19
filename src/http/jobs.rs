@@ -217,6 +217,13 @@ impl Job {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
+    /// Resolves once the job has stopped, however it stopped.
+    pub(crate) async fn ended(&self) {
+        let mut progress = self.progress.subscribe();
+        // A sender dropped first means the job is gone, which is an end too.
+        let _ = progress.wait_for(|progress| progress.done).await;
+    }
+
     /// The results written so far, from the start.
     pub(crate) fn open_results(&self) -> io::Result<File> {
         File::open(&self.results)
