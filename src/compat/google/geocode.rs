@@ -75,48 +75,15 @@ async fn geocode_address(
     text: Option<String>,
 ) -> Result<Response, VendorError> {
     let mask = field_mask(headers, query);
-    let lines = query.all("address.addressLines");
-    let locality = query.get("address.locality");
-    let region = query.get("address.administrativeArea");
-    let postcode = query.get("address.postalCode");
-    let country = query.get("address.regionCode");
-    let structured =
-        !lines.is_empty() || locality.is_some() || region.is_some() || postcode.is_some();
-    let args = match (text.filter(|text| !text.trim().is_empty()), structured) {
-        (Some(_), true) => {
-            return Err(invalid(
-                "Give the address as addressQuery or as address fields, not both",
-            ));
-        }
-        (Some(text), false) => Args::new()
-            .set("q", text)
-            .maybe("focus", bias(query)?)
-            .maybe("country", country),
-        // og matches the street line on its own and checks the town, region
-        // and postcode against it.
-        (None, true) if !lines.is_empty() => Args::new()
-            .set("address", lines.join(", "))
-            .maybe("locality", locality)
-            .maybe("region", region)
-            .maybe("postcode", postcode)
-            .maybe("country", country),
-        // No street line. Google reads the parts as one address, and og
-        // searches them as one text.
-        (None, true) => Args::new()
-            .set(
-                "q",
-                [locality, region, postcode]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
-            .maybe("focus", bias(query)?)
-            .maybe("country", country),
-        (None, false) => {
-            return Err(invalid("addressQuery or address is required"));
-        }
+    let address = AddressQuery {
+        text,
+        lines: query.all("address.addressLines"),
+        locality: query.get("address.locality"),
+        region: query.get("address.administrativeArea"),
+        postcode: query.get("address.postalCode"),
+        country: query.get("address.regionCode"),
     };
+    let args = address.args(|| bias(query))?;
     let language = language(state, query)?;
     let args = args.maybe("lang", language.code());
     let found = native::geocode(state, args).await.map_err(from_problem)?;
@@ -132,6 +99,73 @@ async fn geocode_address(
         })
         .collect();
     Ok(respond(&GeocodeResponse { results }, mask.as_ref()))
+}
+
+/// An address as Geocoding takes one, as one text or as postal parts.
+pub(super) struct AddressQuery<'a> {
+    pub(super) text: Option<String>,
+    pub(super) lines: Vec<&'a str>,
+    pub(super) locality: Option<&'a str>,
+    pub(super) region: Option<&'a str>,
+    pub(super) postcode: Option<&'a str>,
+    pub(super) country: Option<&'a str>,
+}
+
+impl AddressQuery<'_> {
+    /// og's geocode arguments. `focus` is read only for a search by text,
+    /// the only one a bias applies to.
+    pub(super) fn args(
+        self,
+        focus: impl FnOnce() -> Result<Option<String>, VendorError>,
+    ) -> Result<Args, VendorError> {
+        let Self {
+            text,
+            lines,
+            locality,
+            region,
+            postcode,
+            country,
+        } = self;
+        let structured =
+            !lines.is_empty() || locality.is_some() || region.is_some() || postcode.is_some();
+        Ok(
+            match (text.filter(|text| !text.trim().is_empty()), structured) {
+                (Some(_), true) => {
+                    return Err(invalid(
+                        "Give the address as addressQuery or as address fields, not both",
+                    ));
+                }
+                (Some(text), false) => Args::new()
+                    .set("q", text)
+                    .maybe("focus", focus()?)
+                    .maybe("country", country),
+                // og matches the street line on its own and checks the town,
+                // region and postcode against it.
+                (None, true) if !lines.is_empty() => Args::new()
+                    .set("address", lines.join(", "))
+                    .maybe("locality", locality)
+                    .maybe("region", region)
+                    .maybe("postcode", postcode)
+                    .maybe("country", country),
+                // No street line. Google reads the parts as one address, and
+                // og searches them as one text.
+                (None, true) => Args::new()
+                    .set(
+                        "q",
+                        [locality, region, postcode]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                    .maybe("focus", focus()?)
+                    .maybe("country", country),
+                (None, false) => {
+                    return Err(invalid("addressQuery or address is required"));
+                }
+            },
+        )
+    }
 }
 
 /// `languageCode`. Geocoding's default is the local language, which is og's
