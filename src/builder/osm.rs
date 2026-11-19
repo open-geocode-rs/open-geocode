@@ -625,12 +625,7 @@ impl<'a> Run<'a> {
             addresses: Some(ExternalSorter::new(&scratch, "addresses", &memory, budget)),
             streets: Some(ExternalSorter::new(&scratch, "streets", &memory, budget)),
             places: Some(ExternalSorter::new(&scratch, "places", &memory, budget)),
-            context_records: Some(ExternalSorter::new(
-                &scratch,
-                "context-records",
-                &memory,
-                (budget / 16).max(1),
-            )),
+            context_records: Some(context_sorter(&scratch, &memory, budget)),
             datasets: Datasets::default(),
             seq: 0,
             memory,
@@ -732,10 +727,10 @@ impl<'a> Run<'a> {
             places: sorter_of(sorters, "places", &scratch, &memory, budget)?,
             context_records: sorter_of(
                 sorters,
-                "context-records",
+                CONTEXT_RECORDS,
                 &scratch,
                 &memory,
-                (budget / 16).max(1),
+                context_share(budget),
             )?,
             datasets: Datasets::from_names(state.datasets.clone()),
             seq: state.seq,
@@ -1261,9 +1256,10 @@ impl<'a> Run<'a> {
         }
         self.build.absorb(places)?;
         drop((line_memory, line_at, lines, relations, batch_memory));
+        self.build.report.geometry_passes.boundary_shape_vertices = builder.vertices();
+        let mut boundaries = builder.finish()?;
+        self.merge_place_points(&mut boundaries)?;
         let passes = &mut self.build.report.geometry_passes;
-        passes.boundary_shape_vertices = builder.vertices();
-        let boundaries = builder.finish()?;
         passes.boundary_shape_bytes = boundaries.shapes().bytes();
         passes.boundary_heap_bytes = boundaries.heap_bytes() as u64;
         drop(held);
@@ -1281,6 +1277,35 @@ impl<'a> Run<'a> {
         self.geometry_saved.clear();
         self.progress.finish(BuildStage::Boundaries);
         self.build.report.phases.boundary_build_ms = phase.elapsed().as_millis();
+        Ok(())
+    }
+
+    /// Merges place points into the boundaries they name, dropping their own records.
+    fn merge_place_points(&mut self, boundaries: &mut BoundarySet) -> Result<()> {
+        let mut links = boundaries.place_links();
+        if links.is_empty() {
+            return Ok(());
+        }
+        let Some(points) = self.build.context_records.take() else {
+            return Ok(());
+        };
+        self.sorted
+            .insert("place_points".to_string(), sorter_report(&points));
+        let mut kept = context_sorter(&self.scratch, &self.memory, self.budget);
+        let mut merged = 0;
+        for pending in points.finish()? {
+            let pending = pending?;
+            if let Body::Record(record) = &pending.body
+                && let Record::Place(layer, place) = record.as_ref()
+                && boundaries.merge_place_point(&mut links, *layer, place)
+            {
+                merged += 1;
+            } else {
+                kept.push(pending)?;
+            }
+        }
+        self.build.context_records = Some(kept);
+        self.build.report.accepted.place_points_merged = merged;
         Ok(())
     }
 
@@ -1422,6 +1447,9 @@ impl<'a> Run<'a> {
             match &item.origin {
                 Some(ContextOrigin::Boundary(boundary)) => {
                     boundary_ids[*boundary as usize] = record_id;
+                    if boundaries.is_settled(*boundary as usize) {
+                        settled.insert(record_id);
+                    }
                 }
                 Some(ContextOrigin::DerivedCountry(code)) => {
                     country_ids.insert(code.clone(), record_id);
@@ -2075,6 +2103,21 @@ fn open<'s, T>(
     sorter
         .as_mut()
         .ok_or_else(|| Error::Inconsistent(format!("the {label} sorter was read already")))
+}
+
+const CONTEXT_RECORDS: &str = "context-records";
+
+/// The context-record sorter gets a sixteenth of a share, since context records are few.
+fn context_share(budget: usize) -> usize {
+    (budget / 16).max(1)
+}
+
+fn context_sorter(
+    scratch: &Arc<Scratch>,
+    memory: &Arc<Budget>,
+    budget: usize,
+) -> ExternalSorter<PendingRecord> {
+    ExternalSorter::new(scratch, CONTEXT_RECORDS, memory, context_share(budget))
 }
 
 /// A step ran before the one that makes what it needs.
@@ -5778,6 +5821,366 @@ mod tests {
             .expect("generations")
             .count();
         assert_eq!(generations, 1, "the stopped build's generation is gone");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Seattle's relation labels its city node, and Bellevue's shares its
+    /// node's Wikidata item: each becomes one record at its node's point.
+    #[test]
+    fn cities_merge_with_their_label_or_wikidata_node() {
+        let dir = temp_dir("two-cities");
+        let input = dir.join("cities.osm.pbf");
+        let city = |name, item| {
+            [
+                ("boundary", "administrative"),
+                ("admin_level", "8"),
+                ("name", name),
+                ("wikidata", item),
+            ]
+        };
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(
+                        10,
+                        0.2,
+                        0.3,
+                        &[
+                            ("place", "city"),
+                            ("name", "Seattle"),
+                            ("alt_name", "Emerald City"),
+                            ("name:lut", "dᶻidᶻəlal̓ič"),
+                        ],
+                    ),
+                    node(
+                        11,
+                        2.4,
+                        2.6,
+                        &[
+                            ("place", "city"),
+                            ("name", "Bellevue"),
+                            ("wikidata", "Q214164"),
+                        ],
+                    ),
+                    node(100, 0.0, 0.0, &[]),
+                    node(101, 0.0, 1.0, &[]),
+                    node(102, 1.0, 1.0, &[]),
+                    node(103, 1.0, 0.0, &[]),
+                    node(110, 2.0, 2.0, &[]),
+                    node(111, 2.0, 3.0, &[]),
+                    node(112, 3.0, 3.0, &[]),
+                    node(113, 3.0, 2.0, &[]),
+                ],
+                vec![
+                    way(100, &[100, 101, 102, 103, 100], &[]),
+                    way(110, &[110, 111, 112, 113, 110], &[]),
+                ],
+                vec![
+                    TestElement::Relation {
+                        id: 900,
+                        members: vec![(100, "outer")],
+                        nodes: vec![(10, "label")],
+                        tags: city("Seattle", "Q5083").to_vec(),
+                    },
+                    relation(901, &[(110, "outer")], &city("Bellevue", "Q214164")),
+                ],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.place_points_merged, 2);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let mut cities = reader
+            .records_json_by_layer("locality", 0)
+            .expect("cities")
+            .into_iter()
+            .map(|city| {
+                (
+                    city["id"].as_str().expect("id").to_string(),
+                    city["geometry"]["coordinates"].clone(),
+                    city["alt_names"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        cities.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            cities,
+            [
+                (
+                    "osm:relation:900".to_string(),
+                    serde_json::json!([0.3, 0.2]),
+                    serde_json::json!(["Emerald City", "dᶻidᶻəlal̓ič"]),
+                ),
+                (
+                    "osm:relation:901".to_string(),
+                    serde_json::json!([2.6, 2.4]),
+                    serde_json::Value::Null,
+                ),
+            ]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A county's relation may name its seat as both `label` and
+    /// `admin_centre`, but the seat is a town of its own and stays separate.
+    #[test]
+    fn a_countys_seat_stays_its_own_place() {
+        let dir = temp_dir("county-seat");
+        let input = dir.join("county.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(10, 0.5, 0.5, &[("place", "town"), ("name", "Kent")]),
+                    node(100, 0.0, 0.0, &[]),
+                    node(101, 0.0, 1.0, &[]),
+                    node(102, 1.0, 1.0, &[]),
+                    node(103, 1.0, 0.0, &[]),
+                ],
+                vec![way(100, &[100, 101, 102, 103, 100], &[])],
+                vec![TestElement::Relation {
+                    id: 900,
+                    members: vec![(100, "outer")],
+                    nodes: vec![(10, "label"), (10, "admin_centre")],
+                    tags: vec![
+                        ("boundary", "administrative"),
+                        ("admin_level", "6"),
+                        ("name", "King County"),
+                    ],
+                }],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.place_points_merged, 0);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        for id in ["osm:node:10", "osm:relation:900"] {
+            assert!(
+                reader.find_by_source_id(id).expect("lookup").is_some(),
+                "{id}"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A suburb tagged with its city's Wikidata item is on another layer, and
+    /// a city node far outside the boundary must not be pulled in by a
+    /// mistagged item: both stay separate.
+    #[test]
+    fn a_shared_item_merges_only_on_its_layer_and_within_bounds() {
+        let dir = temp_dir("shared-item");
+        let input = dir.join("bellevue.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(
+                        10,
+                        0.5,
+                        0.5,
+                        &[
+                            ("place", "suburb"),
+                            ("name", "Downtown Bellevue"),
+                            ("wikidata", "Q214164"),
+                        ],
+                    ),
+                    node(
+                        11,
+                        5.0,
+                        5.0,
+                        &[
+                            ("place", "city"),
+                            ("name", "Bellevue"),
+                            ("wikidata", "Q214164"),
+                        ],
+                    ),
+                    node(100, 0.0, 0.0, &[]),
+                    node(101, 0.0, 1.0, &[]),
+                    node(102, 1.0, 1.0, &[]),
+                    node(103, 1.0, 0.0, &[]),
+                ],
+                vec![way(100, &[100, 101, 102, 103, 100], &[])],
+                vec![relation(
+                    900,
+                    &[(100, "outer")],
+                    &[
+                        ("boundary", "administrative"),
+                        ("admin_level", "8"),
+                        ("name", "Bellevue"),
+                        ("wikidata", "Q214164"),
+                    ],
+                )],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.place_points_merged, 0);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        for id in ["osm:node:10", "osm:node:11", "osm:relation:900"] {
+            assert!(
+                reader.find_by_source_id(id).expect("lookup").is_some(),
+                "{id}"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Ballard has no label or item, so the suburb node of its name inside it
+    /// merges and lends it its item. A Ballard node outside it, and a
+    /// differently named node inside, stay separate.
+    #[test]
+    fn a_place_node_merges_into_the_boundary_of_its_name_around_it() {
+        let dir = temp_dir("merge-by-name");
+        let input = dir.join("ballard.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(
+                        10,
+                        0.5,
+                        0.5,
+                        &[
+                            ("place", "suburb"),
+                            ("name", "Ballard"),
+                            ("wikidata", "Q3428047"),
+                        ],
+                    ),
+                    node(11, 5.0, 5.0, &[("place", "suburb"), ("name", "Ballard")]),
+                    node(
+                        12,
+                        0.6,
+                        0.6,
+                        &[("place", "neighbourhood"), ("name", "Loyal Heights")],
+                    ),
+                    node(100, 0.0, 0.0, &[]),
+                    node(101, 0.0, 1.0, &[]),
+                    node(102, 1.0, 1.0, &[]),
+                    node(103, 1.0, 0.0, &[]),
+                    node(200, -1.0, -1.0, &[]),
+                    node(201, -1.0, 6.0, &[]),
+                    node(202, 6.0, 6.0, &[]),
+                    node(203, 6.0, -1.0, &[]),
+                ],
+                vec![
+                    way(
+                        100,
+                        &[100, 101, 102, 103, 100],
+                        &[
+                            ("boundary", "administrative"),
+                            ("admin_level", "10"),
+                            ("name", "Ballard"),
+                        ],
+                    ),
+                    way(200, &[200, 201, 202, 203, 200], &[]),
+                ],
+                vec![relation(
+                    900,
+                    &[(200, "outer")],
+                    &[
+                        ("boundary", "administrative"),
+                        ("admin_level", "8"),
+                        ("name", "Seattle"),
+                    ],
+                )],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.place_points_merged, 1);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let mut places = reader
+            .records_json_by_layer("neighbourhood", 0)
+            .expect("places")
+            .into_iter()
+            .map(|place| {
+                (
+                    place["id"].as_str().expect("id").to_string(),
+                    place["geometry"]["coordinates"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        places.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            places,
+            [
+                ("osm:node:11".to_string(), serde_json::json!([5.0, 5.0])),
+                ("osm:node:12".to_string(), serde_json::json!([0.6, 0.6])),
+                ("osm:way:100".to_string(), serde_json::json!([0.5, 0.5])),
+            ]
+        );
+        let ballard = reader
+            .find_by_source_id("osm:way:100")
+            .expect("lookup")
+            .expect("Ballard");
+        assert_eq!(
+            reader.records().wikidata(ballard).expect("wikidata"),
+            Some(3428047)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A boundary that absorbs a town node is a settlement, so streets inside
+    /// it take the town's name rather than the district's.
+    #[test]
+    fn a_boundary_that_absorbs_a_town_node_is_a_settlement() {
+        let dir = temp_dir("labelled-town");
+        let input = dir.join("town.osm.pbf");
+        let admin = |level, name| {
+            vec![
+                ("boundary", "administrative"),
+                ("admin_level", level),
+                ("name", name),
+            ]
+        };
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(10, 0.75, 0.75, &[("place", "town"), ("name", "Kingston")]),
+                    node(20, 0.7, 0.7, &[]),
+                    node(21, 0.7, 0.701, &[]),
+                    node(100, 0.0, 0.0, &[]),
+                    node(101, 0.0, 1.0, &[]),
+                    node(102, 1.0, 1.0, &[]),
+                    node(103, 1.0, 0.0, &[]),
+                    node(110, 0.6, 0.6, &[]),
+                    node(111, 0.6, 0.9, &[]),
+                    node(112, 0.9, 0.9, &[]),
+                    node(113, 0.9, 0.6, &[]),
+                ],
+                vec![
+                    way(100, &[100, 101, 102, 103, 100], &[]),
+                    way(110, &[110, 111, 112, 113, 110], &[]),
+                    way(
+                        700,
+                        &[20, 21],
+                        &[("highway", "residential"), ("name", "Main Street")],
+                    ),
+                ],
+                vec![
+                    relation(900, &[(100, "outer")], &admin("6", "Auckland")),
+                    TestElement::Relation {
+                        id: 910,
+                        members: vec![(110, "outer")],
+                        nodes: vec![(10, "label")],
+                        tags: admin("8", "Kingston"),
+                    },
+                ],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.place_points_merged, 1);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let labels = reader
+            .records_json_by_layer("street", 0)
+            .expect("streets")
+            .into_iter()
+            .map(|street| street["label"].as_str().expect("label").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["Main Street, Kingston"]);
         let _ = fs::remove_dir_all(dir);
     }
 }

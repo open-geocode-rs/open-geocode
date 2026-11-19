@@ -23,7 +23,7 @@ use super::{
         validate_address_tags,
     },
     boundary::{
-        BoundaryRelationMember, BoundaryRelationStub, boundary_tags, has_area_tags,
+        BoundaryRelationMember, BoundaryRelationStub, boundary_tags, has_area_tags, is_label_role,
         relation_member_role,
     },
     emitted::Emitted,
@@ -121,17 +121,24 @@ pub(crate) fn scan_block(block: &PrimitiveBlock) -> ScanOutput {
                 if !may_matter(relation.tags().map(|(key, _)| key)) {
                     continue;
                 }
+                let mut label = None;
                 let members = relation
                     .members()
                     .filter_map(|member| {
-                        if member.member_type != RelMemberType::Way {
-                            return None;
+                        let role = member.role().unwrap_or_default();
+                        match member.member_type {
+                            RelMemberType::Way => Some(BoundaryRelationMember {
+                                way_id: member.member_id,
+                                role: relation_member_role(role)?,
+                            }),
+                            RelMemberType::Node => {
+                                if label.is_none() && is_label_role(role) {
+                                    label = Some(member.member_id);
+                                }
+                                None
+                            }
+                            RelMemberType::Relation => None,
                         }
-                        let role = relation_member_role(member.role().unwrap_or_default())?;
-                        Some(BoundaryRelationMember {
-                            way_id: member.member_id,
-                            role,
-                        })
                     })
                     .collect();
                 scan_relation(
@@ -139,6 +146,7 @@ pub(crate) fn scan_block(block: &PrimitiveBlock) -> ScanOutput {
                     relation.id(),
                     &collect_clean_tags(relation.tags()),
                     members,
+                    label,
                 );
             }
         }
@@ -388,12 +396,14 @@ fn scan_relation(
     object_id: i64,
     all_tags: &BTreeMap<String, String>,
     members: Vec<BoundaryRelationMember>,
+    label: Option<i64>,
 ) {
     if has_area_tags(all_tags) && is_area_relation(all_tags) {
         if !members.is_empty() {
             output.relations.push(BoundaryRelationStub {
                 object_id,
                 members,
+                label,
                 tags: boundary_tags(all_tags),
             });
         }
@@ -408,6 +418,7 @@ fn scan_relation(
             output.relations.push(BoundaryRelationStub {
                 object_id,
                 members,
+                label: None,
                 tags: poi_tags(all_tags, address.as_ref()),
             });
         }
