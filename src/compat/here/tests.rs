@@ -259,6 +259,11 @@ impl Reply {
         })
     }
 
+    /// The body as JSON, or `null` for one that is empty or not JSON.
+    fn json_or_null(&self) -> Value {
+        serde_json::from_slice(&self.body).unwrap_or(Value::Null)
+    }
+
     pub(super) fn text(&self) -> String {
         String::from_utf8(self.body.clone()).expect("UTF-8")
     }
@@ -942,17 +947,34 @@ async fn errors_take_here_shapes() {
     assert_eq!(reply.json()["title"], "Illegal input for parameter 'q'");
     assert_eq!(reply.json()["requestId"], "rid-1");
 
-    let reply = send(&router, "POST", "/compat/here/v1/signals", None).await;
-    assert_eq!(reply.status, StatusCode::NOT_IMPLEMENTED);
+    let signal = "version=1&action=here:gs:action:view&correlationId=c&resourceId=r&rank=0";
+    let reply = send(
+        &router,
+        "POST",
+        "/compat/here/v1/signals",
+        Some(("text/plain", signal)),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    assert!(reply.body.is_empty());
+    let reply = send(
+        &router,
+        "POST",
+        "/compat/here/v1/signals",
+        Some(("text/plain", &signal.replace("version=1", "version=9"))),
+    )
+    .await;
     assert_eq!(
         reply.json(),
         here_error(
-            501,
-            "Not Implemented",
-            Some("This server does not serve /compat/here/v1/signals"),
-            None,
+            400,
+            "Illegal input for parameter 'version'",
+            Some("Actual parameter value: '9'"),
+            Some("Unsupported value: '9'. Supported values: '1'"),
         )
     );
+    let reply = get(&router, "/compat/here/v1/signals").await;
+    assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
     let reply = get(&router, "/compat/here/v1/nowhere").await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
     assert_eq!(
@@ -1586,9 +1608,6 @@ async fn batch_errors_take_the_batch_shape() {
     .await;
     assert_eq!(reply.json()["total"], 1);
 
-    let reply = get(&router, "/compat/here/v7/batch/notifications").await;
-    assert_eq!(reply.status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(reply.json()["code"], "E6005010");
     // The batch API documents no 405: another method is its 404.
     let reply = send(&router, "PATCH", "/compat/here/v7/batch/jobs", None).await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
@@ -1602,6 +1621,248 @@ async fn batch_errors_take_the_batch_shape() {
         get(&router, "/compat/here/v7/health").await.json(),
         json!({"status": "ok"})
     );
+}
+
+/// A server that answers every request 200 and keeps the request lines,
+/// as a webhook endpoint does.
+async fn hook_receiver() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = std::sync::Arc::clone(&calls);
+    let app = Router::new().fallback(move |uri: axum::http::Uri| {
+        let kept = std::sync::Arc::clone(&kept);
+        async move {
+            kept.lock().expect("calls").push(uri.to_string());
+            StatusCode::OK
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    (format!("http://{address}"), calls)
+}
+
+/// Waits for the receiver to have taken `count` calls.
+async fn calls_taken(calls: &std::sync::Mutex<Vec<String>>, count: usize) -> Vec<String> {
+    for _ in 0..400 {
+        let taken = calls.lock().expect("calls").clone();
+        if taken.len() >= count {
+            return taken;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the webhook took {count} calls")
+}
+
+#[tokio::test]
+async fn notifications_are_kept_and_called_when_a_job_ends() {
+    let pack = pack("batch-notify");
+    let router = pack.router();
+    let (hook, calls) = hook_receiver().await;
+    let url = format!(
+        "{hook}/done?id=${{JOB_ID}}&name=${{JOB_NAME}}&status=${{JOB_STATUS}}&ok=${{JOB_RECORDS_SUCCEEDED}}&failed=${{JOB_RECORDS_FAILED}}&total=${{JOB_RECORDS_TOTAL}}"
+    );
+    let body = json!({"type": "webHook", "config": {"url": url}}).to_string();
+    let created = send(
+        &router,
+        "POST",
+        "/compat/here/v7/batch/notifications",
+        Some(("application/json", &body)),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
+    let created = created.json();
+    let id = created["id"].as_str().expect("id").to_string();
+    assert!(id.starts_with("NOTIFICATION-"));
+    assert_eq!(
+        created,
+        json!({"id": id, "type": "webHook", "config": {"url": url}})
+    );
+    let path = format!("/compat/here/v7/batch/notifications/{id}");
+
+    // Kept on disk. A second server on the same job directory reads it.
+    let other = build_router(pack.state(Limits::DEFAULT), None, None);
+    assert_eq!(get(&other, &path).await.json(), created);
+    assert_eq!(
+        get(&other, "/compat/here/v7/batch/notifications")
+            .await
+            .json(),
+        json!([created])
+    );
+
+    let reply = get(&router, &format!("{path}/test")).await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT, "{}", reply.text());
+    assert_eq!(
+        calls_taken(&calls, 1).await,
+        [
+            "/done?id=JOB-00000000-0000-0000-0000-000000000000&name=test&status=completed&ok=0&failed=0&total=0"
+        ]
+    );
+    let used = get(&router, &path).await.json();
+    assert!(
+        used["lastUsedTime"]
+            .as_str()
+            .is_some_and(|at| at.ends_with('Z'))
+    );
+
+    let job = send(
+        &router,
+        "POST",
+        &format!("/compat/here/v7/batch/jobs?tag=night%20run&notificationIds={id}"),
+        Some((
+            "text/plain",
+            "recId|q\na1|10 King Street\na2|zzzz qqqq xxxx\n",
+        )),
+    )
+    .await;
+    assert_eq!(job.status, StatusCode::CREATED, "{}", job.text());
+    let job = job.json()["id"].as_str().expect("job id").to_string();
+    let details = finished(&router, &job).await;
+    assert_eq!(details["notificationIds"], json!([id]));
+    assert_eq!(
+        calls_taken(&calls, 2).await[1],
+        format!("/done?id={job}&name=night%20run&status=completed&ok=2&failed=0&total=2")
+    );
+
+    let replaced = send(
+        &router,
+        "PUT",
+        &path,
+        Some((
+            "application/json",
+            &json!({"type": "WEB_HOOK", "config": {"url": format!("{hook}/v2")}}).to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(replaced.status, StatusCode::OK);
+    assert_eq!(replaced.json()["config"]["url"], format!("{hook}/v2"));
+    assert_eq!(replaced.json()["id"], id);
+
+    let unknown = "NOTIFICATION-3fa85f64-5717-4562-b3fc-2c963f66afa6";
+    let reply = send(
+        &router,
+        "POST",
+        &format!("/compat/here/v7/batch/jobs?notificationIds={unknown}"),
+        Some(("text/plain", "q\n10 King Street\n")),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.json()["title"], "Notification not found");
+    let six = ["a", "b", "c", "d", "e", "f"].join(",");
+    let reply = send(
+        &router,
+        "POST",
+        &format!("/compat/here/v7/batch/jobs?notificationIds={six}"),
+        Some(("text/plain", "q\n10 King Street\n")),
+    )
+    .await;
+    assert_eq!(reply.json()["title"], "Too many notifications");
+
+    let reply = send(
+        &router,
+        "POST",
+        "/compat/here/v7/batch/notifications",
+        Some(("application/json", r#"{"config":{"url":"ftp://x.test"}}"#)),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reply.json()["title"],
+        "Illegal input for field 'config.url'"
+    );
+
+    let reply = send(&router, "DELETE", &path, None).await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let reply = get(&router, &path).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        reply.json(),
+        json!({
+            "title": "Notification not found",
+            "status": 404,
+            "code": "E6004044",
+            "cause": "Notification with the specified ID could not be found",
+            "action": "Verify the notification ID and try again",
+            "correlationId": "rid-1",
+        })
+    );
+    assert_eq!(
+        get(&router, "/compat/here/v7/batch/notifications")
+            .await
+            .json(),
+        json!([])
+    );
+    let reply = send(&router, "PATCH", &path, None).await;
+    assert_eq!(reply.json()["code"], "E6004040");
+}
+
+#[tokio::test]
+async fn openapi_lists_the_batch_routes_og_serves() {
+    let pack = pack("batch-openapi");
+    let router = pack.router();
+    let reply = get(&router, "/compat/here/v7/openapi").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.header("content-type"), Some("application/json"));
+    let document = reply.json();
+    assert_eq!(document["openapi"], "3.1.0");
+    assert_eq!(
+        document["servers"],
+        json!([{"url": "http://og.test/compat/here/v7"}])
+    );
+    let paths = document["paths"]
+        .as_object()
+        .expect("paths")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        [
+            "/batch/jobs",
+            "/batch/jobs/{jobId}",
+            "/batch/jobs/{jobId}/errors",
+            "/batch/jobs/{jobId}/results",
+            "/batch/jobs/{jobId}/start",
+            "/batch/jobs/{jobId}/stop",
+            "/batch/notifications",
+            "/batch/notifications/{notificationId}",
+            "/batch/notifications/{notificationId}/test",
+            "/health",
+            "/openapi",
+            "/version",
+        ]
+    );
+    // Every path answers on this server, so none is listed that is not.
+    for path in &paths {
+        let concrete = path
+            .replace("{jobId}", "JOB-3fa85f64-5717-4562-b3fc-2c963f66afa6")
+            .replace(
+                "{notificationId}",
+                "NOTIFICATION-3fa85f64-5717-4562-b3fc-2c963f66afa6",
+            );
+        for method in document["paths"][path].as_object().expect("methods").keys() {
+            let reply = send(
+                &router,
+                &method.to_ascii_uppercase(),
+                &format!("/compat/here/v7{concrete}"),
+                None,
+            )
+            .await;
+            assert_ne!(reply.json_or_null()["code"], "E6004040", "{method} {path}");
+        }
+    }
+
+    let yaml = send_with(
+        &router,
+        "GET",
+        "/compat/here/v7/openapi",
+        &[("accept", "text/yaml")],
+        None,
+    )
+    .await;
+    assert_eq!(yaml.header("content-type"), Some("text/yaml"));
+    assert_eq!(yaml.json(), document);
 }
 
 #[tokio::test]

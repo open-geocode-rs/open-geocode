@@ -76,6 +76,12 @@ impl ErrorLog {
         self.write(&line.to_string());
     }
 
+    /// One line an operator reads that no error caused, such as a call the
+    /// server made out to a client's own endpoint.
+    pub(crate) fn event(&self, line: &serde_json::Value) {
+        self.write(&line.to_string());
+    }
+
     fn write(&self, line: &str) {
         #[cfg(test)]
         if let Some(lines) = &self.captured {

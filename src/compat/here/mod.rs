@@ -11,7 +11,10 @@
 mod batch;
 mod category;
 mod item;
+mod notify;
+mod openapi;
 mod search;
+mod signals;
 #[cfg(test)]
 mod tests;
 
@@ -20,7 +23,7 @@ use axum::{
     extract::{FromRequestParts, OriginalUri},
     http::{StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
-    routing::{MethodRouter, any, get, post, put},
+    routing::{MethodRouter, get, post, put},
 };
 use serde_json::{Value, json};
 
@@ -52,7 +55,7 @@ pub(crate) fn router() -> Router<AppState> {
             "/v1/browse",
             search_route(get(search::browse).post(search::browse)),
         )
-        .route("/v1/signals", search_route(post(not_implemented)))
+        .route("/v1/signals", search_route(post(signals::signals)))
         .route(
             "/v7/batch/jobs",
             batch_route(
@@ -75,12 +78,19 @@ pub(crate) fn router() -> Router<AppState> {
             "/v7/batch/jobs/{id}/errors",
             batch_route(get(batch::errors)),
         )
-        .route("/v7/batch/notifications", any(batch::not_implemented))
         .route(
-            "/v7/batch/notifications/{*rest}",
-            any(batch::not_implemented),
+            "/v7/batch/notifications",
+            batch_route(post(notify::create).get(notify::list)),
         )
-        .route("/v7/openapi", any(batch::not_implemented))
+        .route(
+            "/v7/batch/notifications/{id}",
+            batch_route(get(notify::get).put(notify::replace).delete(notify::delete)),
+        )
+        .route(
+            "/v7/batch/notifications/{id}/test",
+            batch_route(get(notify::test)),
+        )
+        .route("/v7/openapi", batch_route(get(openapi::openapi)))
         .route("/v7/version", batch_route(get(batch::version)))
         .route("/v7/health", batch_route(get(batch::health)))
         .fallback(not_found)
@@ -249,13 +259,6 @@ fn respond<T: serde::Serialize>(request_id: &str, answer: Result<T, Gs7Error>) -
         Ok(answer) => axum::Json(answer).into_response(),
         Err(error) => error.into_vendor(request_id).into_response(),
     }
-}
-
-async fn not_implemented(Rid(request_id): Rid, OriginalUri(uri): OriginalUri) -> Response {
-    Gs7Error::new(StatusCode::NOT_IMPLEMENTED, "Not Implemented")
-        .cause(format!("This server does not serve {}", uri.path()))
-        .into_vendor(&request_id)
-        .into_response()
 }
 
 async fn method_not_allowed(Rid(request_id): Rid) -> Response {
