@@ -8,7 +8,10 @@ use crate::{
     spatial_index::haversine_m,
 };
 
-use super::LatLng;
+use super::{
+    LatLng,
+    category::{self, ItemCategory},
+};
 
 /// An og feature as og's JSON carries it. A live answer is read through its
 /// JSON too, so a batch job's results, read back from disk, map by the same
@@ -37,6 +40,8 @@ struct Properties {
     context: Context,
     confidence: Option<f32>,
     distance_m: Option<f64>,
+    /// A place's kind, as og's map tag (`amenity:cafe`).
+    category: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -105,6 +110,9 @@ pub(super) struct Item {
     pub(super) position: Option<Position>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) distance: Option<i64>,
+    /// The HERE categories of a place whose kind has one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) categories: Vec<ItemCategory>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) scoring: Option<Scoring>,
 }
@@ -218,6 +226,11 @@ pub(super) fn item(feature: &Feature) -> Item {
         distance: properties
             .distance_m
             .map(|distance| distance.round() as i64),
+        categories: properties
+            .category
+            .as_deref()
+            .map(category::of_place)
+            .unwrap_or_default(),
         scoring: properties.confidence.map(|confidence| Scoring {
             query_score: confidence,
         }),

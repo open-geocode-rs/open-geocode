@@ -9,6 +9,7 @@
 //! `/jobs/{id}` as any other.
 
 mod batch;
+mod category;
 mod item;
 mod search;
 #[cfg(test)]
@@ -47,11 +48,9 @@ pub(crate) fn router() -> Router<AppState> {
             search_route(get(search::discover).post(search::discover)),
         )
         .route("/v1/lookup", search_route(get(search::lookup)))
-        // Browse lists places of HERE category ids around a point; og's
-        // categories are OSM tags and map onto none of them.
         .route(
             "/v1/browse",
-            search_route(get(not_implemented).post(not_implemented)),
+            search_route(get(search::browse).post(search::browse)),
         )
         .route("/v1/signals", search_route(post(not_implemented)))
         .route(
