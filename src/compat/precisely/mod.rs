@@ -1,11 +1,11 @@
-//! `/compat/precisely`, Precisely's Data Integrity Suite APIs. The token
-//! call, real-time Geo Addressing v1 and Bulk Geo Addressing v2.
+//! `/compat/precisely`, Precisely's Data Integrity Suite APIs. Real-time Geo
+//! Addressing v1 and Bulk Geo Addressing v2. No token call: og checks no
+//! credentials, so the SDK sends none to og.
 //!
 //! Real-time calls answer each item with og's own lookup. Bulk jobs are og
 //! `/jobs`. The uploaded CSV streams into a job as JSONL, and the job's JSONL
 //! results stream back out as Precisely's output CSV.
 
-mod auth;
 mod bulk;
 mod explain;
 mod match_code;
@@ -35,7 +35,6 @@ pub(crate) use bulk::sweep;
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
-        .route("/auth/v2/token", post(auth::token).fallback(not_found))
         .route("/v1/geocode", post(realtime::geocode).fallback(not_found))
         .route(
             "/v1/reverse-geocode",

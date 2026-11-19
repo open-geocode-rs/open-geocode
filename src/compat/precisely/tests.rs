@@ -385,63 +385,6 @@ fn address_result(score: &Value) -> Value {
 }
 
 #[tokio::test]
-async fn token_is_handed_out_without_checking_credentials() {
-    let fixture = Fixture::new("token");
-    let router = fixture.router();
-    let token = |body: &'static str| {
-        Request::post("/compat/precisely/auth/v2/token")
-            .header(header::AUTHORIZATION, "Basic bm90OmNoZWNrZWQ=")
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from(body))
-            .expect("request")
-    };
-
-    let reply = send(
-        &router,
-        token("grant_type=client_credentials&scope=default"),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::OK);
-    let mut body = reply.json();
-    let access_token = body["access_token"].take();
-    assert_eq!(
-        body,
-        json!({"access_token": null, "token_type": "Bearer", "expires_in": 3600, "scope": "default"})
-    );
-    let access_token = access_token.as_str().expect("token").to_string();
-    assert_eq!(access_token.len(), 64);
-    assert!(access_token.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    let again = send(&router, token("grant_type=client_credentials")).await;
-    assert_eq!(again.status, StatusCode::OK);
-    assert_ne!(again.json()["access_token"], json!(access_token));
-
-    for (body, error, description) in [
-        (
-            "",
-            "invalid_request",
-            "Request body is not specified (DIS-AUTH-1019)",
-        ),
-        (
-            "grant_type=password",
-            "unsupported_grant_type",
-            "Invalid grant_type (DIS-AUTH-1016)",
-        ),
-        (
-            "grant_type=client_credentials&scope=admin",
-            "invalid_scope",
-            "Invalid scope value (DIS-AUTH-1021)",
-        ),
-    ] {
-        let reply = send(&router, token(body)).await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(
-            reply.json(),
-            json!({"error": error, "error_description": description})
-        );
-    }
-}
-
-#[tokio::test]
 async fn geocode_answers_each_address_in_order() {
     let fixture = Fixture::new("geocode");
     let router = fixture.router();
@@ -824,6 +767,7 @@ async fn an_unknown_path_or_method_is_not_found() {
         ("GET", "/compat/precisely/v1/geocode"),
         ("DELETE", "/compat/precisely/v2/bulk-geocode"),
         ("GET", "/compat/precisely/v1/bulk/jobs"),
+        ("POST", "/compat/precisely/auth/v2/token"),
     ] {
         let reply = send(
             &router,
