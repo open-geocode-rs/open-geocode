@@ -1,4 +1,5 @@
-//! Text Search, Autocomplete and Place Details of Places API (New) v1.
+//! Text Search, Nearby Search, Autocomplete and Place Details of Places API
+//! (New) v1.
 
 use axum::{
     body::Bytes,
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     Area, Code, LatLng, QueryParams, body, both_shapes, error, field_mask, from_problem, invalid,
     language::{Language, accept_language},
-    model::{Kind, Place, after_name},
+    model::{Kind, Place, after_name, categories_of},
     proto_int, respond, run,
 };
 use crate::{
@@ -89,6 +90,201 @@ pub(super) async fn search_text(
         Ok(respond(&answer, mask.as_ref()))
     })
     .await
+}
+
+/// Google's cap on one Nearby Search answer, and its default.
+const MAX_NEARBY: i64 = 20;
+/// The widest circle Nearby Search takes, in metres.
+const MAX_NEARBY_RADIUS: f64 = 50_000.0;
+/// The most types one list of a Nearby Search request holds.
+const MAX_TYPES: usize = 50;
+/// How many of the nearest places are read before the request's own type
+/// rules pick among them. It is the most one og search answers.
+const NEARBY_WINDOW: usize = crate::http::bounds::MAX_SEARCH_LIMIT;
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct SearchNearbyRequest {
+    #[serde(alias = "location_restriction")]
+    location_restriction: Option<Area>,
+    #[serde(alias = "included_types")]
+    included_types: Vec<String>,
+    #[serde(alias = "excluded_types")]
+    excluded_types: Vec<String>,
+    #[serde(alias = "included_primary_types")]
+    included_primary_types: Vec<String>,
+    #[serde(alias = "excluded_primary_types")]
+    excluded_primary_types: Vec<String>,
+    #[serde(alias = "max_result_count", deserialize_with = "proto_int")]
+    max_result_count: Option<i64>,
+    #[serde(alias = "rank_preference")]
+    rank_preference: Option<String>,
+    #[serde(alias = "language_code")]
+    language_code: Option<String>,
+}
+
+/// Search places around a point (Places API v1)
+///
+/// The answer is the places inside the circle, nearest first, under either
+/// `rankPreference`: og holds no measure of how popular a place is. A type og
+/// has no category for names no place.
+pub(super) async fn search_nearby(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    bytes: Bytes,
+) -> Response {
+    run(async {
+        let query = QueryParams::parse(query.as_deref())?;
+        let mask = field_mask(&headers, &query);
+        let request: SearchNearbyRequest = body(&bytes)?;
+        let (center, radius) = nearby_circle(request.location_restriction.as_ref())?;
+        let limit = match request.max_result_count {
+            None | Some(0) => MAX_NEARBY,
+            Some(count) if (1..=MAX_NEARBY).contains(&count) => count,
+            Some(count) => {
+                return Err(invalid(format!(
+                    "maxResultCount must be within [1, {MAX_NEARBY}], got {count}"
+                )));
+            }
+        };
+        if let Some(rank) = request.rank_preference.as_deref()
+            && !["RANK_PREFERENCE_UNSPECIFIED", "DISTANCE", "POPULARITY"].contains(&rank)
+        {
+            return Err(invalid(format!(
+                "Invalid value at 'rank_preference' (type.googleapis.com/google.maps.places.v1.SearchNearbyRequest.RankPreference), \"{rank}\""
+            )));
+        }
+        let rules = TypeRules::of(&request)?;
+        let language = places_language(&state, request.language_code.clone())?;
+        let categories = rules.categories();
+        if categories.is_empty() {
+            return Ok(respond(
+                &SearchTextResponse { places: Vec::new() },
+                mask.as_ref(),
+            ));
+        }
+        let args = Args::new()
+            .set("limit", NEARBY_WINDOW.to_string())
+            .set("focus", format!("{},{}", center[0], center[1]))
+            .set("radius", radius.to_string())
+            .maybe("lang", language.code());
+        let found = native::of_categories(&state, categories, args)
+            .await
+            .map_err(from_problem)?;
+        let answer = SearchTextResponse {
+            places: found
+                .features
+                .iter()
+                .filter(|feature| rules.admit(Kind::of(&feature.properties.common)))
+                .take(usize::try_from(limit).unwrap_or_default())
+                .map(|feature| place(feature, &language))
+                .collect(),
+        };
+        Ok(respond(&answer, mask.as_ref()))
+    })
+    .await
+}
+
+/// The circle Nearby Search is held to, as og's `focus` point and a radius
+/// in metres.
+fn nearby_circle(restriction: Option<&Area>) -> Result<([f64; 2], f64), VendorError> {
+    let circle = match restriction {
+        Some(Area {
+            circle: Some(circle),
+            rectangle: None,
+        }) => circle,
+        Some(Area {
+            rectangle: Some(_), ..
+        }) => {
+            return Err(invalid(
+                "locationRestriction takes only a circle in Nearby Search",
+            ));
+        }
+        _ => return Err(invalid("locationRestriction.circle is required")),
+    };
+    let center = circle.center.checked("locationRestriction.circle.center")?;
+    if !(circle.radius > 0.0 && circle.radius <= MAX_NEARBY_RADIUS) {
+        return Err(invalid(format!(
+            "locationRestriction.circle.radius must be within (0, {MAX_NEARBY_RADIUS}], got {}",
+            circle.radius
+        )));
+    }
+    Ok((center, circle.radius))
+}
+
+/// The four type lists of a Nearby Search request. A place must pass each
+/// list that is sent.
+struct TypeRules<'a> {
+    included: &'a [String],
+    excluded: &'a [String],
+    included_primary: &'a [String],
+    excluded_primary: &'a [String],
+}
+
+impl<'a> TypeRules<'a> {
+    fn of(request: &'a SearchNearbyRequest) -> Result<Self, VendorError> {
+        let lists = [
+            ("includedTypes", &request.included_types),
+            ("excludedTypes", &request.excluded_types),
+            ("includedPrimaryTypes", &request.included_primary_types),
+            ("excludedPrimaryTypes", &request.excluded_primary_types),
+        ];
+        for (name, list) in lists {
+            if list.len() > MAX_TYPES {
+                return Err(invalid(format!(
+                    "{name} takes at most {MAX_TYPES} types, got {}",
+                    list.len()
+                )));
+            }
+        }
+        for (included, excluded) in [(lists[0], lists[1]), (lists[2], lists[3])] {
+            if let Some(both) = included.1.iter().find(|named| excluded.1.contains(named)) {
+                return Err(invalid(format!(
+                    "{both} is in both {} and {}",
+                    included.0, excluded.0
+                )));
+            }
+        }
+        Ok(Self {
+            included: &request.included_types,
+            excluded: &request.excluded_types,
+            included_primary: &request.included_primary_types,
+            excluded_primary: &request.excluded_primary_types,
+        })
+    }
+
+    /// og's categories that can hold a place the lists admit. With no type
+    /// asked for they are every kind.
+    fn categories(&self) -> Vec<&'static str> {
+        let named = |list: &'a [String]| categories_of(list.iter().map(String::as_str));
+        match (self.included.is_empty(), self.included_primary.is_empty()) {
+            (true, true) => crate::categories::keys(),
+            (false, true) => named(self.included),
+            (true, false) => named(self.included_primary),
+            // A place must pass both, so the narrower list finds them all.
+            (false, false) => {
+                let (types, primary) = (named(self.included), named(self.included_primary));
+                if primary.len() <= types.len() {
+                    primary
+                } else {
+                    types
+                }
+            }
+        }
+    }
+
+    fn admit(&self, kind: Kind) -> bool {
+        let types = kind.types();
+        let primary = kind.primary();
+        let holds = |list: &[String], named: &str| list.iter().any(|listed| listed == named);
+        let any_type = |list: &[String]| types.iter().any(|named| holds(list, named));
+        let is_primary = |list: &[String]| primary.is_some_and(|primary| holds(list, primary));
+        (self.included.is_empty() || any_type(self.included))
+            && !any_type(self.excluded)
+            && (self.included_primary.is_empty() || is_primary(self.included_primary))
+            && !is_primary(self.excluded_primary)
+    }
 }
 
 /// `pageSize` wins over the older `maxResultCount`; 0 or unset is Google's
