@@ -369,6 +369,51 @@ pub(super) async fn details(
     .await
 }
 
+/// The bounds Google puts on each side of a photo asked for.
+const PHOTO_SIZE: std::ops::RangeInclusive<i64> = 1..=4800;
+
+/// `GET /v1/places/{place}/photos/{photo}/media`. og holds no photos, so a
+/// place og knows has none by any name, and the name is refused as Google
+/// refuses one it never issued.
+pub(super) async fn photo_media(
+    State(state): State<AppState>,
+    Path((place_id, photo)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    run(async {
+        let query = QueryParams::parse(query.as_deref())?;
+        let size = |name: &str| -> Result<Option<i64>, VendorError> {
+            let Some(value) = query.get(name) else {
+                return Ok(None);
+            };
+            let pixels = value.parse::<i64>().map_err(|_| {
+                invalid(format!(
+                    "Invalid value at '{name}' (TYPE_INT32), \"{value}\""
+                ))
+            })?;
+            if !PHOTO_SIZE.contains(&pixels) {
+                return Err(invalid(format!(
+                    "{name} must be within [1, 4800], got {pixels}"
+                )));
+            }
+            Ok(Some(pixels))
+        };
+        let width = size("maxWidthPx")?;
+        let height = size("maxHeightPx")?;
+        if width.is_none() && height.is_none() {
+            return Err(invalid(
+                "Neither maxWidthPx nor maxHeightPx is set, and at least one is required",
+            ));
+        }
+        let language = places_language(&state, None)?;
+        by_place_id(&state, &place_id, &language).await?;
+        Err(invalid(format!(
+            "The photo resource 'places/{place_id}/photos/{photo}' is invalid."
+        )))
+    })
+    .await
+}
+
 /// The record a Google place id names, shared with Place Geocoding.
 pub(super) async fn by_place_id(
     state: &AppState,

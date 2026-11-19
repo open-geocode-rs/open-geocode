@@ -7,7 +7,7 @@ use super::language::Language;
 use crate::{
     api::{Accuracy, Common, ContextArea},
     compat::{self, encode_id},
-    record::Layer,
+    record::{AccessPoint, Layer},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -136,6 +136,82 @@ impl GeocodeResult {
             postal_address: postal_address(common),
             address_components: address_components(common, language),
             types: Kind::of(common).types(),
+        }
+    }
+}
+
+/// A Geocoding API v4 `PlaceView`, the place a destination is or holds.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PlaceView {
+    pub(super) place: String,
+    pub(super) place_id: String,
+    pub(super) display_name: LocalizedText,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) primary_type: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) types: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) formatted_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) postal_address: Option<PostalAddress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) structure_type: Option<&'static str>,
+    pub(super) location: LatLng,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) address_components: Vec<AddressComponent>,
+}
+
+impl PlaceView {
+    pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
+        let place_id = encode_id(&common.id);
+        let kind = Kind::of(common);
+        Self {
+            // Destinations write the resource name without the host, unlike
+            // the other v4 methods.
+            place: format!("places/{place_id}"),
+            place_id,
+            display_name: LocalizedText {
+                text: common.name.clone(),
+                language_code: language.of(common.record_id),
+            },
+            primary_type: kind.primary(),
+            types: kind.types(),
+            // A destination's address leads with a POI's name, so it is the
+            // whole label.
+            formatted_address: (!common.label.is_empty()).then(|| common.label.clone()),
+            postal_address: postal_address(common),
+            // og holds only a point for a result without a box. One with a
+            // box may be a building or grounds, which og cannot tell apart.
+            structure_type: common.bbox.is_none().then_some("POINT"),
+            location: LatLng::of(coordinates),
+            address_components: address_components(common, language),
+        }
+    }
+}
+
+/// A destination's `Entrance`, one of the entrances og maps for a place.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Entrance {
+    pub(super) location: LatLng,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) tags: Vec<&'static str>,
+    pub(super) place: String,
+}
+
+impl Entrance {
+    /// `PREFERRED` marks an entrance into the main part of the place, which
+    /// is what an `entrance=main` tag states. Any other entrance is untagged.
+    pub(super) fn of(access: &AccessPoint, place: &str) -> Self {
+        Self {
+            location: LatLng::of([access.lon, access.lat]),
+            tags: if access.kind == "main" {
+                vec!["PREFERRED"]
+            } else {
+                Vec::new()
+            },
+            place: place.to_string(),
         }
     }
 }
