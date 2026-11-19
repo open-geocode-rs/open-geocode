@@ -339,10 +339,7 @@ impl Kind {
     pub(super) fn types(self) -> Vec<&'static str> {
         match self {
             Self::Types(types) => types.to_vec(),
-            Self::Poi(category) => category
-                .into_iter()
-                .chain(["point_of_interest", "establishment"])
-                .collect(),
+            Self::Poi(category) => category.into_iter().chain(ANY_PLACE).collect(),
             Self::Unknown => Vec::new(),
         }
     }
@@ -358,36 +355,68 @@ impl Kind {
     }
 }
 
-/// og's POI category (`key:value`) to Google's Table A type of the same
-/// meaning.
+/// og's POI categories, as the catalog writes them, each beside Google's
+/// Table A type of the same meaning.
+const CATEGORY_TYPES: &[(&str, &str)] = &[
+    ("amenity atm", "atm"),
+    ("amenity bank", "bank"),
+    ("amenity bar", "bar"),
+    ("amenity cafe", "cafe"),
+    ("amenity cinema", "movie_theater"),
+    ("amenity dentist", "dentist"),
+    ("amenity doctors", "doctor"),
+    ("amenity fast_food", "fast_food_restaurant"),
+    ("amenity fire_station", "fire_station"),
+    ("amenity fuel", "gas_station"),
+    ("amenity hospital", "hospital"),
+    ("amenity library", "library"),
+    ("amenity parking", "parking"),
+    ("amenity pharmacy", "pharmacy"),
+    ("amenity police", "police"),
+    ("amenity post_office", "post_office"),
+    ("amenity pub", "pub"),
+    ("amenity restaurant", "restaurant"),
+    ("amenity school", "school"),
+    ("amenity university", "university"),
+    ("leisure park", "park"),
+    ("shop bakery", "bakery"),
+    ("shop convenience", "convenience_store"),
+    ("shop supermarket", "supermarket"),
+    ("tourism hotel", "hotel"),
+    ("tourism museum", "museum"),
+];
+
+/// Google's types every place has, whatever its kind.
+const ANY_PLACE: [&str; 2] = ["point_of_interest", "establishment"];
+
+/// og's POI category (`key:value`) as Google's type.
 fn category_type(category: &str) -> Option<&'static str> {
-    Some(match category {
-        "amenity:atm" => "atm",
-        "amenity:bank" => "bank",
-        "amenity:bar" => "bar",
-        "amenity:cafe" => "cafe",
-        "amenity:cinema" => "movie_theater",
-        "amenity:dentist" => "dentist",
-        "amenity:doctors" => "doctor",
-        "amenity:fast_food" => "fast_food_restaurant",
-        "amenity:fire_station" => "fire_station",
-        "amenity:fuel" => "gas_station",
-        "amenity:hospital" => "hospital",
-        "amenity:library" => "library",
-        "amenity:parking" => "parking",
-        "amenity:pharmacy" => "pharmacy",
-        "amenity:police" => "police",
-        "amenity:post_office" => "post_office",
-        "amenity:pub" => "pub",
-        "amenity:restaurant" => "restaurant",
-        "amenity:school" => "school",
-        "amenity:university" => "university",
-        "leisure:park" => "park",
-        "shop:bakery" => "bakery",
-        "shop:convenience" => "convenience_store",
-        "shop:supermarket" => "supermarket",
-        "tourism:hotel" => "hotel",
-        "tourism:museum" => "museum",
-        _ => return None,
-    })
+    let (key, value) = category.split_once(':')?;
+    CATEGORY_TYPES
+        .iter()
+        .find(|(known, _)| {
+            known
+                .split_once(' ')
+                .is_some_and(|(known_key, known_value)| known_key == key && known_value == value)
+        })
+        .map(|(_, google)| *google)
+}
+
+/// og's categories of the places Google's `types` name, as the catalog
+/// writes them. A type every place has names every kind, and a type og has
+/// no category for names none.
+pub(super) fn categories_of<'a>(types: impl IntoIterator<Item = &'a str>) -> Vec<&'static str> {
+    let mut categories = Vec::new();
+    for named in types {
+        if ANY_PLACE.contains(&named) {
+            return crate::categories::keys();
+        }
+        categories.extend(
+            CATEGORY_TYPES
+                .iter()
+                .filter(|(_, google)| *google == named)
+                .map(|(category, _)| *category),
+        );
+    }
+    categories
 }

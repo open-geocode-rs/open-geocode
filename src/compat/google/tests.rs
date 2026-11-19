@@ -814,16 +814,122 @@ async fn place_geocoding_answers_one_bare_result() {
     );
 }
 
+const SEARCH_NEARBY: &str = "/compat/google/v1/places:searchNearby";
+
+fn around(radius: f64) -> Value {
+    json!({"circle": {"center": {"latitude": 43.0, "longitude": -79.0}, "radius": radius}})
+}
+
+#[tokio::test]
+async fn search_nearby_answers_the_places_inside_the_circle() {
+    let fixture = fixture();
+    let found = json!({"places": [bakery_place()]});
+    for request in [
+        json!({"locationRestriction": around(1000.0)}),
+        json!({"locationRestriction": around(1000.0), "includedTypes": ["bakery"]}),
+        json!({"locationRestriction": around(1000.0), "includedTypes": ["cafe", "establishment"]}),
+        json!({
+            "location_restriction": around(1000.0),
+            "included_primary_types": ["bakery", "cafe"],
+            "excluded_types": ["cafe"],
+            "max_result_count": "1",
+            "rank_preference": "DISTANCE",
+        }),
+        json!({
+            "locationRestriction": around(1000.0),
+            "includedTypes": ["point_of_interest"],
+            "includedPrimaryTypes": ["bakery"],
+        }),
+    ] {
+        let reply = post(&fixture.router, SEARCH_NEARBY, request.clone()).await;
+        assert_eq!(reply.status, StatusCode::OK, "{request}");
+        assert_eq!(reply.body, found, "{request}");
+    }
+    // Outside the circle, another type, a type og has no category for, and
+    // the place's own type excluded.
+    for request in [
+        json!({"locationRestriction": around(100.0)}),
+        json!({"locationRestriction": around(1000.0), "includedTypes": ["cafe"]}),
+        json!({"locationRestriction": around(1000.0), "includedTypes": ["chinese_restaurant"]}),
+        json!({"locationRestriction": around(1000.0), "excludedTypes": ["bakery"]}),
+        json!({"locationRestriction": around(1000.0), "excludedPrimaryTypes": ["bakery"]}),
+        json!({
+            "locationRestriction": around(1000.0),
+            "includedTypes": ["bakery"],
+            "includedPrimaryTypes": ["cafe"],
+        }),
+    ] {
+        let reply = post(&fixture.router, SEARCH_NEARBY, request.clone()).await;
+        assert_eq!(reply.status, StatusCode::OK, "{request}");
+        assert_eq!(reply.body, json!({}), "{request}");
+    }
+
+    let reply = post_with(
+        &fixture.router,
+        SEARCH_NEARBY,
+        &[("x-goog-fieldmask", "places.displayName")],
+        json!({"locationRestriction": around(1000.0), "languageCode": "en"}),
+    )
+    .await;
+    assert_eq!(
+        reply.body,
+        json!({"places": [{"displayName": {"text": "Queen Bakery"}}]})
+    );
+}
+
+#[tokio::test]
+async fn search_nearby_refuses_what_google_refuses() {
+    let fixture = fixture();
+    for (request, message) in [
+        (json!({}), "locationRestriction.circle is required"),
+        (
+            json!({"locationRestriction": {"rectangle": {}}}),
+            "locationRestriction takes only a circle in Nearby Search",
+        ),
+        (
+            json!({"locationRestriction": around(0.0)}),
+            "locationRestriction.circle.radius must be within (0, 50000], got 0",
+        ),
+        (
+            json!({"locationRestriction": around(50001.0)}),
+            "locationRestriction.circle.radius must be within (0, 50000], got 50001",
+        ),
+        (
+            json!({"locationRestriction": around(10.0), "maxResultCount": 21}),
+            "maxResultCount must be within [1, 20], got 21",
+        ),
+        (
+            json!({"locationRestriction": around(10.0), "maxResultCount": -1}),
+            "maxResultCount must be within [1, 20], got -1",
+        ),
+        (
+            json!({
+                "locationRestriction": around(10.0),
+                "includedTypes": ["cafe"],
+                "excludedTypes": ["cafe"],
+            }),
+            "cafe is in both includedTypes and excludedTypes",
+        ),
+        (
+            json!({"locationRestriction": around(10.0), "rankPreference": "NEAREST"}),
+            "Invalid value at 'rank_preference' (type.googleapis.com/google.maps.places.v1.SearchNearbyRequest.RankPreference), \"NEAREST\"",
+        ),
+    ] {
+        let reply = post(&fixture.router, SEARCH_NEARBY, request.clone()).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{request}");
+        assert_eq!(
+            reply.body,
+            google_error(400, "INVALID_ARGUMENT", message),
+            "{request}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn unserved_methods_unknown_paths_and_wrong_methods() {
     let fixture = fixture();
     let router = &fixture.router;
     for (method, uri, name) in [
-        (
-            "POST",
-            "/compat/google/v1/places:searchNearby",
-            "places:searchNearby",
-        ),
         (
             "GET",
             "/compat/google/v1/places/abc/photos/def/media",

@@ -292,6 +292,22 @@ pub fn strong_words() -> impl Iterator<Item = &'static str> {
     table().strong.keys().map(String::as_str)
 }
 
+/// Every key the catalog has a category under (`amenity`, `shop`). Together
+/// they hold every kind of place.
+pub fn keys() -> Vec<&'static str> {
+    let mut keys = table()
+        .categories
+        .iter()
+        .map(|category| {
+            category
+                .split_once(' ')
+                .map_or(category.as_str(), |(key, _)| key)
+        })
+        .collect::<Vec<_>>();
+    keys.dedup();
+    keys
+}
+
 /// Whether the catalog has `category`, written as it writes one
 /// (`amenity pharmacy`, or a bare key).
 pub fn is_known(category: &str) -> bool {

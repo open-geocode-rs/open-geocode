@@ -38,7 +38,7 @@ pub(crate) fn router() -> Router<AppState> {
         )
         .route(
             "/v1/places:searchNearby",
-            only(MethodFilter::POST, || unimplemented("places:searchNearby")),
+            only(MethodFilter::POST, places::search_nearby),
         )
         .route(
             "/v1/places/{place_id}",
