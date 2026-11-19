@@ -40,11 +40,12 @@ use crate::{
 use super::{
     Area, Gs7Error, LatLng, Params, Rid,
     item::{Feature, Item, item},
+    notify,
     search::{Geocode, Qualified, first_language, reverse_items},
 };
 
-const GEOCODE_HRN: &str = "hrn:here:service::olp-here:search-geocode-7";
-const REVGEOCODE_HRN: &str = "hrn:here:service::olp-here:search-revgeocode-7";
+pub(super) const GEOCODE_HRN: &str = "hrn:here:service::olp-here:search-geocode-7";
+pub(super) const REVGEOCODE_HRN: &str = "hrn:here:service::olp-here:search-revgeocode-7";
 
 /// The longest `recId` og can carry back. og's item id holds 128
 /// characters, and the ordinal, limit and radius go first.
@@ -147,6 +148,9 @@ struct Meta {
     /// The counts and end of a deleted job, whose og jobs are gone with it.
     #[serde(default)]
     frozen: Option<Frozen>,
+    /// Notifications called each time a run of the job ends.
+    #[serde(default)]
+    notification_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -193,9 +197,9 @@ impl View {
 
 /// Batch's `ErrorResponse`, and its status.
 #[derive(Debug)]
-struct BatchError {
+pub(super) struct BatchError {
     status: StatusCode,
-    title: String,
+    pub(super) title: String,
     code: &'static str,
     cause: String,
     action: String,
@@ -203,7 +207,7 @@ struct BatchError {
 }
 
 impl BatchError {
-    fn new(
+    pub(super) fn new(
         status: StatusCode,
         code: &'static str,
         title: impl Into<String>,
@@ -223,7 +227,7 @@ impl BatchError {
     // HERE documents a code for few of its errors. The rest take codes of
     // the same form, `E600` then the status and a digit, none of which
     // HERE uses.
-    fn bad_request(title: impl Into<String>, cause: impl Into<String>) -> Self {
+    pub(super) fn bad_request(title: impl Into<String>, cause: impl Into<String>) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
             "E6004001",
@@ -273,7 +277,7 @@ impl BatchError {
         error
     }
 
-    fn into_response(self, request_id: &str) -> Response {
+    pub(super) fn into_response(self, request_id: &str) -> Response {
         let body = json!({
             "title": self.title,
             "status": self.status.as_u16(),
@@ -308,20 +312,6 @@ pub(super) async fn not_found(Rid(request_id): Rid, OriginalUri(uri): OriginalUr
     .into_response(&request_id)
 }
 
-pub(super) async fn not_implemented(
-    Rid(request_id): Rid,
-    OriginalUri(uri): OriginalUri,
-) -> Response {
-    BatchError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "E6005010",
-        "Not implemented",
-        format!("This server does not serve {}", uri.path()),
-        "Do without this resource",
-    )
-    .into_response(&request_id)
-}
-
 pub(super) async fn version() -> Response {
     axum::Json(json!({
         "apiVersion": "v7",
@@ -342,7 +332,7 @@ fn unix_now() -> u64 {
 }
 
 /// Unix seconds as RFC 3339 in UTC, HERE's `date-time`.
-fn date_time(seconds: u64) -> String {
+pub(super) fn date_time(seconds: u64) -> String {
     let days = seconds / 86_400;
     let rest = seconds % 86_400;
     // Civil date of a day count since 1970-01-01, in the proleptic
@@ -370,7 +360,7 @@ fn date_time(seconds: u64) -> String {
 }
 
 /// Where HERE jobs are kept, beside og's in a folder og's own scan skips.
-fn store_dir(state: &AppState) -> PathBuf {
+pub(super) fn store_dir(state: &AppState) -> PathBuf {
     state.jobs().dir().join("here")
 }
 
@@ -506,12 +496,12 @@ fn all(state: &AppState) -> Vec<View> {
 /// and prefix, so a link works through whatever path the server is mounted
 /// at.
 #[derive(Debug)]
-struct Links {
+pub(super) struct Links {
     jobs: String,
 }
 
 impl Links {
-    fn of(headers: &HeaderMap, uri: &axum::http::Uri) -> Self {
+    pub(super) fn of(headers: &HeaderMap, uri: &axum::http::Uri) -> Self {
         let path = uri.path();
         let prefix = path.find("/v7/").map_or("", |at| &path[..at]);
         let host = crate::compat::header(headers, "host");
@@ -520,6 +510,11 @@ impl Links {
         Self {
             jobs: format!("{origin}{prefix}/v7/batch/jobs"),
         }
+    }
+
+    /// The root the Batch paths hang off, `.../v7`.
+    pub(super) fn root(&self) -> &str {
+        self.jobs.strip_suffix("/batch/jobs").unwrap_or(&self.jobs)
     }
 
     fn job(&self, id: &str) -> String {
@@ -578,6 +573,9 @@ fn job_details(view: &View, links: &Links) -> Value {
     }
     .into();
     body["outputType"] = view.meta.output_type.as_str().into();
+    if !view.meta.notification_ids.is_empty() {
+        body["notificationIds"] = json!(view.meta.notification_ids);
+    }
     body
 }
 
@@ -594,6 +592,7 @@ struct Plan {
     output_filter: Option<Vec<String>>,
     start: bool,
     output_type: OutputType,
+    notification_ids: Vec<String>,
 }
 
 /// HERE's longest `inputColumns`, `outputColumns` or `outputFilter`.
@@ -671,8 +670,34 @@ impl Plan {
             output_filter: list("outputFilter"),
             start,
             output_type,
+            notification_ids: notification_ids(params.get("notificationIds"))?,
         })
     }
+}
+
+/// `notificationIds`, at most 5, comma-separated. Whether each is kept is
+/// checked against the store once the job is made.
+fn notification_ids(value: Option<&str>) -> Result<Vec<String>, BatchError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let mut ids = Vec::new();
+    for id in value.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+        if !ids.iter().any(|seen: &String| seen == id) {
+            ids.push(id.to_string());
+        }
+    }
+    if ids.len() > notify::MAX_PER_JOB {
+        return Err(BatchError::bad_request(
+            "Too many notifications",
+            format!(
+                "The job names {} notifications; at most {} are allowed",
+                ids.len(),
+                notify::MAX_PER_JOB
+            ),
+        ));
+    }
+    Ok(ids)
 }
 
 /// A delimiter, one character or `\t` written out for a tab. An output
@@ -1315,6 +1340,16 @@ async fn create_job(
 ) -> Result<Response, BatchError> {
     let params = Params::parse(query).map_err(|error| param_error(&error))?;
     let plan = Plan::read(&params)?;
+    if let Some(unknown) = plan
+        .notification_ids
+        .iter()
+        .find(|id| !notify::exists(state, id))
+    {
+        return Err(BatchError::bad_request(
+            "Notification not found",
+            format!("No notification has the ID '{unknown}'; create it first"),
+        ));
+    }
     let gzip = match crate::compat::header(headers, "content-encoding") {
         None | Some("identity") => false,
         Some(encoding) if encoding.eq_ignore_ascii_case("gzip") => true,
@@ -1422,6 +1457,7 @@ async fn create_job(
         expires_at: now + retention,
         request_id: request_id.to_string(),
         frozen: None,
+        notification_ids: plan.notification_ids,
     };
     let _guard = LOCK.lock().await;
     if plan.start
@@ -1465,10 +1501,52 @@ async fn launch(state: &AppState, meta: &mut Meta, uuid: uuid::Uuid) -> Result<(
     )
     .await
     .map_err(BatchError::of)?;
-    meta.runs.push(job.snapshot().id);
+    let run = job.snapshot().id;
+    {
+        let state = state.clone();
+        let id = meta.id.clone();
+        let run = run.clone();
+        tokio::spawn(async move {
+            job.ended().await;
+            announce_end(&state, &id, &run).await;
+        });
+    }
+    meta.runs.push(run);
     meta.started.get_or_insert_with(unix_now);
     meta.stopped = false;
     Ok(())
+}
+
+/// Calls the job's notifications once run `run` has ended, unless a later
+/// run took over or the job was deleted meanwhile.
+async fn announce_end(state: &AppState, id: &str, run: &str) {
+    // Taken so a stop's record is saved before the end is read.
+    let view = {
+        let _guard = LOCK.lock().await;
+        load(state, id).and_then(|meta| view(state, meta))
+    };
+    let Some(view) = view else {
+        return;
+    };
+    let ended = matches!(view.status, "completed" | "stopped" | "failure");
+    if !ended
+        || view.meta.notification_ids.is_empty()
+        || view.meta.runs.last().map(String::as_str) != Some(run)
+    {
+        return;
+    }
+    let facts = notify::Facts {
+        id: view.meta.id.clone(),
+        name: view.meta.tag.clone().unwrap_or_default(),
+        status: view.status,
+        output_type: view.meta.output_type.as_str(),
+        succeeded: view.records.succeeded,
+        failed: view.records.failed,
+        total: view.records.total,
+        valid: view.records.valid,
+        invalid: view.records.invalid,
+    };
+    notify::deliver(state, &view.meta.notification_ids, &facts);
 }
 
 /// The items file, less the lines an earlier run answered, in chunks.
@@ -1732,7 +1810,7 @@ pub(super) async fn delete(
 }
 
 /// The statuses a list or a bulk delete filters by.
-const FILTERS: [&str; 8] = [
+pub(super) const FILTERS: [&str; 8] = [
     "any",
     "submitted",
     "queued",
@@ -2372,6 +2450,7 @@ mod tests {
             expires_at: u64::MAX,
             request_id: "rid".into(),
             frozen: None,
+            notification_ids: Vec::new(),
         }
     }
 
