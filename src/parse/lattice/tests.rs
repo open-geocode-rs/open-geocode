@@ -228,14 +228,14 @@ fn a_toy_model_decodes_the_best_labelling() {
         ],
         Vec::new(),
     );
-    let paths = decode::best(&lattice, &weights, 3);
+    let paths = decode::best(&lattice, &weights, 3, None);
     assert_eq!(paths[0].labels(&lattice), [HouseNumber, Street]);
     assert_eq!(paths[0].score, 3.0);
     assert_eq!(paths[1].labels(&lattice), [Locality, Locality]);
     assert_eq!(paths[1].score, 2.5);
     // A transition from the house number to the street can outweigh it.
     weights.global[(HouseNumber as usize) * decode::STATES + Street as usize] = -1.0;
-    let paths = decode::best(&lattice, &weights, 1);
+    let paths = decode::best(&lattice, &weights, 1, None);
     assert_eq!(paths[0].labels(&lattice), [Locality, Locality]);
 }
 
@@ -409,6 +409,44 @@ fn a_query_ending_in_its_country_is_read_as_the_words_before_it_and_the_country(
 }
 
 #[test]
+fn a_number_after_the_number_sign_is_a_unit() {
+    let tagger = tagger();
+    for query in [
+        "1700 District Ave #300, Burlington, MA",
+        "1700 District Ave # 300, Burlington, MA",
+    ] {
+        let best = &tagger.parse(query)[0];
+        assert_eq!(
+            best.words(Label::HouseNumber).collect::<Vec<_>>(),
+            ["1700"],
+            "{query}"
+        );
+        assert_eq!(
+            best.words(Label::Unit).collect::<Vec<_>>(),
+            ["300"],
+            "{query}"
+        );
+    }
+    // A sign before the first word, or apart from any word, numbers nothing.
+    assert_eq!(
+        super::after_number_sign("#5 Main St"),
+        [false, false, false]
+    );
+    assert_eq!(
+        super::after_number_sign("5 Main St #"),
+        [false, false, false]
+    );
+    assert_eq!(
+        super::after_number_sign("5 Main St, #2"),
+        [false, false, false, true]
+    );
+    assert_eq!(
+        super::after_number_sign("5 Main St #-2"),
+        [false, false, false, false]
+    );
+}
+
+#[test]
 fn queries_without_words_tag_nothing() {
     let tagger = tagger();
     assert!(tagger.tag("").is_empty());
@@ -535,7 +573,7 @@ fn unit_shape(text: &str) -> (Vec<String>, Vec<bool>, Vec<bool>, Vec<Option<char
 /// The label of every unit of `text` in each of its best labellings.
 fn unit_labels(tagger: &LatticeTagger, text: &str) -> Vec<Vec<Label>> {
     let lattice = tagger.lattice(&Tokens::new(text), &Suppression::default());
-    decode::best(&lattice, tagger.weights(), N_BEST)
+    decode::best(&lattice, tagger.weights(), N_BEST, None)
         .iter()
         .map(|path| path.labels(&lattice))
         .collect()

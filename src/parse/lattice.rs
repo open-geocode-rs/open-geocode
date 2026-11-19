@@ -276,6 +276,24 @@ pub fn is_numeral(character: char) -> bool {
     character.is_numeric() || numeral_value(character).is_some()
 }
 
+/// Per word of `text` as [`Tokens::new`] splits it, whether the number sign
+/// `#` stands right before it, spaces aside, after some other word. Written
+/// so ("District Ave #300") it numbers a flat or a suite, never the house,
+/// though [`search_key`] drops the sign and leaves a bare number.
+fn after_number_sign(text: &str) -> Vec<bool> {
+    let mut signed = Vec::new();
+    let mut sign = false;
+    search_pieces(text, |piece| match piece {
+        Piece::Word(_) => {
+            signed.push(sign && !signed.is_empty());
+            sign = false;
+        }
+        Piece::Gap('#') => sign = true,
+        Piece::Gap(character) => sign &= character.is_whitespace(),
+    });
+    signed
+}
+
 /// `key` with each run of numerals written as `#`, the form numbered areas
 /// of one kind share ("#丁目" of "5丁目" and "四丁目", "sector #"), or
 /// `None` when it has no numeral or nothing but numerals.
@@ -815,8 +833,9 @@ impl LatticeTagger {
         if tokens.is_empty() {
             return (Vec::new(), None);
         }
+        let signed = after_number_sign(query);
         let lattice = self.lattice(&tokens, &Suppression::default());
-        let mut parsed = self.parse_lattice(&tokens, &lattice, n);
+        let mut parsed = self.parse_lattice(&tokens, &lattice, n, &signed);
         let mut explanation = Explanation {
             best: parsed.first().map_or(0.0, |parse| parse.score),
             lattice,
@@ -825,7 +844,9 @@ impl LatticeTagger {
             return (parsed, Some(explanation));
         };
         let country = &tokens.words[at..];
-        for mut reading in self.parse_tokens(&tokens.prefix(at), n) {
+        let prefix = tokens.prefix(at);
+        let prefix_lattice = self.lattice(&prefix, &Suppression::default());
+        for mut reading in self.parse_lattice(&prefix, &prefix_lattice, n, &signed[..at]) {
             let words = country.iter().map(|word| Tagged {
                 token: word.clone(),
                 label: Label::Country,
@@ -925,19 +946,33 @@ impl LatticeTagger {
             return Vec::new();
         }
         let lattice = self.lattice(tokens, &Suppression::default());
-        self.parse_lattice(tokens, &lattice, n)
+        self.parse_lattice(tokens, &lattice, n, &[])
     }
 
-    fn parse_lattice(&self, tokens: &Tokens, lattice: &Lattice, n: usize) -> Vec<ParsedQuery> {
+    /// The best `n` labellings of `tokens`, a word `signed` marks (see
+    /// [`after_number_sign`]) read as a unit.
+    fn parse_lattice(
+        &self,
+        tokens: &Tokens,
+        lattice: &Lattice,
+        n: usize,
+        signed: &[bool],
+    ) -> Vec<ParsedQuery> {
         if n == 0 {
             return Vec::new();
         }
-        let mut paths = decode::best(lattice, &self.weights, n);
+        let flat = |span: &decode::Span, label: Label| {
+            label == Label::Unit
+                || !(span.start..span.end)
+                    .any(|unit| signed.get(lattice.units.token_of[unit]) == Some(&true))
+        };
+        let allows: Option<decode::Allows<'_>> = signed.contains(&true).then_some(&flat);
+        let mut paths = decode::best(lattice, &self.weights, n, allows);
         // The best labellings are almost always addresses; only when one is
         // not are more decoded to find those that are. When none is, the
         // best ones still read it.
         if !paths.iter().all(|path| self.is_one_address(lattice, path)) {
-            let addresses = decode::best(lattice, &self.weights, n.max(CONSTRAINED_PATHS))
+            let addresses = decode::best(lattice, &self.weights, n.max(CONSTRAINED_PATHS), allows)
                 .into_iter()
                 .filter(|path| self.is_one_address(lattice, path))
                 .collect::<Vec<_>>();

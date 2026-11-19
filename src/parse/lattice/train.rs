@@ -1291,7 +1291,7 @@ impl Tally {
             .par_iter()
             .map(|row| {
                 let lattice = tagger.lattice(&row.tokens, &Suppression::default());
-                decode::best(&lattice, weights, 1)
+                decode::best(&lattice, weights, 1, None)
                     .into_iter()
                     .next()
                     .map(|path| lattice.units.collapse(&path.labels(&lattice)))
