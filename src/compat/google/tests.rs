@@ -9,13 +9,13 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use crate::{
-    compat::encode_id,
+    compat::encode_parts,
     context::{AdminContextTuple, RecordContext},
     limits::Limits,
     pack::Writer,
     record::{
-        AddressComponents, AddressRecord, Entrance, LocationPrecision, ObjectType, PlaceLayer,
-        PlaceRecord, PoiRecord, Record, SourceProvenance, point_geometry,
+        AddressComponents, AddressRecord, Entrance, Layer, LocationPrecision, ObjectType,
+        PlaceLayer, PlaceRecord, PoiRecord, Record, SourceProvenance, point_geometry,
     },
     runtime::{AppState, build_router},
 };
@@ -31,6 +31,16 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.pack);
         let _ = std::fs::remove_dir_all(self.pack.with_extension("jobs"));
     }
+}
+
+/// The vendor id og issues for an address of the fixture: its og id, its
+/// layer and its label, since the catalogue holds no address.
+fn address_vendor_id(og_id: &str) -> String {
+    let label = match og_id {
+        "osm:node:10" => "10 King Street, Unit 4B, City of Toronto, ON, M5V 1A1, Canada",
+        _ => panic!("{og_id} is no address of the fixture"),
+    };
+    encode_parts(og_id, Some(Layer::Address), label)
 }
 
 fn fixture() -> Fixture {
@@ -222,11 +232,11 @@ const SEARCH_TEXT: &str = "/compat/google/v1/places:searchText";
 const AUTOCOMPLETE: &str = "/compat/google/v1/places:autocomplete";
 
 fn bakery_id() -> String {
-    encode_id("osm:way:11", "")
+    encode_parts("osm:way:11", Some(Layer::Poi), "")
 }
 
 fn address_id() -> String {
-    encode_id("osm:node:10", "")
+    address_vendor_id("osm:node:10")
 }
 
 fn bakery_components() -> Value {
@@ -615,7 +625,7 @@ async fn place_details_by_id_and_unknown_ids() {
         json!({"id": id, "displayName": {"text": "Queen Bakery"}})
     );
 
-    let never_issued = encode_id("osm:way:999", "");
+    let never_issued = encode_parts("osm:way:999", Some(Layer::Poi), "");
     for unknown in [never_issued.as_str(), "not-an-og-id", "b3NtOjE"] {
         let reply = get(router, &format!("/compat/google/v1/places/{unknown}")).await;
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{unknown}");
@@ -767,7 +777,7 @@ async fn reverse_geocode_by_path_and_by_fields_with_filters() {
     assert_eq!(
         localities.body,
         json!({"results": [{
-            "placeId": encode_id("osm:relation:6", ""),
+            "placeId": encode_parts("osm:relation:6", Some(Layer::Locality), ""),
             "granularity": "GEOMETRIC_CENTER",
             "types": ["locality", "political"],
         }]})
@@ -831,7 +841,7 @@ async fn place_geocoding_answers_one_bare_result() {
     fields.insert("granularity".to_string(), json!("GEOMETRIC_CENTER"));
     assert_eq!(reply.body, expected);
 
-    let unknown = encode_id("osm:node:404", "");
+    let unknown = encode_parts("osm:node:404", Some(Layer::Poi), "");
     let missing = get(
         router,
         &format!("/compat/google/v4/geocode/places/{unknown}"),
@@ -1014,7 +1024,11 @@ async fn every_og_value_lands_in_its_google_slot() {
         let og_id = properties["id"].as_str().expect("id");
         let name = properties["name"].as_str().expect("name");
         let label = properties["label"].as_str().expect("label");
-        let id = encode_id(og_id, label);
+        let id = encode_parts(
+            og_id,
+            Layer::parse(properties["layer"].as_str().expect("layer")),
+            label,
+        );
         let coordinates = &feature["geometry"]["coordinates"];
         let reply = get(router, &result_uri).await.body;
         let result = reply.get("results").map_or(&reply, |results| &results[0]);
@@ -1363,7 +1377,7 @@ async fn photo_media_checks_the_size_then_finds_no_photo_og_holds() {
         )
     );
 
-    let unknown = encode_id("osm:way:999", "");
+    let unknown = encode_parts("osm:way:999", Some(Layer::Poi), "");
     let reply = get(router, &photo(&unknown, "?maxHeightPx=400")).await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
     assert_eq!(
@@ -1529,7 +1543,7 @@ async fn destinations_leave_out_areas_and_refuse_what_google_refuses() {
 
     // A town is no destination, by id or by name.
     for request in [
-        json!({"place": format!("places/{}", encode_id("osm:relation:5", ""))}),
+        json!({"place": format!("places/{}", encode_parts("osm:relation:5", Some(Layer::Locality), ""))}),
         json!({"addressQuery": {"addressQuery": "Toronto"}}),
     ] {
         let reply = post(router, DESTINATIONS, request.clone()).await;
@@ -1537,7 +1551,7 @@ async fn destinations_leave_out_areas_and_refuse_what_google_refuses() {
         assert_eq!(reply.body, json!({}), "{request}");
     }
 
-    let unknown = encode_id("osm:way:999", "");
+    let unknown = encode_parts("osm:way:999", Some(Layer::Poi), "");
     let reply = post(
         router,
         DESTINATIONS,

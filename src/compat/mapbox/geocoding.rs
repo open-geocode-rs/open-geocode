@@ -22,7 +22,7 @@ use super::{
 use crate::{
     api::{Common, ContextArea, ForwardCollection, Languages, ReverseCollection},
     batch::map_in_order,
-    compat::{Args, decode_id, encode_id, iso, native},
+    compat::{Args, decode_id, encode_area_id, encode_id, iso, native},
     http::{
         batch::{self as og_batch, Prepared, RawItem},
         problem::Problem,
@@ -170,12 +170,9 @@ impl Feature {
         ]
         .into_iter()
         .flatten()
-        .map(|area| (encode_id(&area.id, &area.name), Names::of_area(area)))
+        .map(|area| (encode_area_id(area), Names::of_area(area)))
         .collect::<HashMap<_, _>>();
-        areas.insert(
-            encode_id(&common.id, &common.label),
-            Names::of_result(common),
-        );
+        areas.insert(encode_id(common), Names::of_result(common));
         let translated = Translated::of(common, coordinates);
         let layer = |key: &str, area: super::Area| {
             let (mapbox_id, fields) = area.split();
@@ -637,16 +634,19 @@ fn check(state: &AppState, lookup: Lookup) -> Result<Checked, crate::compat::Ven
                 .map(Checked::Geocode)
         }
         Lookup::Id { named, lang, text } => {
-            if let Some(label) = &named.label {
-                let args = Args::new()
-                    .set("q", label.clone())
-                    .set("limit", native::LABEL_CANDIDATES.to_string())
-                    .maybe("lang", lang);
-                return prepared(og_batch::prepare(state, runtime::GEOCODE, &[], item(args)))
-                    .map(|request| Checked::Labelled(request, named))
-                    .map_err(|problem| Api::Geocoding.failed(problem));
-            }
-            let ids = Args::new().set("ids", named.id).maybe("lang", lang);
+            let id = match &named {
+                crate::compat::OgRef::Labelled { label, .. } => {
+                    let args = Args::new()
+                        .set("q", label.clone())
+                        .set("limit", native::LABEL_CANDIDATES.to_string())
+                        .maybe("lang", lang);
+                    return prepared(og_batch::prepare(state, runtime::GEOCODE, &[], item(args)))
+                        .map(|request| Checked::Labelled(request, named))
+                        .map_err(|problem| Api::Geocoding.failed(problem));
+                }
+                crate::compat::OgRef::Catalogued { id, .. } => id.as_str().to_string(),
+            };
+            let ids = Args::new().set("ids", id).maybe("lang", lang);
             match prepared(og_batch::prepare(state, runtime::PLACES, &[], item(ids))) {
                 Ok(request) => Ok(Checked::Places(request)),
                 Err(problem) if problem.status() == 400 => {

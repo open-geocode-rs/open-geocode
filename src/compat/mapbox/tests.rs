@@ -11,7 +11,7 @@ use tower::ServiceExt;
 use super::{attribution, split_label};
 use crate::{
     api::{Accuracy, Address, Attribution, Common, Context, Source},
-    compat::encode_id,
+    compat::encode_parts,
     context::{AdminContextTuple, RecordContext},
     limits::Limits,
     pack::Writer,
@@ -35,6 +35,16 @@ impl Drop for Pack {
 
 /// An address with a unit, a cafe of a chain and an interpolation range in
 /// Canada > Ontario > Toronto > Downtown.
+/// The vendor id og issues for an address of the fixture: its og id, its
+/// layer and its label, since the catalogue holds no address.
+fn address_vendor_id(og_id: &str) -> String {
+    let label = match og_id {
+        "osm:node:10" => "10 King Street, Unit 2, Toronto, M5V 1A1",
+        _ => panic!("{og_id} is no address of the fixture"),
+    };
+    encode_parts(og_id, Some(Layer::Address), label)
+}
+
 fn write_pack() -> Pack {
     let dir = std::env::temp_dir().join(format!(
         "open-geocode-compat-mapbox-{}-{}",
@@ -223,9 +233,9 @@ async fn get(router: &Router, uri: &str) -> (StatusCode, Value) {
 const OSM: &str =
     "© OpenStreetMap contributors, ODbL 1.0 (https://www.openstreetmap.org/copyright)";
 
-/// The `mapbox_id` of an OSM record, which carries no label.
+/// The `mapbox_id` of a context area.
 fn id(og_id: &str) -> String {
-    encode_id(og_id, "")
+    encode_parts(og_id, None, "")
 }
 
 /// The Geocoding context every Toronto record has.
@@ -268,7 +278,7 @@ async fn geocoding_forward_answers_an_address_in_mapbox_shape() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let address = id("osm:node:10");
+    let address = address_vendor_id("osm:node:10");
     assert_eq!(
         body,
         json!({
@@ -331,8 +341,9 @@ async fn every_og_value_lands_in_its_mapbox_slot() {
         for (og, feature) in og_features.iter().zip(features) {
             let og = &og["properties"];
             let properties = &feature["properties"];
-            let own = encode_id(
+            let own = encode_parts(
                 og["id"].as_str().expect("id"),
+                Layer::parse(og["layer"].as_str().expect("layer")),
                 og["label"].as_str().expect("label"),
             );
             assert_eq!(feature["id"], own);
@@ -464,7 +475,11 @@ async fn geocoding_structured_input_is_og_structured_geocode() {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{query}");
-        assert_eq!(body["features"][0]["id"], id("osm:node:10"), "{query}");
+        assert_eq!(
+            body["features"][0]["id"],
+            address_vendor_id("osm:node:10"),
+            "{query}"
+        );
     }
 
     // A country og has no data in is a hard filter, as Mapbox's code is.
@@ -491,7 +506,7 @@ async fn geocoding_structured_input_is_og_structured_geocode() {
 async fn geocoding_forward_takes_a_mapbox_id_as_q() {
     let pack = write_pack();
     let router = router(&pack);
-    let poi = id("osm:node:11");
+    let poi = encode_parts("osm:node:11", Some(Layer::Poi), "");
     let (status, body) = get(
         &router,
         &format!("/compat/mapbox/search/geocode/v6/forward?q={poi}"),
@@ -523,14 +538,23 @@ async fn geocoding_batch_answers_each_query_in_order() {
     assert_eq!(status, StatusCode::OK);
     let batch = body["batch"].as_array().expect("batch");
     assert_eq!(batch.len(), 4);
-    assert_eq!(batch[0]["features"][0]["id"], id("osm:node:10"));
+    assert_eq!(
+        batch[0]["features"][0]["id"],
+        address_vendor_id("osm:node:10")
+    );
     assert_eq!(
         batch[1],
         json!({"type": "FeatureCollection", "features": [], "attribution": OSM})
     );
     assert_eq!(batch[2]["features"].as_array().map(Vec::len), Some(1));
-    assert_eq!(batch[2]["features"][0]["id"], id("osm:node:10"));
-    assert_eq!(batch[3]["features"][0]["id"], id("osm:node:10"));
+    assert_eq!(
+        batch[2]["features"][0]["id"],
+        address_vendor_id("osm:node:10")
+    );
+    assert_eq!(
+        batch[3]["features"][0]["id"],
+        address_vendor_id("osm:node:10")
+    );
     // Each answer is what the same GET answers.
     let (_, single) = get(
         &router,
@@ -657,7 +681,7 @@ async fn search_box_suggest_then_retrieve() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let poi = id("osm:node:11");
+    let poi = encode_parts("osm:node:11", Some(Layer::Poi), "");
     let context = json!({
         "address": {"name": "12 King Street", "address_number": "12", "street_name": "King Street"},
         "street": {"name": "King Street"},
@@ -737,14 +761,20 @@ async fn search_box_forward_picks_the_og_search_of_the_same_meaning() {
     let base = "/compat/mapbox/search/searchbox/v1/forward";
     for (query, expected) in [
         // og's /geocode, which has addresses and no places.
-        ("q=10%20King%20Street", vec![id("osm:node:10")]),
+        (
+            "q=10%20King%20Street",
+            vec![address_vendor_id("osm:node:10")],
+        ),
         ("q=Queen%20Cafe&types=address", vec![]),
         // og's /places.
-        ("q=Queen%20Cafe&types=poi", vec![id("osm:node:11")]),
+        (
+            "q=Queen%20Cafe&types=poi",
+            vec![encode_parts("osm:node:11", Some(Layer::Poi), "")],
+        ),
         // og's /autocomplete, which has both.
         (
             "q=Queen%20Caf&auto_complete=true&types=poi",
-            vec![id("osm:node:11")],
+            vec![encode_parts("osm:node:11", Some(Layer::Poi), "")],
         ),
     ] {
         let (status, body) = get(&router, &format!("{base}?{query}")).await;
@@ -774,7 +804,7 @@ async fn search_box_reverse_keys_context_by_id() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let address = id("osm:node:10");
+    let address = address_vendor_id("osm:node:10");
     assert_eq!(
         body["features"][0]["properties"]["context"]["address"],
         json!({
@@ -811,7 +841,10 @@ async fn search_box_category_answers_the_places_of_one_kind() {
     assert_eq!(body["attribution"], OSM);
     let properties = &body["features"][0]["properties"];
     assert_eq!(properties["name"], "Queen Cafe");
-    assert_eq!(properties["mapbox_id"], id("osm:node:11"));
+    assert_eq!(
+        properties["mapbox_id"],
+        encode_parts("osm:node:11", Some(Layer::Poi), "")
+    );
     assert_eq!(properties["feature_type"], "poi");
     assert_eq!(properties["maki"], "cafe");
     assert_eq!(

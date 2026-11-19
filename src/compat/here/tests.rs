@@ -9,15 +9,15 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use crate::{
-    compat::{decode_id, encode_id, iso},
+    compat::{decode_id, encode_parts, iso},
     confidence::{FEATURES, Model},
     context::{AdminContextTuple, RecordContext},
     limits::Limits,
     pack::Writer,
     record::{
         AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRange,
-        InterpolationRecord, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, PoiRecord,
-        Record, SourceProvenance, StreetRecord, point_geometry,
+        InterpolationRecord, Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord,
+        PoiRecord, Record, SourceProvenance, StreetRecord, point_geometry,
     },
     runtime::{AppState, build_router},
 };
@@ -44,6 +44,17 @@ impl TestPack {
     pub(super) fn state(&self, limits: Limits) -> AppState {
         AppState::open(&self.0, &self.0.with_extension("jobs"), limits).expect("open pack")
     }
+}
+
+/// The vendor id og issues for an address of the fixture: its og id, its
+/// layer and its label, since the catalogue holds no address.
+fn address_vendor_id(og_id: &str) -> String {
+    let label = match og_id {
+        "osm:node:10" => "10 King Street, Unit 5, M5V 1A1",
+        "osm:node:20" => "20 Queen Street, Toronto City, ON, M5H 2N2",
+        _ => panic!("{og_id} is no address of the fixture"),
+    };
+    encode_parts(og_id, Some(Layer::Address), label)
 }
 
 fn line(from: [f64; 2], to: [f64; 2]) -> geojson::Geometry {
@@ -353,7 +364,7 @@ fn king_address() -> Value {
 fn king(extra: Value) -> Value {
     let mut item = json!({
         "title": "10 King Street, Unit 5, M5V 1A1",
-        "id": encode_id("osm:node:10", ""),
+        "id": address_vendor_id("osm:node:10"),
         "resultType": "houseNumber",
         "houseNumberType": "PA",
         "address": king_address(),
@@ -384,7 +395,7 @@ fn queen_address() -> Value {
 fn bakery(distance: Option<i64>) -> Value {
     let mut item = json!({
         "title": "Queen Bakery",
-        "id": encode_id("osm:way:11", ""),
+        "id": encode_parts("osm:way:11", Some(Layer::Poi), ""),
         "resultType": "place",
         "address": {
             "label": "Queen Bakery, 12 King Street, Old Town, M5V 1A1",
@@ -413,11 +424,22 @@ fn bakery(distance: Option<i64>) -> Value {
     item
 }
 
+/// The og layer of a HERE address slot an area of the fixture fills.
+fn slot_layer(slot: &str) -> &'static str {
+    match slot {
+        "district" => "neighbourhood",
+        "city" => "locality",
+        "county" => "district",
+        "state" => "region",
+        _ => "country",
+    }
+}
+
 fn area(id: &str, title: &str, kind: (&str, &str, &str), slot: &str) -> Value {
     let (result_type, type_key, type_value) = kind;
     let mut item = json!({
         "title": title,
-        "id": encode_id(id, title),
+        "id": encode_parts(id, Layer::parse(slot_layer(slot)), title),
         "resultType": result_type,
         "address": {"label": title},
         "position": {"lat": 43.0, "lng": -79.0},
@@ -532,7 +554,11 @@ async fn geocode_types_keep_the_kinds_asked() {
     assert_eq!(items.len(), 1);
     assert_eq!(
         items[0]["id"],
-        encode_id("osm:way:13:interp:2-98", "Queen Street 2-98 even, Toronto")
+        encode_parts(
+            "osm:way:13:interp:2-98",
+            Some(Layer::Interpolation),
+            "Queen Street 2-98 even, Toronto",
+        )
     );
     // A range found by its street alone is a street, as no number was asked.
     assert_eq!(items[0]["resultType"], "street");
@@ -543,7 +569,7 @@ async fn geocode_types_keep_the_kinds_asked() {
         numbers,
         json!({"items": [{
             "title": "20 Queen Street, Toronto City, ON, M5H 2N2",
-            "id": encode_id("osm:node:20", ""),
+            "id": address_vendor_id("osm:node:20"),
             "resultType": "houseNumber",
             "houseNumberType": "PA",
             "address": queen_address(),
@@ -626,7 +652,10 @@ async fn revgeocode_answers_the_nearest_first() {
     )
     .await;
     let items = reply.json()["items"].clone();
-    assert_eq!(items[0]["id"], encode_id("osm:way:12", ""));
+    assert_eq!(
+        items[0]["id"],
+        encode_parts("osm:way:12", Some(Layer::Street), "")
+    );
     assert_eq!(items[0]["resultType"], "street");
     assert_eq!(items[0]["address"]["street"], "King Street");
 
@@ -709,7 +738,7 @@ async fn autosuggest_autocomplete_and_discover() {
     let router = pack.router();
     let queen = json!({
         "title": "20 Queen Street, Toronto City, ON, M5H 2N2",
-        "id": encode_id("osm:node:20", ""),
+        "id": address_vendor_id("osm:node:20"),
         "resultType": "houseNumber",
         "houseNumberType": "PA",
         "address": queen_address(),
@@ -742,7 +771,7 @@ async fn autosuggest_autocomplete_and_discover() {
     let reply = get(&router, &format!("{page}1")).await.json();
     assert_eq!(reply["offset"], 1);
     assert_eq!(reply.get("nextOffset"), None);
-    assert_eq!(reply["items"][0]["id"], encode_id("osm:node:20", ""));
+    assert_eq!(reply["items"][0]["id"], address_vendor_id("osm:node:20"));
 
     let reply = get(&router, "/compat/here/v1/autosuggest?q=Queen").await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
@@ -863,7 +892,10 @@ async fn lookup_finds_what_a_search_returned() {
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.json(), bakery(None));
 
-    for id in [encode_id("osm:way:999", ""), "not-an-id".to_string()] {
+    for id in [
+        encode_parts("osm:way:999", Some(Layer::Poi), ""),
+        "not-an-id".to_string(),
+    ] {
         let reply = get(&router, &format!("/compat/here/v1/lookup?id={id}")).await;
         assert_eq!(reply.status, StatusCode::NOT_FOUND);
         assert_eq!(
@@ -894,7 +926,7 @@ async fn lookup_finds_a_record_the_catalogue_does_not_hold() {
     assert_eq!(range["houseNumberType"], "interpolated");
     let id = range["id"].as_str().expect("id");
     assert_eq!(
-        decode_id(id).map(|named| named.id).as_deref(),
+        decode_id(id).map(|named| named.id().to_string()).as_deref(),
         Some("osm:way:13:interp:2-98")
     );
     let reply = get(&router, &format!("/compat/here/v1/lookup?id={id}")).await;
@@ -904,16 +936,18 @@ async fn lookup_finds_a_record_the_catalogue_does_not_hold() {
 
     // An imported row renumbered by a newer release of its data: the
     // record with the label the id carries.
-    let renumbered = encode_id(
+    let renumbered = encode_parts(
         "openaddresses:ca/on/toronto:row:999999",
+        Some(Layer::Interpolation),
         range["title"].as_str().expect("title"),
     );
     let reply = get(&router, &format!("/compat/here/v1/lookup?id={renumbered}")).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     assert_eq!(reply.json()["title"], range["title"]);
 
-    let unknown = encode_id(
+    let unknown = encode_parts(
         "openaddresses:ca/on/toronto:row:1",
+        Some(Layer::Address),
         "Nowhere Lane, Atlantis",
     );
     let reply = get(&router, &format!("/compat/here/v1/lookup?id={unknown}")).await;
@@ -1126,7 +1160,11 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
 
     let id = properties["id"].as_str().unwrap_or_default();
     let label = properties["label"].as_str().unwrap_or_default();
-    assert_eq!(item["id"], encode_id(id, label), "{at}");
+    assert_eq!(
+        item["id"],
+        encode_parts(id, Layer::parse(layer), label),
+        "{at}"
+    );
     let title = if layer == "poi" {
         &properties["name"]
     } else {

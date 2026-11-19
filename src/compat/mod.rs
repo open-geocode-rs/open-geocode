@@ -34,6 +34,7 @@ use serde_json::Value;
 use crate::{
     api::{ForwardCollection, ForwardFeature, ReverseCollection},
     http::{problem::Problem, request_id::Logged},
+    record::Layer,
     runtime::{self, AppState},
 };
 
@@ -46,39 +47,142 @@ pub(crate) fn router() -> Router<AppState> {
         .nest("/compat/precisely", precisely::router())
 }
 
-/// og's id as a vendor id: URL-safe base64, so it survives a path segment and
-/// a query string unescaped. An id og's catalogue cannot look up (an
-/// imported row, an estimate, an interpolation, a derived postcode) carries
-/// `label` after it, which finds the record again (see [`native::by_id`]).
-pub(crate) fn encode_id(og_id: &str, label: &str) -> String {
-    match crate::ids::parse(og_id) {
-        Ok(Some(_)) => URL_SAFE_NO_PAD.encode(og_id),
-        _ => URL_SAFE_NO_PAD.encode(format!("{og_id}{LABEL_SEPARATOR}{label}")),
+/// A record's id as a vendor id (see [`OgRef`]).
+pub(crate) fn encode_id(common: &crate::api::Common) -> String {
+    encode_parts(&common.id, Some(common.layer), &common.label)
+}
+
+/// A vendor id of its parts: an og id, the layer of a record (`None` for
+/// a context area), and its label or name.
+pub(crate) fn encode_parts(id: &str, layer: Option<Layer>, label: &str) -> String {
+    OgRef::of(id, layer, label).encode()
+}
+
+/// An area's id as a vendor id. A context area's tier is no one layer, and
+/// its id names one area, so it carries no layer.
+pub(crate) fn encode_area_id(area: &crate::api::ContextArea) -> String {
+    encode_parts(&area.id, None, &area.name)
+}
+
+/// What a vendor id names. og's id alone does not name one record: an OSM
+/// node is a POI and the address it states, and og's catalogue holds no
+/// address, estimate or derived postcode. So the layer travels with the id,
+/// and a record the catalogue cannot look up carries its label, which finds
+/// it again (see [`native::lookup`]). Only a [`CatalogueId`] reaches
+/// `/places?ids`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OgRef {
+    Catalogued {
+        id: CatalogueId,
+        layer: Option<Layer>,
+    },
+    Labelled {
+        id: String,
+        layer: Option<Layer>,
+        label: String,
+    },
+}
+
+/// An og id the catalogue looks up: an OSM place, area or street. Built
+/// only by [`CatalogueId::of`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogueId(String);
+
+impl CatalogueId {
+    /// `id` when the catalogue can hold a record of it on `layer`. An
+    /// address or a range of one shares its OSM id with a POI or a street
+    /// the catalogue holds, but is none of them.
+    fn of(id: &str, layer: Option<Layer>) -> Option<Self> {
+        let held = matches!(crate::ids::parse(id), Ok(Some(_)))
+            && !matches!(layer, Some(Layer::Address | Layer::Interpolation));
+        held.then(|| Self(id.to_string()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-/// Between an og id and the label a vendor id carries with it. No id or
-/// label holds a line break.
-const LABEL_SEPARATOR: char = '\n';
+/// Between the parts of a vendor id. No id, layer or label holds a line
+/// break.
+const SEPARATOR: char = '\n';
 
-/// What a vendor id names: an og id, and the label of a record the
-/// catalogue cannot look up.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OgRef {
-    pub(crate) id: String,
-    pub(crate) label: Option<String>,
+impl OgRef {
+    fn of(id: &str, layer: Option<Layer>, label: &str) -> Self {
+        // An area's id is the same whether it is the answer or holds it.
+        let layer = layer.filter(|layer| !layer.is_context());
+        match CatalogueId::of(id, layer) {
+            Some(id) => Self::Catalogued { id, layer },
+            None => Self::Labelled {
+                id: id.to_string(),
+                layer,
+                label: label.to_string(),
+            },
+        }
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        match self {
+            Self::Catalogued { id, .. } => id.as_str(),
+            Self::Labelled { id, .. } => id,
+        }
+    }
+
+    pub(crate) fn layer(&self) -> Option<Layer> {
+        match self {
+            Self::Catalogued { layer, .. } | Self::Labelled { layer, .. } => *layer,
+        }
+    }
+
+    fn label(&self) -> Option<&str> {
+        match self {
+            Self::Catalogued { .. } => None,
+            Self::Labelled { label, .. } => Some(label),
+        }
+    }
+
+    /// URL-safe base64, so it survives a path segment and a query string
+    /// unescaped.
+    fn encode(&self) -> String {
+        let mut text = self.id().to_string();
+        if self.layer().is_some() || self.label().is_some() {
+            text.push(SEPARATOR);
+            text.push_str(self.layer().map_or("", Layer::as_str));
+        }
+        if let Some(label) = self.label() {
+            text.push(SEPARATOR);
+            text.push_str(label);
+        }
+        URL_SAFE_NO_PAD.encode(text)
+    }
 }
 
-/// The og id a vendor id stands for, or `None` for one og never issued.
+/// What a vendor id names, or `None` for one og never issued: one whose id
+/// is not og's, or that asks the catalogue for a record it cannot hold.
 pub(crate) fn decode_id(vendor_id: &str) -> Option<OgRef> {
     let bytes = URL_SAFE_NO_PAD.decode(vendor_id.trim()).ok()?;
     let text = String::from_utf8(bytes).ok()?;
-    let (id, label) = match text.split_once(LABEL_SEPARATOR) {
-        Some((id, label)) => (id.to_string(), Some(label.to_string())),
-        None => (text, None),
-    };
+    let mut parts = text.splitn(3, SEPARATOR);
+    let id = parts.next()?;
     // Every og id is `dataset:kind:number`; anything else is not one of ours.
-    (id.split(':').count() >= 3).then_some(OgRef { id, label })
+    if id.split(':').count() < 3 {
+        return None;
+    }
+    let layer = match parts.next() {
+        None | Some("") => None,
+        Some(layer) => Some(Layer::parse(layer)?),
+    };
+    Some(match parts.next() {
+        Some(label) => OgRef::Labelled {
+            id: id.to_string(),
+            layer,
+            label: label.to_string(),
+        },
+        None => OgRef::Catalogued {
+            id: CatalogueId::of(id, layer)?,
+            layer,
+        },
+    })
 }
 
 /// The parameters of one native lookup, as its query string would carry them.
@@ -250,13 +354,25 @@ pub(crate) mod native {
         named: &OgRef,
         lang: Option<&str>,
     ) -> Result<Option<ForwardCollection>, Problem> {
-        let Some(label) = &named.label else {
-            return match places(state, Args::new().set("ids", &named.id).maybe("lang", lang)).await
-            {
-                Ok(collection) => Ok(Some(collection)),
-                Err(problem) if problem.status() == 400 => Ok(None),
-                Err(problem) => Err(problem),
-            };
+        let label = match named {
+            OgRef::Labelled { label, .. } => label,
+            OgRef::Catalogued { id, .. } => {
+                // `/places?ids` answers every record of the id, and of the
+                // relation of a region also the country it derives.
+                return match places(
+                    state,
+                    Args::new().set("ids", id.as_str()).maybe("lang", lang),
+                )
+                .await
+                {
+                    Ok(mut collection) => {
+                        keep_named(&mut collection, named);
+                        Ok(Some(collection))
+                    }
+                    Err(problem) if problem.status() == 400 => Ok(None),
+                    Err(problem) => Err(problem),
+                };
+            }
         };
         let args = Args::new()
             .set("q", label)
@@ -271,16 +387,22 @@ pub(crate) mod native {
         Ok(Some(collection))
     }
 
-    /// Keeps of the answers to a vendor id's label only the record it
-    /// names: the one with its id and label, else its id, else its label.
+    /// Keeps of the answers only the record a vendor id names, on its
+    /// layer: the one with its id and label, else its id, else its label.
     /// An id alone can be read otherwise: a range the label names whole is
-    /// also the house its last number names.
+    /// also the house its last number names. A label alone is a row whose
+    /// id a newer release of its data renumbered.
     pub(crate) fn keep_named(collection: &mut ForwardCollection, named: &OgRef) {
-        let same_id = |feature: &ForwardFeature| feature.properties.common.id == named.id;
+        let same_id = |feature: &ForwardFeature| feature.properties.common.id == named.id();
         let same_label = |feature: &ForwardFeature| {
-            Some(&feature.properties.common.label) == named.label.as_ref()
+            Some(feature.properties.common.label.as_str()) == named.label()
         };
-        let features = std::mem::take(&mut collection.features);
+        let mut features = std::mem::take(&mut collection.features);
+        features.retain(|feature| {
+            named
+                .layer()
+                .is_none_or(|layer| feature.properties.common.layer == layer)
+        });
         let at = features
             .iter()
             .position(|feature| same_id(feature) && same_label(feature))
@@ -362,4 +484,40 @@ pub(crate) fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> 
 /// The ISO 3166-1 alpha-2 code of the country a feature lies in.
 pub(crate) fn country_code(context: &crate::api::Context) -> Option<&str> {
     context.country.as_ref()?.code.as_deref()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_place_area_or_street_id_reaches_the_catalogue() {
+        let poi = encode_parts("osm:node:7", Some(Layer::Poi), "Diner, 25 Dorrance Street");
+        let address = encode_parts("osm:node:7", Some(Layer::Address), "25 Dorrance Street");
+        assert_ne!(poi, address, "one node, two records");
+        assert!(matches!(decode_id(&poi), Some(OgRef::Catalogued { .. })));
+        assert_eq!(
+            decode_id(&address),
+            Some(OgRef::Labelled {
+                id: "osm:node:7".to_string(),
+                layer: Some(Layer::Address),
+                label: "25 Dorrance Street".to_string(),
+            })
+        );
+        // An address id without its label would ask the catalogue for a
+        // record it never holds, so og never issued it.
+        let forged = URL_SAFE_NO_PAD.encode("osm:node:7\naddress");
+        assert_eq!(decode_id(&forged), None);
+        let row = encode_parts(
+            "openaddresses:us/ri:row:9",
+            Some(Layer::Address),
+            "1 Main St",
+        );
+        assert!(matches!(decode_id(&row), Some(OgRef::Labelled { .. })));
+        assert_eq!(
+            encode_parts("osm:relation:5", Some(Layer::Region), "Rhode Island"),
+            encode_parts("osm:relation:5", None, "Rhode Island"),
+            "an area's id is the same as answer and as context"
+        );
+    }
 }

@@ -85,7 +85,7 @@ pub(super) struct Place {
 
 impl Place {
     pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
-        let id = encode_id(&common.id, &common.label);
+        let id = encode_id(common);
         let kind = Kind::of(common);
         Self {
             name: format!("places/{id}"),
@@ -124,7 +124,7 @@ pub(super) struct GeocodeResult {
 
 impl GeocodeResult {
     pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
-        let place_id = encode_id(&common.id, &common.label);
+        let place_id = encode_id(common);
         Self {
             // Every v4 response Google documents writes the full resource
             // name, host included, though its reference says `places/{id}`.
@@ -164,7 +164,7 @@ pub(super) struct PlaceView {
 
 impl PlaceView {
     pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
-        let place_id = encode_id(&common.id, &common.label);
+        let place_id = encode_id(common);
         let kind = Kind::of(common);
         Self {
             // Destinations write the resource name without the host, unlike
