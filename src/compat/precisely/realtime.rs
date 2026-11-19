@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Failure, Preferences, country_code, error, given, read_json,
-    result::{self, Candidate, Feature},
+    result::{self, Candidate, Feature, Product},
 };
 use crate::{
     compat::{Args, VendorError, decode_id, native},
@@ -184,11 +184,16 @@ struct Outcome {
 }
 
 impl Outcome {
-    fn found(address_id: Option<String>, features: &[Feature], max: usize) -> Self {
+    fn found(
+        address_id: Option<String>,
+        features: &[Feature],
+        max: usize,
+        product: Product,
+    ) -> Self {
         let results = features
             .iter()
             .take(max)
-            .map(Feature::candidate)
+            .map(|feature| feature.candidate(product))
             .collect::<Vec<_>>();
         let status = if results.is_empty() {
             "ZERO_RESULTS"
@@ -227,14 +232,15 @@ impl Outcome {
         address_id: Option<String>,
         features: &[T],
         max: usize,
+        product: Product,
     ) -> Result<Self, VendorError> {
         let features = result::features(features).map_err(internal)?;
-        Ok(Self::found(address_id, &features, max))
+        Ok(Self::found(address_id, &features, max, product))
     }
 }
 
 /// og's own answer did not read back as og's shape. A bug, logged as one.
-fn internal(cause: serde_json::Error) -> VendorError {
+pub(super) fn internal(cause: serde_json::Error) -> VendorError {
     let problem = Problem::internal(cause.into());
     Failure::of(&problem, None).into_error(problem)
 }
@@ -329,6 +335,23 @@ pub(super) async fn geocode(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Response, VendorError> {
+    addresses(state, request, Product::Geocode).await
+}
+
+/// Verify reads the address as geocode does and answers the record og
+/// matched, standardized, with how each stated part matched it.
+pub(super) async fn verify(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Response, VendorError> {
+    addresses(state, request, Product::Verify).await
+}
+
+async fn addresses(
+    state: AppState,
+    request: Request,
+    product: Product,
+) -> Result<Response, VendorError> {
     let started = Instant::now();
     let id = request_id(&request);
     let body = read_json::<GeocodeRequest>(&state, request, "INVALID_REQUEST").await?;
@@ -338,14 +361,20 @@ pub(super) async fn geocode(
         let address_id = address.address_id.clone();
         outcomes.push(
             match native::geocode(&state, args(address.geocode_params(max))).await {
-                Ok(collection) => Outcome::of_features(address_id, &collection.features, max)?,
+                Ok(collection) => {
+                    Outcome::of_features(address_id, &collection.features, max, product)?
+                }
                 Err(problem) => Outcome::refused(address_id, problem, address.country()),
             },
         );
     }
+    let route = match product {
+        Product::Geocode => "/compat/precisely/v1/geocode",
+        Product::Verify => "/compat/precisely/v1/verify",
+    };
     Ok(respond(
         state.error_log(),
-        "/compat/precisely/v1/geocode",
+        route,
         id.as_deref(),
         started,
         outcomes,
@@ -366,7 +395,12 @@ pub(super) async fn reverse(
             .maybe("lon", location.longitude.map(|lon| lon.to_string()))
             .maybe("lat", location.latitude.map(|lat| lat.to_string()));
         outcomes.push(match native::reverse(&state, args).await {
-            Ok(collection) => Outcome::of_features(location.address_id, &collection.features, max)?,
+            Ok(collection) => Outcome::of_features(
+                location.address_id,
+                &collection.features,
+                max,
+                Product::Geocode,
+            )?,
             Err(problem) => Outcome::refused(location.address_id, problem, None),
         });
     }
@@ -403,9 +437,11 @@ pub(super) async fn lookup(
             ),
             (_, None) => invalid("Lookup key cannot be null or empty (DIS-LI-1027)".to_string()),
             ("PB_KEY", Some(value)) => match decode_id(value) {
-                None => Outcome::found(None, &[], 1),
+                None => Outcome::found(None, &[], 1, Product::Geocode),
                 Some(og_id) => match native::by_id(&state, &og_id, None).await {
-                    Ok(feature) => Outcome::of_features(None, feature.as_slice(), 1)?,
+                    Ok(feature) => {
+                        Outcome::of_features(None, feature.as_slice(), 1, Product::Geocode)?
+                    }
                     Err(problem) => Outcome::refused(None, problem, None),
                 },
             },
@@ -458,7 +494,7 @@ pub(super) async fn autocomplete(
         .iter()
         .map(|feature| Prediction {
             prediction: feature.label().to_string(),
-            candidate: feature.candidate(),
+            candidate: feature.candidate(Product::Geocode),
         })
         .collect::<Vec<_>>();
     Ok(Json(AutocompleteResponse {
@@ -518,7 +554,10 @@ mod tests {
         assert_eq!(
             answer(
                 &log,
-                vec![busy("1"), Outcome::found(Some("2".to_string()), &[], 1)]
+                vec![
+                    busy("1"),
+                    Outcome::found(Some("2".to_string()), &[], 1, Product::Geocode)
+                ]
             )
             .await,
             (
@@ -552,7 +591,10 @@ mod tests {
         );
         let (status, _, body) = answer(
             &log,
-            vec![Outcome::found(Some("1".to_string()), &[], 1), broken],
+            vec![
+                Outcome::found(Some("1".to_string()), &[], 1, Product::Geocode),
+                broken,
+            ],
         )
         .await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
