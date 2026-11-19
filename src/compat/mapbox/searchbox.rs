@@ -286,10 +286,12 @@ pub(super) async fn forward(
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
     let collection = if autocomplete {
         native::autocomplete(&state, args.maybe("layer", layer)).await
-    } else if layer == Some("poi") {
-        native::places(&state, args).await
     } else {
-        native::geocode(&state, args.maybe("layer", layer)).await
+        match layer {
+            Some("poi") => native::places(&state, args).await,
+            Some(layer) => native::geocode(&state, args.set("layer", layer)).await,
+            None => native::search(&state, args).await,
+        }
     }
     .map_err(failed)?;
     Ok(Json(Collection::forward(&collection, types.as_ref())))

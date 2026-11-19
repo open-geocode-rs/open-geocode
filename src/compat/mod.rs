@@ -83,6 +83,17 @@ impl Args {
         }
     }
 
+    fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn copied(&self) -> Self {
+        Self(self.0.clone())
+    }
+
     fn query<T: serde::de::DeserializeOwned>(
         &self,
     ) -> Result<Query<T>, axum::extract::rejection::QueryRejection> {
@@ -120,6 +131,59 @@ pub(crate) mod native {
         runtime::autocomplete(State(state.clone()), args.query())
             .await
             .map(|json| json.0)
+    }
+
+    /// Free text answered with addresses and places together, as a vendor
+    /// search that knows no split between the two does. og keeps them
+    /// apart (`/geocode`, `/places`), so both run. An address joins the
+    /// answer only when it is what the query names, its street matched and
+    /// no part it states unmatched, since `/geocode` answers any text with
+    /// its nearest reading. Those addresses come first, the places after.
+    pub(crate) async fn search(state: &AppState, args: Args) -> Result<ForwardCollection, Problem> {
+        let limit = args
+            .get("limit")
+            .and_then(|limit| limit.parse::<usize>().ok())
+            .filter(|limit| *limit > 0);
+        let (addresses, places) =
+            tokio::join!(geocode(state, args.copied()), self::places(state, args));
+        let (mut addresses, places) = match (addresses, places) {
+            (Ok(addresses), Ok(places)) => (addresses, places.features),
+            (Ok(addresses), Err(_)) => (addresses, Vec::new()),
+            (Err(_), Ok(places)) => return Ok(places),
+            (Err(_), Err(problem)) => return Err(problem),
+        };
+        let limit = limit.unwrap_or_else(|| addresses.features.len().max(places.len()));
+        addresses.features.retain(names_address);
+        let mut seen = addresses
+            .features
+            .iter()
+            .map(|feature| feature.properties.common.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        addresses.features.extend(
+            places
+                .into_iter()
+                .filter(|feature| seen.insert(feature.properties.common.id.clone())),
+        );
+        addresses.features.truncate(limit);
+        Ok(addresses)
+    }
+
+    /// Whether an address answer is the address or street the query names.
+    fn names_address(feature: &ForwardFeature) -> bool {
+        use crate::api::PartMatch;
+        feature.properties.matched.as_ref().is_some_and(|found| {
+            found.street == Some(PartMatch::Matched)
+                && [
+                    found.housenumber,
+                    found.unit,
+                    found.locality,
+                    found.region,
+                    found.postcode,
+                    found.country,
+                ]
+                .iter()
+                .all(|part| *part != Some(PartMatch::Unmatched))
+        })
     }
 
     pub(crate) async fn reverse(
