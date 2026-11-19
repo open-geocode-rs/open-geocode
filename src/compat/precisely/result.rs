@@ -8,7 +8,18 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::match_code::{Holds, Judged, MatchCode, QueryMatch};
 use crate::compat::{encode_id, iso};
+
+/// The real-time or bulk product a result answers. Verify standardizes an
+/// address, so its result has no location; geocode places it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Product {
+    #[default]
+    Geocode,
+    Verify,
+}
 
 /// og's feature, the fields a Precisely result carries.
 #[derive(Debug, Deserialize)]
@@ -35,6 +46,11 @@ struct Properties {
     context: Context,
     source: Source,
     confidence: Option<f64>,
+    #[serde(default)]
+    address_lines: Vec<String>,
+    #[serde(rename = "match")]
+    matched: Option<QueryMatch>,
+    distance_m: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -86,7 +102,10 @@ pub(super) struct Candidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) score: Option<u8>,
     pub(super) address: ResponseAddress,
-    pub(super) location: Location,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) address_lines: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) location: Option<Location>,
     pub(super) explanation: Explanation,
     pub(super) custom_fields: BTreeMap<&'static str, String>,
 }
@@ -173,6 +192,20 @@ pub(super) struct SimpleFeature {
     pub(super) geometry: PointGeometry,
 }
 
+impl SimpleFeature {
+    /// A point in og's coordinates.
+    pub(super) fn point(coordinates: [f64; 2]) -> Self {
+        Self {
+            kind: "Feature",
+            properties: BTreeMap::from([("crsName", CRS_NAME)]),
+            geometry: PointGeometry {
+                kind: "Point",
+                coordinates,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(super) struct PointGeometry {
     #[serde(rename = "type")]
@@ -190,6 +223,16 @@ pub(super) struct Explanation {
 pub(super) struct AddressMatch {
     #[serde(rename = "type")]
     pub(super) kind: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) description: Vec<MatchDescription>,
+}
+
+/// How one address part matched, `MatchDescription`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct MatchDescription {
+    pub(super) label: &'static str,
+    pub(super) match_type: &'static str,
 }
 
 /// og's coordinates are WGS 84 longitude and latitude.
@@ -205,7 +248,21 @@ impl Feature {
         &self.properties.label
     }
 
-    pub(super) fn candidate(&self) -> Candidate {
+    pub(super) fn name(&self) -> &str {
+        &self.properties.name
+    }
+
+    /// `[longitude, latitude]`.
+    pub(super) const fn coordinates(&self) -> [f64; 2] {
+        self.geometry.coordinates
+    }
+
+    /// Metres from the point a reverse geocode asked about.
+    pub(super) const fn distance_m(&self) -> Option<f64> {
+        self.properties.distance_m
+    }
+
+    pub(super) fn candidate(&self, product: Product) -> Candidate {
         let properties = &self.properties;
         let address = &properties.address;
         let context = &properties.context;
@@ -271,7 +328,7 @@ impl Feature {
         } else {
             (None, None)
         };
-        Candidate {
+        let mut candidate = Candidate {
             score: properties
                 .confidence
                 .map(|confidence| (confidence * 100.0).round().clamp(0.0, 100.0) as u8),
@@ -306,7 +363,8 @@ impl Feature {
                 postal_code_ext,
                 country,
             },
-            location: Location {
+            address_lines: Vec::new(),
+            location: Some(Location {
                 explanation: LocationExplanation {
                     kind: location_type(layer, &properties.accuracy),
                     designation: (properties.accuracy == "centroid").then_some("CENTROID"),
@@ -315,24 +373,80 @@ impl Feature {
                         properties.source.dataset.clone(),
                     )]),
                 },
-                feature: SimpleFeature {
-                    kind: "Feature",
-                    properties: BTreeMap::from([("crsName", CRS_NAME)]),
-                    geometry: PointGeometry {
-                        kind: "Point",
-                        coordinates: self.geometry.coordinates,
-                    },
-                },
-            },
+                feature: SimpleFeature::point(self.geometry.coordinates),
+            }),
             explanation: Explanation {
                 address_match: AddressMatch {
                     kind: match_type(layer, &properties.accuracy),
+                    description: Vec::new(),
                 },
             },
             custom_fields: BTreeMap::from([(ID_FIELD, encode_id(&properties.id))]),
+        };
+        if product == Product::Verify {
+            self.as_verified(&mut candidate);
+        }
+        candidate
+    }
+
+    /// A geocode candidate as verify answers it. The address standardized
+    /// to og's record and how each stated part matched it, with no point.
+    /// What verify adds from postal registers, such as deliverability and
+    /// carrier routes, og has no data for, so those fields are absent.
+    fn as_verified(&self, candidate: &mut Candidate) {
+        let properties = &self.properties;
+        candidate.location = None;
+        candidate
+            .address_lines
+            .clone_from(&properties.address_lines);
+        let judged = properties.matched.unwrap_or_default();
+        let address = &candidate.address;
+        let holds = Holds {
+            housenumber: address.address_number.is_some(),
+            street: address.street.is_some(),
+            unit: address.unit.is_some(),
+            sub_city: address.neighborhood.is_some() || address.suburb.is_some(),
+            city: address.city.is_some(),
+            region: address.admin1.is_some(),
+            postcode: address.postal_code.is_some(),
+            postcode_ext: address.postal_code_ext.is_some(),
+            country: address.country.is_some(),
+        };
+        let parts = [
+            ("addressNumber", judged.housenumber, holds.housenumber),
+            ("street", judged.street, holds.street),
+            ("unitMatch", judged.unit, holds.unit),
+            ("city", judged.locality, holds.city),
+            ("admin1", judged.region, holds.region),
+            ("postalCode", judged.postcode, holds.postcode),
+            ("country", judged.country, holds.country),
+        ];
+        candidate.explanation.address_match.description = parts
+            .into_iter()
+            .map(|(label, judged, holds)| MatchDescription {
+                label,
+                match_type: match (judged, holds) {
+                    (Some(Judged::Matched), _) => "EXACT",
+                    (Some(Judged::Partial), _) => "PARTIAL",
+                    (None, true) => "ADDED",
+                    (Some(Judged::Unmatched) | None, _) => "NONE",
+                },
+            })
+            .collect();
+        if let Some(code) = MatchCode::derive(judged, holds, properties.confidence) {
+            candidate
+                .custom_fields
+                .insert(SIMPLE_MATCH_CODE, code.simple());
+            candidate
+                .custom_fields
+                .insert(EXTENDED_MATCH_CODE, code.extended());
         }
     }
 }
+
+/// The keys a verify result's Global Match Codes are under.
+pub(super) const SIMPLE_MATCH_CODE: &str = "SIMPLE_MATCH_CODE";
+pub(super) const EXTENDED_MATCH_CODE: &str = "EXTENDED_MATCH_CODE";
 
 /// og's label as Precisely's two lines. The street line, with the unit
 /// when the label writes it next, and the rest. The label starts with the
@@ -397,9 +511,9 @@ fn match_type(layer: &str, accuracy: &str) -> &'static str {
     }
 }
 
-/// The columns of a bulk output row, in order. Precisely names the fields
-/// but documents no order, so this is og's.
-pub(super) const COLUMNS: [&str; 30] = [
+/// The columns of a bulk geocode output row, in order. Precisely names the
+/// fields but documents no order, so this is og's.
+const COLUMNS: [&str; 30] = [
     "addressId",
     "status",
     "errorMessage",
@@ -432,9 +546,24 @@ pub(super) const COLUMNS: [&str; 30] = [
     "customFields",
 ];
 
+/// Columns bulk verify output leaves out, since a verified address has no
+/// point.
+const UNPLACED: [&str; 2] = ["latitude", "longitude"];
+
+impl Product {
+    /// The columns of the product's bulk output row, in order.
+    pub(super) fn columns(self) -> Vec<&'static str> {
+        COLUMNS
+            .into_iter()
+            .filter(|column| self == Self::Geocode || !UNPLACED.contains(column))
+            .collect()
+    }
+}
+
 impl Candidate {
-    /// The candidate's cells from `score` on, as [`COLUMNS`] lists them.
-    pub(super) fn cells(&self) -> Vec<String> {
+    /// The candidate's cells from `score` on, as [`Product::columns`] lists
+    /// them.
+    pub(super) fn cells(&self, product: Product) -> Vec<String> {
         let address = &self.address;
         let text = |value: &Option<String>| value.clone().unwrap_or_default();
         let name = |field: &Option<AdminField>| {
@@ -444,14 +573,27 @@ impl Candidate {
                 .unwrap_or_default()
         };
         let country = address.country.as_ref();
-        let [lon, lat] = self.location.feature.geometry.coordinates;
+        let location = self.location.as_ref();
+        let coordinate = |index: usize| {
+            location
+                .map(|location| location.feature.geometry.coordinates[index].to_string())
+                .unwrap_or_default()
+        };
         // Bulk output names custom fields in camelCase, unlike real time.
-        let custom_fields = self
-            .custom_fields
-            .get(ID_FIELD)
-            .map(|id| serde_json::json!({ "pbKey": id }).to_string())
-            .unwrap_or_default();
-        vec![
+        let custom_fields = [
+            (ID_FIELD, "pbKey"),
+            (SIMPLE_MATCH_CODE, "simpleMatchCode"),
+            (EXTENDED_MATCH_CODE, "extendedMatchCode"),
+        ]
+        .into_iter()
+        .filter_map(|(key, name)| Some((name, self.custom_fields.get(key)?)))
+        .collect::<BTreeMap<_, _>>();
+        let custom_fields = if custom_fields.is_empty() {
+            String::new()
+        } else {
+            serde_json::json!(custom_fields).to_string()
+        };
+        let cells = vec![
             self.score
                 .map(|score| score.to_string())
                 .unwrap_or_default(),
@@ -490,18 +632,25 @@ impl Candidate {
                 .and_then(|country| country.iso_numeric_code)
                 .unwrap_or_default()
                 .to_string(),
-            lat.to_string(),
-            lon.to_string(),
-            CRS_NAME.to_string(),
-            "Point".to_string(),
-            self.location
-                .explanation
-                .kind
+            coordinate(1),
+            coordinate(0),
+            location.map(|_| CRS_NAME.to_string()).unwrap_or_default(),
+            location.map(|_| "Point".to_string()).unwrap_or_default(),
+            location
+                .and_then(|location| location.explanation.kind)
                 .unwrap_or_default()
                 .to_string(),
             self.explanation.address_match.kind.to_string(),
             custom_fields,
-        ]
+        ];
+        // `COLUMNS` opens with the id, status and message, which the caller
+        // writes.
+        COLUMNS[3..]
+            .iter()
+            .zip(cells)
+            .filter(|(column, _)| product == Product::Geocode || !UNPLACED.contains(column))
+            .map(|(_, cell)| cell)
+            .collect()
     }
 }
 

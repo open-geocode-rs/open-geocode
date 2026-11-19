@@ -7,6 +7,10 @@
 
 mod auth;
 mod bulk;
+mod explain;
+mod match_code;
+mod postal_city;
+mod proximity;
 mod realtime;
 mod result;
 #[cfg(test)]
@@ -38,7 +42,7 @@ pub(crate) fn router() -> Router<AppState> {
             post(realtime::reverse).fallback(not_found),
         )
         .route("/v1/lookup", post(realtime::lookup).fallback(not_found))
-        .route("/v1/verify", post(not_implemented).fallback(not_found))
+        .route("/v1/verify", post(realtime::verify).fallback(not_found))
         .route(
             "/v1/autocomplete",
             post(realtime::autocomplete).fallback(not_found),
@@ -55,15 +59,15 @@ pub(crate) fn router() -> Router<AppState> {
         )
         .route(
             "/v1/autocomplete/postal-city",
-            post(not_implemented).fallback(not_found),
+            post(postal_city::postal_city).fallback(not_found),
         )
         .route(
             "/v1/explain-addresscode",
-            post(not_implemented).fallback(not_found),
+            post(explain::explain_addresscode).fallback(not_found),
         )
         .route(
             "/v1/proximity-search",
-            post(not_implemented).fallback(not_found),
+            post(proximity::proximity_search).fallback(not_found),
         )
         .route(
             "/v2/files/upload-url",
@@ -78,10 +82,8 @@ pub(crate) fn router() -> Router<AppState> {
             "/v2/files/{file_id}/content",
             put(bulk::put_content).fallback(not_found),
         )
-        .route("/v2/bulk-geocode", post(bulk::submit).fallback(not_found))
-        // Verify checks deliverability against a postal file; og has none,
-        // so a geocode dressed as a verification would mislead.
-        .route("/v2/bulk-verify", post(not_implemented).fallback(not_found))
+        .route("/v2/bulk-geocode", post(bulk::geocode).fallback(not_found))
+        .route("/v2/bulk-verify", post(bulk::verify).fallback(not_found))
         .route("/v2/bulk/jobs", get(bulk::list_jobs).fallback(not_found))
         .route(
             "/v2/bulk/jobs/{job_id}",
@@ -111,14 +113,6 @@ async fn not_found() -> VendorError {
         StatusCode::NOT_FOUND,
         "NOT_FOUND",
         "No such resource on this server",
-    )
-}
-
-async fn not_implemented() -> VendorError {
-    error(
-        StatusCode::NOT_IMPLEMENTED,
-        "NOT_IMPLEMENTED",
-        "This API is not implemented by this server",
     )
 }
 
