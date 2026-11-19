@@ -686,6 +686,8 @@ async fn search_box_suggest_then_retrieve() {
                 "context": context,
                 "maki": "cafe",
                 "brand": ["Queen Coffee"],
+                "poi_category": ["Coffee", "Cafe", "Food and Drink"],
+                "poi_category_ids": ["coffee", "cafe", "food_and_drink"],
             }],
             "attribution": OSM,
         })
@@ -715,6 +717,8 @@ async fn search_box_suggest_then_retrieve() {
                     "coordinates": {"longitude": -79.005, "latitude": 43.0},
                     "maki": "cafe",
                     "brand": ["Queen Coffee"],
+                    "poi_category": ["Coffee", "Cafe", "Food and Drink"],
+                    "poi_category_ids": ["coffee", "cafe", "food_and_drink"],
                 },
             }],
             "attribution": OSM,
@@ -784,6 +788,100 @@ async fn search_box_reverse_keys_context_by_id() {
 }
 
 #[tokio::test]
+async fn search_box_category_answers_the_places_of_one_kind() {
+    let pack = write_pack();
+    let router = router(&pack);
+    let base = "/compat/mapbox/search/searchbox/v1/category";
+    let names = |body: &Value| {
+        body["features"]
+            .as_array()
+            .expect("features")
+            .iter()
+            .map(|feature| feature["properties"]["name"].clone())
+            .collect::<Vec<_>>()
+    };
+
+    let (status, body) = get(&router, &format!("{base}/coffee?proximity=-79,43")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["type"], "FeatureCollection");
+    assert_eq!(body["attribution"], OSM);
+    let properties = &body["features"][0]["properties"];
+    assert_eq!(properties["name"], "Queen Cafe");
+    assert_eq!(properties["mapbox_id"], id("osm:node:11"));
+    assert_eq!(properties["feature_type"], "poi");
+    assert_eq!(properties["maki"], "cafe");
+    assert_eq!(
+        properties["poi_category"],
+        json!(["Coffee", "Cafe", "Food and Drink"])
+    );
+    assert_eq!(
+        properties["poi_category_ids"],
+        json!(["coffee", "cafe", "food_and_drink"])
+    );
+    assert_eq!(
+        body["features"][0]["geometry"],
+        json!({"type": "Point", "coordinates": [-79.005, 43.0]})
+    );
+
+    // A wider kind, an id of the catalog's own words, and no point to search around.
+    for uri in [
+        format!("{base}/food_and_drink?proximity=-79,43&radius=0.1&limit=25"),
+        format!("{base}/caf%C3%A9?proximity=-79,43"),
+        format!("{base}/coffee"),
+        format!("{base}/coffee?proximity=ip&country=ca&bbox=-80,42,-78,44"),
+    ] {
+        let (status, body) = get(&router, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(names(&body), [json!("Queen Cafe")], "{uri}");
+    }
+
+    // Another kind, a point too far, another country, and the kind excluded.
+    for uri in [
+        format!("{base}/gas_station?proximity=-79,43"),
+        format!("{base}/coffee?proximity=-70,43&radius=1"),
+        format!("{base}/coffee?country=fr"),
+        format!("{base}/coffee?bbox=0,0,1,1"),
+        format!("{base}/coffee?proximity=-79,43&poi_category_exclusions=food_and_drink"),
+    ] {
+        let (status, body) = get(&router, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(names(&body), Vec::<Value>::new(), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn search_box_lists_the_categories_it_searches_by() {
+    let pack = write_pack();
+    let router = router(&pack);
+    let (status, body) = get(
+        &router,
+        "/compat/mapbox/search/searchbox/v1/list/category?language=fr",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["listItems"].as_array().expect("listItems");
+    let coffee = items
+        .iter()
+        .find(|item| item["canonical_id"] == "coffee")
+        .expect("coffee");
+    assert_eq!(coffee["name"], "Coffee");
+    assert_eq!(coffee["icon"], "cafe");
+    assert_eq!(coffee["version"], env!("CARGO_PKG_VERSION"));
+    assert!(uuid::Uuid::parse_str(coffee["uuid"].as_str().expect("uuid")).is_ok());
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    // Every listed id answers a category search.
+    for item in items {
+        let id = item["canonical_id"].as_str().expect("id");
+        let (status, _) = get(
+            &router,
+            &format!("/compat/mapbox/search/searchbox/v1/category/{id}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{id}");
+    }
+}
+
+#[tokio::test]
 async fn search_box_errors_are_mapbox_errors() {
     let pack = write_pack();
     let router = router(&pack);
@@ -826,14 +924,29 @@ async fn search_box_errors_are_mapbox_errors() {
             "Not Found",
         ),
         (
-            format!("{base}/category/coffee"),
-            StatusCode::NOT_IMPLEMENTED,
-            "Not Implemented",
+            format!("{base}/category/no_such_kind_of_place"),
+            StatusCode::NOT_FOUND,
+            "Not Found",
         ),
         (
-            format!("{base}/list/category"),
-            StatusCode::NOT_IMPLEMENTED,
-            "Not Implemented",
+            format!("{base}/category/coffee?limit=26"),
+            StatusCode::BAD_REQUEST,
+            "limit must be a whole number from 1 to 25",
+        ),
+        (
+            format!("{base}/category/coffee?radius=1"),
+            StatusCode::BAD_REQUEST,
+            "radius needs proximity",
+        ),
+        (
+            format!("{base}/category/coffee?proximity=-79,43&radius=11"),
+            StatusCode::BAD_REQUEST,
+            "radius must be a number from 0.00001 to 10",
+        ),
+        (
+            format!("{base}/category/coffee?proximity=1"),
+            StatusCode::BAD_REQUEST,
+            "focus must be 2 comma-separated numbers, lon,lat",
         ),
         (
             format!("{base}/details"),

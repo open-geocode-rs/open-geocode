@@ -1,4 +1,5 @@
-//! Search Box v1: `suggest`, `retrieve`, `forward` and `reverse`.
+//! Search Box v1: `suggest`, `retrieve`, `forward` and `reverse`. Category
+//! search is in [`super::category`].
 
 use axum::{
     Json,
@@ -9,7 +10,7 @@ use serde::Serialize;
 
 use super::{
     Api, Context, Coordinates, Geometry, LayerFields, Params, Translated, Types, admitted,
-    attribution, error,
+    attribution, category, error,
 };
 use crate::{
     api::{Common, ForwardCollection, ReverseCollection},
@@ -48,10 +49,17 @@ struct Poi {
     maki: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     brand: Option<Vec<String>>,
+    /// The names of the listed kinds the place is, closest first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    poi_category: Option<Vec<&'static str>>,
+    /// The canonical ids of those kinds, as `list/category` gives them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    poi_category_ids: Option<Vec<&'static str>>,
 }
 
 fn described(common: &Common, coordinates: [f64; 2]) -> (Described, Coordinates, Poi) {
     let translated = Translated::of(common, coordinates);
+    let kinds = common.category.as_deref().and_then(category::kinds);
     // The context keeps the unit og states only in Geocoding, whose
     // `secondary_address` layer Search Box has no counterpart of.
     let context = Context {
@@ -75,6 +83,8 @@ fn described(common: &Common, coordinates: [f64; 2]) -> (Described, Coordinates,
         Poi {
             maki: translated.maki,
             brand: translated.brand.map(|brand| vec![brand]),
+            poi_category: kinds.clone().map(|(names, _)| names),
+            poi_category_ids: kinds.map(|(_, ids)| ids),
         },
     )
 }
@@ -148,7 +158,7 @@ impl Collection {
         }
     }
 
-    fn forward(collection: &ForwardCollection, types: Option<&Types>) -> Self {
+    pub(super) fn forward(collection: &ForwardCollection, types: Option<&Types>) -> Self {
         Self::of(
             collection
                 .features
@@ -173,7 +183,7 @@ impl Collection {
 
 /// The one language Search Box names results in. It is the first of
 /// `language`, or English when none is sent.
-fn language(params: &Params) -> &str {
+pub(super) fn language(params: &Params) -> &str {
     params
         .get("language")
         .and_then(|value| {
