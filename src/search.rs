@@ -7641,14 +7641,9 @@ struct Prior {
 /// the building, 2 another flat (see [`TieBreak::unit`]).
 fn unit_rank(record: &Summary, ranking: &Ranking) -> u8 {
     // A flat kept as written ("2/10") is the one "2/10" names, though it
-    // states no unit.
-    let as_written = ranking.unit.is_some()
-        && record
-            .address
-            .housenumber
-            .as_deref()
-            .and_then(search_key)
-            .is_some_and(|written| ranking.states_number(&written));
+    // states no unit. The house number alone is the building, not the flat.
+    let as_written = ranking.flat_text.is_some()
+        && record.address.housenumber.as_deref().and_then(search_key) == ranking.flat_text;
     let stated = record.address.unit.as_deref().and_then(search_key);
     match (ranking.unit.as_deref(), stated.as_deref()) {
         _ if as_written => 0,
@@ -7664,9 +7659,7 @@ fn names_unit(stated: &str, sought: &str) -> bool {
 }
 
 /// How a record answers the unit a query names. It states the flat, as a
-/// unit or written with its house number ("2/10"), or it does not. Not
-/// [`unit_rank`], which ranks a building with the house number first
-/// whatever flat is asked for.
+/// unit or written with its house number ("2/10"), or it does not.
 fn unit_match(record: &Summary, ranking: &Ranking) -> Option<PartMatch> {
     let sought = ranking.unit.as_deref()?;
     let key = |value: &Option<String>| value.as_deref().and_then(search_key);
@@ -14842,6 +14835,36 @@ mod tests {
                 .map(|hit| hit.record.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["osm:node:8"]
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_flat_the_query_does_not_name_ranks_after_its_building() {
+        let temp_dir = temp_pack_path("search-other-flat");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let mut flat = address_record("osm:node:1", "", "5", "Queen Street", None, None);
+        flat.address.unit = Some("Unit 2".to_string());
+        let mut building = address_record("osm:node:2", "", "5", "Queen Street", None, None);
+        building.geometry = point_geometry(-79.0002, 43.0);
+        for record in [flat, building] {
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+
+        assert_eq!(
+            top_ids(&searcher, "Unit 3 5 Queen Street")
+                .first()
+                .map(String::as_str),
+            Some("osm:node:2")
+        );
+        assert_eq!(
+            top_ids(&searcher, "Unit 2 5 Queen Street")
+                .first()
+                .map(String::as_str),
+            Some("osm:node:1")
         );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
