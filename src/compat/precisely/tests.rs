@@ -21,9 +21,9 @@ use crate::{
     limits::Limits,
     pack::Writer,
     record::{
-        AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRange,
-        InterpolationRecord, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, PoiRecord,
-        Record, SourceProvenance, point_geometry,
+        AddressComponents, AddressRecord, DerivedSourceProvenance, InterpolationAddressComponents,
+        InterpolationRange, InterpolationRecord, LocationPrecision, ObjectType, PlaceLayer,
+        PlaceRecord, PoiRecord, PostcodeRecord, Record, SourceProvenance, point_geometry,
     },
     runtime::{AppState, build_router},
 };
@@ -166,7 +166,7 @@ fn write_pack(dir: &Path) {
             context.clone(),
         )
         .expect("poi");
-    let interpolation_context = context;
+    let interpolation_context = context.clone();
     writer
         .write(
             &InterpolationRecord {
@@ -195,6 +195,17 @@ fn write_pack(dir: &Path) {
             interpolation_context,
         )
         .expect("interpolation");
+    writer
+        .write(
+            &Record::Postcode(PostcodeRecord {
+                postcode: "M5X 1A9".to_string(),
+                country: Some(crate::parse::lattice::CountryCode::parse("CA").expect("code")),
+                geometry: point_geometry(-79.3815, 43.6492),
+                source: DerivedSourceProvenance::osm_address_records(1),
+            }),
+            context,
+        )
+        .expect("postcode");
     writer.finish().expect("finish");
     // Calibrated, so answers carry the confidence `score` is made from.
     let pack = crate::pack::Reader::open(dir).expect("pack");
@@ -804,24 +815,9 @@ async fn lookup_finds_a_record_by_the_pb_key_og_issued() {
 }
 
 #[tokio::test]
-async fn what_og_lacks_is_not_implemented_and_the_rest_not_found() {
+async fn an_unknown_path_or_method_is_not_found() {
     let fixture = Fixture::new("missing");
     let router = fixture.router();
-    let not_implemented = errors(
-        "NOT_IMPLEMENTED",
-        "This API is not implemented by this server",
-    );
-    for path in [
-        "/v1/verify",
-        "/v2/bulk-verify",
-        "/v1/autocomplete/postal-city",
-        "/v1/explain-addresscode",
-        "/v1/proximity-search",
-    ] {
-        let reply = post(&router, path, &json!({})).await;
-        assert_eq!(reply.status, StatusCode::NOT_IMPLEMENTED, "{path}");
-        assert_eq!(reply.json(), not_implemented, "{path}");
-    }
     let not_found = errors("NOT_FOUND", "No such resource on this server");
     for (method, path) in [
         ("POST", "/compat/precisely/v1/nowhere"),
@@ -969,7 +965,7 @@ async fn a_bulk_job_runs_on_og_jobs_and_downloads_as_precisely_csv() {
     let mut lines = rows.lines();
     assert_eq!(
         lines.next(),
-        Some(super::result::COLUMNS.join(",").as_str())
+        Some(super::result::Product::Geocode.columns().join(",").as_str())
     );
     let first = lines.next().expect("A1");
     let score = first.split(',').nth(3).expect("score");
@@ -984,7 +980,7 @@ async fn a_bulk_job_runs_on_og_jobs_and_downloads_as_precisely_csv() {
             encode_id("osm:node:10")
         )
     );
-    let blank = ",".repeat(super::result::COLUMNS.len() - 4);
+    let blank = ",".repeat(super::result::Product::Geocode.columns().len() - 4);
     assert_eq!(
         lines.collect::<Vec<_>>(),
         vec![
@@ -1300,5 +1296,471 @@ async fn uploads_and_job_records_expire_with_og_jobs() {
     assert_eq!(
         gone.json(),
         errors("INVALID_REQUEST", "Invalid Job Id (DIS-LI-1051)")
+    );
+}
+
+/// The standardized result verify gives for 100 King Street West, with
+/// the score og's confidence makes.
+fn verified_result(score: &Value, stated: &[&str], codes: [&str; 2]) -> Value {
+    let match_type = |label: &str| {
+        if stated.contains(&label) {
+            "EXACT"
+        } else {
+            "ADDED"
+        }
+    };
+    json!({
+        "score": score,
+        "address": {
+            "formattedAddress": "100 King Street West, Unit 5, ON, M5X 1A9",
+            "formattedStreetAddress": "100 King Street West, Unit 5",
+            "formattedLocationAddress": "ON, M5X 1A9",
+            "addressNumber": "100",
+            "street": "King Street West",
+            "unit": "5",
+            "neighborhood": {"longName": "Financial District"},
+            "suburb": {"longName": "Old Toronto"},
+            "city": {"longName": "Toronto"},
+            "admin2": {"longName": "Toronto Division"},
+            "admin1": {"longName": "Ontario", "shortName": "ON"},
+            "postalCode": "M5X 1A9",
+            "country": {"name": "Canada", "isoAlpha2Code": "CA", "isoAlpha3Code": "CAN",
+                        "isoNumericCode": "124"},
+        },
+        "addressLines": ["Unit 5", "100 King Street West", "Toronto, ON M5X 1A9", "Canada"],
+        "explanation": {"addressMatch": {"type": "ADDRESS", "description": [
+            {"label": "addressNumber", "matchType": match_type("addressNumber")},
+            {"label": "street", "matchType": match_type("street")},
+            {"label": "unitMatch", "matchType": "ADDED"},
+            {"label": "city", "matchType": match_type("city")},
+            {"label": "admin1", "matchType": "ADDED"},
+            {"label": "postalCode", "matchType": match_type("postalCode")},
+            {"label": "country", "matchType": "ADDED"},
+        ]}},
+        "customFields": {
+            "PB_KEY": encode_id("osm:node:10"),
+            "SIMPLE_MATCH_CODE": codes[0],
+            "EXTENDED_MATCH_CODE": codes[1],
+        },
+    })
+}
+
+#[tokio::test]
+async fn verify_answers_the_matched_address_standardized_without_a_point() {
+    let fixture = Fixture::new("verify");
+    let router = fixture.router();
+    let og = native(
+        &router,
+        "/geocode?address=100%20King%20Street%20West&locality=Toronto&postcode=M5X%201A9\
+         &country=CA&limit=1",
+    )
+    .await;
+    let properties = &og["features"][0]["properties"];
+    let confidence = properties["confidence"].as_f64().expect("calibrated");
+    assert_eq!(
+        properties["match"],
+        json!({"housenumber": "matched", "street": "matched", "locality": "matched",
+               "postcode": "matched"})
+    );
+    let score = json!((confidence * 100.0).round() as u8);
+    let stars = (confidence * 5.0).round() as u8;
+
+    let reply = post(
+        &router,
+        "/v1/verify",
+        &json!({"addresses": [
+            {"addressId": "1", "addressNumber": "100", "street": "King Street West",
+             "city": "Toronto", "postalCode": "M5X 1A9", "country": "CA"},
+            {"addressId": "2", "addressLines": ["99 Nowhere Lane"], "country": "CAN"},
+        ]}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        reply.json(),
+        json!({"responses": [
+            {"addressId": "1", "status": "OK", "results": [verified_result(
+                &score,
+                &["addressNumber", "street", "city", "postalCode"],
+                [
+                    &format!("V4-P4S4A6T4R6Z4C6-{stars}"),
+                    &format!("V4-D0M0B0U6F0G0P4S4Q0X0A6T4E0R6W0Z4Y0C6-{stars}"),
+                ],
+            )]},
+            {"addressId": "2", "status": "ZERO_RESULTS", "results": []},
+        ]})
+    );
+
+    // The code verify gives reads back through explain-addresscode.
+    let explained = post(
+        &router,
+        "/v1/explain-addresscode",
+        &json!({"codeType": "GlobalMatchCode",
+                "codes": [{"code": format!("V4-P4S4A6T4R6Z4C6-{stars}")}]}),
+    )
+    .await;
+    assert_eq!(explained.status, StatusCode::OK);
+    assert!(
+        explained.json()["responses"][0]["result"]["customerInsightSummary"]
+            .as_str()
+            .expect("summary")
+            .starts_with("Address premise verified with ")
+    );
+}
+
+#[tokio::test]
+async fn explain_reads_a_global_match_code_back_as_words() {
+    let fixture = Fixture::new("explain");
+    let router = fixture.router();
+    let reply = post(
+        &router,
+        "/v1/explain-addresscode",
+        &json!({"codeType": "GlobalMatchCode",
+                "codes": [{"id": "1", "code": "V4-P4S4A0T4R6Z4C4-5"}],
+                "responseOptions": {"includeOfficialDescription": true}}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let body = reply.json();
+    let generated = body["generatedAt"].as_str().expect("generatedAt");
+    assert_eq!(
+        generated.len(),
+        "2025-12-18T13:48:29.842Z".len(),
+        "{generated}"
+    );
+    let component = |label: &str, value: u8, meaning: &str| json!({"label": label, "value": value, "meaning": meaning});
+    assert_eq!(
+        body["responses"],
+        json!([{"id": "1", "status": "OK", "result": {
+            "codeType": "GlobalMatchCode",
+            "customerInsightSummary":
+                "Address premise verified with high confidence. Region/State appended from \
+                 reference data.",
+            "officialDescription": {
+                "addressMatchStatus": {"symbol": "V4", "status": "Verified",
+                    "verificationLevel": 4, "verificationLevelLabel": "Premise verified"},
+                "componentMatchStatus": {
+                    "A": component("Sub-city", 0, "Not found or empty"),
+                    "C": component("Country", 4, "Verified without changes"),
+                    "P": component("Premise/House Number", 4, "Verified without changes"),
+                    "R": component("Region/State", 6, "Appended using reference data"),
+                    "S": component("Street", 4, "Verified without changes"),
+                    "T": component("City", 4, "Verified without changes"),
+                    "Z": component("Postcode/Zip Code", 4, "Verified without changes"),
+                },
+                "matchConfidence": {"value": 5, "label": "High Confidence"},
+            },
+        }}])
+    );
+
+    // Without the option, no official description.
+    let reply = post(
+        &router,
+        "/v1/explain-addresscode",
+        &json!({"codeType": "GlobalMatchCode", "codes": [{"code": "V3-P1S4C4-2"}]}),
+    )
+    .await;
+    assert_eq!(
+        reply.json()["responses"],
+        json!([{"status": "OK", "result": {"codeType": "GlobalMatchCode",
+            "customerInsightSummary": "Address street verified with medium-low confidence. \
+                Premise/House Number not identified in reference data."}}])
+    );
+}
+
+#[tokio::test]
+async fn explain_answers_each_code_it_cannot_read() {
+    let fixture = Fixture::new("explain-errors");
+    let router = fixture.router();
+    let explain = |body: Value| {
+        let router = router.clone();
+        async move { post(&router, "/v1/explain-addresscode", &body).await }
+    };
+    let reply = explain(json!({"codeType": "GlobalMatchCode", "codes": [
+        {"id": "1", "code": "V4-P4S4C4-5"},
+        {"id": "2", "code": "V4-D0U4M0-5"},
+        {"id": "3", "code": " "},
+    ]}))
+    .await;
+    assert_eq!(reply.status, StatusCode::PARTIAL_CONTENT);
+    let responses = reply.json()["responses"].clone();
+    assert_eq!(responses[0]["status"], "OK");
+    assert_eq!(
+        responses[1],
+        json!({"id": "2", "status": "INVALID_REQUEST", "errorMessage":
+            "Invalid code format for GlobalMatchCode in the request (DIS-LI-1040): component \
+             order violation - Company (M) must come before Sub-premise/Unit (U)"})
+    );
+    assert_eq!(
+        responses[2],
+        json!({"id": "3", "status": "INVALID_REQUEST",
+               "errorMessage": "Code is null or blank (DIS-LI-1039)"})
+    );
+
+    // Every code malformed fails the request.
+    let reply =
+        explain(json!({"codeType": "GlobalMatchCode", "codes": [{"code": "V5-P4-5"}]})).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reply.json(),
+        errors(
+            "INVALID_REQUEST",
+            "Invalid code format for GlobalMatchCode in the request (DIS-LI-1040): verification \
+             level must be 1-4"
+        )
+    );
+
+    // A code type og issues none of is answered, item by item.
+    let reply =
+        explain(json!({"codeType": "ForwardResultCode", "codes": [{"code": "S8HPNTSCZA"}]})).await;
+    assert_eq!(reply.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        reply.json()["responses"],
+        json!([{"status": "ERROR", "errorMessage":
+            "ForwardResultCode is not explained by this server, which issues Global Match \
+             Codes only"}])
+    );
+
+    let too_many = (0..26)
+        .map(|_| json!({"code": "V4-P4-5"}))
+        .collect::<Vec<_>>();
+    for (body, status, message) in [
+        (
+            json!({"codes": [{"code": "V4-P4-5"}]}),
+            ("INVALID_REQUEST", StatusCode::BAD_REQUEST),
+            "CodeType is not provided in the request (DIS-LI-1037)",
+        ),
+        (
+            json!({"codeType": "Morse", "codes": [{"code": "V4-P4-5"}]}),
+            ("INVALID_REQUEST", StatusCode::BAD_REQUEST),
+            "Invalid CodeType, it must be a valid codeType (DIS-LI-1038)",
+        ),
+        (
+            json!({"codeType": "GlobalMatchCode", "codes": []}),
+            ("INVALID_REQUEST", StatusCode::BAD_REQUEST),
+            "Request Body is not valid (DIS-LI-1018)",
+        ),
+        (
+            json!({"codeType": "GlobalMatchCode", "codes": too_many}),
+            ("BATCH_SIZE_EXCEEDED", StatusCode::PAYLOAD_TOO_LARGE),
+            "Batch size must not exceed 25 (DIS-LI-1014)",
+        ),
+    ] {
+        let reply = explain(body).await;
+        assert_eq!(reply.status, status.1, "{message}");
+        assert_eq!(reply.json(), errors(status.0, message));
+    }
+}
+
+#[tokio::test]
+async fn proximity_search_finds_the_nearest_address() {
+    let fixture = Fixture::new("proximity");
+    let router = fixture.router();
+    let og = native(&router, "/reverse?lon=-79.3816&lat=43.6494&layer=address").await;
+    let metres = og["features"][0]["properties"]["distance_m"]
+        .as_f64()
+        .expect("distance");
+    let search = |distance: Value, country: &str| {
+        let router = router.clone();
+        let body = json!({
+            "preferences": {"dataset": "premium-address-points", "maxResults": 3,
+                            "distance": distance},
+            "location": {"addressId": "7", "latitude": 43.6494, "longitude": -79.3816,
+                         "country": country},
+        });
+        async move { post(&router, "/v1/proximity-search", &body).await }
+    };
+    let reply = search(json!({"value": 1, "distanceUnit": "KILOMETER"}), "CAN").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        reply.json(),
+        json!({"response": {"addressId": "7", "status": "OK", "results": [{
+            "distance": metres / 1000.0,
+            "location": {"latitude": 43.6493, "longitude": -79.3817},
+            "metadata": {
+                "PBKEY": encode_id("osm:node:10"),
+                "FORMATTEDADDRESS": "100 King Street West, Unit 5, ON, M5X 1A9",
+                "ADDRLINE1": "100 King Street West, Unit 5",
+                "ADDNUMBER": "100",
+                "STREETNAME": "King Street West",
+                "CITY": "Toronto",
+                "ADMIN2": "Toronto Division",
+                "ADMIN1": "ON",
+                "POSTALCODE": "M5X 1A9",
+                "COUNTRY": "CAN",
+            },
+        }]}})
+    );
+    let reply = search(json!({"value": 100, "distanceUnit": "FOOT"}), "CA").await;
+    let feet = reply.json()["response"]["results"][0]["distance"]
+        .as_f64()
+        .expect("feet");
+    assert!((feet - metres / 0.3048).abs() < 1e-9, "{feet}");
+
+    // Out of reach, or over the border, is nothing.
+    for (distance, country) in [
+        (json!({"value": 1, "distanceUnit": "METER"}), "CAN"),
+        (json!({"value": 1, "distanceUnit": "KILOMETER"}), "USA"),
+    ] {
+        assert_eq!(
+            search(distance, country).await.json(),
+            json!({"response": {"addressId": "7", "status": "ZERO_RESULTS", "results": []}})
+        );
+    }
+
+    for (body, message) in [
+        (
+            json!({"preferences": {}, "location": {"latitude": 1, "longitude": 1, "country": "CA"}}),
+            "Dataset is not provided in the request (DIS-LI-1031)",
+        ),
+        (
+            json!({"preferences": {"dataset": "d"}, "location": {"latitude": 1, "longitude": 1}}),
+            "Country is not provided in the request (DIS-LI-1015)",
+        ),
+        (
+            json!({"preferences": {"dataset": "d"}, "location": {"latitude": 1, "country": "CA"}}),
+            "Request Body is not valid (DIS-LI-1018)",
+        ),
+        (
+            json!({"preferences": {"dataset": "d", "distance": {"value": 1, "distanceUnit": "CUBIT"}},
+                   "location": {"latitude": 1, "longitude": 1, "country": "CA"}}),
+            "Request Body is not valid (DIS-LI-1018)",
+        ),
+        (
+            json!({"preferences": {"dataset": "d", "maxResults": 0},
+                   "location": {"latitude": 1, "longitude": 1, "country": "CA"}}),
+            "Invalid value for maxResults (DIS-LI-1036)",
+        ),
+    ] {
+        let reply = post(&router, "/v1/proximity-search", &body).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{message}");
+        assert_eq!(reply.json(), errors("INVALID_REQUEST", message));
+    }
+}
+
+#[tokio::test]
+async fn postal_city_completes_a_postcode_with_its_town() {
+    let fixture = Fixture::new("postal-city");
+    let router = fixture.router();
+    let prediction = json!({
+        "address": {
+            "country": {"isoAlpha3Code": "CAN"},
+            "admin1": {"longName": "Ontario", "shortName": "ON"},
+            "admin2": {"longName": "Toronto Division"},
+            "city": {"longName": "Toronto"},
+            "postalCode": "M5X 1A9",
+        },
+        "location": {"feature": {"type": "Feature", "properties": {"crsName": "epsg:4326"},
+            "geometry": {"type": "Point", "coordinates": [-79.3815, 43.6492]}}},
+    });
+    // With no type named, text with a digit is a postcode.
+    for address in [
+        json!({"type": "POSTAL", "postAddress": "M5X", "country": "CAN"}),
+        json!({"postAddress": "m5x 1", "country": "CA"}),
+    ] {
+        let reply = post(
+            &router,
+            "/v1/autocomplete/postal-city",
+            &json!({"preferences": {"maxResults": 5}, "address": address}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.json(),
+            json!({"response": {"status": "OK", "predictions": [prediction]}})
+        );
+    }
+    let reply = post(
+        &router,
+        "/v1/autocomplete/postal-city",
+        &json!({"address": {"type": "POSTAL", "postAddress": "H2X", "country": "CAN"}}),
+    )
+    .await;
+    assert_eq!(
+        reply.json(),
+        json!({"response": {"status": "ZERO_RESULTS", "predictions": []}})
+    );
+    for (address, message) in [
+        (
+            json!({"type": "STREET", "postAddress": "M5X", "country": "CAN"}),
+            "Type should be either POSTAL or CITY only (DIS-LI-1025)",
+        ),
+        (
+            json!({"type": "POSTAL", "postAddress": "M5X"}),
+            "Country is not provided in the request (DIS-LI-1015)",
+        ),
+        (
+            json!({"type": "POSTAL", "postAddress": "", "country": "CAN"}),
+            "Request Body is not valid (DIS-LI-1018)",
+        ),
+    ] {
+        let reply = post(
+            &router,
+            "/v1/autocomplete/postal-city",
+            &json!({ "address": address }),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{message}");
+        assert_eq!(reply.json(), errors("INVALID_REQUEST", message));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bulk_verify_job_writes_verify_output() {
+    let fixture = Fixture::new("bulk-verify");
+    let router = fixture.router();
+    let file_id = upload(
+        &router,
+        "addressId,address,city,admin1,postalCode,country\n\
+         V1,100 King Street West,Toronto,,M5X 1A9,CA\n\
+         V2,99 Nowhere Lane,,,,CA\n",
+    )
+    .await;
+    let submitted = post(
+        &router,
+        "/v2/bulk-verify",
+        &json!({"fileId": file_id, "delimiter": ","}),
+    )
+    .await;
+    assert_eq!(
+        submitted.status,
+        StatusCode::ACCEPTED,
+        "{}",
+        submitted.text()
+    );
+    let status_url = submitted.json()["statusUrl"]
+        .as_str()
+        .expect("statusUrl")
+        .to_string();
+    let job_id = status_url.rsplit('/').next().expect("job id").to_string();
+    assert_eq!(finished(&router, &job_id).await["status"], "COMPLETED");
+    let output = get(
+        &router,
+        &format!("/compat/precisely/v2/bulk/jobs/{job_id}/output"),
+    )
+    .await;
+    let rows = output.text();
+    let mut lines = rows.lines();
+    let header = lines.next().expect("header");
+    assert_eq!(header, super::result::Product::Verify.columns().join(","));
+    assert!(!header.contains("latitude") && !header.contains("longitude"));
+    let first = lines.next().expect("V1");
+    let score = first.split(',').nth(3).expect("score");
+    let stars = (score.parse::<f64>().expect("score") / 20.0).round();
+    assert_eq!(
+        first,
+        format!(
+            "V1,OK,,{score},\"100 King Street West, Unit 5, ON, M5X 1A9\",\"100 King Street West, Unit 5\",\
+             \"ON, M5X 1A9\",100,King Street West,5,,Financial District,Old Toronto,\
+             Toronto,Toronto Division,Ontario,ON,M5X 1A9,,CAN,Canada,CA,124,,,,ADDRESS,\
+             \"{{\"\"extendedMatchCode\"\":\"\"V4-D0M0B0U6F0G0P4S4Q0X0A6T4E0R6W0Z4Y0C6-{stars}\"\",\
+             \"\"pbKey\"\":\"\"{}\"\",\"\"simpleMatchCode\"\":\"\"V4-P4S4A6T4R6Z4C6-{stars}\"\"}}\"",
+            encode_id("osm:node:10")
+        )
+    );
+    let blank = ",".repeat(super::result::Product::Verify.columns().len() - 4);
+    assert_eq!(
+        lines.next(),
+        Some(format!("V2,ZERO_RESULTS,,{blank}").as_str())
     );
 }

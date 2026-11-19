@@ -33,7 +33,7 @@ use tokio::{sync::mpsc, task};
 use super::{
     Failure, INTERNAL_MESSAGE, Preferences, base_url, channel_body, error, given, read_json,
     realtime::InputAddress,
-    result::{COLUMNS, Feature},
+    result::{Feature, Product},
 };
 use crate::{
     compat::VendorError,
@@ -70,9 +70,12 @@ struct StoredJob {
     file_name: String,
     /// Unix milliseconds.
     submitted_at: u64,
+    /// Absent on a job stored before bulk verify, which was a geocode.
+    #[serde(default)]
+    product: Product,
 }
 
-fn now() -> Duration {
+pub(super) fn now() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -599,9 +602,27 @@ fn translate(
     }
 }
 
-pub(super) async fn submit(
+/// `/v2/bulk-geocode`.
+pub(super) async fn geocode(
     State(state): State<AppState>,
     request: Request,
+) -> Result<Response, VendorError> {
+    submit(state, request, Product::Geocode).await
+}
+
+/// `/v2/bulk-verify`. The same job as a geocode, written out as verify
+/// output.
+pub(super) async fn verify(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Response, VendorError> {
+    submit(state, request, Product::Verify).await
+}
+
+async fn submit(
+    state: AppState,
+    request: Request,
+    product: Product,
 ) -> Result<Response, VendorError> {
     let base = base_url(request.headers());
     let body = read_json::<SubmitRequest>(&state, request, "INVALID_REQUEST").await?;
@@ -666,6 +687,7 @@ pub(super) async fn submit(
         file_id: file.file_id,
         file_name: file.file_name,
         submitted_at: u64::try_from(now().as_millis()).unwrap_or(u64::MAX),
+        product,
     };
     write_record(&jobs_dir(&state).join(format!("{job_id}.json")), &stored).map_err(internal)?;
     Ok((
@@ -817,7 +839,7 @@ pub(super) async fn list_jobs(
 }
 
 /// Unix milliseconds as `2025-11-03T09:39:17.128Z`.
-fn iso8601(millis: u64) -> String {
+pub(super) fn iso8601(millis: u64) -> String {
     let seconds = millis / 1000;
     let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX);
     let of_day = seconds % 86_400;
@@ -876,10 +898,10 @@ struct RowParam {
 
 /// The output rows of one input row. One a candidate, or one saying why
 /// there is none.
-fn output_rows(line: ResultLine) -> io::Result<Vec<u8>> {
+fn output_rows(line: ResultLine, product: Product) -> io::Result<Vec<u8>> {
     let mut writer = WriterBuilder::new().from_writer(Vec::new());
     let id = line.id.unwrap_or_default();
-    let blank = vec![String::new(); COLUMNS.len() - 3];
+    let blank = vec![String::new(); product.columns().len() - 3];
     let mut row = |status: &str, message: &str, cells: Vec<String>| {
         writer.write_record(
             [id.as_str(), status, message]
@@ -890,7 +912,7 @@ fn output_rows(line: ResultLine) -> io::Result<Vec<u8>> {
     match (line.response, line.error) {
         (Some(collection), _) if !collection.features.is_empty() => {
             for feature in &collection.features {
-                row("OK", "", feature.candidate().cells())?;
+                row("OK", "", feature.candidate(product).cells(product))?;
             }
         }
         (Some(_), _) => row("ZERO_RESULTS", "", blank)?,
@@ -920,10 +942,10 @@ fn output_rows(line: ResultLine) -> io::Result<Vec<u8>> {
 
 /// Write the job's results as Precisely's output, in input order, a chunk
 /// at a time.
-fn convert(results: &Path, chunks: &mpsc::Sender<Result<Bytes, io::Error>>) {
+fn convert(results: &Path, product: Product, chunks: &mpsc::Sender<Result<Bytes, io::Error>>) {
     let run = || -> io::Result<()> {
         let mut header = WriterBuilder::new().from_writer(Vec::new());
-        header.write_record(COLUMNS)?;
+        header.write_record(product.columns())?;
         let mut buffer = header.into_inner().map_err(|error| error.into_error())?;
         // og writes rows as they finish; the order is restored here, as og
         // restores it for its own CSV.
@@ -931,7 +953,7 @@ fn convert(results: &Path, chunks: &mpsc::Sender<Result<Bytes, io::Error>>) {
         let mut next_row = 0;
         for line in BufReader::new(File::open(results)?).lines() {
             let line = serde_json::from_str::<ResultLine>(&line?)?;
-            pending.insert(line.row, output_rows(line)?);
+            pending.insert(line.row, output_rows(line, product)?);
             while let Some(rows) = pending.remove(&next_row) {
                 buffer.extend_from_slice(&rows);
                 next_row += 1;
@@ -977,7 +999,8 @@ pub(super) async fn output(
             )
         })?;
     let (chunks_tx, chunks_rx) = mpsc::channel(16);
-    task::spawn_blocking(move || convert(&results, &chunks_tx));
+    let product = job.product;
+    task::spawn_blocking(move || convert(&results, product, &chunks_tx));
     let mut response = channel_body(chunks_rx).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
