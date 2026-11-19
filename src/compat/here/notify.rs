@@ -247,13 +247,42 @@ fn read(body: &[u8]) -> Result<String, BatchError> {
     Ok(url)
 }
 
+/// `url` when its host is one the operator lets jobs call.
+fn on_allowed_host(state: &AppState, url: String) -> Result<String, BatchError> {
+    match allowed(state, &fill(&url, &Facts::dummy())) {
+        true => Ok(url),
+        false => Err(BatchError::bad_request(
+            "Illegal input for field 'config.url'",
+            format!(
+                "Actual value: '{url}'; this server calls back only the hosts its operator allows"
+            ),
+        )),
+    }
+}
+
+/// Whether `url`'s host is one the operator lets jobs call (see
+/// `serve --hook-host`).
+fn allowed(state: &AppState, url: &str) -> bool {
+    url.parse::<Uri>()
+        .ok()
+        .and_then(|uri| {
+            let host = uri
+                .host()?
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string();
+            Some(state.may_call(&host, uri.port_u16()))
+        })
+        .unwrap_or(false)
+}
+
 pub(super) async fn create(
     State(state): State<AppState>,
     Rid(request_id): Rid,
     body: Bytes,
 ) -> Response {
     let answer = || {
-        let url = read(&body)?;
+        let url = on_allowed_host(&state, read(&body)?)?;
         let stored = Stored {
             id: format!("{PREFIX}{}", uuid::Uuid::new_v4()),
             url,
@@ -307,7 +336,7 @@ pub(super) async fn replace(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stored = load(&state, &id).ok_or_else(not_found)?;
-        stored.url = read(&body)?;
+        stored.url = on_allowed_host(&state, read(&body)?)?;
         save(&state, &stored).map_err(|error| internal(&error))?;
         Ok::<_, BatchError>(stored)
     };
@@ -389,6 +418,13 @@ fn call(state: &AppState, id: &str, facts: &Facts) -> Result<(), String> {
         let _ = save(state, &stored);
         fill(&stored.url, facts)
     };
+    // Checked again on each call: the operator may have dropped the host
+    // since the notification was kept.
+    if !allowed(state, &url) {
+        let cause = "the host is not one this server calls back".to_string();
+        log(state, id, facts, None, Some(&cause));
+        return Err(cause);
+    }
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(TIMEOUT))
         .http_status_as_error(false)

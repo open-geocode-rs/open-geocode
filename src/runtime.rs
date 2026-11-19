@@ -77,6 +77,8 @@ pub struct ServeOptions {
     /// system's temporary directory when not given.
     pub job_dir: Option<PathBuf>,
     pub limits: Limits,
+    /// Hosts a job may call back when it ends, as `name` or `name:port`.
+    pub hook_hosts: Vec<String>,
     /// Longest the server takes to stop once Ctrl-C or SIGTERM arrives;
     /// what is still open then is dropped. Zero drops it at once.
     pub shutdown_timeout: Duration,
@@ -102,6 +104,8 @@ pub(crate) struct AppState {
     lookup_slots: Arc<Semaphore>,
     /// `/openapi.json` for this server's limits, built once.
     spec: Arc<str>,
+    /// See [`ServeOptions::hook_hosts`].
+    hook_hosts: Arc<[String]>,
 }
 
 impl AppState {
@@ -151,7 +155,29 @@ impl AppState {
             )),
             spec: openapi::document(&limits)?.into(),
             limits,
+            hook_hosts: Arc::from([]),
         })
+    }
+
+    /// The same state, calling back only `hosts` (see
+    /// [`ServeOptions::hook_hosts`]).
+    pub(crate) fn with_hook_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.hook_hosts = hosts
+            .into_iter()
+            .map(|host| host.trim().to_ascii_lowercase())
+            .filter(|host| !host.is_empty())
+            .collect();
+        self
+    }
+
+    /// Whether a job may call `host` on `port`: the operator allows that
+    /// host on any port, or on that one.
+    pub(crate) fn may_call(&self, host: &str, port: Option<u16>) -> bool {
+        let host = host.to_ascii_lowercase();
+        let with_port = port.map(|port| format!("{host}:{port}"));
+        self.hook_hosts
+            .iter()
+            .any(|allowed| *allowed == host || Some(allowed) == with_port.as_ref())
     }
 
     pub(crate) fn stopping(&self) -> &CancellationToken {
@@ -364,7 +390,8 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         .job_dir
         .clone()
         .unwrap_or_else(|| jobs::default_dir(options.bind.port()));
-    let state = AppState::open(&options.pack, &jobs_dir, options.limits)?;
+    let state = AppState::open(&options.pack, &jobs_dir, options.limits)?
+        .with_hook_hosts(options.hook_hosts.clone());
     tokio::spawn(jobs::sweep_forever(state.clone()));
     let app = build_router(
         state.clone(),

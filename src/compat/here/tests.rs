@@ -1658,8 +1658,23 @@ async fn calls_taken(calls: &std::sync::Mutex<Vec<String>>, count: usize) -> Vec
 #[tokio::test]
 async fn notifications_are_kept_and_called_when_a_job_ends() {
     let pack = pack("batch-notify");
-    let router = pack.router();
     let (hook, calls) = hook_receiver().await;
+    let allowed = || {
+        pack.state(Limits::DEFAULT)
+            .with_hook_hosts(vec![hook.trim_start_matches("http://").to_string()])
+    };
+    let refused = send(
+        &pack.router(),
+        "POST",
+        "/compat/here/v7/batch/notifications",
+        Some((
+            "application/json",
+            &json!({"config": {"url": format!("{hook}/done")}}).to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "no host allowed");
+    let router = build_router(allowed(), None, None);
     let url = format!(
         "{hook}/done?id=${{JOB_ID}}&name=${{JOB_NAME}}&status=${{JOB_STATUS}}&ok=${{JOB_RECORDS_SUCCEEDED}}&failed=${{JOB_RECORDS_FAILED}}&total=${{JOB_RECORDS_TOTAL}}"
     );
@@ -1682,7 +1697,7 @@ async fn notifications_are_kept_and_called_when_a_job_ends() {
     let path = format!("/compat/here/v7/batch/notifications/{id}");
 
     // Kept on disk. A second server on the same job directory reads it.
-    let other = build_router(pack.state(Limits::DEFAULT), None, None);
+    let other = build_router(allowed(), None, None);
     assert_eq!(get(&other, &path).await.json(), created);
     assert_eq!(
         get(&other, "/compat/here/v7/batch/notifications")
