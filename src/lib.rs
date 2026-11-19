@@ -34,6 +34,7 @@ pub mod spatial_index;
 mod stop;
 pub mod structured;
 pub mod text_index;
+pub mod translations;
 mod util;
 
 pub use error::{Error, Result};

@@ -45,6 +45,7 @@ use crate::{
     record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
     records, spatial_index,
     text_index::{self, PostcodeAreas},
+    translations::Translations,
 };
 
 pub use crate::{
@@ -919,6 +920,7 @@ pub struct Reader {
     records: records::Reader,
     context: context::Reader,
     postcode_addresses: PostcodeAddresses,
+    translations: Option<Arc<Translations>>,
 }
 
 impl std::fmt::Debug for Reader {
@@ -951,6 +953,7 @@ impl Reader {
         let postcode_addresses = PostcodeAddresses::from_bytes(
             &container.section(POSTCODE_ADDRESSES_SECTION, POSTCODE_ADDRESSES_VERSION)?,
         )?;
+        let translations = Translations::open(&container)?;
         Ok(Self {
             path,
             container,
@@ -958,6 +961,7 @@ impl Reader {
             records,
             context,
             postcode_addresses,
+            translations,
         })
     }
 
@@ -982,6 +986,11 @@ impl Reader {
     /// See [`PostcodeAddresses`].
     pub fn postcode_addresses(&self) -> &PostcodeAddresses {
         &self.postcode_addresses
+    }
+
+    /// The languages the Pack was built with; `None` for a Pack built without.
+    pub fn translations(&self) -> Option<&Arc<Translations>> {
+        self.translations.as_ref()
     }
 
     pub fn records(&self) -> &records::Reader {
