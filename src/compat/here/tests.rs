@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use crate::{
-    compat::{encode_id, iso},
+    compat::{decode_id, encode_id, iso},
     confidence::{FEATURES, Model},
     context::{AdminContextTuple, RecordContext},
     limits::Limits,
@@ -353,7 +353,7 @@ fn king_address() -> Value {
 fn king(extra: Value) -> Value {
     let mut item = json!({
         "title": "10 King Street, Unit 5, M5V 1A1",
-        "id": encode_id("osm:node:10"),
+        "id": encode_id("osm:node:10", ""),
         "resultType": "houseNumber",
         "houseNumberType": "PA",
         "address": king_address(),
@@ -384,7 +384,7 @@ fn queen_address() -> Value {
 fn bakery(distance: Option<i64>) -> Value {
     let mut item = json!({
         "title": "Queen Bakery",
-        "id": encode_id("osm:way:11"),
+        "id": encode_id("osm:way:11", ""),
         "resultType": "place",
         "address": {
             "label": "Queen Bakery, 12 King Street, Old Town, M5V 1A1",
@@ -417,7 +417,7 @@ fn area(id: &str, title: &str, kind: (&str, &str, &str), slot: &str) -> Value {
     let (result_type, type_key, type_value) = kind;
     let mut item = json!({
         "title": title,
-        "id": encode_id(id),
+        "id": encode_id(id, title),
         "resultType": result_type,
         "address": {"label": title},
         "position": {"lat": 43.0, "lng": -79.0},
@@ -530,7 +530,10 @@ async fn geocode_types_keep_the_kinds_asked() {
     let street = get(&router, &uri("street")).await.json();
     let items = street["items"].as_array().expect("items");
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["id"], encode_id("osm:way:13:interp:2-98"));
+    assert_eq!(
+        items[0]["id"],
+        encode_id("osm:way:13:interp:2-98", "Queen Street 2-98 even, Toronto")
+    );
     // A range found by its street alone is a street, as no number was asked.
     assert_eq!(items[0]["resultType"], "street");
     assert_eq!(items[0].get("houseNumberType"), None);
@@ -540,7 +543,7 @@ async fn geocode_types_keep_the_kinds_asked() {
         numbers,
         json!({"items": [{
             "title": "20 Queen Street, Toronto City, ON, M5H 2N2",
-            "id": encode_id("osm:node:20"),
+            "id": encode_id("osm:node:20", ""),
             "resultType": "houseNumber",
             "houseNumberType": "PA",
             "address": queen_address(),
@@ -623,7 +626,7 @@ async fn revgeocode_answers_the_nearest_first() {
     )
     .await;
     let items = reply.json()["items"].clone();
-    assert_eq!(items[0]["id"], encode_id("osm:way:12"));
+    assert_eq!(items[0]["id"], encode_id("osm:way:12", ""));
     assert_eq!(items[0]["resultType"], "street");
     assert_eq!(items[0]["address"]["street"], "King Street");
 
@@ -706,7 +709,7 @@ async fn autosuggest_autocomplete_and_discover() {
     let router = pack.router();
     let queen = json!({
         "title": "20 Queen Street, Toronto City, ON, M5H 2N2",
-        "id": encode_id("osm:node:20"),
+        "id": encode_id("osm:node:20", ""),
         "resultType": "houseNumber",
         "houseNumberType": "PA",
         "address": queen_address(),
@@ -739,7 +742,7 @@ async fn autosuggest_autocomplete_and_discover() {
     let reply = get(&router, &format!("{page}1")).await.json();
     assert_eq!(reply["offset"], 1);
     assert_eq!(reply.get("nextOffset"), None);
-    assert_eq!(reply["items"][0]["id"], encode_id("osm:node:20"));
+    assert_eq!(reply["items"][0]["id"], encode_id("osm:node:20", ""));
 
     let reply = get(&router, "/compat/here/v1/autosuggest?q=Queen").await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
@@ -860,7 +863,7 @@ async fn lookup_finds_what_a_search_returned() {
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.json(), bakery(None));
 
-    for id in [encode_id("osm:way:999"), "not-an-id".to_string()] {
+    for id in [encode_id("osm:way:999", ""), "not-an-id".to_string()] {
         let reply = get(&router, &format!("/compat/here/v1/lookup?id={id}")).await;
         assert_eq!(reply.status, StatusCode::NOT_FOUND);
         assert_eq!(
@@ -878,6 +881,43 @@ async fn lookup_finds_what_a_search_returned() {
         reply.json(),
         here_error(400, "Missing parameter 'id'", None, Some("Provide 'id'"))
     );
+}
+
+#[tokio::test]
+async fn lookup_finds_a_record_the_catalogue_does_not_hold() {
+    let pack = pack("lookup-label");
+    let router = pack.router();
+    let found = get(&router, "/compat/here/v1/geocode?q=50+Queen+Street+Toronto")
+        .await
+        .json();
+    let range = &found["items"][0];
+    assert_eq!(range["houseNumberType"], "interpolated");
+    let id = range["id"].as_str().expect("id");
+    assert_eq!(
+        decode_id(id).map(|named| named.id).as_deref(),
+        Some("osm:way:13:interp:2-98")
+    );
+    let reply = get(&router, &format!("/compat/here/v1/lookup?id={id}")).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json()["id"], range["id"]);
+    assert_eq!(reply.json()["title"], range["title"]);
+
+    // An imported row renumbered by a newer release of its data: the
+    // record with the label the id carries.
+    let renumbered = encode_id(
+        "openaddresses:ca/on/toronto:row:999999",
+        range["title"].as_str().expect("title"),
+    );
+    let reply = get(&router, &format!("/compat/here/v1/lookup?id={renumbered}")).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json()["title"], range["title"]);
+
+    let unknown = encode_id(
+        "openaddresses:ca/on/toronto:row:1",
+        "Nowhere Lane, Atlantis",
+    );
+    let reply = get(&router, &format!("/compat/here/v1/lookup?id={unknown}")).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -1085,7 +1125,8 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
     let at = format!("{uri}: {}", properties["id"]);
 
     let id = properties["id"].as_str().unwrap_or_default();
-    assert_eq!(item["id"], encode_id(id), "{at}");
+    let label = properties["label"].as_str().unwrap_or_default();
+    assert_eq!(item["id"], encode_id(id, label), "{at}");
     let title = if layer == "poi" {
         &properties["name"]
     } else {

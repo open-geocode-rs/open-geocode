@@ -282,7 +282,9 @@ fn assert_carries(feature: &Value, result: &Value) {
     let context = &properties["context"];
     let carried = &result["address"];
     assert_eq!(
-        decode_id(result["customFields"]["PB_KEY"].as_str().expect("PB_KEY")).as_deref(),
+        decode_id(result["customFields"]["PB_KEY"].as_str().expect("PB_KEY"))
+            .map(|named| named.id)
+            .as_deref(),
         properties["id"].as_str()
     );
     assert_eq!(carried["formattedAddress"], properties["label"]);
@@ -380,7 +382,7 @@ fn address_result(score: &Value) -> Value {
             },
         },
         "explanation": {"addressMatch": {"type": "ADDRESS"}},
-        "customFields": {"PB_KEY": encode_id("osm:node:10")},
+        "customFields": {"PB_KEY": encode_id("osm:node:10", "")},
     })
 }
 
@@ -535,7 +537,7 @@ async fn a_poi_says_what_it_is_and_where() {
                             "geometry": {"type": "Point", "coordinates": [-79.383, 43.649]}},
             },
             "explanation": {"addressMatch": {"type": "POI"}},
-            "customFields": {"PB_KEY": encode_id("osm:way:11")},
+            "customFields": {"PB_KEY": encode_id("osm:way:11", "")},
         }]}})
     );
 
@@ -716,7 +718,7 @@ async fn lookup_finds_a_record_by_the_pb_key_og_issued() {
     let reply = post(
         &router,
         "/v1/lookup",
-        &json!({"keys": [{"key": encode_id("osm:way:11"), "type": "PB_KEY", "country": "CAN"}]}),
+        &json!({"keys": [{"key": encode_id("osm:way:11", ""), "type": "PB_KEY", "country": "CAN"}]}),
     )
     .await;
     assert_eq!(reply.status, StatusCode::OK);
@@ -730,9 +732,9 @@ async fn lookup_finds_a_record_by_the_pb_key_og_issued() {
         &router,
         "/v1/lookup",
         &json!({"keys": [
-            {"key": encode_id("osm:node:999"), "type": "PB_KEY", "country": "CAN"},
+            {"key": encode_id("osm:node:999", ""), "type": "PB_KEY", "country": "CAN"},
             // og looks places up by id, not address points.
-            {"key": encode_id("osm:node:10"), "type": "PB_KEY", "country": "CAN"},
+            {"key": encode_id("osm:node:10", ""), "type": "PB_KEY", "country": "CAN"},
             {"key": "P0000GL41OME", "type": "PB_KEY", "country": "USA"},
             {"key": "10023122", "type": "UPRN", "country": "GBR"},
             {"key": "10023122", "type": "POSTCODE", "country": "GBR"},
@@ -921,7 +923,7 @@ async fn a_bulk_job_runs_on_og_jobs_and_downloads_as_precisely_csv() {
              \"ON, M5X 1A9\",100,King Street West,5,,Financial District,Old Toronto,\
              Toronto,Toronto Division,Ontario,ON,M5X 1A9,,CAN,Canada,CA,124,43.6493,-79.3817,\
              epsg:4326,Point,ADDRESS_POINT,ADDRESS,\"{{\"\"pbKey\"\":\"\"{}\"\"}}\"",
-            encode_id("osm:node:10")
+            encode_id("osm:node:10", "")
         )
     );
     let blank = ",".repeat(super::result::Product::Geocode.columns().len() - 4);
@@ -1282,7 +1284,7 @@ fn verified_result(score: &Value, stated: &[&str], codes: [&str; 2]) -> Value {
             {"label": "country", "matchType": "ADDED"},
         ]}},
         "customFields": {
-            "PB_KEY": encode_id("osm:node:10"),
+            "PB_KEY": encode_id("osm:node:10", ""),
             "SIMPLE_MATCH_CODE": codes[0],
             "EXTENDED_MATCH_CODE": codes[1],
         },
@@ -1522,7 +1524,7 @@ async fn proximity_search_finds_the_nearest_address() {
             "distance": metres / 1000.0,
             "location": {"latitude": 43.6493, "longitude": -79.3817},
             "metadata": {
-                "PBKEY": encode_id("osm:node:10"),
+                "PBKEY": encode_id("osm:node:10", ""),
                 "FORMATTEDADDRESS": "100 King Street West, Unit 5, ON, M5X 1A9",
                 "ADDRLINE1": "100 King Street West, Unit 5",
                 "ADDNUMBER": "100",
@@ -1699,7 +1701,7 @@ async fn a_bulk_verify_job_writes_verify_output() {
              Toronto,Toronto Division,Ontario,ON,M5X 1A9,,CAN,Canada,CA,124,,,,ADDRESS,\
              \"{{\"\"extendedMatchCode\"\":\"\"V4-D0M0B0U6F0G0P4S4Q0X0A6T4E0R6W0Z4Y0C6-{stars}\"\",\
              \"\"pbKey\"\":\"\"{}\"\",\"\"simpleMatchCode\"\":\"\"V4-P4S4A6T4R6Z4C6-{stars}\"\"}}\"",
-            encode_id("osm:node:10")
+            encode_id("osm:node:10", "")
         )
     );
     let blank = ",".repeat(super::result::Product::Verify.columns().len() - 4);

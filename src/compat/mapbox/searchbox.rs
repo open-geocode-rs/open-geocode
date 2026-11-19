@@ -246,14 +246,12 @@ pub(super) async fn retrieve(
 ) -> Result<Json<Collection>, VendorError> {
     let params = Params::from_query(Api::SearchBox, query)?;
     let not_found = || error(StatusCode::NOT_FOUND, "Not Found");
-    let og_id = decode_id(&id).ok_or_else(not_found)?;
-    let args = Args::new().set("ids", og_id).set("lang", language(&params));
-    let collection = match native::places(&state, args).await {
-        Ok(collection) => collection,
-        // An id `/places` cannot read is one it never issued for lookup.
-        Err(problem) if problem.status() == 400 => return Err(not_found().caused_by(problem)),
-        Err(problem) => return Err(failed(problem)),
-    };
+    let named = decode_id(&id).ok_or_else(not_found)?;
+    let lang = language(&params);
+    let collection = native::lookup(&state, &named, Some(lang))
+        .await
+        .map_err(failed)?
+        .ok_or_else(not_found)?;
     if collection.features.is_empty() {
         return Err(not_found());
     }

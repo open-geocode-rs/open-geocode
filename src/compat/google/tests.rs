@@ -222,11 +222,11 @@ const SEARCH_TEXT: &str = "/compat/google/v1/places:searchText";
 const AUTOCOMPLETE: &str = "/compat/google/v1/places:autocomplete";
 
 fn bakery_id() -> String {
-    encode_id("osm:way:11")
+    encode_id("osm:way:11", "")
 }
 
 fn address_id() -> String {
-    encode_id("osm:node:10")
+    encode_id("osm:node:10", "")
 }
 
 fn bakery_components() -> Value {
@@ -615,7 +615,7 @@ async fn place_details_by_id_and_unknown_ids() {
         json!({"id": id, "displayName": {"text": "Queen Bakery"}})
     );
 
-    let never_issued = encode_id("osm:way:999");
+    let never_issued = encode_id("osm:way:999", "");
     for unknown in [never_issued.as_str(), "not-an-og-id", "b3NtOjE"] {
         let reply = get(router, &format!("/compat/google/v1/places/{unknown}")).await;
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{unknown}");
@@ -767,7 +767,7 @@ async fn reverse_geocode_by_path_and_by_fields_with_filters() {
     assert_eq!(
         localities.body,
         json!({"results": [{
-            "placeId": encode_id("osm:relation:6"),
+            "placeId": encode_id("osm:relation:6", ""),
             "granularity": "GEOMETRIC_CENTER",
             "types": ["locality", "political"],
         }]})
@@ -831,7 +831,7 @@ async fn place_geocoding_answers_one_bare_result() {
     fields.insert("granularity".to_string(), json!("GEOMETRIC_CENTER"));
     assert_eq!(reply.body, expected);
 
-    let unknown = encode_id("osm:node:404");
+    let unknown = encode_id("osm:node:404", "");
     let missing = get(
         router,
         &format!("/compat/google/v4/geocode/places/{unknown}"),
@@ -1012,9 +1012,9 @@ async fn every_og_value_lands_in_its_google_slot() {
         let feature = &native["features"][0];
         let properties = &feature["properties"];
         let og_id = properties["id"].as_str().expect("id");
-        let id = encode_id(og_id);
         let name = properties["name"].as_str().expect("name");
         let label = properties["label"].as_str().expect("label");
+        let id = encode_id(og_id, label);
         let coordinates = &feature["geometry"]["coordinates"];
         let reply = get(router, &result_uri).await.body;
         let result = reply.get("results").map_or(&reply, |results| &results[0]);
@@ -1363,7 +1363,7 @@ async fn photo_media_checks_the_size_then_finds_no_photo_og_holds() {
         )
     );
 
-    let unknown = encode_id("osm:way:999");
+    let unknown = encode_id("osm:way:999", "");
     let reply = get(router, &photo(&unknown, "?maxHeightPx=400")).await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
     assert_eq!(
@@ -1529,7 +1529,7 @@ async fn destinations_leave_out_areas_and_refuse_what_google_refuses() {
 
     // A town is no destination, by id or by name.
     for request in [
-        json!({"place": format!("places/{}", encode_id("osm:relation:5"))}),
+        json!({"place": format!("places/{}", encode_id("osm:relation:5", ""))}),
         json!({"addressQuery": {"addressQuery": "Toronto"}}),
     ] {
         let reply = post(router, DESTINATIONS, request.clone()).await;
@@ -1537,7 +1537,7 @@ async fn destinations_leave_out_areas_and_refuse_what_google_refuses() {
         assert_eq!(reply.body, json!({}), "{request}");
     }
 
-    let unknown = encode_id("osm:way:999");
+    let unknown = encode_id("osm:way:999", "");
     let reply = post(
         router,
         DESTINATIONS,
