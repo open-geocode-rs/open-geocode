@@ -6,6 +6,7 @@
 
 mod destinations;
 mod geocode;
+mod hours;
 mod language;
 mod model;
 mod places;

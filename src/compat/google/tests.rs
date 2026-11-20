@@ -14,8 +14,8 @@ use crate::{
     limits::Limits,
     pack::Writer,
     record::{
-        AddressComponents, AddressRecord, Entrance, Layer, LocationPrecision, ObjectType,
-        PlaceLayer, PlaceRecord, PoiRecord, Record, SourceProvenance, point_geometry,
+        AddressComponents, AddressRecord, Contact, Entrance, Layer, LocationPrecision, ObjectType,
+        PlaceLayer, PlaceRecord, PoiDetails, PoiRecord, Record, SourceProvenance, point_geometry,
     },
     runtime::{AppState, build_router},
 };
@@ -174,7 +174,19 @@ fn write_pack(dir: &Path) {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
-                details: None,
+                details: Some(Box::new(PoiDetails {
+                    contact: Some(Contact {
+                        phone: Some("+1 416-555-0111".to_string()),
+                        website: Some("https://queenbakery.example/".to_string()),
+                        email: Some("hello@queenbakery.example".to_string()),
+                    }),
+                    opening_hours: Some("Mo-Fr 07:00-18:00; Sa 08:00-14:00".to_string()),
+                    extent: Some([-790_051_000, 429_995_000, -790_049_000, 430_005_000]),
+                    access: vec![Entrance {
+                        at: [-790_050_000, 429_995_000],
+                        kind: "main".to_string(),
+                    }],
+                })),
                 aliases: Vec::new(),
             }
             .into(),
@@ -273,7 +285,27 @@ fn bakery_place() -> Value {
         },
         "addressComponents": bakery_components(),
         "location": {"latitude": 43.0, "longitude": -79.005},
+        "viewport": {
+            "low": {"latitude": 42.9995, "longitude": -79.0051},
+            "high": {"latitude": 43.0005, "longitude": -79.0049},
+        },
+        "internationalPhoneNumber": "+1 416-555-0111",
+        "websiteUri": "https://queenbakery.example/",
+        "regularOpeningHours": {"periods": bakery_hours()},
+        "entrances": [{
+            "location": {"latitude": 42.9995, "longitude": -79.005},
+            "tags": ["PREFERRED"],
+        }],
     })
+}
+
+/// "Mo-Fr 07:00-18:00; Sa 08:00-14:00", as Google's periods.
+fn bakery_hours() -> Value {
+    let mut periods = (1..=5)
+        .map(|day| json!({"open": {"day": day, "hour": 7, "minute": 0}, "close": {"day": day, "hour": 18, "minute": 0}}))
+        .collect::<Vec<_>>();
+    periods.push(json!({"open": {"day": 6, "hour": 8, "minute": 0}, "close": {"day": 6, "hour": 14, "minute": 0}}));
+    Value::Array(periods)
 }
 
 #[tokio::test]
@@ -830,7 +862,18 @@ async fn place_geocoding_answers_one_bare_result() {
     assert_eq!(reply.status, StatusCode::OK);
     let mut expected = bakery_place();
     let fields = expected.as_object_mut().expect("a place");
-    for field in ["name", "id", "displayName", "primaryType"] {
+    // A geocode result has a place's box but none of what a Place holds
+    // of the place itself.
+    for field in [
+        "name",
+        "id",
+        "displayName",
+        "primaryType",
+        "internationalPhoneNumber",
+        "websiteUri",
+        "regularOpeningHours",
+        "entrances",
+    ] {
         fields.remove(field);
     }
     fields.insert(
@@ -889,12 +932,26 @@ async fn search_nearby_answers_the_places_inside_the_circle() {
         assert_eq!(reply.status, StatusCode::OK, "{request}");
         assert_eq!(reply.body, found, "{request}");
     }
-    // Outside the circle, another type, a type og has no category for, and
-    // the place's own type excluded.
+    // A type og has no category for would match places og cannot tell
+    // apart, so it is refused, not answered with none.
+    let reply = post(
+        &fixture.router,
+        SEARCH_NEARBY,
+        json!({"locationRestriction": around(1000.0), "includedTypes": ["chinese_restaurant"]}),
+    )
+    .await;
+    assert_eq!(
+        reply.body,
+        google_error(
+            400,
+            "INVALID_ARGUMENT",
+            "includedTypes \"chinese_restaurant\" is not supported by this server."
+        )
+    );
+    // Outside the circle, another type, and the place's own type excluded.
     for request in [
         json!({"locationRestriction": around(100.0)}),
         json!({"locationRestriction": around(1000.0), "includedTypes": ["cafe"]}),
-        json!({"locationRestriction": around(1000.0), "includedTypes": ["chinese_restaurant"]}),
         json!({"locationRestriction": around(1000.0), "excludedTypes": ["bakery"]}),
         json!({"locationRestriction": around(1000.0), "excludedPrimaryTypes": ["bakery"]}),
         json!({
@@ -998,29 +1055,44 @@ async fn unknown_paths_and_wrong_methods() {
 }
 
 /// Every og value of a result lands in its Google slot unchanged, through
-/// every response shape that carries the result. og looks up only places
-/// by id, so the address is reached by search.
+/// every response shape that carries the result. The fixture's results
+/// state every field that has a Google slot, so a slot that goes empty
+/// fails here. `match` has no slot in Places or Geocoding v4, so Google
+/// carries none.
 #[tokio::test]
 async fn every_og_value_lands_in_its_google_slot() {
     let fixture = fixture();
     let router = &fixture.router;
     let bakery = bakery_id();
+    // og measures `distance_m` from `focus`, Google `distanceMeters` from
+    // `origin`, so both are given the same point.
+    let (focus, origin) = (
+        "focus=-79.01,43.01",
+        json!({"latitude": 43.01, "longitude": -79.01}),
+    );
+    let mut stated = std::collections::BTreeSet::new();
     let cases = [
         (
-            "/geocode?q=10%20King%20Street",
-            None,
+            "/geocode?q=10%20King%20Street,%20Toronto",
+            Some(format!("/compat/google/v1/places/{}", address_id())),
             "/compat/google/v4/geocode/address/10%20King%20Street".to_string(),
+            "10 king st",
         ),
         (
             "/places?ids=osm:way:11",
             Some(format!("/compat/google/v1/places/{bakery}")),
             format!("/compat/google/v4/geocode/places/{bakery}"),
+            // A whole category word suggests by kind, with nothing marked.
+            "queen bak",
         ),
     ];
-    for (native, place_uri, result_uri) in cases {
+    for (native, place_uri, result_uri, input) in cases {
         let native = get(router, native).await.body;
         let feature = &native["features"][0];
         let properties = &feature["properties"];
+        for (field, _) in properties.as_object().expect("properties") {
+            stated.insert(field.clone());
+        }
         let og_id = properties["id"].as_str().expect("id");
         let name = properties["name"].as_str().expect("name");
         let label = properties["label"].as_str().expect("label");
@@ -1036,10 +1108,50 @@ async fn every_og_value_lands_in_its_google_slot() {
             Some(uri) => Some(get(router, uri).await.body),
             None => None,
         };
-        let suggested = post(router, AUTOCOMPLETE, json!({"input": name}))
-            .await
-            .body;
+        let suggested = post(
+            router,
+            AUTOCOMPLETE,
+            json!({"input": input, "origin": origin}),
+        )
+        .await
+        .body;
         let prediction = &suggested["suggestions"][0]["placePrediction"];
+        let typed = get(
+            router,
+            &format!("/autocomplete?q={}&{focus}", input.replace(' ', "%20")),
+        )
+        .await
+        .body;
+        let typed = &typed["features"][0]["properties"];
+        assert_eq!(typed["id"], og_id, "{input}");
+        for (field, _) in typed.as_object().expect("properties") {
+            stated.insert(field.clone());
+        }
+        let distance = typed["distance_m"].as_f64().expect("a distance");
+        assert_eq!(
+            prediction["distanceMeters"],
+            json!(distance.round() as u64),
+            "{og_id}"
+        );
+        let highlights = typed["highlights"].clone();
+        assert!(
+            highlights.as_array().is_some_and(|all| !all.is_empty()),
+            "{input}"
+        );
+        // og's highlights of the label, words typed together joined.
+        let first = &highlights[0];
+        let last = &highlights[highlights.as_array().map_or(0, Vec::len) - 1];
+        assert_eq!(
+            prediction["text"]["matches"][0]["endOffset"], last["end"],
+            "{og_id}"
+        );
+        assert_eq!(
+            prediction["text"]["matches"][0]
+                .get("startOffset")
+                .cloned()
+                .unwrap_or_else(|| json!(0)),
+            first["start"]
+        );
 
         assert_eq!(result["placeId"], id, "{og_id}");
         assert_eq!(
@@ -1079,6 +1191,38 @@ async fn every_og_value_lands_in_its_google_slot() {
             assert_eq!(place["location"], result["location"]);
             assert_eq!(place["addressComponents"], result["addressComponents"]);
             assert_eq!(place["postalAddress"], result["postalAddress"]);
+            // og's box is `[west, south, east, north]`.
+            let corner = |at: usize| match &properties["bbox"] {
+                Value::Null => Value::Null,
+                bbox => json!({"latitude": bbox[at + 1], "longitude": bbox[at]}),
+            };
+            assert_eq!(place["viewport"]["low"], corner(0), "{og_id}");
+            assert_eq!(place["viewport"]["high"], corner(2), "{og_id}");
+            assert_eq!(result["viewport"], place["viewport"]);
+            let contact = &properties["contact"];
+            assert_eq!(place["websiteUri"], contact["website"]);
+            let phone = if place["internationalPhoneNumber"].is_null() {
+                &place["nationalPhoneNumber"]
+            } else {
+                &place["internationalPhoneNumber"]
+            };
+            assert_eq!(phone, &contact["phone"]);
+            let hours = properties["opening_hours"]
+                .as_str()
+                .and_then(super::hours::parse);
+            assert_eq!(
+                place["regularOpeningHours"],
+                serde_json::to_value(hours).expect("hours"),
+                "{og_id}"
+            );
+            assert_eq!(place["timeZone"]["id"], properties["timezone"]);
+            let access = properties["access"].as_array().cloned().unwrap_or_default();
+            let entrances = place["entrances"].as_array().cloned().unwrap_or_default();
+            assert_eq!(entrances.len(), access.len(), "{og_id}");
+            for (entrance, access) in entrances.iter().zip(&access) {
+                assert_eq!(entrance["location"]["longitude"], access["lon"]);
+                assert_eq!(entrance["location"]["latitude"], access["lat"]);
+            }
         }
 
         let destination = match &place_uri {
@@ -1153,6 +1297,10 @@ async fn every_og_value_lands_in_its_google_slot() {
             component("administrative_area_level_1")["longText"],
             context["region"]["name"]
         );
+        assert_eq!(
+            component("administrative_area_level_1")["shortText"],
+            json!(context["region"]["code"].as_str().map(|code| &code[3..]))
+        );
         assert_eq!(component("country")["longText"], context["country"]["name"]);
         assert_eq!(
             component("country")["shortText"],
@@ -1189,6 +1337,33 @@ async fn every_og_value_lands_in_its_google_slot() {
             areas.map_or_else(|| context["sublocality"]["name"].clone(), Value::from)
         );
     }
+    // A field no case states would leave its slot unchecked.
+    for field in [
+        "bbox",
+        "contact",
+        "opening_hours",
+        "access",
+        "distance_m",
+        "highlights",
+        "match",
+        "address",
+        "context",
+    ] {
+        assert!(stated.contains(field), "no case states {field}");
+    }
+
+    // An area result is its own component, with its own code.
+    let ontario = get(router, "/compat/google/v4/geocode/address/Ontario")
+        .await
+        .body;
+    assert_eq!(
+        ontario["results"][0]["addressComponents"][0],
+        json!({
+            "longText": "Ontario",
+            "shortText": "ON",
+            "types": ["administrative_area_level_1", "political"],
+        })
+    );
 }
 
 /// `languageCode` names areas in that language where og has the name, and
@@ -1454,7 +1629,15 @@ fn bakery_destination() -> Value {
     let id = bakery_id();
     let mut primary = bakery_place();
     let fields = primary.as_object_mut().expect("a place");
-    for field in ["name", "id"] {
+    for field in [
+        "name",
+        "id",
+        "viewport",
+        "internationalPhoneNumber",
+        "websiteUri",
+        "regularOpeningHours",
+        "entrances",
+    ] {
         fields.remove(field);
     }
     fields.insert("place".to_string(), json!(format!("places/{id}")));
@@ -1463,8 +1646,16 @@ fn bakery_destination() -> Value {
         "formattedAddress".to_string(),
         json!("Queen Bakery, 12 King Street, Toronto, M5V 1A1"),
     );
-    fields.insert("structureType".to_string(), json!("POINT"));
-    json!({"primary": primary})
+    // Its outline is a box, so it is no bare point, and og cannot tell a
+    // building from grounds.
+    json!({
+        "primary": primary,
+        "entrances": [{
+            "location": {"latitude": 42.9995, "longitude": -79.005},
+            "tags": ["PREFERRED"],
+            "place": format!("places/{id}"),
+        }],
+    })
 }
 
 #[tokio::test]
@@ -1602,4 +1793,88 @@ async fn destinations_leave_out_areas_and_refuse_what_google_refuses() {
             "{request}"
         );
     }
+}
+
+#[tokio::test]
+async fn filters_og_cannot_honour_are_refused_and_the_rest_applied() {
+    let fixture = fixture();
+    let router = &fixture.router;
+    let refused = |what: &str| google_error(400, "INVALID_ARGUMENT", what);
+    for (body, message) in [
+        (
+            json!({"textQuery": "Queen", "openNow": true}),
+            "openNow is not supported by this server.",
+        ),
+        (
+            json!({"textQuery": "Queen", "minRating": 4.0}),
+            "minRating is not supported by this server.",
+        ),
+        (
+            json!({"textQuery": "Queen", "priceLevels": ["PRICE_LEVEL_MODERATE"]}),
+            "priceLevels is not supported by this server.",
+        ),
+        (
+            json!({"textQuery": "Queen", "pageToken": "garbage"}),
+            "Invalid pageToken \"garbage\".",
+        ),
+        (
+            json!({"textQuery": "Queen", "includedType": "chinese_restaurant"}),
+            "includedType \"chinese_restaurant\" is not supported by this server.",
+        ),
+        (
+            json!({"textQuery": "Queen", "rankPreference": "DISTANCE"}),
+            "rankPreference DISTANCE needs a locationBias on this server.",
+        ),
+    ] {
+        let reply = post(router, SEARCH_TEXT, body.clone()).await;
+        assert_eq!(reply.body, refused(message), "{body}");
+    }
+    let ids = |reply: &Value, list: &str| {
+        reply[list]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item["id"].as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    // A type og maps is held to strictly, or ranked first when not strict.
+    let strict = post(
+        router,
+        SEARCH_TEXT,
+        json!({"textQuery": "King Street", "includedType": "bakery", "strictTypeFiltering": true}),
+    )
+    .await
+    .body;
+    assert_eq!(ids(&strict, "places"), [bakery_id()]);
+    let cafes = post(
+        router,
+        SEARCH_TEXT,
+        json!({"textQuery": "King Street", "includedType": "cafe", "strictTypeFiltering": true}),
+    )
+    .await
+    .body;
+    assert_eq!(cafes, json!({}));
+
+    let autocomplete = |types: Value| {
+        post(
+            router,
+            AUTOCOMPLETE,
+            json!({"input": "queen bak", "includedPrimaryTypes": types}),
+        )
+    };
+    let reply = autocomplete(json!(["chinese_restaurant"])).await;
+    assert_eq!(
+        reply.body,
+        refused("includedPrimaryTypes \"chinese_restaurant\" is not supported by this server.")
+    );
+    let bakeries = autocomplete(json!(["bakery"])).await.body;
+    assert_eq!(
+        bakeries["suggestions"][0]["placePrediction"]["placeId"],
+        bakery_id()
+    );
+    let cities = autocomplete(json!(["(cities)"])).await.body;
+    assert_eq!(cities, json!({}), "a bakery is no city");
 }
