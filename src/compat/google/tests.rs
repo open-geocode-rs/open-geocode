@@ -696,10 +696,7 @@ async fn place_details_by_id_and_unknown_ids() {
 }
 
 fn address_result() -> Value {
-    let id = address_id();
     json!({
-        "place": format!("//places.googleapis.com/places/{id}"),
-        "placeId": id,
         "location": {"latitude": 43.0, "longitude": -79.0},
         "granularity": "ROOFTOP",
         "formattedAddress": "10 King Street, Unit 4B, City of Toronto, ON, M5V 1A1, Canada",
@@ -745,10 +742,13 @@ async fn geocode_address_in_the_path_and_as_fields() {
 
     let query = get(
         router,
-        "/compat/google/v4/geocode/address?addressQuery=10%20King%20Street&fields=results.placeId",
+        "/compat/google/v4/geocode/address?addressQuery=10%20King%20Street&fields=results.placeId,results.place,results.location",
     )
     .await;
-    assert_eq!(query.body, json!({"results": [{"placeId": address_id()}]}));
+    assert_eq!(
+        query.body,
+        json!({"results": [{"location": {"latitude": 43.0, "longitude": -79.0}}]})
+    );
 
     let fields = get(
         router,
@@ -768,12 +768,12 @@ async fn geocode_address_in_the_path_and_as_fields() {
 
     let biased = get(
         router,
-        "/compat/google/v4/geocode/address/10%20King%20Street?$fields=results.placeId\
+        "/compat/google/v4/geocode/address/10%20King%20Street?$fields=results.location\
          &locationBias.rectangle.low.latitude=42.9&locationBias.rectangle.low.longitude=-79.1\
          &locationBias.rectangle.high.latitude=43.1&locationBias.rectangle.high.longitude=-78.9",
     )
     .await;
-    assert_eq!(biased.body, json!({"results": [{"placeId": address_id()}]}));
+    assert_eq!(biased.body, query.body);
 
     let both = get(
         router,
@@ -803,7 +803,7 @@ async fn geocode_address_in_the_path_and_as_fields() {
 async fn reverse_geocode_by_path_and_by_fields_with_filters() {
     let fixture = fixture();
     let router = &fixture.router;
-    let mask = "fields=results.placeId,results.types,results.granularity";
+    let mask = "fields=results.place,results.placeId,results.types,results.granularity";
     let path = get(
         router,
         &format!("/compat/google/v4/geocode/location/43.0,-79.0?{mask}"),
@@ -813,7 +813,7 @@ async fn reverse_geocode_by_path_and_by_fields_with_filters() {
     let results = path.body["results"].as_array().expect("results");
     assert_eq!(
         results[0],
-        json!({"placeId": address_id(), "granularity": "ROOFTOP", "types": ["street_address"]})
+        json!({"granularity": "ROOFTOP", "types": ["street_address"]})
     );
     let fields = get(
         router,
@@ -832,7 +832,6 @@ async fn reverse_geocode_by_path_and_by_fields_with_filters() {
     assert_eq!(
         localities.body,
         json!({"results": [{
-            "placeId": encode_parts("osm:relation:6", Some(Layer::Locality), ""),
             "granularity": "GEOMETRIC_CENTER",
             "types": ["locality", "political"],
         }]})
@@ -899,11 +898,6 @@ async fn place_geocoding_answers_one_bare_result() {
     ] {
         fields.remove(field);
     }
-    fields.insert(
-        "place".to_string(),
-        json!(format!("//places.googleapis.com/places/{id}")),
-    );
-    fields.insert("placeId".to_string(), json!(id));
     fields.insert("granularity".to_string(), json!("GEOMETRIC_CENTER"));
     assert_eq!(reply.body, expected);
 
@@ -1176,11 +1170,8 @@ async fn every_og_value_lands_in_its_google_slot() {
             first["start"]
         );
 
-        assert_eq!(result["placeId"], id, "{og_id}");
-        assert_eq!(
-            result["place"],
-            format!("//places.googleapis.com/places/{id}")
-        );
+        assert!(result.get("placeId").is_none(), "{og_id}");
+        assert!(result.get("place").is_none(), "{og_id}");
         assert_eq!(prediction["placeId"], id);
         assert_eq!(prediction["place"], format!("places/{id}"));
         assert_eq!(prediction["text"]["text"], label);
@@ -1628,6 +1619,7 @@ fn address_destination() -> Value {
         fields.remove(field);
     }
     fields.insert("place".to_string(), json!(place));
+    fields.insert("placeId".to_string(), json!(id));
     fields.insert("displayName".to_string(), json!({"text": "10 King Street"}));
     fields.insert("primaryType".to_string(), json!("street_address"));
     fields.insert("types".to_string(), json!(["street_address"]));

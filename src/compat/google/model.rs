@@ -201,8 +201,6 @@ impl Place {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct GeocodeResult {
-    pub(super) place: String,
-    pub(super) place_id: String,
     pub(super) location: LatLng,
     pub(super) granularity: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -223,7 +221,6 @@ pub(super) struct GeocodeResult {
 
 impl GeocodeResult {
     pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
-        let place_id = encode_id(common);
         let mut postal_address = postal_address(common);
         let formatted_address = if common.layer == Layer::Address
             && compat::country_code(&common.context) == Some("US")
@@ -231,14 +228,11 @@ impl GeocodeResult {
             postal_address
                 .as_mut()
                 .and_then(|postal| formatted_us_address(common, postal))
+                .or_else(|| formatted_address(common))
         } else {
             formatted_address(common)
         };
         Self {
-            // Every v4 response Google documents writes the full resource
-            // name, host included, though its reference says `places/{id}`.
-            place: format!("//places.googleapis.com/places/{place_id}"),
-            place_id,
             location: LatLng::of(coordinates),
             granularity: granularity(common.accuracy),
             formatted_address,
@@ -362,10 +356,10 @@ fn formatted_us_address(common: &Common, postal: &mut PostalAddress) -> Option<S
             })
         })
         .map(str::to_owned);
-    postal.administrative_area = state_code;
+    let state = state_code?;
+    postal.administrative_area = Some(state.clone());
     let street = postal.address_lines.first()?;
     let locality = postal.locality.as_deref()?;
-    let state = postal.administrative_area.as_deref()?;
     let zip = postal.postal_code.as_deref()?;
     if let Some(unit) = common.address.unit.as_deref() {
         return Some(format!(
