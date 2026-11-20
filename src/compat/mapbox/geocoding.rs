@@ -30,7 +30,6 @@ use crate::{
         batch::{self as og_batch, Prepared, RawItem},
         problem::Problem,
     },
-    reverse::GeocodeOptions,
     runtime::{self, AppState, GeocodeRequest, Named, PlacesRequest},
     stop::CancelOnDrop,
 };
@@ -723,9 +722,8 @@ fn country_code(value: &str) -> Option<String> {
 
 fn reverse_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
     let types = params.types(Api::Geocoding)?;
-    // og answers one result per hierarchy level, Mapbox's `limit=1`, and at
-    // most one of a single type. A larger limit is checked as Mapbox checks
-    // it and then answered with what og has.
+    // og answers one result per hierarchy level, Mapbox's `limit=1`, and the
+    // nearest `limit` of a single type.
     let limit = limit(params, MAX_REVERSE_LIMIT)?;
     let single = types.as_ref().is_some_and(|types| types.0.len() == 1);
     if limit.is_some_and(|limit| limit > 1) && !single {
@@ -734,10 +732,17 @@ fn reverse_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
         ));
     }
     let languages = languages(params)?;
+    let layer = types.as_ref().and_then(Types::reverse_layer);
     let args = Args::new()
         .maybe("lon", params.get("longitude"))
         .maybe("lat", params.get("latitude"))
-        .maybe("layer", types.as_ref().and_then(Types::reverse_layer))
+        .maybe("layer", layer)
+        .maybe(
+            "limit",
+            limit
+                .filter(|_| layer.is_some())
+                .map(|limit| limit.to_string()),
+        )
         .maybe("lang", (!languages.is_empty()).then(|| languages.join(",")));
     Ok(Plan {
         lookup: Lookup::Reverse {
@@ -764,7 +769,7 @@ enum Checked {
     /// id names (see [`native::keep_named`]).
     Labelled(Named<GeocodeRequest>, crate::compat::OgRef),
     /// The reverse lookup and the countries `country` keeps.
-    Reverse(Named<GeocodeOptions>, Vec<String>),
+    Reverse(Named<runtime::ReverseRequest>, Vec<String>),
 }
 
 /// Where a query reads in the Pack, so neighbours run together.

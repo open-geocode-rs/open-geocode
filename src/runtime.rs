@@ -386,8 +386,20 @@ pub(crate) struct ReverseParams {
     lat: f64,
     /// See [`parse_layer`].
     layer: Param,
+    /// How many results of `layer` to answer, nearest first. 0, the
+    /// default, is 1, and above 1 needs a `layer`.
+    #[serde(default)]
+    limit: usize,
     /// See [`parse_lang`].
     lang: Param,
+}
+
+/// `/reverse`'s request, checked: the point and layer, and how many results
+/// of the layer to answer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReverseRequest {
+    options: GeocodeOptions,
+    limit: usize,
 }
 
 /// Resolve `lang`, the comma-separated language codes to name results in,
@@ -1635,6 +1647,12 @@ fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCo
          description = "Return only the nearest result of this layer, or for an area \
                         layer the area of that layer the point lies in, and no other \
                         area. An unknown layer returns `400`."),
+        ("limit" = Option<usize>, Query,
+         description = "How many results of `layer` to return, nearest first, up to \
+                        50. Default and 0 mean 1. Above 1 it needs `layer`. A point \
+                        lies in one area of each layer, so an area layer returns at \
+                        most one.",
+         minimum = 0, maximum = 50),
         ("lang" = Option<String>, Query,
          description = "Languages to name results and their areas in, as \
                         comma-separated language codes. The first names each \
@@ -1648,8 +1666,9 @@ fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCo
         (status = 200, description = "Results at the point, most precise first. \
                                       `features` is empty when nothing is near.",
          body = ReverseCollection),
-        (status = 400, description = "`lon` or `lat` is missing or out of range, or \
-                                      `layer` is unknown.",
+        (status = 400, description = "`lon` or `lat` is missing or out of range, \
+                                      `layer` is unknown, or `limit` is out of range or \
+                                      above 1 with no `layer`.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
@@ -1717,7 +1736,7 @@ pub(crate) async fn reverse_batch(State(state): State<AppState>, request: Reques
 }
 
 /// `/reverse` as a batch item, in `QUERY /reverse` and in `/jobs`.
-pub(crate) const REVERSE: Lookup<ReverseParams, Named<GeocodeOptions>, ReverseCollection, u64> =
+pub(crate) const REVERSE: Lookup<ReverseParams, Named<ReverseRequest>, ReverseCollection, u64> =
     Lookup {
         route: "/reverse",
         prepare: |state, params| {
@@ -1726,7 +1745,7 @@ pub(crate) const REVERSE: Lookup<ReverseParams, Named<GeocodeOptions>, ReverseCo
                 request: reverse_request(state, params)?,
             })
         },
-        place: |named| reverse_place(&named.request),
+        place: |named| reverse_place(&named.request.options),
         answer: |state, named| {
             let mut collection = reverse_answer(state, named.request)?;
             api::localize_reverse(&state.pack, &mut collection, &named.languages);
@@ -1735,18 +1754,26 @@ pub(crate) const REVERSE: Lookup<ReverseParams, Named<GeocodeOptions>, ReverseCo
     };
 
 /// `/reverse`'s parameters, checked.
-fn reverse_request(_: &AppState, params: ReverseParams) -> Result<GeocodeOptions, Problem> {
+fn reverse_request(_: &AppState, params: ReverseParams) -> Result<ReverseRequest, Problem> {
     let ReverseParams {
         lon,
         lat,
         layer,
+        limit,
         lang: _,
     } = params;
     bounds::validate_coords(lon, lat)?;
-    Ok(GeocodeOptions {
-        lon,
-        lat,
-        layer: parse_layer(&layer)?,
+    let layer = parse_layer(&layer)?;
+    let limit = limit.max(1);
+    bounds::validate_search_limit(limit)?;
+    if limit > 1 && layer.is_none() {
+        let reason = "above 1 needs a layer, since without one the answer is the point's areas";
+        return Err(Problem::malformed_parameter(format!("limit {reason}"))
+            .with_invalid_params(vec![InvalidParam::new("limit", reason)]));
+    }
+    Ok(ReverseRequest {
+        options: GeocodeOptions { lon, lat, layer },
+        limit,
     })
 }
 
@@ -1759,9 +1786,29 @@ fn reverse_place(options: &GeocodeOptions) -> u64 {
     )
 }
 
-fn reverse_answer(state: &AppState, options: GeocodeOptions) -> Result<ReverseCollection> {
-    let response = state.reverse_geocoder.reverse(options)?;
-    api::reverse_collection(&state.pack, &response)
+fn reverse_answer(state: &AppState, request: ReverseRequest) -> Result<ReverseCollection> {
+    let ReverseRequest { options, limit } = request;
+    let Some(layer) = options.layer.filter(|_| limit > 1) else {
+        let response = state.reverse_geocoder.reverse(options)?;
+        return api::reverse_collection(&state.pack, &response);
+    };
+    let nearest = state
+        .reverse_geocoder
+        .reverse_nearest(options, layer, limit)?;
+    let mut collection = api::reverse_collection(
+        &state.pack,
+        &crate::reverse::GeocodeResponse {
+            lon: options.lon,
+            lat: options.lat,
+            result: None,
+        },
+    )?;
+    for response in &nearest {
+        collection
+            .features
+            .extend(api::reverse_collection(&state.pack, response)?.features);
+    }
+    Ok(collection)
 }
 
 #[cfg(test)]
@@ -3575,6 +3622,85 @@ mod router_tests {
     }
 
     #[tokio::test]
+    async fn a_reverse_with_a_layer_answers_its_nearest_results_up_to_the_limit() {
+        let pack = temp_path("reverse-limit");
+        let _ = std::fs::remove_dir_all(&pack);
+        let mut writer = Writer::create(&pack).expect("writer");
+        // Three houses about 8 m apart along one street.
+        for (id, number, lon) in [(1, "10", -79.0), (2, "12", -79.0001), (3, "14", -79.0002)] {
+            let house = AddressRecord {
+                access: Vec::new(),
+                disputed: false,
+                street_postcodes: Vec::new(),
+                address: AddressComponents {
+                    areas: Vec::new(),
+                    number: number.to_string(),
+                    street: Some("King Street".to_string()),
+                    place: None,
+                    unit: None,
+                    locality: None,
+                    region: None,
+                    postcode: None,
+                    country: None,
+                },
+                geometry: point_geometry(lon, 43.0),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, id),
+            };
+            writer.write(&house.into(), None).expect("house");
+        }
+        writer.finish().expect("finish");
+        let router = build_router(state_for(&pack, true), None, None);
+        let ids = |answer: &serde_json::Value| {
+            answer["features"]
+                .as_array()
+                .expect("features")
+                .iter()
+                .map(|feature| {
+                    feature["properties"]["id"]
+                        .as_str()
+                        .expect("id")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let reply = send(
+            router.clone(),
+            request(
+                "GET",
+                "/reverse?lon=-79.00005&lat=43.0&layer=address&limit=5",
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let nearest = ids(&reply.json());
+        assert_eq!(nearest.len(), 3, "{nearest:?}");
+        assert_eq!(nearest[2], "osm:node:3", "nearest first");
+        let reply = send(
+            router.clone(),
+            request(
+                "GET",
+                "/reverse?lon=-79.00005&lat=43.0&layer=address&limit=2",
+            ),
+        )
+        .await;
+        assert_eq!(ids(&reply.json()).len(), 2);
+        let reply = send(
+            router.clone(),
+            request("GET", "/reverse?lon=-79.00005&lat=43.0&layer=address"),
+        )
+        .await;
+        assert_eq!(ids(&reply.json()).len(), 1);
+        // Without a layer the answer is the point's areas, one of each.
+        let reply = send(
+            router,
+            request("GET", "/reverse?lon=-79.0&lat=43.0&limit=2"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn a_geocode_result_says_how_the_query_matched_it_on_every_form() {
         let pack = temp_path("query-match");
         write_matched_pack(&pack);
@@ -5106,7 +5232,7 @@ mod router_tests {
                 route: "/reverse",
                 batchable: true,
                 fields: field_names::<ReverseParams>(),
-                fixed: &[("lon", "-79"), ("lat", "43")],
+                fixed: &[("lon", "-79"), ("lat", "43"), ("limit", "0")],
                 filled: &[("layer", "address"), ("lang", "fr,de")],
                 modes: &["layer"],
                 empty_is_missing: &["layer", "lang"],

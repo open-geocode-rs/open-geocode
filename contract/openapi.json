@@ -3498,6 +3498,17 @@
             }
           },
           {
+            "description": "How many results of `layer` to return, nearest first, up to 50. Default and 0 mean 1. Above 1 it needs `layer`. A point lies in one area of each layer, so an area layer returns at most one.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 50,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
             "description": "Languages to name results and their areas in, as comma-separated language codes. The first names each result and area, falling back to its local name; each other one goes into `translations` where a name in it exists. Repeats count once. A malformed code, or more than 20 distinct codes, returns `400`.",
             "example": "fr,de",
             "in": "query",
@@ -3550,7 +3561,7 @@
                 }
               }
             },
-            "description": "`lon` or `lat` is missing or out of range, or `layer` is unknown.",
+            "description": "`lon` or `lat` is missing or out of range, `layer` is unknown, or `limit` is out of range or above 1 with no `layer`.",
             "headers": {
               "Accept-Query": {
                 "description": "The media type a QUERY body is read as.",

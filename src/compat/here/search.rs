@@ -379,6 +379,8 @@ impl Reverse {
         ];
         if let Some(layer) = self.layer {
             fields.push(("layer", layer.to_string()));
+            // og answers the nearest of one kind as many times as asked.
+            fields.push(("limit", self.limit.to_string()));
         }
         if let Some(lang) = &self.lang {
             fields.push(("lang", lang.clone()));
