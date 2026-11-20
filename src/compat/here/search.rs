@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::{
     api::{ForwardCollection, ReverseCollection},
     compat::{Args, decode_id, native},
-    http::{bounds::MAX_SEARCH_LIMIT, problem::Problem},
+    http::bounds::MAX_SEARCH_LIMIT,
     runtime::AppState,
     util::fold::search_key,
 };
@@ -71,16 +71,12 @@ struct Page {
     limit: Option<usize>,
 }
 
-fn features(collection: &ForwardCollection) -> Result<Vec<Feature>, Gs7Error> {
-    collection.features.iter().map(feature).collect()
+fn features(collection: &ForwardCollection) -> Vec<Feature> {
+    collection.features.iter().map(Feature::from).collect()
 }
 
-fn reverse_features(collection: &ReverseCollection) -> Result<Vec<Feature>, Gs7Error> {
-    collection.features.iter().map(feature).collect()
-}
-
-fn feature(feature: &impl Serialize) -> Result<Feature, Gs7Error> {
-    Feature::of(feature).map_err(|error| Gs7Error::of(Problem::internal(error.into())))
+fn reverse_features(collection: &ReverseCollection) -> Vec<Feature> {
+    collection.features.iter().map(Feature::from).collect()
 }
 
 fn args(fields: Vec<(&'static str, String)>) -> Args {
@@ -295,7 +291,7 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
     let collection = native::geocode(state, args(fields).maybe("lang", og_lang(&params)))
         .await
         .map_err(Gs7Error::of)?;
-    let items = features(&collection)?
+    let items = features(&collection)
         .iter()
         .map(|feature| item(feature).distance_from(at))
         .filter(|item| item.is_any_of(types.as_deref()))
@@ -456,7 +452,7 @@ async fn reverse_lookup(state: &AppState, request: &Reverse) -> Result<Vec<Item>
         .await
         .map_err(Gs7Error::of)?;
     Ok(reverse_items(
-        &reverse_features(&collection)?,
+        &reverse_features(&collection),
         request.radius_m,
         request.types.as_deref(),
         request.limit,
@@ -717,9 +713,15 @@ pub(super) async fn autosuggest(
         let collection = native::autocomplete(&state, args(fields).maybe("lang", og_lang(&params)))
             .await
             .map_err(Gs7Error::of)?;
-        let items = features(&collection)?
+        let items = features(&collection)
             .iter()
-            .map(|feature| item(feature).without_scoring().distance_from(near.center))
+            .map(|feature| {
+                item(feature)
+                    .without_scoring()
+                    .with_details(feature)
+                    .with_highlights(feature)
+                    .distance_from(near.center)
+            })
             .filter(|item| near.admits(item))
             .collect();
         Ok(page(items, offset, limit, true))
@@ -752,11 +754,16 @@ pub(super) async fn autocomplete(
         let collection = native::autocomplete(&state, args(fields).maybe("lang", og_lang(&params)))
             .await
             .map_err(Gs7Error::of)?;
-        let items = features(&collection)?
+        let items = features(&collection)
             .iter()
-            .map(|feature| item(feature).without_scoring().distance_from(near.center))
+            .map(|feature| {
+                item(feature)
+                    .without_scoring()
+                    .with_highlights(feature)
+                    .distance_from(near.center)
+            })
             .filter(|item| near.admits(item))
-            .filter(|item| item.result_type.is_some_and(|kind| kind != "place"))
+            .filter(|item| item.result_type != "place")
             .filter(|item| item.is_any_of(types.as_deref()))
             .take(limit)
             .map(Item::without_position)
@@ -788,9 +795,14 @@ pub(super) async fn discover(
         let collection = native::search(&state, args(fields).maybe("lang", og_lang(&params)))
             .await
             .map_err(Gs7Error::of)?;
-        let items = features(&collection)?
+        let items = features(&collection)
             .iter()
-            .map(|feature| item(feature).without_scoring().distance_from(near.center))
+            .map(|feature| {
+                item(feature)
+                    .without_scoring()
+                    .with_details(feature)
+                    .distance_from(near.center)
+            })
             .filter(|item| near.admits(item))
             .collect();
         Ok(page(items, offset, limit, false))
@@ -852,9 +864,14 @@ pub(super) async fn browse(
         )
         .await
         .map_err(Gs7Error::of)?;
-        let mut items = features(&collection)?
+        let mut items = features(&collection)
             .iter()
-            .map(|feature| item(feature).without_scoring().distance_from(Some(at)))
+            .map(|feature| {
+                item(feature)
+                    .without_scoring()
+                    .with_details(feature)
+                    .distance_from(Some(at))
+            })
             .filter(|item| filter.admits(&item.categories))
             .filter(|item| {
                 name.as_deref().is_none_or(|name| {
@@ -895,7 +912,8 @@ pub(super) async fn lookup(
             .await
             .map_err(Gs7Error::of)?
             .ok_or_else(not_found)?;
-        Ok(item(&self::feature(&feature)?).without_scoring())
+        let feature = Feature::from(&feature);
+        Ok(item(&feature).without_scoring().with_details(&feature))
     };
     respond(&request_id, answer.await)
 }
