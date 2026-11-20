@@ -910,7 +910,9 @@ impl Reader {
         radius_m: f64,
         limit: usize,
     ) -> Result<Vec<SegmentCandidate>> {
-        let mut candidates = Vec::new();
+        // One candidate a record, at its nearest stretch: a road of many
+        // stretches is one answer, however many of them lie near.
+        let mut candidates = Vec::<SegmentCandidate>::new();
         let mut closest = Closest::new(limit);
         for (item, bound) in self.lines.nearest(lon, lat, radius_m) {
             if closest.settled(bound) {
@@ -924,16 +926,20 @@ impl Reader {
                 continue;
             };
             let total = line.total();
+            let mut nearest: Option<SegmentCandidate> = None;
             for segment in &line.segments {
                 if segment.end_length - segment.start_length <= f64::EPSILON {
                     continue;
                 }
                 let projection = project_to_segment_m(lon, lat, segment.start, segment.end);
-                if projection.distance_m <= radius_m {
+                if projection.distance_m <= radius_m
+                    && nearest
+                        .as_ref()
+                        .is_none_or(|held| projection.distance_m < held.distance_m)
+                {
                     let start_fraction = segment.start_length / total;
                     let end_fraction = segment.end_length / total;
-                    closest.add(projection.distance_m);
-                    candidates.push(SegmentCandidate {
+                    nearest = Some(SegmentCandidate {
                         record_id,
                         layer,
                         closest_lon: projection.lon,
@@ -941,6 +947,21 @@ impl Reader {
                         distance_m: projection.distance_m,
                         fraction: start_fraction + projection.t * (end_fraction - start_fraction),
                     });
+                }
+            }
+            let Some(nearest) = nearest else {
+                continue;
+            };
+            // A record the index holds as several items keeps its nearest.
+            match candidates
+                .iter_mut()
+                .find(|held| held.record_id == record_id)
+            {
+                Some(held) if nearest.distance_m < held.distance_m => *held = nearest,
+                Some(_) => {}
+                None => {
+                    closest.add(nearest.distance_m);
+                    candidates.push(nearest);
                 }
             }
         }

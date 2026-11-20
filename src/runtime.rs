@@ -3701,6 +3701,72 @@ mod router_tests {
     }
 
     #[tokio::test]
+    async fn a_reverse_with_a_limit_answers_each_street_once() {
+        let pack = temp_path("reverse-streets");
+        let _ = std::fs::remove_dir_all(&pack);
+        let mut writer = Writer::create(&pack).expect("writer");
+        let street = |id, name: &str, coordinates: Vec<[f64; 2]>| crate::record::StreetRecord {
+            other_ways: Vec::new(),
+            road_class: crate::record::RoadClass::Residential,
+            alt_names: Vec::new(),
+            locality: None,
+            name: name.to_string(),
+            representative_point: coordinates[0],
+            geometry: geojson::Geometry::new(geojson::GeometryValue::LineString {
+                coordinates: coordinates
+                    .into_iter()
+                    .map(|point| point.to_vec().into())
+                    .collect(),
+            }),
+            source: SourceProvenance::osm(ObjectType::Way, id),
+        };
+        // A street of many short stretches beside the point, and another a
+        // little further.
+        let near = (0..8)
+            .map(|step| [-79.0 + f64::from(step) * 0.00002, 43.00005])
+            .collect();
+        writer
+            .write(&street(1, "Court Street", near).into(), None)
+            .expect("near");
+        writer
+            .write(
+                &street(2, "Park Place", vec![[-79.0, 43.0001], [-78.9998, 43.0001]]).into(),
+                None,
+            )
+            .expect("far");
+        writer.finish().expect("finish");
+        let router = build_router(state_for(&pack, true), None, None);
+        let ids = |answer: serde_json::Value| {
+            answer["features"]
+                .as_array()
+                .expect("features")
+                .iter()
+                .map(|feature| {
+                    feature["properties"]["id"]
+                        .as_str()
+                        .expect("id")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let reply = send(
+            router.clone(),
+            request(
+                "GET",
+                "/reverse?lon=-79.00005&lat=43.0&layer=street&limit=5",
+            ),
+        )
+        .await;
+        assert_eq!(ids(reply.json()), ["osm:way:1", "osm:way:2"]);
+        let reply = send(
+            router,
+            request("GET", "/reverse?lon=-79.00005&lat=43.0&layer=street"),
+        )
+        .await;
+        assert_eq!(ids(reply.json()), ["osm:way:1"]);
+    }
+
+    #[tokio::test]
     async fn a_geocode_result_says_how_the_query_matched_it_on_every_form() {
         let pack = temp_path("query-match");
         write_matched_pack(&pack);
