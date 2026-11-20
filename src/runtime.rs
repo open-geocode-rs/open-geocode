@@ -3517,7 +3517,22 @@ mod router_tests {
             details: None,
             aliases: Vec::new(),
         };
+        // A house whose street the source writes abbreviated.
+        let abbreviated = AddressRecord {
+            address: AddressComponents {
+                number: "12".to_string(),
+                street: Some("Queen St W".to_string()),
+                postcode: None,
+                ..house.address.clone()
+            },
+            geometry: point_geometry(-79.2, 43.0),
+            source: SourceProvenance::osm(ObjectType::Node, 2),
+            ..house.clone()
+        };
         writer.write(&house.into(), context.clone()).expect("house");
+        writer
+            .write(&abbreviated.into(), context.clone())
+            .expect("abbreviated house");
         writer.write(&cafe.into(), context).expect("cafe");
         writer.finish().expect("finish");
     }
@@ -3563,6 +3578,10 @@ mod router_tests {
         );
         let town = without("osm:relation:13");
         let cafe = without("osm:node:5");
+        let queen = with(
+            "osm:node:2",
+            serde_json::json!({"housenumber": "matched", "street": "matched"}),
+        );
 
         for (uri, expected) in [
             ("/geocode?q=10%20King%20Street%20West,%20Toronto", &in_town),
@@ -3571,6 +3590,8 @@ mod router_tests {
                 &in_postcode,
             ),
             ("/geocode?q=10%20Knig%20Street%20West", &typo),
+            // The record writes the abbreviation of the words asked.
+            ("/geocode?q=12%20Queen%20Street%20West", &queen),
             ("/geocode?q=99%20Nowhere%20Road,%20Toronto", &town_for_it),
             (
                 "/geocode?address=10%20King%20Street%20West&locality=Toronto&postcode=M5H%201A1",

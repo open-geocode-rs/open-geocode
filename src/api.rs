@@ -374,7 +374,8 @@ pub struct Highlight {
 ///   for it.
 /// - `street`: the query's street words against the words of the result's
 ///   street, as search counts typos. `matched` when the street has each
-///   word, or the word an abbreviation stands for. `partial` when a word is
+///   word, the word an abbreviation stands for, or its abbreviation
+///   (`Street` for a street written `St`). `partial` when a word is
 ///   a typo away or missing. `unmatched` when it has none of them or the
 ///   result has no street.
 /// - `unit`: `matched` when the result states the unit, else `unmatched`.
