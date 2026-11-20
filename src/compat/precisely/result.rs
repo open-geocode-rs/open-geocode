@@ -481,8 +481,13 @@ impl Feature {
             iso_numeric_code: code.as_deref().and_then(iso::numeric),
             iso_alpha2_code: code,
         });
+        // An area result is its own area of its layer: a town fills `city`
+        // with its own name, as a region fills `admin1`.
+        let own = |of: &str| (layer == of).then(|| properties.name.clone());
         // `areas` runs outermost first, a suburb before a neighbourhood.
-        let neighborhood = area(&context.neighbourhood).or_else(|| address.areas.last().cloned());
+        let neighborhood = area(&context.neighbourhood)
+            .or_else(|| address.areas.last().cloned())
+            .or_else(|| own("neighbourhood"));
         let suburb = area(&context.sublocality)
             .or_else(|| (address.areas.len() > 1).then(|| address.areas[0].clone()));
         let street = address
@@ -530,8 +535,18 @@ impl Feature {
                 // The record's own locality is the one its address is
                 // written with; the containing area may name the wider
                 // municipality.
-                city: admin(address.locality.clone().or_else(|| area(&context.locality))),
-                admin2: admin(area(&context.district).or_else(|| area(&context.subregion))),
+                city: admin(
+                    address
+                        .locality
+                        .clone()
+                        .or_else(|| area(&context.locality))
+                        .or_else(|| own("locality")),
+                ),
+                admin2: admin(
+                    area(&context.district)
+                        .or_else(|| area(&context.subregion))
+                        .or_else(|| own("district")),
+                ),
                 admin1,
                 postal_code,
                 postal_code_ext,
@@ -844,6 +859,31 @@ impl Candidate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_area_result_fills_its_own_slot() {
+        let candidate = |layer: &str, name: &str| {
+            let feature: Feature = serde_json::from_value(serde_json::json!({
+                "geometry": {"coordinates": [-71.6, 41.58]},
+                "properties": {
+                    "id": "osm:relation:2", "layer": layer, "accuracy": "centroid",
+                    "name": name, "label": name, "source": {"dataset": "osm"},
+                    "context": {"region": {"name": "Rhode Island", "code": "US-RI"}},
+                },
+            }))
+            .expect("an og feature");
+            serde_json::to_value(feature.candidate(Product::Geocode).address).expect("address")
+        };
+        let town = candidate("locality", "Exeter");
+        assert_eq!(town["city"], serde_json::json!({"longName": "Exeter"}));
+        assert_eq!(town["admin1"]["shortName"], "RI");
+        let county = candidate("district", "Washington County");
+        assert_eq!(
+            county["admin2"],
+            serde_json::json!({"longName": "Washington County"})
+        );
+        assert_eq!(county.get("city"), None);
+    }
 
     #[test]
     fn a_zip_plus_four_comes_apart() {
