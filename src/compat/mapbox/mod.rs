@@ -25,15 +25,32 @@ use serde_json::json;
 
 use crate::{
     api::{
-        Accuracy, Attribution, Common, ForwardFeature, QueryMatch, ReverseCollection,
-        ReverseFeature,
+        Accuracy, Attribution, Common, ForwardCollection, ForwardFeature, QueryMatch,
+        ReverseCollection, ReverseFeature,
     },
-    compat::{VendorError, encode_area_id, encode_id, retry_after},
+    compat::{Args, VendorError, encode_area_id, encode_id, native, retry_after},
     http::problem::Problem,
     iso,
     record::Layer,
     runtime::AppState,
 };
+
+/// Mapbox's address type also includes numbered points on mapped ranges.
+async fn complete(
+    state: &AppState,
+    args: Args,
+    types: Option<&Types>,
+) -> Result<ForwardCollection, Problem> {
+    let layer = types.and_then(Types::og_layer);
+    if layer != Some("address") {
+        return native::autocomplete(state, args.maybe("layer", layer)).await;
+    }
+    let found = native::autocomplete(state, args.clone().set("layer", "address")).await?;
+    if found.features.is_empty() {
+        return native::autocomplete(state, args.set("layer", "interpolation")).await;
+    }
+    Ok(found)
+}
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()

@@ -376,9 +376,10 @@ pub(super) async fn suggest(
         .maybe("country", params.get("country"))
         .maybe("focus", params.focus(Api::SearchBox)?)
         .maybe("bbox", params.bbox(Api::SearchBox)?)
-        .maybe("layer", types.as_ref().and_then(Types::og_layer))
         .set("lang", language(&params));
-    let mut collection = native::autocomplete(&state, args).await.map_err(failed)?;
+    let mut collection = super::complete(&state, args, types.as_ref())
+        .await
+        .map_err(failed)?;
     asked.keep(&mut collection);
     let suggestions = collection
         .features
@@ -450,7 +451,7 @@ pub(super) async fn forward(
         .get("auto_complete")
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
     let mut collection = if autocomplete {
-        native::autocomplete(&state, args.maybe("layer", layer)).await
+        super::complete(&state, args, types.as_ref()).await
     } else {
         match layer {
             Some("poi") => native::places(&state, args).await,

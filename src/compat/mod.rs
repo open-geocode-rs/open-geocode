@@ -193,7 +193,7 @@ pub(crate) fn decode_id(vendor_id: &str) -> Option<OgRef> {
 }
 
 /// The parameters of one native lookup, as its query string would carry them.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Args(Vec<(&'static str, String)>);
 
 impl Args {

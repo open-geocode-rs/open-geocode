@@ -497,7 +497,7 @@ async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compa
             if reads_whole(&found) {
                 return translated(Collection::forward(&found, types, naming));
             }
-            let mut completed = native::autocomplete(state, complete)
+            let mut completed = super::complete(state, complete, types)
                 .await
                 .map_err(failed)?;
             // Geocoding answers no POIs.
@@ -533,23 +533,22 @@ fn reads_whole(found: &ForwardCollection) -> bool {
 fn answers_whole(fallback: bool, matched: Option<&QueryMatch>) -> bool {
     !fallback
         && matched.is_some_and(|parts| {
-            let addressed = parts.street == Some(PartMatch::Matched)
-                && parts
-                    .housenumber
-                    .is_some_and(|number| number != PartMatch::Unmatched);
-            addressed
-                || [
-                    parts.housenumber,
-                    parts.street,
-                    parts.unit,
-                    parts.locality,
-                    parts.region,
-                    parts.postcode,
-                    parts.country,
-                ]
-                .into_iter()
-                .flatten()
-                .all(|part| part == PartMatch::Matched)
+            // A weaker reading may match the number and city while dropping
+            // the street entirely. It cannot end a numbered address search.
+            if let Some(number) = parts.housenumber {
+                return number != PartMatch::Unmatched && parts.street == Some(PartMatch::Matched);
+            }
+            [
+                parts.street,
+                parts.unit,
+                parts.locality,
+                parts.region,
+                parts.postcode,
+                parts.country,
+            ]
+            .into_iter()
+            .flatten()
+            .all(|part| part == PartMatch::Matched)
         })
 }
 
@@ -574,6 +573,18 @@ mod whole_tests {
             Some(&parts(Some(PartMatch::Partial), None))
         ));
         assert!(!answers_whole(true, Some(&town)));
+        let numbered = QueryMatch {
+            housenumber: Some(PartMatch::Matched),
+            ..town
+        };
+        assert!(!answers_whole(false, Some(&numbered)));
+        let interpolated = QueryMatch {
+            housenumber: Some(PartMatch::Partial),
+            street: Some(PartMatch::Matched),
+            locality: Some(PartMatch::Partial),
+            ..QueryMatch::default()
+        };
+        assert!(answers_whole(false, Some(&interpolated)));
     }
 }
 
@@ -619,7 +630,7 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
     let layer = types.as_ref().and_then(Types::og_layer);
     let wanted = limit(params, MAX_FORWARD_LIMIT)?;
     let (focus, bbox) = (params.focus(Api::Geocoding)?, params.bbox(Api::Geocoding)?);
-    let limited = |q: &str, limit: usize| {
+    let limited = |q: &str, limit: usize, layer: Option<&str>| {
         Args::new()
             .set("q", q)
             .set("limit", limit.to_string())
@@ -629,7 +640,7 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
             .maybe("layer", layer)
             .maybe("lang", lang.clone())
     };
-    let text = |q: &str| limited(q, wanted.unwrap_or(DEFAULT_LIMIT));
+    let text = |q: &str| limited(q, wanted.unwrap_or(DEFAULT_LIMIT), layer);
     if let Some(q) = params.get("q") {
         let lookup = match decode_id(q) {
             Some(named) => Lookup::Id {
@@ -641,7 +652,7 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
                 geocode: text(q),
                 // POIs are dropped from what the text completes to, so as
                 // many are asked for as Geocoding may answer.
-                complete: limited(q, MAX_FORWARD_LIMIT),
+                complete: limited(q, MAX_FORWARD_LIMIT, None),
                 limit: wanted.unwrap_or(DEFAULT_LIMIT),
             },
             None => Lookup::Geocode(text(q)),

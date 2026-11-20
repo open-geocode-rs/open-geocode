@@ -910,17 +910,19 @@ impl TextSearcher {
     }
 
     // An incomplete address must not trigger a geocoding retry on each keystroke.
-    // Try only the best reading and keep only its house number on its stated street and locality.
+    // Try only the best reading and keep its house number on its stated street and locality.
     fn autocomplete_address(
         &self,
         options: &TextAutocompleteOptions,
     ) -> Result<Vec<TextSearchHit>> {
+        let layers = match options.layer.as_deref() {
+            None => &[Layer::Address, Layer::Interpolation][..],
+            Some("address") => &[Layer::Address],
+            Some("interpolation") => &[Layer::Interpolation],
+            Some(_) => return Ok(Vec::new()),
+        };
         let mut words = options.query.split_whitespace();
         if self.places
-            || options
-                .layer
-                .as_deref()
-                .is_some_and(|layer| layer != Layer::Address.as_str())
             || words.clone().take(3).count() < 3
             || !words.any(|word| is_numeric_token(word.trim_matches(',')))
         {
@@ -953,35 +955,39 @@ impl TextSearcher {
             return Ok(Vec::new());
         }
 
-        crate::stop::check()?;
-        let filters = Filters::new(
-            Some(Layer::Address.as_str()),
-            &options.countries,
-            options.bbox,
-        );
-        let (mut hits, _) = self.search_plan(
-            plan,
-            &placed,
-            Scope::Scoped,
-            &QueryWords::new(&query),
-            &filters,
-            options.focus,
-            1,
-            &Session::new(self.budget),
-            &mut |_, _, _, hit| {
-                Ok(hit.record.layer == Layer::Address.as_str()
-                    && hit.record.address.housenumber.as_deref() == Some(number.text.as_str()))
-            },
-        )?;
-        hits.retain(|hit| {
-            hit.matched.street == Some(PartMatch::Matched)
-                && hit.matched.locality == Some(PartMatch::Matched)
-        });
-        self.rate(&mut hits, Numbered::Yes);
-        for hit in &mut hits {
-            hit.highlights = typed_highlights(&query, &hit.record.label);
+        let query_words = QueryWords::new(&query);
+        let session = Session::new(self.budget);
+        for layer in layers {
+            crate::stop::check()?;
+            let filters = Filters::new(Some(layer.as_str()), &options.countries, options.bbox);
+            let (mut hits, _) = self.search_plan(
+                plan,
+                &placed,
+                Scope::Scoped,
+                &query_words,
+                &filters,
+                options.focus,
+                1,
+                &session,
+                &mut |_, _, _, hit| {
+                    Ok(hit.record.address.housenumber.as_deref() == Some(number.text.as_str()))
+                },
+            )?;
+            hits.retain(|hit| {
+                hit.matched.street == Some(PartMatch::Matched)
+                    && (hit.matched.locality == Some(PartMatch::Matched)
+                        || (*layer == Layer::Interpolation
+                            && hit.matched.locality == Some(PartMatch::Partial)))
+            });
+            if !hits.is_empty() {
+                self.rate(&mut hits, Numbered::Yes);
+                for hit in &mut hits {
+                    hit.highlights = typed_highlights(&query, &hit.record.label);
+                }
+                return Ok(hits);
+            }
         }
-        Ok(hits)
+        Ok(Vec::new())
     }
 
     fn autocomplete_as(
@@ -14917,6 +14923,83 @@ mod tests {
                     .is_empty()
             );
         }
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn autocomplete_can_use_a_mapped_house_number_range() {
+        use crate::record::{
+            InterpolationAddressComponents, InterpolationRange, InterpolationRecord,
+        };
+
+        let temp_dir = temp_pack_path("autocomplete-mapped-range");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        writer
+            .write(
+                &InterpolationRecord {
+                    address: InterpolationAddressComponents {
+                        street: Some("Queen Street West".to_string()),
+                        locality: Some("Toronto Centre".to_string()),
+                        place: None,
+                        region: None,
+                        postcode: None,
+                        country: None,
+                    },
+                    interpolation: InterpolationRange {
+                        kind: "even".to_string(),
+                        start: 2,
+                        end: 98,
+                        step: 2,
+                    },
+                    anchor_node_ids: [2, 98],
+                    geometry: queen_street_line(),
+                    representative_point: [-79.0, 43.0005],
+                    source: SourceProvenance::osm(ObjectType::Way, 20),
+                }
+                .into(),
+                None,
+            )
+            .expect("interpolation");
+        writer
+            .write(
+                &address_record("osm:node:21", "", "1", "King Street", Some("Toronto"), None)
+                    .into(),
+                None,
+            )
+            .expect("locality evidence");
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let ask = |query: &str, layer: Option<Layer>| {
+            suggest(
+                &searcher,
+                &searcher.places(),
+                &TextAutocompleteOptions {
+                    query: query.to_string(),
+                    limit: 5,
+                    layer: layer.map(|layer| layer.as_str().to_string()),
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                },
+            )
+            .expect("suggestions")
+        };
+        let hits = ask("50 Queen St W Toronto", None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record.id, "osm:way:20:interp:2-98");
+        assert_eq!(
+            hits[0].record.point.expect("point").precision,
+            PointPrecision::Estimated
+        );
+        for query in [
+            "51 Queen St W Toronto",
+            "50 Queen St E Toronto",
+            "50 Queen St W Vancouver",
+        ] {
+            assert!(ask(query, None).is_empty(), "{query}");
+        }
+        assert!(ask("50 Queen St W Toronto", Some(Layer::Address)).is_empty());
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
