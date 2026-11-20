@@ -1991,3 +1991,34 @@ async fn a_bulk_verify_job_writes_verify_output() {
         Some(format!("V2,ZERO_RESULTS,,{blank}").as_str())
     );
 }
+
+#[tokio::test]
+async fn express_autocomplete_v2_refuses_a_filter_it_cannot_honour() {
+    let fixture = Fixture::new("filter-bias");
+    let router = fixture.router();
+    let address = json!({"addressLines": ["Queen Bak"], "country": "CAN"});
+    let plain = post(
+        &router,
+        "/v2/express-autocomplete",
+        &json!({"address": address}),
+    )
+    .await;
+    assert_eq!(plain.status, StatusCode::OK);
+    assert_eq!(plain.json()["response"]["status"], "OK");
+    let filtered = post(
+        &router,
+        "/v2/express-autocomplete",
+        &json!({"preferences": {"filterBias": {"type": "filter",
+                    "fields": {"include": {"city": {"value": "Toronto"}}}}},
+                "address": address}),
+    )
+    .await;
+    assert_eq!(filtered.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        filtered.json(),
+        errors(
+            "INVALID_REQUEST",
+            "filterBias is not supported by this server (DIS-LI-1018)"
+        )
+    );
+}
