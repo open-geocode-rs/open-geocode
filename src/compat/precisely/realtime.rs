@@ -442,8 +442,8 @@ pub(super) async fn reverse(
     ))
 }
 
-/// Key types Precisely documents. og answers only `PB_KEY`, which carries
-/// og's own id; the others name records in registers og does not keep.
+/// Key types Precisely documents. Existing clients can still supply
+/// previously issued og references as lookup input.
 const KEY_TYPES: [&str; 5] = ["PB_KEY", "GNAF_PID", "UDPRN", "UPRN", "EIR_CODE"];
 
 pub(super) async fn lookup(
