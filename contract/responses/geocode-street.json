@@ -16,7 +16,6 @@
           -79.0,
           43.001
         ],
-        "confidence": 0.37754068,
         "context": {
           "country": {
             "code": "CA",
@@ -73,7 +72,6 @@
           "Toronto, ON M5V 1A1",
           "Canada"
         ],
-        "confidence": 0.76852477,
         "context": {
           "country": {
             "code": "CA",
