@@ -729,20 +729,29 @@ impl Translated {
         let feature_type = feature_type(common);
         let parts = &common.address;
         let is_address = is_address(common);
+        let address_subject = parts.street.as_deref().or(parts.place.as_deref());
         let address = if is_address {
             Some(common.name.clone())
         } else {
-            address_line(
-                parts.housenumber.as_deref(),
-                parts.street.as_deref().or(parts.place.as_deref()),
-            )
+            address_line(parts.housenumber.as_deref(), address_subject)
         };
-        let (full_address, place_formatted) = split_label(
-            common,
-            address.as_deref().filter(|_| common.layer == Layer::Poi),
-        );
+        let context = context(common, &mapbox_id, is_address);
+        let place_formatted = place_line(common.layer, &context);
+        let address_name = if common.layer == Layer::Poi {
+            address.as_deref().filter(|_| address_subject.is_some())
+        } else {
+            Some(common.name.as_str())
+        };
+        let full_address = address_name.map(|name| {
+            let unit = parts.unit.as_deref().map(crate::labels::unit_label);
+            [Some(name), unit.as_deref(), place_formatted.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
         Self {
-            context: context(common, &mapbox_id, is_address),
+            context,
             mapbox_id,
             feature_type,
             name: common.name.clone(),
@@ -780,50 +789,38 @@ fn address_line(number: Option<&str>, street: Option<&str>) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
-/// `full_address` and `place_formatted` cut from og's label.
-///
-/// og's label is `name`, then for a POI its address line, then the unit,
-/// then the stated locality, region, postcode and country. Mapbox's
-/// `place_formatted` is only that last run, and a POI's `full_address` is
-/// its address without the POI's name. A label that does not start with
-/// `name` cannot be cut honestly, so neither is sent but the whole label.
-fn split_label(common: &Common, poi_address: Option<&str>) -> (Option<String>, Option<String>) {
-    let label = common.label.as_str();
-    let non_empty = |text: &str| (!text.is_empty()).then(|| text.to_string());
-    let rest = if label == common.name {
-        Some("")
-    } else {
-        label
-            .strip_prefix(common.name.as_str())
-            .and_then(|rest| rest.strip_prefix(", "))
-    };
-    let Some(rest) = rest else {
-        let full = (common.layer != Layer::Poi).then(|| label.to_string());
-        return (full, None);
-    };
-    let full_address = if common.layer == Layer::Poi {
-        non_empty(rest)
-    } else {
-        Some(label.to_string())
-    };
-    let mut place = rest;
-    if let Some(line) = poi_address {
-        place = strip_segment(place, line);
+/// Mapbox joins region and postcode with a space inside the place line.
+fn place_line(layer: Layer, context: &Context<Area>) -> Option<String> {
+    let place =
+        area_name(&context.place).filter(|_| !matches!(layer, Layer::Locality | Layer::Place));
+    let region = area_name(&context.region).filter(|_| layer != Layer::Region);
+    let postcode = area_name(&context.postcode)
+        .filter(|_| !matches!(layer, Layer::Postcode | Layer::Region | Layer::Country));
+    let country = area_name(&context.country).filter(|_| layer != Layer::Country);
+    if place.is_none() && region.is_none() && country.is_none() {
+        return None;
     }
-    if common.address.unit.is_some() {
-        // The unit as the label writes it ("Unit 2"), one segment.
-        place = place.split_once(", ").map_or("", |(_, after)| after);
-    }
-    (full_address, non_empty(place))
+    let region_postcode = [region, postcode]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let line = [
+        place,
+        (!region_postcode.is_empty()).then_some(region_postcode.as_str()),
+        country,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ");
+    Some(line)
 }
 
-fn strip_segment<'a>(text: &'a str, segment: &str) -> &'a str {
-    if text == segment {
-        return "";
-    }
-    text.strip_prefix(segment)
-        .and_then(|rest| rest.strip_prefix(", "))
-        .unwrap_or(text)
+fn area_name(area: &Option<Area>) -> Option<&str> {
+    area.as_ref()
+        .map(|area| area.name.trim())
+        .filter(|name| !name.is_empty())
 }
 
 /// og's areas and stated address parts as Mapbox's context layers.

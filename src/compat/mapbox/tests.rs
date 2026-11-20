@@ -8,9 +8,9 @@ use axum::{
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use super::{attribution, split_label};
+use super::{Area, Context, attribution, place_line};
 use crate::{
-    api::{Accuracy, Address, Attribution, Common, Context, Source},
+    api::Attribution,
     compat::encode_parts,
     context::{AdminContextTuple, RecordContext},
     limits::Limits,
@@ -353,7 +353,7 @@ async fn geocoding_forward_answers_an_address_in_mapbox_shape() {
                 "properties": {
                     "mapbox_id": address,
                     "feature_type": "address",
-                    "full_address": "10 King Street, Unit 2, Toronto, M5V 1A1",
+                    "full_address": "10 King Street, Unit 2, Toronto, Ontario M5V 1A1, Canada",
                     "name": "10 King Street",
                     // og's own point of the address, a known address point.
                     "coordinates": {
@@ -364,7 +364,7 @@ async fn geocoding_forward_answers_an_address_in_mapbox_shape() {
                             {"name": "entrance", "longitude": -79.0001, "latitude": 43.0001},
                         ],
                     },
-                    "place_formatted": "Toronto, M5V 1A1",
+                    "place_formatted": "Toronto, Ontario M5V 1A1, Canada",
                     // The query states the number and street, both matched.
                     // Unstated parts are not in the input, and the country
                     // og fills in is inferred.
@@ -404,10 +404,6 @@ async fn geocoding_forward_answers_an_address_in_mapbox_shape() {
     );
 }
 
-/// Every og value of every result lands in its Mapbox slot unchanged, on
-/// both products, forward and reverse, address ids included. Each og
-/// value with a Mapbox slot must be met at least once, so a fixture or
-/// translator that stops sending one fails here.
 #[tokio::test]
 async fn every_og_value_lands_in_its_mapbox_slot() {
     let pack = write_pack();
@@ -472,9 +468,6 @@ async fn every_og_value_lands_in_its_mapbox_slot() {
                 met.insert("address id");
             }
             assert_eq!(properties["name"], og["name"], "{at}");
-            if layer != "poi" {
-                assert_eq!(properties["full_address"], og["label"], "{at}");
-            }
             assert_eq!(
                 feature["geometry"]["coordinates"], og_feature["geometry"]["coordinates"],
                 "{at}"
@@ -756,8 +749,12 @@ async fn geocoding_reverse_lists_the_areas_holding_the_point() {
         })
     );
     assert_eq!(
-        body["features"][2]["properties"].get("place_formatted"),
-        None
+        body["features"][2]["properties"]["place_formatted"],
+        "Ontario, Canada"
+    );
+    assert_eq!(
+        body["features"][2]["properties"]["full_address"],
+        "Toronto, Ontario, Canada"
     );
 
     let (status, body) = get(
@@ -1062,8 +1059,8 @@ async fn search_box_suggest_then_retrieve() {
                 "mapbox_id": poi,
                 "feature_type": "poi",
                 "address": "12 King Street",
-                "full_address": "12 King Street, Unit A, Toronto, M5V 1A1",
-                "place_formatted": "Toronto, M5V 1A1",
+                "full_address": "12 King Street, Unit A, Toronto, Ontario M5V 1A1, Canada",
+                "place_formatted": "Toronto, Ontario M5V 1A1, Canada",
                 "context": context,
                 "language": "en",
                 "maki": "cafe",
@@ -1094,8 +1091,8 @@ async fn search_box_suggest_then_retrieve() {
                     "mapbox_id": poi,
                     "feature_type": "poi",
                     "address": "12 King Street",
-                    "full_address": "12 King Street, Unit A, Toronto, M5V 1A1",
-                    "place_formatted": "Toronto, M5V 1A1",
+                    "full_address": "12 King Street, Unit A, Toronto, Ontario M5V 1A1, Canada",
+                    "place_formatted": "Toronto, Ontario M5V 1A1, Canada",
                     "context": context,
                     "coordinates": {
                         "longitude": -79.005,
@@ -1360,80 +1357,27 @@ async fn search_box_errors_are_mapbox_errors() {
     }
 }
 
-fn common(layer: Layer, name: &str, label: &str, unit: Option<&str>) -> Common {
-    Common {
-        id: "osm:node:1".to_string(),
-        code: None,
-        layer,
-        accuracy: Accuracy::Rooftop,
-        name: name.to_string(),
-        label: label.to_string(),
-        category: None,
-        road_class: None,
-        brand: None,
-        contact: None,
-        opening_hours: None,
-        bbox: None,
-        timezone: None,
-        access: Vec::new(),
-        address_lines: Vec::new(),
-        address: Address {
-            unit: unit.map(str::to_string),
-            ..Address::default()
-        },
-        context: Context::default(),
-        source: Source {
-            dataset: "osm".to_string(),
-        },
-        translations: None,
-        record_id: None,
-        local_name: None,
-    }
-}
-
 #[test]
-fn the_label_is_cut_at_og_label_parts() {
-    let cut = |layer, name, label, unit, poi_address| {
-        split_label(&common(layer, name, label, unit), poi_address)
+fn the_place_line_keeps_distinct_layers_and_omits_missing_parts() {
+    let mut context = Context {
+        place: Some(Area::named(None, "New York")),
+        region: Some(Area::named(None, "New York")),
+        postcode: Some(Area::named(None, "10118")),
+        country: Some(Area::named(None, "United States")),
+        ..Context::default()
     };
-    let some = |text: &str| Some(text.to_string());
     assert_eq!(
-        cut(
-            Layer::Address,
-            "1 A St",
-            "1 A St, Unit 2, Town, 1000",
-            Some("2"),
-            None
-        ),
-        (some("1 A St, Unit 2, Town, 1000"), some("Town, 1000"))
+        place_line(Layer::Address, &context).as_deref(),
+        Some("New York, New York 10118, United States")
     );
+    context.region = None;
     assert_eq!(
-        cut(
-            Layer::Poi,
-            "Cafe",
-            "Cafe, 1 A St, Town",
-            None,
-            Some("1 A St")
-        ),
-        (some("1 A St, Town"), some("Town"))
+        place_line(Layer::Address, &context).as_deref(),
+        Some("New York, 10118, United States")
     );
-    assert_eq!(
-        cut(Layer::Poi, "Cafe", "Cafe, Town", None, None),
-        (some("Town"), some("Town"))
-    );
-    assert_eq!(
-        cut(Layer::Country, "Canada", "Canada", None, None),
-        (some("Canada"), None)
-    );
-    // A label that does not start with the name is not cut.
-    assert_eq!(
-        cut(Layer::Street, "A St", "Other, Town", None, None),
-        (some("Other, Town"), None)
-    );
-    assert_eq!(
-        cut(Layer::Poi, "Cafe", "Other, Town", None, None),
-        (None, None)
-    );
+    context.place = None;
+    context.country = None;
+    assert_eq!(place_line(Layer::Address, &context), None);
 }
 
 #[test]
