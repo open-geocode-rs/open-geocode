@@ -219,7 +219,7 @@ pub(super) async fn upload_url(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Json<UploadUrl>, VendorError> {
-    let base = base_url(request.headers());
+    let base = base_url(&state, request.headers());
     let body = read_json::<UploadUrlRequest>(&state, request, "INVALID_CLIENT_INPUT").await?;
     let file_name = given(body.file_name.as_deref())
         .filter(|name| name.chars().count() <= MAX_FILE_NAME_CHARS)
@@ -624,7 +624,7 @@ async fn submit(
     request: Request,
     product: Product,
 ) -> Result<Response, VendorError> {
-    let base = base_url(request.headers());
+    let base = base_url(&state, request.headers());
     let body = read_json::<SubmitRequest>(&state, request, "INVALID_REQUEST").await?;
     let invalid_file = || error(StatusCode::BAD_REQUEST, "INVALID_REQUEST", INVALID_FILE);
     let file = given(body.file_id.as_deref())
@@ -727,7 +727,7 @@ pub(super) async fn job_status(
 ) -> Result<Json<JobStatus>, VendorError> {
     let (job, status) = stored_job(&state, &id)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_REQUEST", INVALID_JOB))?;
-    let base = base_url(&headers);
+    let base = base_url(&state, &headers);
     Ok(Json(JobStatus {
         status: status_name(status.status),
         download_url: (status.status == Status::Completed)

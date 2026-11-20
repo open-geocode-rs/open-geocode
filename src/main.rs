@@ -115,6 +115,14 @@ enum Commands {
         )]
         hook_hosts: Vec<String>,
 
+        /// The URL clients reach this server by, such as
+        /// `https://geo.example.com`, when a proxy stands in front of it.
+        /// Every absolute URL the server hands back starts with it. Without
+        /// it such a URL takes the `Host` the client connected with, over
+        /// plain HTTP.
+        #[arg(long, env = "OG_PUBLIC_URL", value_name = "URL", value_parser = public_url)]
+        public_url: Option<String>,
+
         /// Longest, in seconds, the server takes to stop after Ctrl-C or
         /// SIGTERM; what is still open then is dropped. 0 drops it at once.
         #[arg(long, value_name = "SECS", default_value_t = DEFAULT_SHUTDOWN_TIMEOUT_SECS)]
@@ -821,6 +829,7 @@ async fn main() -> Result<()> {
             job_dir,
             limits,
             hook_hosts,
+            public_url,
             shutdown_timeout,
         } => {
             serve(ServeOptions {
@@ -831,6 +840,7 @@ async fn main() -> Result<()> {
                 job_dir,
                 limits,
                 hook_hosts,
+                public_url,
                 shutdown_timeout: Duration::from_secs(shutdown_timeout),
             })
             .await?;
@@ -1243,8 +1253,38 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
     }))
 }
 
+/// `--public-url`: an `http` or `https` URL with a host and nothing after
+/// its path.
+fn public_url(value: &str) -> std::result::Result<String, String> {
+    let rest = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .ok_or("must start with http:// or https://")?;
+    let host = rest.split('/').next().unwrap_or_default();
+    if host.is_empty() || rest.contains(['?', '#', ' ']) {
+        return Err("must name a host, with no query or fragment".to_string());
+    }
+    Ok(value.trim_end_matches('/').to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_public_url_is_an_http_origin_with_an_optional_path() {
+        assert_eq!(
+            super::public_url("https://geo.example.com/og/").as_deref(),
+            Ok("https://geo.example.com/og")
+        );
+        for refused in [
+            "geo.example.com",
+            "ftp://geo.example.com",
+            "https://",
+            "https://x?y=1",
+        ] {
+            assert!(super::public_url(refused).is_err(), "{refused}");
+        }
+    }
+
     use clap::Parser;
 
     use super::*;

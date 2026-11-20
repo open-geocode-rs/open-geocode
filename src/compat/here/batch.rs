@@ -492,23 +492,20 @@ fn all(state: &AppState) -> Vec<View> {
     views
 }
 
-/// Where this job's links point. They take the request's own scheme, host
-/// and prefix, so a link works through whatever path the server is mounted
-/// at.
+/// Where this job's links point. They start where clients reach the server
+/// (see [`AppState::origin`]) and keep the request's prefix, so a link works
+/// through whatever path the server is mounted at.
 #[derive(Debug)]
 pub(super) struct Links {
     jobs: String,
 }
 
 impl Links {
-    pub(super) fn of(headers: &HeaderMap, uri: &axum::http::Uri) -> Self {
+    pub(super) fn of(state: &AppState, headers: &HeaderMap, uri: &axum::http::Uri) -> Self {
         let path = uri.path();
         let prefix = path.find("/v7/").map_or("", |at| &path[..at]);
-        let host = crate::compat::header(headers, "host");
-        let scheme = crate::compat::header(headers, "x-forwarded-proto").unwrap_or("http");
-        let origin = host.map_or_else(String::new, |host| format!("{scheme}://{host}"));
         Self {
-            jobs: format!("{origin}{prefix}/v7/batch/jobs"),
+            jobs: format!("{}{prefix}/v7/batch/jobs", state.origin(headers)),
         }
     }
 
@@ -1463,7 +1460,7 @@ async fn create_job(
     }
     save(state, &meta).map_err(internal)?;
     let view = view(state, meta).ok_or_else(BatchError::job_not_found)?;
-    let links = Links::of(headers, uri);
+    let links = Links::of(state, headers, uri);
     Ok((StatusCode::CREATED, axum::Json(job_response(&view, &links))).into_response())
 }
 
@@ -1687,8 +1684,8 @@ fn answered(state: &AppState, meta: &Meta) -> io::Result<Vec<u64>> {
     Ok(answered)
 }
 
-fn links_for(headers: &HeaderMap, uri: &axum::http::Uri) -> Links {
-    Links::of(headers, uri)
+fn links_for(state: &AppState, headers: &HeaderMap, uri: &axum::http::Uri) -> Links {
+    Links::of(state, headers, uri)
 }
 
 pub(super) async fn details(
@@ -1699,7 +1696,9 @@ pub(super) async fn details(
     UrlPath(id): UrlPath<String>,
 ) -> Response {
     match find(&state, &id) {
-        Ok(view) => axum::Json(job_details(&view, &links_for(&headers, &uri))).into_response(),
+        Ok(view) => {
+            axum::Json(job_details(&view, &links_for(&state, &headers, &uri))).into_response()
+        }
         Err(error) => error.into_response(&request_id),
     }
 }
@@ -1729,7 +1728,9 @@ pub(super) async fn start(
         view(&state, meta).ok_or_else(BatchError::job_not_found)
     };
     match answer.await {
-        Ok(view) => axum::Json(job_response(&view, &links_for(&headers, &uri))).into_response(),
+        Ok(view) => {
+            axum::Json(job_response(&view, &links_for(&state, &headers, &uri))).into_response()
+        }
         Err(error) => error.into_response(&request_id),
     }
 }
@@ -1756,7 +1757,9 @@ pub(super) async fn stop(
         view(&state, meta).ok_or_else(BatchError::job_not_found)
     };
     match answer.await {
-        Ok(view) => axum::Json(job_response(&view, &links_for(&headers, &uri))).into_response(),
+        Ok(view) => {
+            axum::Json(job_response(&view, &links_for(&state, &headers, &uri))).into_response()
+        }
         Err(error) => error.into_response(&request_id),
     }
 }
@@ -1799,7 +1802,9 @@ pub(super) async fn delete(
         delete_job(&state, current).map_err(internal)
     };
     match answer.await {
-        Ok(view) => axum::Json(job_response(&view, &links_for(&headers, &uri))).into_response(),
+        Ok(view) => {
+            axum::Json(job_response(&view, &links_for(&state, &headers, &uri))).into_response()
+        }
         Err(error) => error.into_response(&request_id),
     }
 }
@@ -1854,7 +1859,7 @@ pub(super) async fn list(
         let status = status_filter(params.get("status"))?;
         let tag = params.get("tag");
         let _guard = LOCK.lock().await;
-        let links = links_for(&headers, &uri);
+        let links = links_for(&state, &headers, &uri);
         let items = all(&state)
             .iter()
             .filter(|view| selected(view, status, tag))

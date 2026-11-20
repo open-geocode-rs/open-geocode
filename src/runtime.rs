@@ -80,6 +80,11 @@ pub struct ServeOptions {
     pub limits: Limits,
     /// Hosts a job may call back when it ends, as `name` or `name:port`.
     pub hook_hosts: Vec<String>,
+    /// The `scheme://host[:port][/prefix]` clients reach this server by,
+    /// which every absolute URL it hands back starts with. Without it a URL
+    /// takes the `Host` the client connected with, over plain HTTP, and
+    /// never a forwarded header a client could set.
+    pub public_url: Option<String>,
     /// Longest the server takes to stop once Ctrl-C or SIGTERM arrives;
     /// what is still open then is dropped. Zero drops it at once.
     pub shutdown_timeout: Duration,
@@ -107,6 +112,8 @@ pub(crate) struct AppState {
     spec: Arc<str>,
     /// See [`ServeOptions::hook_hosts`].
     hook_hosts: Arc<[String]>,
+    /// See [`ServeOptions::public_url`], with no trailing `/`.
+    public_url: Option<Arc<str>>,
 }
 
 impl AppState {
@@ -157,6 +164,7 @@ impl AppState {
             spec: openapi::document(&limits)?.into(),
             limits,
             hook_hosts: Arc::from([]),
+            public_url: None,
         })
     }
 
@@ -169,6 +177,30 @@ impl AppState {
             .filter(|host| !host.is_empty())
             .collect();
         self
+    }
+
+    /// The same state, handing back URLs under `url` (see
+    /// [`ServeOptions::public_url`]).
+    pub(crate) fn with_public_url(mut self, url: Option<String>) -> Self {
+        self.public_url = url.map(|url| url.trim_end_matches('/').into());
+        self
+    }
+
+    /// Where a client reaches this server, the start of every absolute URL
+    /// it hands back: the operator's public URL, else the `Host` the client
+    /// connected with. A forwarded header is never read, since any client
+    /// can send one.
+    pub(crate) fn origin(&self, headers: &axum::http::HeaderMap) -> String {
+        match &self.public_url {
+            Some(url) => url.to_string(),
+            None => {
+                let host = headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|host| host.to_str().ok())
+                    .unwrap_or("localhost");
+                format!("http://{host}")
+            }
+        }
     }
 
     /// Whether a job may call `host` on `port`: the operator allows that
@@ -396,7 +428,8 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         .clone()
         .unwrap_or_else(|| jobs::default_dir(options.bind.port()));
     let state = AppState::open(&options.pack, &jobs_dir, options.limits)?
-        .with_hook_hosts(options.hook_hosts.clone());
+        .with_hook_hosts(options.hook_hosts.clone())
+        .with_public_url(options.public_url.clone());
     tokio::spawn(jobs::sweep_forever(state.clone()));
     let app = build_router(
         state.clone(),

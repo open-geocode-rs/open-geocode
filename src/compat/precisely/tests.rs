@@ -1090,6 +1090,30 @@ async fn finished(router: &Router, job_id: &str) -> Value {
     panic!("job {job_id} never finished");
 }
 
+#[tokio::test]
+async fn an_upload_url_starts_at_the_public_url_the_operator_gives() {
+    let fixture = Fixture::new("public-url");
+    let state = fixture
+        .state(Limits::DEFAULT)
+        .with_public_url(Some("https://geo.example.com/og/".to_string()));
+    let router = build_router(state, None, None);
+    let reply = send(
+        &router,
+        Request::post("/compat/precisely/v2/files/upload-url")
+            .header("x-forwarded-host", "evil.example")
+            .header(header::HOST, "10.0.0.7:8080")
+            .body(Body::from(r#"{"fileName": "test"}"#))
+            .expect("request"),
+    )
+    .await;
+    let body = reply.json();
+    let file_id = body["fileId"].as_str().expect("fileId");
+    assert_eq!(
+        body["url"],
+        format!("https://geo.example.com/og/compat/precisely/v2/files/{file_id}/content")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bulk_job_runs_on_og_jobs_and_downloads_as_precisely_csv() {
     let fixture = Fixture::new("bulk");
@@ -1107,11 +1131,13 @@ async fn a_bulk_job_runs_on_og_jobs_and_downloads_as_precisely_csv() {
     .await;
     let body = reply.json();
     let file_id = body["fileId"].as_str().expect("fileId");
+    // A forwarded host is a header any client can send, so the URL takes
+    // the host the client connected with.
     assert_eq!(
         body,
         json!({
             "fileId": file_id,
-            "url": format!("https://og.example.com/compat/precisely/v2/files/{file_id}/content"),
+            "url": format!("http://10.0.0.7:8080/compat/precisely/v2/files/{file_id}/content"),
             "message": "This upload URL will be valid until the file expires.",
         })
     );

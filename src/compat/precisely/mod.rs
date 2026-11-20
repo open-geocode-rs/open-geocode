@@ -384,22 +384,10 @@ async fn read_json<T: DeserializeOwned>(
     })
 }
 
-/// `scheme://host` the client reached og by, so a URL handed back for it
-/// to call works through the proxy in front of og too.
-fn base_url(headers: &HeaderMap) -> String {
-    let forwarded = |name: &str| {
-        super::header(headers, name)
-            .and_then(|value| value.split(',').next())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    };
-    let scheme = forwarded("x-forwarded-proto")
-        .filter(|scheme| matches!(*scheme, "http" | "https"))
-        .unwrap_or("http");
-    let host = forwarded("x-forwarded-host")
-        .or_else(|| super::header(headers, "host"))
-        .unwrap_or("localhost");
-    format!("{scheme}://{host}/compat/precisely")
+/// Where a URL handed back for the client to call starts (see
+/// [`AppState::origin`]).
+fn base_url(state: &AppState, headers: &HeaderMap) -> String {
+    format!("{}/compat/precisely", state.origin(headers))
 }
 
 /// A body fed from a blocking writer through `chunks`; an `Err` ends it
