@@ -208,6 +208,11 @@
             "description": "POI category, such as `amenity:cafe`. Present only on POIs.",
             "type": "string"
           },
+          "code": {
+            "description": "ISO code of a result that is an area: on a country its ISO 3166-1\nalpha-2 code, on an area below it its ISO 3166-2 code, as\n`context` gives them. Absent on any other result, and on an area\nthe source data gives no code.",
+            "example": "MC",
+            "type": "string"
+          },
           "contact": {
             "$ref": "#/components/schemas/Contact",
             "description": "How to reach a place: its phone number, website and email, each as\nits source writes it. og rewrites none and does not check that one\nstill answers. Present only on POIs that state at least one."

@@ -1000,6 +1000,7 @@ async fn search_box_errors_are_mapbox_errors() {
 fn common(layer: Layer, name: &str, label: &str, unit: Option<&str>) -> Common {
     Common {
         id: "osm:node:1".to_string(),
+        code: None,
         layer,
         accuracy: Accuracy::Rooftop,
         name: name.to_string(),
