@@ -197,6 +197,11 @@ impl Outcome {
             .take(max)
             .map(|feature| feature.candidate(product))
             .collect::<Vec<_>>();
+        Self::answered(address_id, results)
+    }
+
+    /// An item answered with these candidates, `ZERO_RESULTS` when none.
+    fn answered(address_id: Option<String>, results: Vec<Candidate>) -> Self {
         let status = if results.is_empty() {
             "ZERO_RESULTS"
         } else {
@@ -418,7 +423,12 @@ pub(super) async fn reverse(
                         })
                     })
                     .collect::<Vec<_>>();
-                Outcome::found(location.address_id, &features, max, Product::Geocode)
+                let results = features
+                    .iter()
+                    .take(max)
+                    .map(Feature::reverse_candidate)
+                    .collect();
+                Outcome::answered(location.address_id, results)
             }
             Err(problem) => Outcome::refused(location.address_id, problem, None),
         });
@@ -490,8 +500,19 @@ struct Predictions {
 #[derive(Debug, Serialize)]
 struct Prediction {
     prediction: String,
+    /// How far the prediction is from `originXY`, when the request gives it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    distance: Option<Metres>,
     #[serde(flatten)]
     candidate: Candidate,
+}
+
+/// Precisely's `Distance` in metres, the unit og measures in.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Metres {
+    value: f64,
+    distance_unit: &'static str,
 }
 
 pub(super) async fn autocomplete(
@@ -499,13 +520,22 @@ pub(super) async fn autocomplete(
     request: Request,
 ) -> Result<Json<AutocompleteResponse>, VendorError> {
     let body = read_json::<AutocompleteRequest>(&state, request, "INVALID_REQUEST").await?;
+    complete(&state, body).await
+}
+
+async fn complete(
+    state: &AppState,
+    body: AutocompleteRequest,
+) -> Result<Json<AutocompleteResponse>, VendorError> {
     let max = body.preferences.max_results()?;
+    let focus = body.preferences.origin()?;
     let address = body.address;
     let args = Args::new()
         .set("q", address.text())
         .set("limit", max.to_string())
-        .maybe("country", address.country().map(country_code));
-    let collection = native::autocomplete(&state, args)
+        .maybe("country", address.country().map(country_code))
+        .maybe("focus", focus.map(|[lon, lat]| format!("{lon},{lat}")));
+    let collection = native::autocomplete(state, args)
         .await
         .map_err(|problem| Failure::of(&problem, address.country()).into_error(problem))?;
     let features = collection
@@ -517,6 +547,10 @@ pub(super) async fn autocomplete(
         .iter()
         .map(|feature| Prediction {
             prediction: feature.label().to_string(),
+            distance: feature.distance_m().map(|value| Metres {
+                value,
+                distance_unit: "METER",
+            }),
             candidate: feature.candidate(Product::Geocode),
         })
         .collect::<Vec<_>>();

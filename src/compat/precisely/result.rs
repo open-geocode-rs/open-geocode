@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::match_code::{self, Holds, MatchCode};
+use super::match_code::{Holds, MatchCode};
 use crate::{
     api::{self, Accuracy, PartMatch, QueryMatch},
     compat::{encode_parts, iso},
@@ -44,6 +44,9 @@ struct Properties {
     accuracy: Accuracy,
     name: String,
     label: String,
+    /// The ISO code of an area result itself, which its `context` does not
+    /// name.
+    code: Option<String>,
     #[serde(default)]
     address: Address,
     #[serde(default)]
@@ -89,6 +92,22 @@ struct Area {
     code: Option<String>,
 }
 
+/// An area the result lies in or is: its name and ISO code.
+#[derive(Debug, Clone, Copy)]
+struct AreaRef<'a> {
+    name: &'a str,
+    code: Option<&'a str>,
+}
+
+impl<'a> From<&'a Area> for AreaRef<'a> {
+    fn from(area: &'a Area) -> Self {
+        Self {
+            name: &area.name,
+            code: area.code.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Source {
     dataset: String,
@@ -118,6 +137,7 @@ impl Feature {
                 accuracy: common.accuracy,
                 name: common.name.clone(),
                 label: common.label.clone(),
+                code: common.code.clone(),
                 address: Address {
                     housenumber: address.housenumber.clone(),
                     unit: address.unit.clone(),
@@ -349,12 +369,66 @@ impl Feature {
                 .is_some_and(|rest| rest.starts_with(':'))
     }
 
-    /// The ISO 3166-1 alpha-2 code of the country it lies in.
-    pub(super) fn country_code(&self) -> Option<&str> {
-        self.properties.context.country.as_ref()?.code.as_deref()
+    /// The result itself as an area of `layer`, when it is one. An area's
+    /// `context` holds only the areas around it.
+    fn own(&self, layer: Layer) -> Option<AreaRef<'_>> {
+        let properties = &self.properties;
+        (properties.layer == layer).then(|| AreaRef {
+            name: &properties.name,
+            code: properties.code.as_deref(),
+        })
     }
 
-    /// Metres from the point a reverse geocode asked about.
+    /// The region the result lies in, or is.
+    fn region(&self) -> Option<AreaRef<'_>> {
+        self.properties
+            .context
+            .region
+            .as_ref()
+            .map(AreaRef::from)
+            .or_else(|| self.own(Layer::Region))
+    }
+
+    /// The country the result lies in, or is.
+    fn country(&self) -> Option<AreaRef<'_>> {
+        self.properties
+            .context
+            .country
+            .as_ref()
+            .map(AreaRef::from)
+            .or_else(|| self.own(Layer::Country))
+    }
+
+    /// The ISO 3166-1 alpha-2 code of the country it lies in or is. A
+    /// region's ISO 3166-2 code starts with it, so a region that names no
+    /// country still gives it.
+    pub(super) fn country_code(&self) -> Option<&str> {
+        self.country().and_then(|country| country.code).or_else(|| {
+            self.region()
+                .and_then(|region| region.code)
+                .and_then(|code| code.split_once('-'))
+                .map(|(country, _)| country)
+        })
+    }
+
+    /// A reverse geocode candidate. It carries how far the result is from
+    /// the asked point in the custom fields Precisely writes it to. An area
+    /// holds the point, so it has none.
+    pub(super) fn reverse_candidate(&self) -> Candidate {
+        let mut candidate = self.candidate(Product::Geocode);
+        if let Some(distance_m) = self.properties.distance_m {
+            candidate
+                .custom_fields
+                .insert(REVERSE_DISTANCE, distance_m.to_string());
+            candidate
+                .custom_fields
+                .insert(REVERSE_DISTANCE_UNIT, "METERS".to_string());
+        }
+        candidate
+    }
+
+    /// Metres from the point a reverse geocode, or an autocomplete with
+    /// `originXY`, measured from.
     pub(super) const fn distance_m(&self) -> Option<f64> {
         self.properties.distance_m
     }
@@ -384,23 +458,25 @@ impl Feature {
         // abbreviation (`NJ`); the area containing it has the full name.
         // The region's code within its country (`ON` of `CA-ON`) is its short
         // name when og knows it.
-        let region_code = context
-            .region
-            .as_ref()
-            .and_then(|region| region.code.as_deref()?.split_once('-'))
+        let region = self.region();
+        let region_code = region
+            .and_then(|region| region.code?.split_once('-'))
             .map(|(_, own)| own.to_string());
-        let admin1 = match (area(&context.region), address.region.clone()) {
+        let admin1 = match (
+            region.map(|region| region.name.to_string()),
+            address.region.clone(),
+        ) {
             (Some(long_name), stated) => Some(AdminField {
                 short_name: region_code.or(stated).filter(|short| *short != long_name),
                 long_name,
             }),
             (None, stated) => admin(stated),
         };
-        let code = context
-            .country
-            .as_ref()
-            .and_then(|country| country.code.clone());
-        let country_name = area(&context.country).or_else(|| address.country.clone());
+        let code = self.country_code().map(str::to_string);
+        let country_name = self
+            .country()
+            .map(|country| country.name.to_string())
+            .or_else(|| address.country.clone());
         let country = (country_name.is_some() || code.is_some()).then(|| CountryField {
             name: country_name,
             iso_alpha3_code: code.as_deref().and_then(iso::alpha3),
@@ -428,12 +504,9 @@ impl Feature {
         };
         let judged = properties.matched.unwrap_or_default();
         let mut candidate = Candidate {
-            // A calibrated Pack's probability, else og's judgement of the
-            // stated parts (see [`match_code::score`]).
             score: properties
                 .confidence
-                .map(|confidence| (confidence * 100.0).round().clamp(0.0, 100.0) as u8)
-                .or_else(|| match_code::score(judged)),
+                .map(|confidence| (confidence * 100.0).round().clamp(0.0, 100.0) as u8),
             address: ResponseAddress {
                 formatted_address: Some(properties.label.clone()),
                 formatted_street_address: street_line,
@@ -553,6 +626,11 @@ fn describe(judged: QueryMatch, holds: &Holds) -> Vec<MatchDescription> {
     })
     .collect()
 }
+
+/// The keys a reverse geocode result's distance from the asked point is
+/// under.
+pub(super) const REVERSE_DISTANCE: &str = "REVERSE_GEOCODE_DISTANCE";
+pub(super) const REVERSE_DISTANCE_UNIT: &str = "REVERSE_GEOCODE_DISTANCE_UNIT";
 
 /// The keys a verify result's Global Match Codes are under.
 pub(super) const SIMPLE_MATCH_CODE: &str = "SIMPLE_MATCH_CODE";

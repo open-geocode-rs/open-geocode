@@ -26,23 +26,6 @@ fn judged_parts(judged: QueryMatch) -> impl Iterator<Item = PartMatch> {
     .flatten()
 }
 
-/// A result's `score`, 0 to 100, from og's own judgement of the parts the
-/// request stated: each matched part earns two, each partial one, each
-/// unmatched none, out of two a part. `None` when og judged no part, as of
-/// a record looked up by its key, since nothing then says how well it
-/// answers.
-pub(super) fn score(judged: QueryMatch) -> Option<u8> {
-    let (earned, stated) = judged_parts(judged).fold((0u32, 0u32), |(earned, stated), part| {
-        let points = match part {
-            PartMatch::Matched => 2,
-            PartMatch::Partial => 1,
-            PartMatch::Unmatched => 0,
-        };
-        (earned + points, stated + 1)
-    });
-    (stated > 0).then(|| u8::try_from((100 * earned + stated) / (2 * stated)).unwrap_or(100))
-}
-
 /// Every component the extended code may carry, in the order the code
 /// writes them, with the label Precisely gives each.
 const COMPONENTS: [(char, &str); 19] = [
@@ -415,7 +398,7 @@ mod tests {
             country: true,
             ..Holds::default()
         };
-        MatchCode::derive(judged, holds, score(judged)).expect("a verified address")
+        MatchCode::derive(judged, holds, Some(80)).expect("a verified address")
     }
 
     #[test]
@@ -469,10 +452,17 @@ mod tests {
             street: Some(PartMatch::Partial),
             ..QueryMatch::default()
         };
-        assert_eq!(score(judged), Some(75));
-        let code = MatchCode::derive(judged, Holds::default(), score(judged)).expect("verified");
-        assert!(code.simple().ends_with("-4"), "{}", code.simple());
-        assert_eq!(score(QueryMatch::default()), None);
+        let confidence = |score: Option<u8>| {
+            let code = MatchCode::derive(judged, Holds::default(), score).expect("verified");
+            code.simple()
+                .rsplit('-')
+                .next()
+                .expect("a confidence")
+                .to_string()
+        };
+        assert_eq!(confidence(Some(75)), "4");
+        assert_eq!(confidence(Some(100)), "5");
+        assert_eq!(confidence(Some(9)), "0");
     }
 
     #[test]

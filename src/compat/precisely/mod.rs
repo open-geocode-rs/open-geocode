@@ -261,6 +261,11 @@ fn given(value: Option<&str>) -> Option<&str> {
 struct Preferences {
     max_results: Option<i64>,
     distance: Option<Distance>,
+    /// The point to measure from, `[x, y]` in the client's coordinate
+    /// system, which og takes as longitude and latitude. Requests send `[]`
+    /// for none.
+    #[serde(rename = "originXY", default)]
+    origin_xy: Vec<f64>,
 }
 
 /// Precisely's `Distance`.
@@ -310,6 +315,22 @@ impl Preferences {
         }
         let unit = distance.distance_unit.unwrap_or(DistanceUnit::Meter);
         Ok(Some(distance.value * unit.metres()))
+    }
+
+    /// The `originXY` point as longitude and latitude, when the request
+    /// gives one. A point og cannot place is refused, not dropped.
+    fn origin(&self) -> Result<Option<[f64; 2]>, VendorError> {
+        match self.origin_xy[..] {
+            [] => Ok(None),
+            [lon, lat] if (-180.0..=180.0).contains(&lon) && (-90.0..=90.0).contains(&lat) => {
+                Ok(Some([lon, lat]))
+            }
+            _ => Err(error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                "Invalid value for originXY (DIS-LI-1018)",
+            )),
+        }
     }
 
     fn max_results(&self) -> Result<usize, VendorError> {
