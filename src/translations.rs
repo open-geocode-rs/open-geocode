@@ -616,7 +616,6 @@ impl Translations {
         found.map(|(translated, _)| translated)
     }
 
-
     fn table(&self, language: &str) -> Option<&Table> {
         let index = self
             .tables
