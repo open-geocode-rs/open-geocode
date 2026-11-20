@@ -336,7 +336,7 @@ pub(super) fn date_time(seconds: u64) -> String {
     let days = seconds / 86_400;
     let rest = seconds % 86_400;
     // Civil date of a day count since 1970-01-01, in the proleptic
-    // Gregorian calendar (Howard Hinnant's `civil_from_days`).
+    // Gregorian calendar.
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let day_of_era = z.rem_euclid(146_097);
@@ -510,11 +510,6 @@ impl Links {
         Self {
             jobs: format!("{origin}{prefix}/v7/batch/jobs"),
         }
-    }
-
-    /// The root the Batch paths hang off, `.../v7`.
-    pub(super) fn root(&self) -> &str {
-        self.jobs.strip_suffix("/batch/jobs").unwrap_or(&self.jobs)
     }
 
     fn job(&self, id: &str) -> String {
@@ -1990,7 +1985,7 @@ fn cell_of(item: &Item, column: &str) -> String {
     match column {
         "title" => item.title.clone(),
         "id" => item.id.clone(),
-        "resultType" => item.result_type.unwrap_or_default().to_string(),
+        "resultType" => item.result_type.to_string(),
         "houseNumberType" => item.house_number_type.unwrap_or_default().to_string(),
         "localityType" => item.locality_type.unwrap_or_default().to_string(),
         "administrativeAreaType" => item
@@ -2020,13 +2015,49 @@ fn cell_of(item: &Item, column: &str) -> String {
             .distance
             .map(|distance| distance.to_string())
             .unwrap_or_default(),
+        "access" => item
+            .access
+            .iter()
+            .map(|point| format!("({},{})", point.lat, point.lng))
+            .collect::<Vec<_>>()
+            .join(","),
+        "accessLat" => joined(item.access.iter().map(|point| point.lat)),
+        "accessLng" => joined(item.access.iter().map(|point| point.lng)),
+        "mapView" => item
+            .map_view
+            .map(|view| {
+                format!(
+                    "({},{});({},{})",
+                    view.south, view.west, view.north, view.east
+                )
+            })
+            .unwrap_or_default(),
+        "mapViewWest" => number(item.map_view.map(|view| view.west)),
+        "mapViewSouth" => number(item.map_view.map(|view| view.south)),
+        "mapViewEast" => number(item.map_view.map(|view| view.east)),
+        "mapViewNorth" => number(item.map_view.map(|view| view.north)),
+        "categories" => item
+            .categories
+            .iter()
+            .map(|category| category.id)
+            .collect::<Vec<_>>()
+            .join(","),
         "scoringQueryScore" => item
             .scoring
+            .as_ref()
             .map(|scoring| scoring.query_score.to_string())
             .unwrap_or_default(),
         // A column HERE has and og never fills.
         _ => String::new(),
     }
+}
+
+/// An array cell, its values joined by commas as HERE renders one.
+fn joined(values: impl Iterator<Item = f64>) -> String {
+    values
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// A cell as written, quoted when it holds the delimiter, a quote or a line
