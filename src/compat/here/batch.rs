@@ -512,11 +512,6 @@ impl Links {
         }
     }
 
-    /// The root the Batch paths hang off, `.../v7`.
-    pub(super) fn root(&self) -> &str {
-        self.jobs.strip_suffix("/batch/jobs").unwrap_or(&self.jobs)
-    }
-
     fn job(&self, id: &str) -> String {
         format!("{}/{id}", self.jobs)
     }

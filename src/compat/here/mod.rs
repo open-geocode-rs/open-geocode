@@ -13,9 +13,7 @@ mod category;
 mod hours;
 mod item;
 mod notify;
-mod openapi;
 mod search;
-mod signals;
 #[cfg(test)]
 mod tests;
 
@@ -56,7 +54,6 @@ pub(crate) fn router() -> Router<AppState> {
             "/v1/browse",
             search_route(get(search::browse).post(search::browse)),
         )
-        .route("/v1/signals", search_route(post(signals::signals)))
         .route(
             "/v7/batch/jobs",
             batch_route(
@@ -91,7 +88,6 @@ pub(crate) fn router() -> Router<AppState> {
             "/v7/batch/notifications/{id}/test",
             batch_route(get(notify::test)),
         )
-        .route("/v7/openapi", batch_route(get(openapi::openapi)))
         .route("/v7/version", batch_route(get(batch::version)))
         .route("/v7/health", batch_route(get(batch::health)))
         .fallback(not_found)

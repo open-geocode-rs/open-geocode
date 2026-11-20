@@ -293,11 +293,6 @@ impl Reply {
         })
     }
 
-    /// The body as JSON, or `null` for one that is empty or not JSON.
-    fn json_or_null(&self) -> Value {
-        serde_json::from_slice(&self.body).unwrap_or(Value::Null)
-    }
-
     pub(super) fn text(&self) -> String {
         String::from_utf8(self.body.clone()).expect("UTF-8")
     }
@@ -1153,34 +1148,15 @@ async fn errors_take_here_shapes() {
     assert_eq!(reply.json()["title"], "Illegal input for parameter 'q'");
     assert_eq!(reply.json()["requestId"], "rid-1");
 
-    let signal = "version=1&action=here:gs:action:view&correlationId=c&resourceId=r&rank=0";
+    // og keeps no store for signals, so the route is not served.
     let reply = send(
         &router,
         "POST",
         "/compat/here/v1/signals",
-        Some(("text/plain", signal)),
+        Some(("text/plain", "version=1&action=here:gs:action:view")),
     )
     .await;
-    assert_eq!(reply.status, StatusCode::NO_CONTENT);
-    assert!(reply.body.is_empty());
-    let reply = send(
-        &router,
-        "POST",
-        "/compat/here/v1/signals",
-        Some(("text/plain", &signal.replace("version=1", "version=9"))),
-    )
-    .await;
-    assert_eq!(
-        reply.json(),
-        here_error(
-            400,
-            "Illegal input for parameter 'version'",
-            Some("Actual parameter value: '9'"),
-            Some("Unsupported value: '9'. Supported values: '1'"),
-        )
-    );
-    let reply = get(&router, "/compat/here/v1/signals").await;
-    assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
     let reply = get(&router, "/compat/here/v1/nowhere").await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
     assert_eq!(
@@ -2238,74 +2214,6 @@ async fn notifications_are_kept_and_called_when_a_job_ends() {
     );
     let reply = send(&router, "PATCH", &path, None).await;
     assert_eq!(reply.json()["code"], "E6004040");
-}
-
-#[tokio::test]
-async fn openapi_lists_the_batch_routes_og_serves() {
-    let pack = pack("batch-openapi");
-    let router = pack.router();
-    let reply = get(&router, "/compat/here/v7/openapi").await;
-    assert_eq!(reply.status, StatusCode::OK);
-    assert_eq!(reply.header("content-type"), Some("application/json"));
-    let document = reply.json();
-    assert_eq!(document["openapi"], "3.1.0");
-    assert_eq!(
-        document["servers"],
-        json!([{"url": "http://og.test/compat/here/v7"}])
-    );
-    let paths = document["paths"]
-        .as_object()
-        .expect("paths")
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(
-        paths,
-        [
-            "/batch/jobs",
-            "/batch/jobs/{jobId}",
-            "/batch/jobs/{jobId}/errors",
-            "/batch/jobs/{jobId}/results",
-            "/batch/jobs/{jobId}/start",
-            "/batch/jobs/{jobId}/stop",
-            "/batch/notifications",
-            "/batch/notifications/{notificationId}",
-            "/batch/notifications/{notificationId}/test",
-            "/health",
-            "/openapi",
-            "/version",
-        ]
-    );
-    // Every path answers on this server, so none is listed that is not.
-    for path in &paths {
-        let concrete = path
-            .replace("{jobId}", "JOB-3fa85f64-5717-4562-b3fc-2c963f66afa6")
-            .replace(
-                "{notificationId}",
-                "NOTIFICATION-3fa85f64-5717-4562-b3fc-2c963f66afa6",
-            );
-        for method in document["paths"][path].as_object().expect("methods").keys() {
-            let reply = send(
-                &router,
-                &method.to_ascii_uppercase(),
-                &format!("/compat/here/v7{concrete}"),
-                None,
-            )
-            .await;
-            assert_ne!(reply.json_or_null()["code"], "E6004040", "{method} {path}");
-        }
-    }
-
-    let yaml = send_with(
-        &router,
-        "GET",
-        "/compat/here/v7/openapi",
-        &[("accept", "text/yaml")],
-        None,
-    )
-    .await;
-    assert_eq!(yaml.header("content-type"), Some("text/yaml"));
-    assert_eq!(yaml.json(), document);
 }
 
 #[tokio::test]
