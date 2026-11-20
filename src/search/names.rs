@@ -509,6 +509,28 @@ impl TextSearcher {
         Ok(false)
     }
 
+    /// Whether `key` holds every word of a name of `hit`, bar a street
+    /// type on a street.
+    fn writes_a_name(&self, key: &str, hit: &TextSearchHit) -> Result<bool> {
+        let dictionaries = self.tagger.dictionaries();
+        let street = Kind::of(&hit.record.layer) == Some(Kind::Street);
+        let written = key.split_whitespace().collect::<HashSet<_>>();
+        for name in self.pack.records().names(hit.record_id)? {
+            let Some(name) = search_key(&name) else {
+                continue;
+            };
+            if name.split_whitespace().all(|word| {
+                written.contains(word)
+                    || (street
+                        && dictionaries.is_street_type(word)
+                        && !dictionaries.is_direction(word))
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether the query writes a name of `record` as it is written, words
     /// whole, accents and all.
     fn written_as(&self, order: &NameOrder, record: RecordId) -> Result<bool> {
@@ -549,6 +571,7 @@ impl TextSearcher {
         hits: &mut Vec<TextSearchHit>,
     ) -> Result<()> {
         let sought = self.sought(order, hits)?;
+        let searched = hits.len();
         for hit in &order.found {
             if !hits.iter().any(|held| held.record_id == hit.record_id) {
                 hits.push(hit.clone());
@@ -563,15 +586,35 @@ impl TextSearcher {
                 hit.matched = self.judged_by_names(order, sought, hit)?;
             }
         }
-        let mut keyed = Vec::with_capacity(hits.len());
-        for (at, hit) in hits.drain(..).enumerate() {
+        // A query of one part is a bare name, and a bare name answers as it
+        // did: what the query names whole first, the rest in the search's
+        // order, then the records only the rule found, by the keys.
+        // "Providence" keeps East Providence above Providence Street; "USA",
+        // which the search answers with nothing, the country.
+        let first = match order.parts.len() {
+            1 => {
+                let part = &order.parts[sought];
+                let mut whole = Vec::with_capacity(searched);
+                for hit in &hits[..searched] {
+                    let naming = self.naming(&part.key, hit.record_id, &hit.record.layer)?;
+                    whole.push(naming > Naming::Whole);
+                }
+                let mut searched_hits = hits.drain(..searched).zip(whole).collect::<Vec<_>>();
+                searched_hits.sort_by_key(|(_, rest)| *rest);
+                hits.splice(0..0, searched_hits.into_iter().map(|(hit, _)| hit));
+                searched
+            }
+            _ => 0,
+        };
+        let mut keyed = Vec::with_capacity(hits.len() - first);
+        for (at, hit) in hits.drain(first..).enumerate() {
             keyed.push((self.keys(order, sought, &hit)?, at, hit));
         }
         keyed.sort_by_key(|(keys, at, _)| (order_key(*keys), *at));
         // The order the sought part's words give asked alone decides only
         // between records the other keys tie, so it is asked only when two
-        // the caller is shown, or the last shown and the next, do. A query of one part is its own bare
-        // order, the order it came in. Asked once, never again from within.
+        // the caller is shown, or the last shown and the next, do. Asked
+        // once, never again from within.
         let shown = (effective_limit(options.limit) + 1).min(keyed.len());
         let tied = keyed[..shown]
             .windows(2)
@@ -639,7 +682,14 @@ impl TextSearcher {
         for (at, part) in order.parts.iter().enumerate() {
             let (how, layer) = if at == sought {
                 let how = match self.naming(&part.key, hit.record_id, &hit.record.layer)? {
-                    Naming::AsWritten | Naming::Whole | Naming::BarType => PartMatch::Matched,
+                    Naming::AsWritten | Naming::Whole => PartMatch::Matched,
+                    // Matched when the part writes every word of a name, bar
+                    // a street type: "Town of Bristol" is Bristol, while
+                    // "Providence" leaves out a word of Providence County.
+                    Naming::BarType => match self.writes_a_name(&part.key, hit)? {
+                        true => PartMatch::Matched,
+                        false => PartMatch::Partial,
+                    },
                     Naming::Misspelt | Naming::InPart => PartMatch::Partial,
                     Naming::None => PartMatch::Unmatched,
                 };
@@ -950,6 +1000,9 @@ mod tests {
         street(111, "Quonset Point Road", 1.4, 41.8);
         // A street a country's code names bar its type.
         street(112, "USA Avenue", 5.4, 41.8);
+        // A street a town's name names bar its type, in another town.
+        street(113, "Providence Street", 7.4, 41.8);
+        street(114, "Rue de la Grande Vingtaine", 1.4, 41.9);
         // Houses of Hope Street, in Bristol's postcode.
         for (at, number) in ["1", "2", "3", "4", "5"].into_iter().enumerate() {
             nodes.push(node(
@@ -990,6 +1043,15 @@ mod tests {
             41.3,
             1.6,
             &[("place", "hamlet"), ("name", "Ca' Baldino")],
+        ));
+        nodes.push(node(
+            904,
+            41.85,
+            1.5,
+            &[
+                ("place", "village"),
+                ("name", "La Vingtaine de St. Nicolas"),
+            ],
         ));
         vec![nodes, ways, relations]
     }
@@ -1151,13 +1213,87 @@ mod tests {
 
     #[test]
     fn a_country_answers_to_its_codes_and_initials() {
-        for query in ["US", "USA", "U.S.A."] {
+        for query in ["US", "U.S.A."] {
             answers(query, "osm:relation:1");
         }
+        // Alone, "USA" answers as the search does, USA Avenue, and the rule
+        // adds the country after it, named whole by its code.
+        let hits = ask(searcher(), "USA");
+        assert_eq!(hits[0].record.id, "osm:way:112");
+        let country = hits
+            .iter()
+            .find(|hit| hit.record.id == "osm:relation:1")
+            .expect("the country");
+        assert_eq!(
+            country.matched.country,
+            Some(crate::api::PartMatch::Matched)
+        );
         answers("Exeter, R.I.", "osm:relation:11");
         answers("Exeter, R I", "osm:relation:11");
         answers("Exeter, U.S.A.", "osm:relation:11");
         answers("Exeter, RI, USA", "osm:relation:11");
+    }
+
+    /// A bare name answers as it did: what it names whole first, then a
+    /// town holding the word before a street named for it bar its type.
+    #[test]
+    fn a_bare_name_keeps_the_order_the_search_gives() {
+        let ids = |query: &str| {
+            ask(searcher(), query)
+                .into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+        let bare = ids("Providence");
+        let at = |id: &str| {
+            bare.iter()
+                .position(|held| held == id)
+                .unwrap_or(usize::MAX)
+        };
+        assert_eq!(bare[0], "osm:relation:14", "{bare:?}");
+        answers("La Vingtaine de St. Nicolas", "osm:node:904");
+        assert!(at("osm:relation:15") < at("osm:way:113"), "{bare:?}");
+    }
+
+    #[test]
+    fn a_bare_name_lifts_a_whole_match_and_keeps_the_rest_in_order() {
+        use crate::parse::types::{Label, Tagged};
+        let searcher = searcher();
+        let options = TextSearchOptions {
+            query: "Providence".to_string(),
+            limit: 5,
+            layer: None,
+            countries: Vec::new(),
+            focus: None,
+            bbox: None,
+        };
+        let pieces = [Tagged {
+            token: "providence".to_string(),
+            label: Label::Locality,
+        }];
+        let filters = super::Filters::new(None, &[], None);
+        let order = searcher
+            .name_order(&options.query, &pieces, &filters, None)
+            .expect("order")
+            .expect("parts name something");
+        let hit = |id: &str| {
+            let record = (0..searcher.pack.records().record_count())
+                .find(|record| searcher.pack.record_summary(*record).expect("summary").id == id)
+                .expect(id);
+            super::TextSearchHit::of_record(
+                record,
+                searcher.pack.record_summary(record).expect("summary"),
+            )
+        };
+        let mut hits = ["osm:way:113", "osm:relation:14", "osm:relation:15"]
+            .map(hit)
+            .to_vec();
+        searcher
+            .order_by_names(&order, &options, super::Depth::Query, &mut hits)
+            .expect("order by name");
+        assert_eq!(hits[0].record.id, "osm:relation:14");
+        assert_eq!(hits[1].record.id, "osm:way:113");
+        assert_eq!(hits[2].record.id, "osm:relation:15");
     }
 
     #[test]
@@ -1237,6 +1373,17 @@ mod tests {
         let initials = matched("Exeter, R.I.");
         assert_eq!(initials.region, Some(PartMatch::Matched));
         assert_eq!(initials.unit, None);
+        // Every word of Bristol is written, but not "county" of Providence
+        // County.
+        assert_eq!(
+            matched("Town of Bristol, RI").locality,
+            Some(PartMatch::Matched)
+        );
+        let county = ask(searcher(), "Providence")
+            .into_iter()
+            .find(|hit| hit.record.id == "osm:relation:5")
+            .expect("the county");
+        assert_ne!(county.matched.locality, Some(PartMatch::Matched));
         let elsewhere = matched("Hope Street, Exeter");
         assert_eq!(elsewhere.street, Some(PartMatch::Matched));
         assert_eq!(elsewhere.locality, Some(PartMatch::Unmatched));
