@@ -347,6 +347,29 @@ async fn search_text_answers_an_address_before_the_places_at_it() {
 }
 
 #[tokio::test]
+async fn search_text_answers_a_town_and_a_district_by_their_names() {
+    let fixture = fixture();
+    for (query, types) in [
+        ("Toronto", json!(["locality", "political"])),
+        ("York", json!(["political"])),
+    ] {
+        let reply = post_with(
+            &fixture.router,
+            SEARCH_TEXT,
+            &[("X-Goog-FieldMask", "places.displayName,places.types")],
+            json!({"textQuery": query}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.body["places"][0],
+            json!({"displayName": {"text": query}, "types": types}),
+            "{query}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn search_text_reads_the_mask_from_header_then_dollar_fields_then_fields() {
     let fixture = fixture();
     let router = &fixture.router;
