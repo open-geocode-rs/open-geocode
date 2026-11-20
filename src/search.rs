@@ -4885,8 +4885,8 @@ impl TextSearcher {
                 Some(standing) => agreement(standing.map(Standing::agrees)),
             };
             if let Some(stated) = &stated {
-                hit.matched =
-                    self.matched(stated, ranking, places, &hit, locality, postcode, session)?;
+                let stands = Stands { locality, postcode };
+                hit.matched = self.matched(stated, ranking, places, &hit, stands, session)?;
             }
             let label = label_words(&hit.record);
             let postcode = postcode.map(Standing::agrees);
@@ -4962,24 +4962,22 @@ impl TextSearcher {
     }
 
     /// How each address part a plan states matched `hit`, from what the
-    /// search that judged it knows. `locality` and `postcode` are where it
-    /// stands by the plan's localities (`None` when it states none,
-    /// `Some(None)` when nothing says) and by its postcode, `places` the
-    /// countries and regions the plan names. Its subject is judged on the
-    /// hit's own words (see [`subject_match`]), a part of the context the
-    /// parser corrected is at best partial, and a region the Pack does not
-    /// list by its key is judged by the names of the hit's areas.
-    #[allow(clippy::too_many_arguments)]
+    /// search that judged it knows: where it `stands` by the plan's
+    /// localities and postcode, and `places` the countries and regions the
+    /// plan names. Its subject is judged on the hit's own words (see
+    /// [`subject_match`]), a part of the context the parser corrected is at
+    /// best partial, and a region the Pack does not list by its key is
+    /// judged by the names of the hit's areas.
     fn matched(
         &self,
         stated: &StatedParts<'_>,
         ranking: &Ranking,
         places: &StatedPlaces,
         hit: &TextSearchHit,
-        locality: Option<Option<Standing>>,
-        postcode: Option<Standing>,
+        stands: Stands,
         session: &Session,
     ) -> Result<QueryMatch> {
+        let Stands { locality, postcode } = stands;
         let plan = stated.plan;
         let states = |label: Label| plan.context.iter().any(|part| part.label == label);
         let (states_region, states_country) = (states(Label::Region), states(Label::Country));
@@ -7104,7 +7102,14 @@ impl TextSearcher {
     }
 }
 
-/// A stated house number beside one no record states.
+/// Where a hit stands by what a plan states: by its localities (`None`
+/// when it states none, `Some(None)` when nothing says) and by its postcode.
+#[derive(Debug, Clone, Copy)]
+struct Stands {
+    locality: Option<Option<Standing>>,
+    postcode: Option<Standing>,
+}
+
 /// How a hit relates to a stated area or postcode. The glossary's
 /// agreement, with what agrees told apart. Best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

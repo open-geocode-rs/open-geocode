@@ -631,20 +631,14 @@ struct FormattableText {
     matches: Vec<StringRange>,
 }
 
-/// Offsets in Unicode scalar values, end exclusive. A start of 0 is left
-/// out, as proto3 JSON leaves out a default.
+/// Offsets in Unicode scalar values, end exclusive. A start of 0 is none,
+/// as proto3 JSON leaves out a default.
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StringRange {
-    #[serde(skip_serializing_if = "is_zero")]
-    start_offset: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_offset: Option<std::num::NonZeroUsize>,
     end_offset: usize,
-}
-
-// serde's `skip_serializing_if` passes a reference.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero(value: &usize) -> bool {
-    *value == 0
 }
 
 /// Where a circle restriction is, once og has searched its bounding box.
@@ -889,7 +883,7 @@ fn within(text: &str, highlights: &[(usize, usize)], from: usize) -> Formattable
                 last.end_offset = end;
             }
             _ => matches.push(StringRange {
-                start_offset: start,
+                start_offset: std::num::NonZeroUsize::new(start),
                 end_offset: end,
             }),
         }
