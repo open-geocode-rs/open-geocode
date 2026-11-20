@@ -7,27 +7,23 @@
 
 use std::{collections::BTreeMap, fmt::Write as _};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-/// og's judgement of one stated address part, as og's `match` writes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum Judged {
-    Matched,
-    Partial,
-    Unmatched,
-}
+use crate::api::{PartMatch, QueryMatch};
 
-/// og's `match`, how each part the query stated matched the result.
-#[derive(Debug, Default, Clone, Copy, Deserialize)]
-pub(super) struct QueryMatch {
-    pub(super) housenumber: Option<Judged>,
-    pub(super) street: Option<Judged>,
-    pub(super) unit: Option<Judged>,
-    pub(super) locality: Option<Judged>,
-    pub(super) region: Option<Judged>,
-    pub(super) postcode: Option<Judged>,
-    pub(super) country: Option<Judged>,
+/// The parts og judged of the parts a request stated.
+fn judged_parts(judged: QueryMatch) -> impl Iterator<Item = PartMatch> {
+    [
+        judged.housenumber,
+        judged.street,
+        judged.unit,
+        judged.locality,
+        judged.region,
+        judged.postcode,
+        judged.country,
+    ]
+    .into_iter()
+    .flatten()
 }
 
 /// Every component the extended code may carry, in the order the code
@@ -93,23 +89,24 @@ pub(super) struct MatchCode {
 
 impl MatchCode {
     /// The code for a result og judged against the stated parts, or `None`
-    /// when no stated part was verified. Precisely's `M` and `U` statuses
-    /// are not issued yet, so an unverified result has no code at all.
+    /// when no stated part was verified or one contradicts the result. A
+    /// result in another town than the one asked for is no verified
+    /// address, and Precisely's `M` and `U` statuses are not issued, so it
+    /// has no code at all.
     ///
     /// A stated part og matched exactly is verified without change, one it
-    /// accepted under another spelling is corrected, and one it could not
-    /// place is parsed but not identified. A part the request left out and
-    /// the result fills in is appended from og's data, which stands in for
-    /// the reference data the code speaks of.
-    pub(super) fn derive(
-        judged: QueryMatch,
-        holds: Holds,
-        og_confidence: Option<f64>,
-    ) -> Option<Self> {
-        let value = |stated: Option<Judged>, has: bool| match (stated, has) {
-            (Some(Judged::Matched), _) => VERIFIED,
-            (Some(Judged::Partial), _) => CORRECTED,
-            (Some(Judged::Unmatched), _) => NOT_IDENTIFIED,
+    /// accepted under another spelling is corrected. A part the request
+    /// left out and the result fills in is appended from og's data, which
+    /// stands in for the reference data the code speaks of. The confidence
+    /// is the result's `score` in fifths, none without one.
+    pub(super) fn derive(judged: QueryMatch, holds: Holds, score: Option<u8>) -> Option<Self> {
+        if judged_parts(judged).any(|part| part == PartMatch::Unmatched) {
+            return None;
+        }
+        let value = |stated: Option<PartMatch>, has: bool| match (stated, has) {
+            (Some(PartMatch::Matched), _) => VERIFIED,
+            (Some(PartMatch::Partial), _) => CORRECTED,
+            (Some(PartMatch::Unmatched), _) => NOT_IDENTIFIED,
             (None, true) => APPENDED,
             (None, false) => NOT_FOUND,
         };
@@ -126,7 +123,7 @@ impl MatchCode {
             ('C', value(judged.country, holds.country)),
         ]);
         let verified =
-            |part: Option<Judged>| matches!(part, Some(Judged::Matched | Judged::Partial));
+            |part: Option<PartMatch>| matches!(part, Some(PartMatch::Matched | PartMatch::Partial));
         let level = if verified(judged.housenumber) {
             4
         } else if verified(judged.street) {
@@ -138,33 +135,7 @@ impl MatchCode {
         } else {
             return None;
         };
-        let confidence = match og_confidence {
-            Some(confidence) => (confidence * 5.0).round().clamp(0.0, 5.0) as u8,
-            // An uncalibrated Pack has no probability, so the share of
-            // stated parts verified stands in for it.
-            None => {
-                let stated = [
-                    judged.housenumber,
-                    judged.street,
-                    judged.unit,
-                    judged.locality,
-                    judged.region,
-                    judged.postcode,
-                    judged.country,
-                ]
-                .into_iter()
-                .flatten()
-                .map(|part| match part {
-                    Judged::Matched => 2,
-                    Judged::Partial => 1,
-                    Judged::Unmatched => 0,
-                })
-                .collect::<Vec<u32>>();
-                let earned = stated.iter().sum::<u32>();
-                let possible = 2 * u32::try_from(stated.len()).unwrap_or(u32::MAX);
-                u8::try_from((5 * earned + possible / 2) / possible.max(1)).unwrap_or(5)
-            }
-        };
+        let confidence = score.map_or(0, |score| (score + 10) / 20);
         Some(Self {
             level,
             values,
@@ -413,9 +384,9 @@ mod tests {
 
     fn verified_street_address() -> MatchCode {
         let judged = QueryMatch {
-            housenumber: Some(Judged::Matched),
-            street: Some(Judged::Partial),
-            locality: Some(Judged::Matched),
+            housenumber: Some(PartMatch::Matched),
+            street: Some(PartMatch::Partial),
+            locality: Some(PartMatch::Matched),
             ..QueryMatch::default()
         };
         let holds = Holds {
@@ -427,14 +398,14 @@ mod tests {
             country: true,
             ..Holds::default()
         };
-        MatchCode::derive(judged, holds, Some(0.93)).expect("a verified address")
+        MatchCode::derive(judged, holds, Some(80)).expect("a verified address")
     }
 
     #[test]
     fn a_verified_address_writes_both_forms() {
         let code = verified_street_address();
-        assert_eq!(code.simple(), "V4-P4S3A0T4R6Z6C6-5");
-        assert_eq!(code.extended(), "V4-D0M0B0U0F0G0P4S3Q0X0A0T4E0R6W0Z6Y0C6-5");
+        assert_eq!(code.simple(), "V4-P4S3A0T4R6Z6C6-4");
+        assert_eq!(code.extended(), "V4-D0M0B0U0F0G0P4S3Q0X0A0T4E0R6W0Z6Y0C6-4");
     }
 
     #[test]
@@ -444,37 +415,54 @@ mod tests {
             MatchCode::derive(judged, holds, None).map(|code| code.simple()[..2].to_string())
         };
         let street = QueryMatch {
-            housenumber: Some(Judged::Unmatched),
-            street: Some(Judged::Matched),
+            street: Some(PartMatch::Matched),
             ..QueryMatch::default()
         };
         assert_eq!(level(street).as_deref(), Some("V3"));
         let postcode = QueryMatch {
-            postcode: Some(Judged::Partial),
+            postcode: Some(PartMatch::Partial),
             ..QueryMatch::default()
         };
         assert_eq!(level(postcode).as_deref(), Some("V2"));
         let town = QueryMatch {
-            locality: Some(Judged::Matched),
+            locality: Some(PartMatch::Matched),
             ..QueryMatch::default()
         };
         assert_eq!(level(town).as_deref(), Some("V1"));
         let nothing = QueryMatch {
-            street: Some(Judged::Unmatched),
+            street: Some(PartMatch::Unmatched),
             ..QueryMatch::default()
         };
         assert_eq!(level(nothing), None);
+        // The house in another town than the one asked for is no verified
+        // address, though its number and street match.
+        let elsewhere = QueryMatch {
+            housenumber: Some(PartMatch::Matched),
+            street: Some(PartMatch::Matched),
+            locality: Some(PartMatch::Unmatched),
+            ..QueryMatch::default()
+        };
+        assert_eq!(level(elsewhere), None);
     }
 
     #[test]
-    fn without_a_probability_the_share_verified_is_the_confidence() {
+    fn the_confidence_is_the_score_in_fifths() {
         let judged = QueryMatch {
-            housenumber: Some(Judged::Matched),
-            street: Some(Judged::Partial),
+            housenumber: Some(PartMatch::Matched),
+            street: Some(PartMatch::Partial),
             ..QueryMatch::default()
         };
-        let code = MatchCode::derive(judged, Holds::default(), None).expect("verified");
-        assert!(code.simple().ends_with("-4"), "{}", code.simple());
+        let confidence = |score: Option<u8>| {
+            let code = MatchCode::derive(judged, Holds::default(), score).expect("verified");
+            code.simple()
+                .rsplit('-')
+                .next()
+                .expect("a confidence")
+                .to_string()
+        };
+        assert_eq!(confidence(Some(75)), "4");
+        assert_eq!(confidence(Some(100)), "5");
+        assert_eq!(confidence(Some(9)), "0");
     }
 
     #[test]
@@ -483,7 +471,7 @@ mod tests {
         for written in [code.simple(), code.extended()] {
             let parsed = parse(&written).expect("og's own code");
             assert_eq!(parsed.level, 4);
-            assert_eq!(parsed.confidence, 5);
+            assert_eq!(parsed.confidence, 4);
         }
     }
 
