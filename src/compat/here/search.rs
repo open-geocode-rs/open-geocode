@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::{
     api::{ForwardCollection, ReverseCollection},
     compat::{Args, decode_id, native},
-    http::{bounds::MAX_SEARCH_LIMIT, problem::Problem},
+    http::bounds::MAX_SEARCH_LIMIT,
     runtime::AppState,
     util::fold::search_key,
 };
@@ -71,16 +71,12 @@ struct Page {
     limit: Option<usize>,
 }
 
-fn features(collection: &ForwardCollection) -> Result<Vec<Feature>, Gs7Error> {
-    collection.features.iter().map(feature).collect()
+fn features(collection: &ForwardCollection) -> Vec<Feature> {
+    collection.features.iter().map(Feature::from).collect()
 }
 
-fn reverse_features(collection: &ReverseCollection) -> Result<Vec<Feature>, Gs7Error> {
-    collection.features.iter().map(feature).collect()
-}
-
-fn feature(feature: &impl Serialize) -> Result<Feature, Gs7Error> {
-    Feature::of(feature).map_err(|error| Gs7Error::of(Problem::internal(error.into())))
+fn reverse_features(collection: &ReverseCollection) -> Vec<Feature> {
+    collection.features.iter().map(Feature::from).collect()
 }
 
 fn args(fields: Vec<(&'static str, String)>) -> Args {
@@ -295,7 +291,7 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
     let collection = native::geocode(state, args(fields).maybe("lang", og_lang(&params)))
         .await
         .map_err(Gs7Error::of)?;
-    let items = features(&collection)?
+    let items = features(&collection)
         .iter()
         .map(|feature| item(feature).distance_from(at))
         .filter(|item| item.is_any_of(types.as_deref()))
@@ -456,7 +452,7 @@ async fn reverse_lookup(state: &AppState, request: &Reverse) -> Result<Vec<Item>
         .await
         .map_err(Gs7Error::of)?;
     Ok(reverse_items(
-        &reverse_features(&collection)?,
+        &reverse_features(&collection),
         request.radius_m,
         request.types.as_deref(),
         request.limit,
@@ -692,17 +688,67 @@ fn fetch(offset: Option<usize>, limit: usize, max: usize) -> usize {
     .min(max)
 }
 
+/// A page past `offset` that og can answer: og gives at most `max` results
+/// to one query, so a page reaching past them is refused, not cut short.
+fn within(
+    offset: Option<usize>,
+    limit: usize,
+    max: usize,
+    params: &Params,
+) -> Result<(), Gs7Error> {
+    let end = offset.unwrap_or(0) + limit;
+    if end <= max {
+        return Ok(());
+    }
+    let (param, value) = match offset {
+        Some(offset) => ("offset", offset.to_string()),
+        None => ("limit", params.get("limit").unwrap_or_default().to_string()),
+    };
+    Err(Gs7Error::illegal(
+        param,
+        &value,
+        format!(
+            "This server answers at most {max} results to one query, so 'offset' plus 'limit' must be at most {max}"
+        ),
+    ))
+}
+
+/// The form body a POST may carry. HERE lets it hold only `route`, a
+/// polyline to search along, which og cannot search along.
+fn refuse_body(body: &Bytes) -> Result<(), Gs7Error> {
+    let fields = serde_urlencoded::from_bytes::<Vec<(String, String)>>(body).map_err(|_| {
+        Gs7Error::new(StatusCode::BAD_REQUEST, "Invalid request body")
+            .action("Send the body as application/x-www-form-urlencoded")
+    })?;
+    match fields.first() {
+        None => Ok(()),
+        Some((name, value)) if name == "route" => Err(Gs7Error::illegal(
+            "route",
+            value,
+            "This server cannot search along a route; search around a point with 'at' instead",
+        )),
+        Some((name, _)) => Err(Gs7Error::new(
+            StatusCode::BAD_REQUEST,
+            format!("Parameter '{name}' is not allowed in the request body"),
+        )
+        .action("Send every parameter but 'route' in the query string")),
+    }
+}
+
 pub(super) async fn autosuggest(
     State(state): State<AppState>,
     Rid(request_id): Rid,
     RawQuery(query): RawQuery,
+    body: Bytes,
 ) -> Response {
     let answer = async {
+        refuse_body(&body)?;
         let params = Params::parse(query.as_deref())?;
         let q = required_q(&params)?;
         let near = Near::read(&params, true)?;
         let limit = params.limit(20, 100)?;
         let offset = params.int("offset", 0, 99)?;
+        within(offset, limit, MAX_AUTOCOMPLETE_LIMIT, &params)?;
         if q.trim().is_empty() {
             return Ok(page(Vec::new(), offset, limit, true));
         }
@@ -717,9 +763,15 @@ pub(super) async fn autosuggest(
         let collection = native::autocomplete(&state, args(fields).maybe("lang", og_lang(&params)))
             .await
             .map_err(Gs7Error::of)?;
-        let items = features(&collection)?
+        let items = features(&collection)
             .iter()
-            .map(|feature| item(feature).without_scoring().distance_from(near.center))
+            .map(|feature| {
+                item(feature)
+                    .without_scoring()
+                    .with_details(feature)
+                    .with_highlights(feature)
+                    .distance_from(near.center)
+            })
             .filter(|item| near.admits(item))
             .collect();
         Ok(page(items, offset, limit, true))
@@ -752,11 +804,16 @@ pub(super) async fn autocomplete(
         let collection = native::autocomplete(&state, args(fields).maybe("lang", og_lang(&params)))
             .await
             .map_err(Gs7Error::of)?;
-        let items = features(&collection)?
+        let items = features(&collection)
             .iter()
-            .map(|feature| item(feature).without_scoring().distance_from(near.center))
+            .map(|feature| {
+                item(feature)
+                    .without_scoring()
+                    .with_highlights(feature)
+                    .distance_from(near.center)
+            })
             .filter(|item| near.admits(item))
-            .filter(|item| item.result_type.is_some_and(|kind| kind != "place"))
+            .filter(|item| item.result_type != "place")
             .filter(|item| item.is_any_of(types.as_deref()))
             .take(limit)
             .map(Item::without_position)
@@ -770,13 +827,16 @@ pub(super) async fn discover(
     State(state): State<AppState>,
     Rid(request_id): Rid,
     RawQuery(query): RawQuery,
+    body: Bytes,
 ) -> Response {
     let answer = async {
+        refuse_body(&body)?;
         let params = Params::parse(query.as_deref())?;
         let q = required_q(&params)?;
         let near = Near::read(&params, true)?;
         let limit = params.limit(20, 100)?;
         let offset = params.int("offset", 0, 99)?;
+        within(offset, limit, MAX_SEARCH_LIMIT, &params)?;
         if q.trim().is_empty() {
             return Ok(page(Vec::new(), offset, limit, false));
         }
@@ -788,9 +848,14 @@ pub(super) async fn discover(
         let collection = native::search(&state, args(fields).maybe("lang", og_lang(&params)))
             .await
             .map_err(Gs7Error::of)?;
-        let items = features(&collection)?
+        let items = features(&collection)
             .iter()
-            .map(|feature| item(feature).without_scoring().distance_from(near.center))
+            .map(|feature| {
+                item(feature)
+                    .without_scoring()
+                    .with_details(feature)
+                    .distance_from(near.center)
+            })
             .filter(|item| near.admits(item))
             .collect();
         Ok(page(items, offset, limit, false))
@@ -804,13 +869,15 @@ pub(super) async fn discover(
 /// around a point. `in=circle` searches that circle instead, and `in=bbox`
 /// that box. `categories` keeps the kinds og has under a HERE id, and `name`
 /// the places whose name holds its words. og's places carry no HERE chain or
-/// food type, so asking for one finds none.
+/// food type, so asking for one is refused.
 pub(super) async fn browse(
     State(state): State<AppState>,
     Rid(request_id): Rid,
     RawQuery(query): RawQuery,
+    body: Bytes,
 ) -> Response {
     let answer = async {
+        refuse_body(&body)?;
         let params = Params::parse(query.as_deref())?;
         let at = params.get("at").ok_or_else(|| {
             Gs7Error::new(StatusCode::BAD_REQUEST, "Missing parameter 'at'").action("Provide 'at'")
@@ -819,13 +886,27 @@ pub(super) async fn browse(
         let area = params.get("in").map(Area::parse).transpose()?;
         let limit = params.limit(20, 100)?;
         let offset = params.int("offset", 0, 99)?;
+        within(offset, limit, MAX_SEARCH_LIMIT, &params)?;
         let filter = Filter::parse(params.get("categories"))?;
         let name = params.get("name").and_then(search_key);
-        let unheld = ["chains", "foodTypes"]
-            .iter()
-            .any(|list| !Listed::parse(params.get(list)).included.is_empty());
+        // og's places carry no HERE chain or food type. Leaving one out
+        // keeps every place; asking for one cannot be honoured, and an empty
+        // answer would read as none there.
+        for list in ["chains", "foodTypes"] {
+            if let Some(value) = params.get(list)
+                && !Listed::parse(Some(value)).included.is_empty()
+            {
+                return Err(Gs7Error::illegal(
+                    list,
+                    value,
+                    format!(
+                        "This server holds no '{list}' for places; filter by 'categories' or 'name'"
+                    ),
+                ));
+            }
+        }
         let categories = filter.og_categories();
-        if unheld || categories.is_empty() {
+        if categories.is_empty() {
             return Ok(page(Vec::new(), offset, limit, false));
         }
         // What the filters drop comes out of og's answer, so og is asked for
@@ -852,9 +933,14 @@ pub(super) async fn browse(
         )
         .await
         .map_err(Gs7Error::of)?;
-        let mut items = features(&collection)?
+        let mut items = features(&collection)
             .iter()
-            .map(|feature| item(feature).without_scoring().distance_from(Some(at)))
+            .map(|feature| {
+                item(feature)
+                    .without_scoring()
+                    .with_details(feature)
+                    .distance_from(Some(at))
+            })
             .filter(|item| filter.admits(&item.categories))
             .filter(|item| {
                 name.as_deref().is_none_or(|name| {
@@ -895,7 +981,8 @@ pub(super) async fn lookup(
             .await
             .map_err(Gs7Error::of)?
             .ok_or_else(not_found)?;
-        Ok(item(&self::feature(&feature)?).without_scoring())
+        let feature = Feature::from(&feature);
+        Ok(item(&feature).without_scoring().with_details(&feature))
     };
     respond(&request_id, answer.await)
 }

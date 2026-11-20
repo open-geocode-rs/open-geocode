@@ -352,7 +352,7 @@ pub struct ForwardProperties {
 /// words and folded as the index folds text. `elysee` marks `Élysée`. A
 /// word still being typed marks only the letters typed so far, and a word
 /// matched through a typo marks the whole label word.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Highlight {
     pub start: usize,
     pub end: usize,
