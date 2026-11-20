@@ -5,13 +5,16 @@
 //! of its ways' ids: a tile names the way a tap lands on.
 //!
 //! Stores no id. A minimal perfect hash (FMPHGO, `ph` crate, ~2-3 bits an id)
-//! maps each id to a slot holding its block number. The hash sends unknown
-//! ids to some slot too, so a lookup checks the record's own id.
+//! maps each id to a slot holding its first block number. The hash sends
+//! unknown ids to some slot too, so a lookup checks the record's own id.
+//! One object can be records in several blocks (a way that is a POI and a
+//! district): its other blocks are listed apart, by key, few as they are.
 //!
 //! ```text
 //! places/ids   width u8 (bytes of a block number) | count u64 | count block
-//!              numbers, `width` bytes each, little-endian | the hash, as
-//!              `ph` writes it
+//!              numbers, `width` bytes each, little-endian | more u64 | more
+//!              (key, block number) pairs, by key, the key 8 bytes and the
+//!              block `width` | the hash, as `ph` writes it
 //! ```
 
 use std::sync::Arc;
@@ -28,7 +31,7 @@ use crate::{
 };
 
 pub const SECTION: &str = "places/ids";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 // Little-endian: a Pack hashes alike on every machine.
 fn key(object_type: ObjectType, object_id: i64) -> Option<[u8; 8]> {
@@ -96,9 +99,19 @@ fn entries(records: &records::Reader) -> Result<Vec<([u8; 8], bool, u64)>> {
 fn build(records: &records::Reader) -> Result<Vec<u8>> {
     let mut places = entries(records)?;
     // One object can be two records (a node that is a town and a POI, a way
-    // that is a market and a road): the place wins over the street.
+    // that is a market and a road), in one block or in two. A place's block
+    // comes before a street's, and every block holding the object is kept.
     places.sort_unstable_by_key(|(key, street, block)| (*key, *street, *block));
-    places.dedup_by_key(|(key, ..)| *key);
+    let mut more = Vec::new();
+    places.dedup_by(|(key, _, block), (held_key, _, held_block)| {
+        let same = key == held_key;
+        if same && block != held_block {
+            more.push((*key, *block));
+        }
+        same
+    });
+    more.sort_unstable();
+    more.dedup();
     let keys = places.iter().map(|(key, ..)| *key).collect::<Vec<_>>();
     let function = GOFunction::from_slice(&keys);
     drop(keys);
@@ -113,10 +126,16 @@ fn build(records: &records::Reader) -> Result<Vec<u8>> {
             as usize;
         values[slot * width..(slot + 1) * width].copy_from_slice(&block.to_le_bytes()[..width]);
     }
-    let mut bytes = Vec::with_capacity(9 + values.len() + function.write_bytes());
+    let mut bytes =
+        Vec::with_capacity(17 + values.len() + more.len() * (8 + width) + function.write_bytes());
     bytes.push(width as u8);
     bytes.extend_from_slice(&(places.len() as u64).to_le_bytes());
     bytes.extend_from_slice(&values);
+    bytes.extend_from_slice(&(more.len() as u64).to_le_bytes());
+    for (key, block) in &more {
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&block.to_le_bytes()[..width]);
+    }
     function.write(&mut bytes)?;
     Ok(bytes)
 }
@@ -126,6 +145,8 @@ pub struct Catalogue {
     width: usize,
     count: usize,
     values: Bytes,
+    /// The other blocks of an object in several, `(key, block)` by key.
+    more: Bytes,
 }
 
 impl std::fmt::Debug for Catalogue {
@@ -152,13 +173,22 @@ impl Catalogue {
             .and_then(|len| len.checked_add(9))
             .filter(|end| *end <= bytes.len() && (1..=8).contains(&width))
             .ok_or_else(truncated)?;
-        let mut hash = &bytes[values_end..];
+        let more_count = crate::util::codec::read_u64_le(&bytes, values_end)
+            .and_then(|more| usize::try_from(more).ok())
+            .ok_or_else(truncated)?;
+        let more_end = more_count
+            .checked_mul(8 + width)
+            .and_then(|len| len.checked_add(values_end + 8))
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(truncated)?;
+        let mut hash = &bytes[more_end..];
         let function = GOFunction::read(&mut hash)?;
         Ok(Some(Arc::new(Self {
             function,
             width,
             count,
             values: bytes.slice(9..values_end),
+            more: bytes.slice(values_end + 8..more_end),
         })))
     }
 
@@ -177,18 +207,41 @@ impl Catalogue {
         if slot >= self.count {
             return Ok(Vec::new());
         }
-        let mut block = [0u8; 8];
-        block[..self.width]
-            .copy_from_slice(&self.values[slot * self.width..(slot + 1) * self.width]);
-        let block = u64::from_le_bytes(block);
-        if block >= records.block_count() {
-            return Ok(Vec::new());
+        let block_at = |bytes: &[u8]| {
+            let mut block = [0u8; 8];
+            block[..self.width].copy_from_slice(&bytes[..self.width]);
+            u64::from_le_bytes(block)
+        };
+        let mut blocks = vec![block_at(&self.values[slot * self.width..])];
+        let pair = 8 + self.width;
+        let pairs = self.more.len() / pair;
+        let key_at = |at: usize| &self.more[at * pair..at * pair + 8];
+        // The first pair of the key, by binary search.
+        let (mut at, mut end) = (0, pairs);
+        while at < end {
+            let middle = at + (end - at) / 2;
+            if key_at(middle) < key.as_slice() {
+                at = middle + 1;
+            } else {
+                end = middle;
+            }
         }
-        let found = records
-            .block_ids(block)?
-            .into_iter()
-            .filter(|id| id.object_type == object_type && id.object_id == object_id)
-            .collect::<Vec<_>>();
+        while at < pairs && key_at(at) == key.as_slice() {
+            blocks.push(block_at(&self.more[at * pair + 8..]));
+            at += 1;
+        }
+        let mut found = Vec::new();
+        for block in blocks {
+            if block >= records.block_count() {
+                continue;
+            }
+            found.extend(
+                records
+                    .block_ids(block)?
+                    .into_iter()
+                    .filter(|id| id.object_type == object_type && id.object_id == object_id),
+            );
+        }
         let place = found.iter().any(|id| !id.street);
         Ok(found
             .into_iter()
@@ -236,6 +289,75 @@ mod tests {
         for malformed in ["7", "osm:node", "osm:node:x", "osm:node:-1", "osm:area:1"] {
             assert!(parse(malformed).is_err(), "{malformed}");
         }
+    }
+
+    #[test]
+    fn finds_an_object_written_as_records_in_two_blocks() {
+        let dir = std::env::temp_dir().join(format!("open-geocode-ids-{}", uuid::Uuid::new_v4()));
+        let mut writer = Writer::create(&dir).expect("writer");
+        let district = SourceProvenance::osm(ObjectType::Way, 7);
+        let poi = |name: &str, source: SourceProvenance, lon: f64| -> Record {
+            PoiRecord {
+                alt_names: Vec::new(),
+                name: name.to_string(),
+                category: "historic:district".to_string(),
+                address: None,
+                geometry: point_geometry(lon, 43.0),
+                location_precision: LocationPrecision::Point,
+                source,
+                prominence: Default::default(),
+                wikidata: None,
+                brand: None,
+                details: None,
+                aliases: Vec::new(),
+            }
+            .into()
+        };
+        // The way as a POI, many records, then the same way as a district.
+        writer
+            .write(&poi("Historic District", district.clone(), -79.0), None)
+            .expect("poi");
+        for index in 0..2_000 {
+            let source = SourceProvenance::osm(ObjectType::Node, i64::from(index) + 100);
+            writer
+                .write(&poi("Cafe", source, -78.0), None)
+                .expect("filler");
+        }
+        writer
+            .write(
+                &Record::Place(
+                    PlaceLayer::Neighbourhood,
+                    PlaceRecord {
+                        alt_names: Vec::new(),
+                        name: "Historic District".to_string(),
+                        place_type: "neighbourhood".to_string(),
+                        geometry: point_geometry(-79.0, 43.0),
+                        source: district,
+                        prominence: Default::default(),
+                        wikidata: None,
+                    },
+                ),
+                None,
+            )
+            .expect("district");
+        writer.finish().expect("finish");
+        let pack = Reader::open(&dir).expect("pack");
+        let catalogue = Catalogue::open(pack.container())
+            .expect("open")
+            .expect("a catalogue");
+        let found = catalogue
+            .find(pack.records(), ObjectType::Way, 7)
+            .expect("find");
+        let layers = found
+            .iter()
+            .map(|id| pack.record_summary(*id).expect("summary").layer)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            layers,
+            ["neighbourhood".to_string(), "poi".to_string()].into(),
+            "the object's records in every block"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
