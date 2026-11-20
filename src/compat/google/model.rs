@@ -525,9 +525,11 @@ impl Kind {
             Layer::Country => Self::Types(&["country", "political"]),
             Layer::Postcode => Self::Types(&["postal_code"]),
             // og's district holds every tier between region and locality,
-            // so which administrative level it is varies by country. A POI
-            // is what its category says, which only `of` reads.
-            Layer::District | Layer::Place | Layer::Poi => Self::Unknown,
+            // so which administrative level it is varies by country. It is
+            // an administrative area all the same. A POI is what its
+            // category says, which only `of` reads.
+            Layer::District => Self::Types(&["political"]),
+            Layer::Place | Layer::Poi => Self::Unknown,
         }
     }
 
@@ -544,7 +546,7 @@ impl Kind {
     pub(super) fn primary(self) -> Option<&'static str> {
         match self {
             Self::Poi(category) => category,
-            Self::Types(types) => types.first().copied(),
+            Self::Types(types) => types.first().copied().filter(|kind| *kind != "political"),
             Self::Unknown => None,
         }
     }

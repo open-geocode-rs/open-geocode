@@ -259,12 +259,13 @@ pub(crate) mod native {
             .map(|json| json.0)
     }
 
-    /// Free text answered with addresses and places together, as a vendor
-    /// search that knows no split between the two does. og keeps them
-    /// apart (`/geocode`, `/places`), so both run. An address joins the
-    /// answer only when it is what the query names, its street matched and
-    /// no part it states unmatched, since `/geocode` answers any text with
-    /// its nearest reading. Those addresses come first, the places after.
+    /// Free text answered with addresses, areas and places together, as a
+    /// vendor search that knows no split between them does. og keeps them
+    /// apart (`/geocode`, `/places`), so both run. An address or an area
+    /// joins the answer only when it is what the query names, its street or
+    /// its own part matched and no part it states unmatched, since
+    /// `/geocode` answers any text with its nearest reading. Those come
+    /// first, the places after.
     pub(crate) async fn search(state: &AppState, args: Args) -> Result<ForwardCollection, Problem> {
         let limit = args
             .get("limit")
@@ -279,7 +280,7 @@ pub(crate) mod native {
             (Err(_), Err(problem)) => return Err(problem),
         };
         let limit = limit.unwrap_or_else(|| addresses.features.len().max(places.len()));
-        addresses.features.retain(names_address);
+        addresses.features.retain(names_answer);
         let mut seen = addresses
             .features
             .iter()
@@ -294,11 +295,22 @@ pub(crate) mod native {
         Ok(addresses)
     }
 
-    /// Whether an address answer is the address or street the query names.
-    fn names_address(feature: &ForwardFeature) -> bool {
+    /// Whether a `/geocode` answer is the address, street or area the query
+    /// names, which is so when its street, or the part the area is, matched.
+    fn names_answer(feature: &ForwardFeature) -> bool {
         use crate::api::PartMatch;
+        use crate::record::Layer;
         feature.properties.matched.as_ref().is_some_and(|found| {
-            found.street == Some(PartMatch::Matched)
+            let own = match feature.properties.common.layer {
+                Layer::Locality | Layer::Neighbourhood | Layer::District | Layer::Place => {
+                    found.locality
+                }
+                Layer::Region => found.region,
+                Layer::Postcode => found.postcode,
+                Layer::Country => found.country,
+                _ => found.street,
+            };
+            own == Some(PartMatch::Matched)
                 && [
                     found.housenumber,
                     found.unit,
