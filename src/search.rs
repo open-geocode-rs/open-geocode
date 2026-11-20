@@ -903,6 +903,9 @@ impl TextSearcher {
                 return Ok(hits);
             }
         }
+        if let Some(normalized) = autocomplete_country_alias(options) {
+            return self.autocomplete(&normalized);
+        }
         self.autocomplete_address(options)
     }
 
@@ -9861,7 +9864,35 @@ pub fn suggest(
         }
         return Ok(mixed);
     }
+    if let Some(normalized) = autocomplete_country_alias(options) {
+        return suggest(addresses, places, &normalized);
+    }
     addresses.autocomplete_address(options)
+}
+
+// Address context indexes alpha-2 codes. Retry only an explicit suffix on
+// a numbered address, so ordinary names and partial queries keep their order.
+fn autocomplete_country_alias(
+    options: &TextAutocompleteOptions,
+) -> Option<TextAutocompleteOptions> {
+    let (address, suffix) = options.query.rsplit_once(',')?;
+    let country = crate::iso::alpha2_of(suffix.trim())?;
+    let number = address.split_whitespace().next()?;
+    if !is_numeric_token(number)
+        || address.split_whitespace().take(3).count() < 3
+        || (!options.countries.is_empty()
+            && !options
+                .countries
+                .iter()
+                .any(|asked| asked.eq_ignore_ascii_case(country)))
+    {
+        return None;
+    }
+    Some(TextAutocompleteOptions {
+        query: format!("{}, {country}", address.trim_end()),
+        countries: vec![country.to_string()],
+        ..options.clone()
+    })
 }
 
 /// The kinds of place a one-word query names through a typo ("pharmcy"),
@@ -14762,6 +14793,36 @@ mod tests {
         // 81 and 91 are on different Victoria Streets.
         assert_eq!(top("85 Victoria St").layer, "street");
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn autocomplete_retries_country_codes_only_for_numbered_addresses() {
+        let options = TextAutocompleteOptions {
+            query: "82 Smith St, Providence, RI 02903, USA".to_string(),
+            limit: 5,
+            layer: None,
+            countries: Vec::new(),
+            focus: None,
+            bbox: None,
+        };
+        let normalized = autocomplete_country_alias(&options).expect("country alias");
+        assert_eq!(normalized.query, "82 Smith St, Providence, RI 02903, US");
+        assert_eq!(normalized.countries, ["US"]);
+        assert!(autocomplete_country_alias(&normalized).is_none());
+        assert!(
+            autocomplete_country_alias(&TextAutocompleteOptions {
+                countries: vec!["CA".to_string()],
+                ..options.clone()
+            })
+            .is_none()
+        );
+        assert!(
+            autocomplete_country_alias(&TextAutocompleteOptions {
+                query: "Providence, USA".to_string(),
+                ..options
+            })
+            .is_none()
+        );
     }
 
     #[test]
