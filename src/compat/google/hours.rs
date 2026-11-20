@@ -1,12 +1,11 @@
-//! A place's OpenStreetMap `opening_hours` as Google's `OpeningHours`.
+//! A place's opening hours as Google's `OpeningHours`.
 //!
-//! Only the weekly form is read: rules of weekdays and times, such as
-//! `Mo-Fr 09:00-17:00; Sa 10:00-14:00`, a rule of times alone, which holds
-//! for every day, and `24/7`. A value with anything
-//! else (holidays, months, weeks, sunrise, comments, `+`) states hours this
-//! reading would get wrong, so it gives none and the slot stays empty.
+//! [`Week`] reads OpenStreetMap's value. A value it does not read gives no
+//! hours, so the slot stays empty.
 
 use serde::Serialize;
+
+use crate::compat::hours::{DAY_MINUTES, Week, Weekday};
 
 /// Google's `OpeningHours`, as weekly periods only. `weekdayDescriptions` is
 /// text Google writes in the language asked, which og does not render.
@@ -23,142 +22,54 @@ pub(super) struct Period {
 }
 
 /// `day` counts from 0 for Sunday.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub(super) struct Point {
     pub(super) day: u8,
     pub(super) hour: u8,
     pub(super) minute: u8,
 }
 
-/// OpenStreetMap's weekdays, Monday first, as Google numbers them.
-const DAYS: [(&str, u8); 7] = [
-    ("Mo", 1),
-    ("Tu", 2),
-    ("We", 3),
-    ("Th", 4),
-    ("Fr", 5),
-    ("Sa", 6),
-    ("Su", 0),
-];
+impl Point {
+    /// `minutes` past the start of `day`, carried into the day after.
+    fn at(day: Weekday, minutes: u16) -> Self {
+        let day = if minutes >= DAY_MINUTES {
+            day.next()
+        } else {
+            day
+        };
+        let minutes = minutes % DAY_MINUTES;
+        Self {
+            day: day.sunday_number(),
+            hour: u8::try_from(minutes / 60).unwrap_or_default(),
+            minute: u8::try_from(minutes % 60).unwrap_or_default(),
+        }
+    }
+}
 
-/// `value` as weekly periods, `None` when it holds anything this reading
-/// does not read exactly.
+/// `value` as weekly periods, `None` when [`Week`] does not read it.
 pub(super) fn parse(value: &str) -> Option<OpeningHours> {
-    let value = value.trim();
-    if value == "24/7" {
+    let week = Week::parse(value)?;
+    if week.is_always_open() {
         // Google writes always open as one period opening on Sunday at
         // midnight with no close.
         return Some(OpeningHours {
             periods: vec![Period {
-                open: Point {
-                    day: 0,
-                    hour: 0,
-                    minute: 0,
-                },
+                open: Point::at(Weekday::Sunday, 0),
                 close: None,
             }],
         });
     }
-    // Each rule sets the days it names, so a later rule overrides an earlier
-    // one for its days.
-    let mut week: [Option<Vec<(u16, u16)>>; 7] = Default::default();
-    for rule in value
-        .split(';')
-        .map(str::trim)
-        .filter(|rule| !rule.is_empty())
-    {
-        // A rule that names no weekday holds for every day.
-        let (days, times) = match rule.starts_with(|character: char| character.is_ascii_digit()) {
-            true => ((0..DAYS.len()).collect(), rule),
-            false => {
-                let (days, times) = rule.split_once(' ')?;
-                (weekdays(days)?, times.trim())
-            }
-        };
-        let spans = if times == "off" || times == "closed" {
-            Vec::new()
-        } else {
-            times
-                .split(',')
-                .map(|span| span_of(span.trim()))
-                .collect::<Option<Vec<_>>>()?
-        };
-        for day in days {
-            week[day] = Some(spans.clone());
-        }
-    }
-    if week.iter().all(Option::is_none) {
-        return None;
-    }
-    let mut periods = Vec::new();
-    for (index, spans) in week.iter().enumerate() {
-        let day = DAYS[index].1;
-        for &(open, close) in spans.iter().flatten() {
-            // A span past midnight ("22:00-02:00", "18:00-24:00") closes on
-            // the next day.
-            let (close_day, close) = if close <= open {
-                ((day + 1) % 7, close)
-            } else if close == 24 * 60 {
-                ((day + 1) % 7, 0)
-            } else {
-                (day, close)
-            };
-            periods.push(Period {
-                open: point(day, open),
-                close: Some(point(close_day, close)),
-            });
-        }
-    }
-    periods.sort_by_key(|period| (period.open.day, period.open.hour, period.open.minute));
+    let mut periods = week
+        .days()
+        .flat_map(|(day, spans)| {
+            spans.iter().map(move |span| Period {
+                open: Point::at(day, span.open()),
+                close: Some(Point::at(day, span.close())),
+            })
+        })
+        .collect::<Vec<_>>();
+    periods.sort_by_key(|period| period.open);
     Some(OpeningHours { periods })
-}
-
-/// The weekdays a rule names, as indices into [`DAYS`]: `Mo`, `Mo-Fr`,
-/// `Mo,We,Fr` or a mix. A range may wrap past Sunday (`Sa-Mo`).
-fn weekdays(text: &str) -> Option<Vec<usize>> {
-    let index = |name: &str| DAYS.iter().position(|(day, _)| *day == name);
-    let mut days = Vec::new();
-    for part in text.split(',') {
-        match part.split_once('-') {
-            Some((from, to)) => {
-                let (from, to) = (index(from)?, index(to)?);
-                let mut day = from;
-                loop {
-                    days.push(day);
-                    if day == to {
-                        break;
-                    }
-                    day = (day + 1) % 7;
-                }
-            }
-            None => days.push(index(part)?),
-        }
-    }
-    Some(days)
-}
-
-/// `HH:MM-HH:MM` as minutes after midnight. The close may be `24:00`.
-fn span_of(text: &str) -> Option<(u16, u16)> {
-    let (open, close) = text.split_once('-')?;
-    let (open, close) = (minutes(open)?, minutes(close)?);
-    (open < 24 * 60 && open != close).then_some((open, close))
-}
-
-fn minutes(text: &str) -> Option<u16> {
-    let (hour, minute) = text.split_once(':')?;
-    if hour.len() != 2 || minute.len() != 2 {
-        return None;
-    }
-    let (hour, minute) = (hour.parse::<u16>().ok()?, minute.parse::<u16>().ok()?);
-    (minute < 60 && (hour < 24 || (hour == 24 && minute == 0))).then_some(hour * 60 + minute)
-}
-
-fn point(day: u8, minutes: u16) -> Point {
-    Point {
-        day,
-        hour: u8::try_from(minutes / 60).unwrap_or_default(),
-        minute: u8::try_from(minutes % 60).unwrap_or_default(),
-    }
 }
 
 #[cfg(test)]
@@ -230,21 +141,5 @@ mod tests {
                 ((3, 9, 0), Some((3, 17, 0)))
             ])
         );
-    }
-
-    #[test]
-    fn anything_but_weekly_hours_gives_none() {
-        for value in [
-            "Mo-Fr 09:00-17:00; PH off",
-            "Jan-Mar Mo 09:00-12:00",
-            "sunrise-sunset",
-            "Mo-Fr 09:00-17:00 \"by appointment\"",
-            "Mo-Fr 09:00+",
-            "Mo-Fr 9:00-17:00",
-            "",
-            "open",
-        ] {
-            assert_eq!(parse(value), None, "{value}");
-        }
     }
 }
