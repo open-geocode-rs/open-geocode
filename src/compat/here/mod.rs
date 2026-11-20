@@ -10,6 +10,7 @@
 
 mod batch;
 mod category;
+mod hours;
 mod item;
 mod notify;
 mod openapi;

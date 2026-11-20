@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{Error, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
@@ -352,7 +352,7 @@ pub struct ForwardProperties {
 /// words and folded as the index folds text. `elysee` marks `Élysée`. A
 /// word still being typed marks only the letters typed so far, and a word
 /// matched through a typo marks the whole label word.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Highlight {
     pub start: usize,
     pub end: usize,
@@ -392,7 +392,7 @@ pub struct Highlight {
 ///
 /// On a `fallback` result the parts the area answers for are judged, and
 /// every other stated part is `unmatched`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct QueryMatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub housenumber: Option<PartMatch>,
@@ -424,7 +424,9 @@ impl QueryMatch {
 /// - `partial`: the result's value differs and was accepted as the same.
 /// - `unmatched`: the result does not have the part, has another value, or
 ///   nothing says it has the stated one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PartMatch {
     Matched,
@@ -455,7 +457,9 @@ pub struct ReverseProperties {
 /// - `centroid`: the centre of a mapped area.
 /// - `approximate`: a point standing for something larger, such as a town
 ///   or postcode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Accuracy {
     Rooftop,

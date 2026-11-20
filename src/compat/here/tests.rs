@@ -15,9 +15,9 @@ use crate::{
     limits::Limits,
     pack::Writer,
     record::{
-        AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRange,
-        InterpolationRecord, Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord,
-        PoiRecord, Record, SourceProvenance, StreetRecord, point_geometry,
+        AddressComponents, AddressRecord, Contact, Entrance, InterpolationAddressComponents,
+        InterpolationRange, InterpolationRecord, Layer, LocationPrecision, ObjectType, PlaceLayer,
+        PlaceRecord, PoiDetails, PoiRecord, Record, SourceProvenance, StreetRecord, point_geometry,
     },
     runtime::{AppState, build_router},
 };
@@ -65,8 +65,9 @@ fn line(from: [f64; 2], to: [f64; 2]) -> geojson::Geometry {
 
 /// Canada > Ontario > Toronto Division > Toronto > Old Toronto >
 /// Entertainment District. Holds an address with only a unit and a postcode
-/// stated, one outside every area stating its own town, region and areas,
-/// a POI, a street and an interpolation range. Calibrated, every confidence
+/// stated and an entrance, one outside every area stating its own town,
+/// region and areas, a POI with two phone numbers, a website, weekly hours
+/// and an entrance, a street and an interpolation range. Calibrated, every confidence
 /// one half.
 pub(super) fn pack(name: &str) -> TestPack {
     let dir = std::env::temp_dir().join(format!(
@@ -147,9 +148,9 @@ pub(super) fn pack(name: &str) -> TestPack {
         postcode: Some("M5V 1A1".to_string()),
         country: None,
     };
-    let address = |address: AddressComponents, lon, id| {
+    let address = |address: AddressComponents, lon, id, access| {
         Record::from(AddressRecord {
-            access: Vec::new(),
+            access,
             disputed: false,
             street_postcodes: Vec::new(),
             address,
@@ -159,7 +160,17 @@ pub(super) fn pack(name: &str) -> TestPack {
         })
     };
     writer
-        .write(&address(king.clone(), -79.0, 10), context.clone())
+        .write(
+            &address(
+                king.clone(),
+                -79.0,
+                10,
+                Entrance::of_tag(Some("main"), -79.00001, 43.00001)
+                    .into_iter()
+                    .collect(),
+            ),
+            context.clone(),
+        )
         .expect("address");
     let queen = AddressComponents {
         areas: vec!["Downtown".to_string(), "Core".to_string()],
@@ -173,7 +184,7 @@ pub(super) fn pack(name: &str) -> TestPack {
     };
     // Outside every boundary og knows, its stated parts are all it has.
     writer
-        .write(&address(queen, -79.002, 20), None)
+        .write(&address(queen, -79.002, 20, Vec::new()), None)
         .expect("address");
     writer
         .write(
@@ -196,7 +207,19 @@ pub(super) fn pack(name: &str) -> TestPack {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
-                details: None,
+                details: PoiDetails {
+                    contact: Contact::stated(
+                        Some("+1 416-555-0111;+1 416-555-0112".to_string()),
+                        Some("https://queenbakery.example/".to_string()),
+                        None,
+                    ),
+                    opening_hours: Some("Mo-Fr 08:00-18:00; Sa 09:00-13:00".to_string()),
+                    extent: None,
+                    access: Entrance::of_tag(Some("yes"), -79.00502, 43.00002)
+                        .into_iter()
+                        .collect(),
+                }
+                .kept(),
                 aliases: Vec::new(),
             }
             .into(),
@@ -369,6 +392,7 @@ fn king(extra: Value) -> Value {
         "houseNumberType": "PA",
         "address": king_address(),
         "position": {"lat": 43.0, "lng": -79.0},
+        "access": [{"lat": 43.00001, "lng": -79.00001}],
     });
     let Value::Object(extra) = extra else {
         panic!("extra fields are an object");
@@ -412,6 +436,18 @@ fn bakery(distance: Option<i64>) -> Value {
             "houseNumber": "12",
         },
         "position": {"lat": 43.0, "lng": -79.005},
+        "access": [{"lat": 43.00002, "lng": -79.00502}],
+        "contacts": [{
+            "phone": [{"value": "+1 416-555-0111"}, {"value": "+1 416-555-0112"}],
+            "www": [{"value": "https://queenbakery.example/"}],
+        }],
+        "openingHours": [{
+            "text": ["Mon-Fri: 08:00 - 18:00", "Sat: 09:00 - 13:00"],
+            "structured": [
+                {"start": "T080000", "duration": "PT10H00M", "recurrence": "FREQ:DAILY;BYDAY:MO,TU,WE,TH,FR"},
+                {"start": "T090000", "duration": "PT04H00M", "recurrence": "FREQ:DAILY;BYDAY:SA"},
+            ],
+        }],
         "categories": [{
             "id": "600-6300-0244",
             "name": "Bakery and Baked Goods Store",
@@ -449,6 +485,12 @@ fn area(id: &str, title: &str, kind: (&str, &str, &str), slot: &str) -> Value {
     item
 }
 
+/// An area item that names itself by its own ISO code too.
+fn coded(mut item: Value, slot: &str, code: &str) -> Value {
+    item["address"][slot] = code.into();
+    item
+}
+
 fn here_error(status: u16, title: &str, cause: Option<&str>, action: Option<&str>) -> Value {
     let mut body = json!({
         "status": status,
@@ -479,7 +521,10 @@ async fn geocode_answers_here_items() {
     assert_eq!(reply.header("x-request-id"), Some("rid-1"));
     assert_eq!(
         reply.json(),
-        json!({"items": [king(json!({"scoring": {"queryScore": 0.5}}))]})
+        json!({"items": [king(json!({"scoring": {
+            "queryScore": 1.0,
+            "fieldScore": {"streets": [1.0], "houseNumber": 1.0},
+        }}))]})
     );
 
     // `at` is og's focus and gives each item its distance from it.
@@ -490,7 +535,10 @@ async fn geocode_answers_here_items() {
     .await;
     assert_eq!(
         reply.json(),
-        json!({"items": [king(json!({"distance": 407, "scoring": {"queryScore": 0.5}}))]})
+        json!({"items": [king(json!({"distance": 407, "scoring": {
+            "queryScore": 1.0,
+            "fieldScore": {"streets": [1.0], "houseNumber": 1.0},
+        }}))]})
     );
 
     // A country filter og honours. Nothing of the Pack lies in the US.
@@ -510,7 +558,10 @@ async fn geocode_answers_here_items() {
 async fn geocode_reads_qualified_queries() {
     let pack = pack("geocode-qq");
     let router = pack.router();
-    let scored = json!({"scoring": {"queryScore": 0.5}});
+    let scored = json!({"scoring": {
+        "queryScore": 1.0,
+        "fieldScore": {"streets": [1.0], "houseNumber": 1.0, "postalCode": 1.0},
+    }});
 
     // A street with no text is og's structured geocode.
     let structured = "/compat/here/v1/geocode?qq=houseNumber%3D10%3Bstreet%3DKing+Street%3BpostalCode%3DM5V+1A1%3Bcountry%3DCAN";
@@ -574,7 +625,9 @@ async fn geocode_types_keep_the_kinds_asked() {
             "houseNumberType": "PA",
             "address": queen_address(),
             "position": {"lat": 43.0, "lng": -79.002},
-            "scoring": {"queryScore": 0.5},
+            // "Toronto" is a word of "Toronto City", a partial match, so
+            // the city counts half.
+            "scoring": {"queryScore": 0.75, "fieldScore": {"streets": [1.0], "city": 0.5}},
         }]})
     );
 
@@ -616,8 +669,8 @@ async fn revgeocode_answers_the_nearest_first() {
             area("osm:relation:6", "Entertainment District", locality("district"), "district"),
             area("osm:relation:5", "Old Toronto", locality("city"), "city"),
             area("osm:relation:4", "Toronto Division", admin("county"), "county"),
-            area("osm:relation:2", "Ontario", admin("state"), "state"),
-            area("osm:relation:1", "Canada", admin("country"), "countryName"),
+            coded(area("osm:relation:2", "Ontario", admin("state"), "state"), "stateCode", "ON"),
+            coded(area("osm:relation:1", "Canada", admin("country"), "countryName"), "countryCode", "CAN"),
         ]})
     );
 
@@ -743,14 +796,23 @@ async fn autosuggest_autocomplete_and_discover() {
         "houseNumberType": "PA",
         "address": queen_address(),
     });
+    // og's marks of "Queen" in each label: the title holds them where it
+    // is the label or starts it.
+    let marked = |mut item: Value, at: usize| {
+        let mark = json!([{"start": at, "end": at + 5}]);
+        item["highlights"] = json!({"title": mark, "address": {"label": mark}});
+        item
+    };
+    let queen = marked(queen, 3);
     let mut queen_near = queen.clone();
     queen_near["position"] = json!({"lat": 43.0, "lng": -79.002});
     queen_near["distance"] = 163.into();
+    let bakery_near = marked(bakery(Some(407)), 0);
 
     let reply = get(&router, "/compat/here/v1/autosuggest?q=Queen&at=43.0,-79.0").await;
     assert_eq!(
         reply.json(),
-        json!({"items": [bakery(Some(407)), queen_near], "queryTerms": []})
+        json!({"items": [bakery_near.clone(), queen_near], "queryTerms": []})
     );
 
     // Paging fields appear only with `offset`, and `nextOffset` only before
@@ -760,7 +822,7 @@ async fn autosuggest_autocomplete_and_discover() {
     assert_eq!(
         reply.json(),
         json!({
-            "items": [bakery(Some(407))],
+            "items": [bakery_near],
             "queryTerms": [],
             "offset": 0,
             "nextOffset": 1,
@@ -1086,7 +1148,9 @@ async fn errors_take_here_shapes() {
 }
 
 /// Fidelity. Every og value of every answer lands in its HERE slot
-/// unchanged, across each endpoint and every layer the Pack holds.
+/// unchanged, across each endpoint and every layer the Pack holds, and every
+/// slot og has data for is filled at least once, so a slot that goes empty
+/// fails here.
 #[tokio::test]
 async fn every_og_value_lands_in_its_here_slot() {
     let pack = pack("fidelity");
@@ -1117,21 +1181,59 @@ async fn every_og_value_lands_in_its_here_slot() {
             "/autocomplete?q=Queen",
             format!("/compat/here/v1/autosuggest?q=Queen&{world}"),
         ),
+        (
+            "/autocomplete?q=10+King",
+            "/compat/here/v1/autocomplete?q=10+King".to_string(),
+        ),
+        (
+            "/places?q=Queen+Bakery",
+            "/compat/here/v1/browse?at=43,-79&name=Queen+Bakery".to_string(),
+        ),
+        (
+            "/places?ids=osm:way:11",
+            format!(
+                "/compat/here/v1/lookup?id={}",
+                encode_parts("osm:way:11", Some(Layer::Poi), "")
+            ),
+        ),
     ];
     let mut layers = std::collections::BTreeSet::new();
+    let mut filled = std::collections::BTreeSet::new();
     for (native, here) in pairs {
         let og = get(&router, native).await.json();
-        let items = get(&router, &here).await.json()["items"].clone();
+        let reply = get(&router, &here).await;
+        assert_eq!(reply.status, StatusCode::OK, "{here}");
+        let reply = reply.json();
+        let items = match reply.get("items") {
+            Some(items) => items.as_array().expect("items").clone(),
+            None => vec![reply],
+        };
         let features = og["features"].as_array().expect("features");
-        let items = items.as_array().expect("items");
         assert_eq!(features.len(), items.len(), "{here} dropped a result");
         assert!(!features.is_empty(), "{native} found nothing");
-        for (feature, item) in features.iter().zip(items) {
+        for (feature, item) in features.iter().zip(&items) {
             let properties = &feature["properties"];
             layers.insert(properties["layer"].as_str().unwrap_or_default().to_string());
             assert_fidelity(properties, &feature["geometry"]["coordinates"], item, &here);
+            filled.extend(slots_filled(item));
         }
     }
+    assert_eq!(
+        filled.into_iter().collect::<Vec<_>>(),
+        [
+            "access",
+            "address.countryCode",
+            "address.stateCode",
+            "contacts",
+            "distance",
+            "highlights.address.label",
+            "highlights.title",
+            "mapView",
+            "openingHours",
+            "scoring.fieldScore",
+            "scoring.queryScore",
+        ]
+    );
     assert_eq!(
         layers.into_iter().collect::<Vec<_>>(),
         [
@@ -1172,8 +1274,15 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
     };
     assert_eq!(&item["title"], title, "{at}");
     assert_eq!(item["address"]["label"], properties["label"], "{at}");
-    assert_eq!(item["position"]["lat"], coordinates[1], "{at}");
-    assert_eq!(item["position"]["lng"], coordinates[0], "{at}");
+    // An `/autocomplete` suggestion has no point, no way in and no box.
+    let suggestion = uri.contains("/v1/autocomplete?");
+    match suggestion {
+        true => assert_eq!(item.get("position"), None, "{at}"),
+        false => {
+            assert_eq!(item["position"]["lat"], coordinates[1], "{at}");
+            assert_eq!(item["position"]["lng"], coordinates[0], "{at}");
+        }
+    }
     assert_eq!(slot("houseNumber"), text(&address["housenumber"]), "{at}");
     assert_eq!(slot("unit"), text(&address["unit"]), "{at}");
     assert_eq!(slot("postalCode"), text(&address["postcode"]), "{at}");
@@ -1201,29 +1310,82 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
         area("district").or_else(|| own("district")),
         "{at}"
     );
+    let (district, subdistrict) = match (area("sublocality"), area("neighbourhood")) {
+        (Some(sublocality), neighbourhood) => (Some(sublocality), neighbourhood),
+        (None, Some(neighbourhood)) => (Some(neighbourhood), None),
+        (None, None) => (text(&address["areas"][0]), text(&address["areas"][1])),
+    };
     assert_eq!(
         slot("district"),
-        area("sublocality")
-            .or_else(|| text(&address["areas"][0]))
-            .or_else(|| own("neighbourhood")),
+        district.or_else(|| own("neighbourhood")),
         "{at}"
     );
-    assert_eq!(
-        slot("subdistrict"),
-        area("neighbourhood").or_else(|| text(&address["areas"][1])),
-        "{at}"
-    );
+    assert_eq!(slot("subdistrict"), subdistrict, "{at}");
     assert_eq!(
         slot("countryName"),
         area("country").or_else(|| own("country")),
         "{at}"
     );
+    // An area's own code names it where no context area does: `US` on the
+    // country, `US-RI` on the region.
+    let own_code = |of: &str| (layer == of).then(|| text(&properties["code"])).flatten();
     assert_eq!(
         slot("countryCode"),
-        context["country"]["code"]
-            .as_str()
-            .and_then(iso::alpha3)
+        text(&context["country"]["code"])
+            .or_else(|| own_code("country"))
+            .and_then(|code| iso::alpha3(&code))
             .map(str::to_string),
+        "{at}"
+    );
+    assert_eq!(
+        slot("stateCode"),
+        text(&context["region"]["code"])
+            .or_else(|| own_code("region"))
+            .and_then(|code| code.split_once('-').map(|(_, own)| own.to_string())),
+        "{at}"
+    );
+    // Contacts and hours are place details, which discover, browse, lookup
+    // and autosuggest carry.
+    let details = [
+        "/v1/discover",
+        "/v1/browse",
+        "/v1/lookup",
+        "/v1/autosuggest",
+    ]
+    .iter()
+    .any(|route| uri.contains(route));
+    let split = |value: &Value| {
+        value
+            .as_str()
+            .map(|value| {
+                value
+                    .split(';')
+                    .map(|value| json!({"value": value.trim()}))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let contact = &properties["contact"];
+    match (details, contact.is_object()) {
+        (true, true) => {
+            let contacts = &item["contacts"][0];
+            for (og, here) in [("phone", "phone"), ("website", "www"), ("email", "email")] {
+                assert_eq!(
+                    contacts.get(here).cloned().unwrap_or(json!([])),
+                    json!(split(&contact[og])),
+                    "{at} {here}"
+                );
+            }
+        }
+        _ => assert_eq!(item.get("contacts"), None, "{at}"),
+    }
+    let hours = properties["opening_hours"]
+        .as_str()
+        .and_then(super::hours::parse)
+        .filter(|_| details);
+    assert_eq!(
+        item.get("openingHours").cloned(),
+        hours.map(|hours| json!([hours])),
         "{at}"
     );
     match properties["distance_m"].as_f64() {
@@ -1231,14 +1393,131 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
         None if uri.contains("revgeocode") => assert_eq!(item.get("distance"), None, "{at}"),
         None => {}
     }
-    if uri.contains("/v1/geocode") {
-        assert_eq!(
-            item["scoring"]["queryScore"], properties["confidence"],
+    // A place has no box in HERE's answers; anything else carries og's.
+    match (layer, properties["bbox"].as_array()) {
+        (_, Some(_)) if suggestion => assert_eq!(item.get("mapView"), None, "{at}"),
+        ("poi", _) | (_, None) => assert_eq!(item.get("mapView"), None, "{at}"),
+        (_, Some(bbox)) => assert_eq!(
+            item["mapView"],
+            json!({"west": bbox[0], "south": bbox[1], "east": bbox[2], "north": bbox[3]}),
             "{at}"
-        );
+        ),
+    }
+    let access = properties["access"]
+        .as_array()
+        .map(|points| {
+            points
+                .iter()
+                .map(|point| json!({"lat": point["lat"], "lng": point["lon"]}))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    match suggestion {
+        true => assert_eq!(item.get("access"), None, "{at}"),
+        false => assert_eq!(
+            item.get("access").cloned().unwrap_or(json!([])),
+            json!(access),
+            "{at}"
+        ),
+    }
+    if uri.contains("/v1/autosuggest") || uri.contains("/v1/autocomplete?") {
+        let label = properties["highlights"].clone();
+        let label = if label.is_null() { json!([]) } else { label };
+        assert_eq!(item["highlights"]["address"]["label"], label, "{at}");
+        // The title holds the marks that lie in it when the label starts
+        // with it.
+        let title = item["title"].as_str().unwrap_or_default();
+        let length = title.chars().count() as u64;
+        let in_title = match properties["label"].as_str().unwrap_or_default().starts_with(title) {
+            true => label
+                .as_array()
+                .expect("marks")
+                .iter()
+                .filter(|mark| mark["start"].as_u64() < Some(length))
+                .map(|mark| json!({"start": mark["start"], "end": mark["end"].as_u64().map(|end| end.min(length))}))
+                .collect(),
+            false => Vec::new(),
+        };
+        assert_eq!(item["highlights"]["title"], json!(in_title), "{at}");
+    } else {
+        assert_eq!(item.get("highlights"), None, "{at}");
+    }
+    if uri.contains("/v1/geocode") {
+        // Each stated part as HERE scores a field: 1 matched, 0.5 partial,
+        // left out unmatched; the query score is their mean with 0 for an
+        // unmatched part.
+        let score = |part: &Value| match part.as_str() {
+            Some("matched") => Some(1.0),
+            Some("partial") => Some(0.5),
+            Some("unmatched") => Some(0.0),
+            _ => None,
+        };
+        let matched = &properties["match"];
+        let parts = [
+            "country",
+            "region",
+            "locality",
+            "street",
+            "housenumber",
+            "postcode",
+            "unit",
+        ]
+        .map(|part| score(&matched[part]));
+        let stated = parts.iter().flatten().collect::<Vec<_>>();
+        let field = &item["scoring"]["fieldScore"];
+        for (part, slot) in [
+            ("country", "country"),
+            ("region", "state"),
+            ("locality", "city"),
+            ("housenumber", "houseNumber"),
+            ("postcode", "postalCode"),
+            ("unit", "unit"),
+        ] {
+            let expected = score(&matched[part]).filter(|score| *score > 0.0);
+            assert_eq!(field[slot].as_f64(), expected, "{at} {part}");
+        }
+        let street = score(&matched["street"]).filter(|score| *score > 0.0);
+        assert_eq!(field["streets"][0].as_f64(), street, "{at} street");
+        // A result og judged on no part takes its calibrated confidence, and
+        // with neither there is no score.
+        let query_score = match stated.is_empty() {
+            false => Some(stated.iter().copied().sum::<f64>() / stated.len() as f64),
+            true => properties["confidence"].as_f64(),
+        };
+        assert_eq!(item["scoring"]["queryScore"].as_f64(), query_score, "{at}");
     } else {
         assert_eq!(item.get("scoring"), None, "{at}");
     }
+}
+
+/// The slots of an item that hold a value, of those M2 fills from og.
+fn slots_filled(item: &Value) -> Vec<&'static str> {
+    let present = |value: &Value| match value {
+        Value::Null => false,
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+        _ => true,
+    };
+    [
+        ("access", &item["access"]),
+        ("address.countryCode", &item["address"]["countryCode"]),
+        ("address.stateCode", &item["address"]["stateCode"]),
+        ("contacts", &item["contacts"]),
+        ("distance", &item["distance"]),
+        (
+            "highlights.address.label",
+            &item["highlights"]["address"]["label"],
+        ),
+        ("highlights.title", &item["highlights"]["title"]),
+        ("mapView", &item["mapView"]),
+        ("openingHours", &item["openingHours"]),
+        ("scoring.fieldScore", &item["scoring"]["fieldScore"]),
+        ("scoring.queryScore", &item["scoring"]["queryScore"]),
+    ]
+    .into_iter()
+    .filter(|(_, value)| present(value))
+    .map(|(slot, _)| slot)
+    .collect()
 }
 
 /// Creates a geocode job of `input` and waits for it to end. Answers its
@@ -2136,4 +2415,43 @@ async fn a_batch_record_takes_its_lang_column() {
             "g2|1|1|Canada",
         ]
     );
+}
+
+/// A live answer converts from og's types and a batch job's from og's
+/// JSON on disk; both must read the same.
+#[tokio::test]
+async fn a_feature_reads_alike_from_og_and_from_its_json() {
+    use super::item::Feature;
+    use crate::compat::{Args, native};
+
+    let pack = pack("feature-alike");
+    let state = pack.state(Limits::DEFAULT);
+    let mut checked = 0;
+    for q in [
+        "10 King Street",
+        "Queen Bakery",
+        "Queen Street",
+        "50 Queen Street",
+        "Toronto",
+    ] {
+        let collection = native::geocode(&state, Args::new().set("q", q))
+            .await
+            .expect("geocode");
+        for feature in &collection.features {
+            let json = serde_json::to_value(feature).expect("JSON");
+            let read: Feature = serde_json::from_value(json).expect("read");
+            assert_eq!(Feature::from(feature), read, "{q}");
+            checked += 1;
+        }
+    }
+    let collection = native::reverse(&state, Args::new().set("lon", "-79.0").set("lat", "43.0"))
+        .await
+        .expect("reverse");
+    for feature in &collection.features {
+        let json = serde_json::to_value(feature).expect("JSON");
+        let read: Feature = serde_json::from_value(json).expect("read");
+        assert_eq!(Feature::from(feature), read);
+        checked += 1;
+    }
+    assert!(checked > 5, "{checked}");
 }
