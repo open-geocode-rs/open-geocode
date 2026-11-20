@@ -1425,8 +1425,19 @@ impl Reader {
                 .map(|(code, name)| (code.as_str(), name.as_str()))
         };
         find(language).or_else(|| {
-            let base = language.split(['-', '_']).next()?;
-            (base.len() < language.len()).then(|| find(base)).flatten()
+            let mut subtags = language.split(['-', '_']);
+            let base = subtags.next()?;
+            if base.len() == language.len() {
+                return None;
+            }
+            let found = find(base)?;
+            // A script subtag asks for the name written in that script, which
+            // the base name may not be: `sr` names are mostly Cyrillic, so
+            // `sr-Latn` takes one only when it is Latin.
+            match subtags.find(|subtag| is_script_subtag(subtag)) {
+                Some(script) => written_in(found.1, script).then_some(found),
+                None => Some(found),
+            }
         })
     }
 
@@ -1690,6 +1701,38 @@ struct PreparedRecord {
     names: RecordNames,
 }
 
+/// Whether a language tag's subtag is an ISO 15924 script code: four
+/// letters, such as `Latn` of `sr-Latn`.
+fn is_script_subtag(subtag: &str) -> bool {
+    subtag.len() == 4 && subtag.bytes().all(|byte| byte.is_ascii_alphabetic())
+}
+
+/// Whether `name` is written in the ISO 15924 script `code`: its letters
+/// are all of it. Simplified and traditional Chinese are both Han, and a
+/// script og cannot tell apart from another is never claimed.
+fn written_in(name: &str, code: &str) -> bool {
+    use unicode_script::{Script, UnicodeScript};
+    let wanted = match code.to_ascii_lowercase().as_str() {
+        "hans" | "hant" | "hani" => Some(Script::Han),
+        _ => {
+            let mut chars = code.chars();
+            let titled = chars.next().map(|first| {
+                first.to_ascii_uppercase().to_string() + &chars.as_str().to_ascii_lowercase()
+            });
+            titled.as_deref().and_then(Script::from_short_name)
+        }
+    };
+    let Some(wanted) = wanted else {
+        return false;
+    };
+    let mut letters = name
+        .chars()
+        .map(|character| character.script())
+        .filter(|script| !matches!(script, Script::Common | Script::Inherited))
+        .peekable();
+    letters.peek().is_some() && letters.all(|script| script == wanted)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -1703,6 +1746,20 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn a_script_subtag_takes_a_base_name_only_in_that_script() {
+        assert!(written_in("Beograd", "Latn"));
+        assert!(!written_in("Београд", "Latn"));
+        assert!(written_in("Београд", "cyrl"));
+        assert!(written_in("北京市", "Hans"));
+        assert!(!written_in("Beijing", "Hant"));
+        assert!(!written_in("123", "Latn"), "no letters, no script");
+        assert!(!written_in("Beograd", "Zzzz"));
+        assert!(is_script_subtag("Latn"));
+        assert!(!is_script_subtag("CH"));
+        assert!(!is_script_subtag("419"));
+    }
 
     #[test]
     fn language_names_survive_the_section_and_a_cut_one_fails() {
