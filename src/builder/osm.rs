@@ -5331,6 +5331,86 @@ mod tests {
         assert!(chain("osm:node:10").contains(&suburb));
     }
 
+    /// Every section a built Pack holds, by name and format version, a group
+    /// of one format (`records/*`) as one.
+    fn section_formats(pack: &Path) -> Vec<(String, u32)> {
+        let reader = Reader::open(pack).expect("reader");
+        let mut formats = reader
+            .container()
+            .sections()
+            .iter()
+            .map(|(name, info)| {
+                let name = match name.split_once('/') {
+                    Some((group, _)) => format!("{group}/*"),
+                    None => name.clone(),
+                };
+                (name, info.version)
+            })
+            .collect::<Vec<_>>();
+        formats.dedup();
+        formats
+    }
+
+    #[test]
+    fn the_schema_moves_with_every_section() {
+        let dir = temp_dir("section-formats");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(1, 52.0, 4.0, &[]),
+                    node(2, 52.0, 4.1, &[]),
+                    node(3, 52.1, 4.1, &[]),
+                    node(4, 52.1, 4.0, &[]),
+                    node(5, 52.05, 4.05, &[("place", "town"), ("name", "Havenstad")]),
+                ],
+                vec![way(100, &[1, 2, 3, 4, 1], &[])],
+                vec![relation(
+                    900,
+                    &[(100, "outer")],
+                    &[
+                        ("boundary", "administrative"),
+                        ("admin_level", "8"),
+                        ("name", "Havenstad"),
+                    ],
+                )],
+            ],
+        );
+        build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        // A section whose format changes fails this. Move
+        // PACK_SCHEMA_VERSION with it, so a Pack of the old format is told
+        // apart by its schema, then write the new formats here. Sections
+        // only some builds write (calibration's, timezones) are not listed.
+        let formats = section_formats(&dir.join("pack"));
+        let expected = [
+            ("context/*", 4),
+            ("country_codes", 1),
+            ("extents", 1),
+            ("gazetteer/*", 1),
+            ("language_names", 1),
+            ("manifest", 1),
+            ("parse/*", 4),
+            ("places/*", 3),
+            ("postcode_addresses", 1),
+            ("records/*", 13),
+            ("spatial/*", 3),
+            ("streets/*", 1),
+            ("subdivision_codes", 1),
+            ("text/*", 15),
+        ]
+        .map(|(name, version)| (name.to_string(), version));
+        assert_eq!(
+            (crate::pack::PACK_SCHEMA_VERSION, formats),
+            (11, expected.to_vec())
+        );
+    }
+
     #[test]
     fn an_area_lies_only_in_the_areas_that_hold_it() {
         let dir = temp_dir("island-context");

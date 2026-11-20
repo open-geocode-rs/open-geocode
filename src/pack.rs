@@ -61,7 +61,9 @@ pub const PACK_FILE: &str = "pack.ogp";
 pub const AUDIT_DIR: &str = "audit";
 pub const REJECTIONS_FILE: &str = "rejections.jsonl";
 pub const BUILD_REPORT_FILE: &str = "build-report.json";
-pub const PACK_SCHEMA_VERSION: u32 = 10;
+/// Moves whenever any section's format does, so a Pack another og wrote is
+/// told apart by its schema alone (see `the_schema_moves_with_every_section`).
+pub const PACK_SCHEMA_VERSION: u32 = 11;
 
 const MANIFEST_SECTION: &str = "manifest";
 const MANIFEST_VERSION: u32 = 1;
@@ -1313,8 +1315,10 @@ impl Reader {
         let manifest: Manifest =
             serde_json::from_slice(&container.section(MANIFEST_SECTION, MANIFEST_VERSION)?)?;
         if manifest.schema_version != PACK_SCHEMA_VERSION {
-            return Err(Error::UnsupportedVersion {
+            return Err(Error::UnsupportedFormat {
+                part: "schema".to_string(),
                 found: manifest.schema_version,
+                expected: PACK_SCHEMA_VERSION,
             });
         }
         let records = records::Reader::open(&container)?;

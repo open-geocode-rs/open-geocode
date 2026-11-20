@@ -998,8 +998,10 @@ impl PackDirectory {
                 continue;
             };
             if info.version != TEXT_INDEX_SCHEMA_VERSION {
-                return Err(Error::UnsupportedVersion {
+                return Err(Error::UnsupportedFormat {
+                    part: format!("section {name}"),
                     found: info.version,
+                    expected: TEXT_INDEX_SCHEMA_VERSION,
                 });
             }
             files.insert(PathBuf::from(file), container.raw_section(name)?);

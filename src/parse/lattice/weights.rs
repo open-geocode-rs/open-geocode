@@ -432,7 +432,11 @@ impl Weights {
         }
         let version = reader.u32()?;
         if version != WEIGHTS_VERSION {
-            return Err(Error::UnsupportedVersion { found: version });
+            return Err(Error::UnsupportedFormat {
+                part: "parser weights".to_string(),
+                found: version,
+                expected: WEIGHTS_VERSION,
+            });
         }
         let schema = reader.u64()?;
         let (features, labels, states) = (reader.u32()?, reader.u32()?, reader.u32()?);

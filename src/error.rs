@@ -45,6 +45,15 @@ pub enum Error {
     #[error("Pack container version {found} is unsupported; rebuild the Pack")]
     UnsupportedVersion { found: u32 },
 
+    /// A part of a Pack (its schema, a section, the parser's weights)
+    /// written in a format this og does not read.
+    #[error("the Pack's {part} is format {found} and this og reads {expected}; rebuild the Pack")]
+    UnsupportedFormat {
+        part: String,
+        found: u32,
+        expected: u32,
+    },
+
     /// A section's bytes do not hash to what the table of contents recorded.
     #[error("Pack section {section} is corrupt: its checksum does not match")]
     ChecksumMismatch { section: String },
