@@ -206,7 +206,9 @@ pub struct Common {
     /// House number and street for an address (`12 King Street West`), or
     /// the name of a street, area or POI.
     pub name: String,
-    /// One-line display label: `name` followed by its location.
+    /// One-line display label: `name` followed by its location. With
+    /// `lang`, each part that names the result or one of its areas is that
+    /// name in the language asked, as `name` and `context` are.
     pub label: String,
     /// POI category, such as `amenity:cafe`. Present only on POIs.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -939,7 +941,9 @@ fn localize_names(
     *translations = (!found.is_empty()).then_some(found);
 }
 
-fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) {
+/// Names a result and its areas in `languages`, and rewrites its label to
+/// match. Returns how each part of the old label moved (see [`relabel`]).
+fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) -> Vec<Moved> {
     if let Some(record_id) = common.record_id {
         localize_names(
             pack,
@@ -977,13 +981,95 @@ fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) {
     // The lines name areas, which just changed language.
     common.address_lines =
         crate::address_lines::address_lines(common.layer, &common.address, &common.context);
+    let context = &common.context;
+    let renamed = std::iter::once((common.local_name.as_deref(), common.name.as_str()))
+        .chain(
+            [
+                &context.neighbourhood,
+                &context.sublocality,
+                &context.locality,
+                &context.subdistrict,
+                &context.district,
+                &context.subregion,
+                &context.region,
+                &context.country,
+                &context.place,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|area| (area.local_name.as_deref(), area.name.as_str())),
+        )
+        .filter_map(|(local, named)| Some((local?.to_string(), named.to_string())))
+        .collect::<Vec<_>>();
+    let (label, moved) = relabel(&common.label, &renamed);
+    common.label = label;
+    moved
+}
+
+/// Where a part of an old label went in a new one, in characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Moved {
+    start: usize,
+    end: usize,
+    /// Where the part starts in the new label, `None` when it was renamed.
+    to: Option<usize>,
+}
+
+/// Separates the parts of a label.
+const LABEL_SEPARATOR: &str = ", ";
+
+/// `label` with each part that is a local name of `renamed` replaced by its
+/// new name, and how each old part moved. A part is the label's text
+/// between separators; the parts that name the result and its areas are
+/// their names as written.
+fn relabel(label: &str, renamed: &[(String, String)]) -> (String, Vec<Moved>) {
+    let mut parts = Vec::new();
+    let mut moved = Vec::new();
+    let (mut start, mut to) = (0, 0);
+    for part in label.split(LABEL_SEPARATOR) {
+        let length = part.chars().count();
+        let new = renamed
+            .iter()
+            .find(|(local, _)| local == part)
+            .map(|(_, named)| named.as_str());
+        moved.push(Moved {
+            start,
+            end: start + length,
+            to: new.is_none().then_some(to),
+        });
+        let written = new.unwrap_or(part);
+        to += written.chars().count() + LABEL_SEPARATOR.chars().count();
+        start += length + LABEL_SEPARATOR.chars().count();
+        parts.push(written);
+    }
+    (parts.join(LABEL_SEPARATOR), moved)
+}
+
+/// `highlights` moved with their label's parts. A highlight in a renamed
+/// part is dropped: the typed text matched the local name, not the new one.
+fn move_highlights(highlights: &mut Vec<Highlight>, moved: &[Moved]) {
+    highlights.retain_mut(|highlight| {
+        let Some(part) = moved
+            .iter()
+            .find(|part| part.start <= highlight.start && highlight.end <= part.end)
+        else {
+            return false;
+        };
+        let Some(to) = part.to else {
+            return false;
+        };
+        let shift = |offset: usize| offset - part.start + to;
+        (highlight.start, highlight.end) = (shift(highlight.start), shift(highlight.end));
+        true
+    });
 }
 
 /// Names every result and context area of a forward answer in the
 /// languages `lang` asked for.
 pub fn localize_forward(pack: &Reader, collection: &mut ForwardCollection, languages: &Languages) {
     for feature in &mut collection.features {
-        localize_common(pack, &mut feature.properties.common, languages);
+        let moved = localize_common(pack, &mut feature.properties.common, languages);
+        move_highlights(&mut feature.properties.highlights, &moved);
     }
 }
 
@@ -1331,6 +1417,27 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_label_names_its_parts_as_lang_does_and_its_highlights_follow() {
+        let renamed = [("Monaco".to_string(), "Монако-Вилль".to_string())];
+        let (label, moved) = relabel("Casino, Place du Casino, Monaco, 98000, MC", &renamed);
+        assert_eq!(label, "Casino, Place du Casino, Монако-Вилль, 98000, MC");
+        let mut highlights = vec![
+            Highlight { start: 0, end: 3 },
+            // "Mon" of the local name, which the label no longer writes.
+            Highlight { start: 25, end: 28 },
+            Highlight { start: 33, end: 38 },
+        ];
+        move_highlights(&mut highlights, &moved);
+        assert_eq!(
+            highlights,
+            [
+                Highlight { start: 0, end: 3 },
+                Highlight { start: 39, end: 44 }
+            ]
+        );
+    }
 
     #[test]
     fn a_unit_names_its_type_only_when_it_starts_with_one() {
