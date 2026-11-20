@@ -89,6 +89,10 @@ pub(crate) struct BoundaryIndex {
     boundaries: Vec<AcceptedBoundary>,
     tree: RTree<BoundaryBox>,
     shapes: Arc<Shapes>,
+    /// Each boundary by its record id.
+    by_record: HashMap<RecordId, usize>,
+    /// Each boundary by the OSM object it was built from.
+    by_source: HashMap<(ObjectType, i64), usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -898,11 +902,51 @@ impl BoundaryIndex {
                 boundary_id,
             })
             .collect::<Vec<_>>();
+        let by_record = boundaries
+            .iter()
+            .enumerate()
+            .map(|(at, boundary)| (boundary.record_id, at))
+            .collect();
+        let by_source = boundaries
+            .iter()
+            .enumerate()
+            .map(|(at, boundary)| ((boundary.source_object_type, boundary.source_object_id), at))
+            .collect();
         Self {
             boundaries,
             tree: RTree::bulk_load(boxes),
             shapes,
+            by_record,
+            by_source,
         }
+    }
+
+    /// The context of an area of `tier`: the areas at its point that are
+    /// broader than it and whose box holds its own. An island's point lies
+    /// in one of the towns on it, which does not hold the island. An area
+    /// with no outline, a place mapped as a node, is its point.
+    pub(crate) fn area_context(
+        &self,
+        tier: PlaceLayer,
+        record: &Record,
+        source: &SourceProvenance,
+    ) -> Option<RecordContext> {
+        let [lon, lat] = record.display_point()?;
+        let own = self
+            .by_source
+            .get(&(source.object_type, source.object_id))
+            .map_or_else(
+                || Rect::new((lon, lat), (lon, lat)),
+                |&at| self.boundaries[at].bounds,
+            );
+        let mut context = record_context(self, record)?;
+        context.admin_context = context.admin_context.above(tier);
+        context.admin_context.retain(|entry| {
+            self.by_record
+                .get(&entry.record_id)
+                .is_none_or(|&at| holds(self.boundaries[at].bounds, own))
+        });
+        Some(context)
     }
 
     pub(crate) fn context_for_point(
@@ -2001,6 +2045,14 @@ fn source_value_for_layer<'a>(
         PlaceLayer::Neighbourhood | PlaceLayer::SubNeighbourhood => source_context.neighbourhood,
         PlaceLayer::Place => source_context.place,
     }
+}
+
+/// Whether box `outer` holds box `inner`, edges included.
+fn holds(outer: Rect<f64>, inner: Rect<f64>) -> bool {
+    outer.min().x <= inner.min().x
+        && outer.min().y <= inner.min().y
+        && outer.max().x >= inner.max().x
+        && outer.max().y >= inner.max().y
 }
 
 fn envelope_from_rect(rect: Rect<f64>) -> AABB<[f64; 2]> {
