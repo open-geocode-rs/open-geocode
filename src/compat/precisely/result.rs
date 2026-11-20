@@ -1,15 +1,16 @@
 //! og's feature as a Precisely `Result`.
 //!
-//! og's answer is read as its JSON, the same for a real-time lookup and for a
-//! job's results read back from disk, so both carry a value into the same
-//! Precisely slot.
+//! A real-time lookup hands og's typed feature over as it is. A job's results
+//! come back from disk as og wrote them, and are parsed there into the same
+//! [`Feature`], so both fill the same Precisely slots.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::match_code::{Holds, Judged, MatchCode, QueryMatch};
+use super::match_code::{self, Holds, MatchCode};
 use crate::{
+    api::{self, Accuracy, PartMatch, QueryMatch},
     compat::{encode_parts, iso},
     record::Layer,
 };
@@ -40,7 +41,7 @@ struct Geometry {
 struct Properties {
     id: String,
     layer: Layer,
-    accuracy: String,
+    accuracy: Accuracy,
     name: String,
     label: String,
     #[serde(default)]
@@ -48,7 +49,7 @@ struct Properties {
     #[serde(default)]
     context: Context,
     source: Source,
-    confidence: Option<f64>,
+    confidence: Option<f32>,
     #[serde(default)]
     address_lines: Vec<String>,
     #[serde(rename = "match")]
@@ -93,9 +94,87 @@ struct Source {
     dataset: String,
 }
 
-/// og's features as this module reads them.
-pub(super) fn features<T: Serialize>(features: &[T]) -> serde_json::Result<Vec<Feature>> {
-    serde_json::from_value(serde_json::to_value(features)?)
+impl Feature {
+    fn of(
+        common: &api::Common,
+        coordinates: [f64; 2],
+        confidence: Option<f32>,
+        matched: Option<QueryMatch>,
+        distance_m: Option<f64>,
+    ) -> Self {
+        let address = &common.address;
+        let context = &common.context;
+        let area = |area: &Option<api::ContextArea>| {
+            area.as_ref().map(|area| Area {
+                name: area.name.clone(),
+                code: area.code.clone(),
+            })
+        };
+        Self {
+            geometry: Geometry { coordinates },
+            properties: Properties {
+                id: common.id.clone(),
+                layer: common.layer,
+                accuracy: common.accuracy,
+                name: common.name.clone(),
+                label: common.label.clone(),
+                address: Address {
+                    housenumber: address.housenumber.clone(),
+                    unit: address.unit.clone(),
+                    unit_type: address.unit_type.clone(),
+                    street: address.street.clone(),
+                    place: address.place.clone(),
+                    areas: address.areas.clone(),
+                    locality: address.locality.clone(),
+                    region: address.region.clone(),
+                    postcode: address.postcode.clone(),
+                    country: address.country.clone(),
+                },
+                context: Context {
+                    neighbourhood: area(&context.neighbourhood),
+                    sublocality: area(&context.sublocality),
+                    locality: area(&context.locality),
+                    district: area(&context.district),
+                    subregion: area(&context.subregion),
+                    region: area(&context.region),
+                    country: area(&context.country),
+                },
+                source: Source {
+                    dataset: common.source.dataset.clone(),
+                },
+                confidence,
+                address_lines: common.address_lines.clone(),
+                matched,
+                distance_m,
+            },
+        }
+    }
+}
+
+impl From<&api::ForwardFeature> for Feature {
+    fn from(feature: &api::ForwardFeature) -> Self {
+        let properties = &feature.properties;
+        Self::of(
+            &properties.common,
+            feature.geometry.coordinates,
+            properties.confidence,
+            properties.matched,
+            properties.distance_m,
+        )
+    }
+}
+
+impl From<&api::ReverseFeature> for Feature {
+    fn from(feature: &api::ReverseFeature) -> Self {
+        let properties = &feature.properties;
+        Self::of(
+            &properties.common,
+            feature.geometry.coordinates,
+            None,
+            None,
+            properties.distance_m,
+        )
+    }
 }
 
 /// Precisely's `Result`.
@@ -260,6 +339,21 @@ impl Feature {
         self.geometry.coordinates
     }
 
+    /// Whether og took it from `dataset`, `osm` or `openaddresses`, whose
+    /// sources og names `openaddresses:<source>`.
+    pub(super) fn is_from(&self, dataset: &str) -> bool {
+        let source = &self.properties.source.dataset;
+        source == dataset
+            || source
+                .strip_prefix(dataset)
+                .is_some_and(|rest| rest.starts_with(':'))
+    }
+
+    /// The ISO 3166-1 alpha-2 code of the country it lies in.
+    pub(super) fn country_code(&self) -> Option<&str> {
+        self.properties.context.country.as_ref()?.code.as_deref()
+    }
+
     /// Metres from the point a reverse geocode asked about.
     pub(super) const fn distance_m(&self) -> Option<f64> {
         self.properties.distance_m
@@ -270,6 +364,7 @@ impl Feature {
         let address = &properties.address;
         let context = &properties.context;
         let layer = properties.layer.as_str();
+        let accuracy = properties.accuracy.as_str();
         let is_street_line = matches!(layer, "address" | "interpolation" | "street");
         let area = |area: &Option<Area>| area.as_ref().map(|area| area.name.clone());
         let admin = |name: Option<String>| {
@@ -331,10 +426,14 @@ impl Feature {
         } else {
             (None, None)
         };
+        let judged = properties.matched.unwrap_or_default();
         let mut candidate = Candidate {
+            // A calibrated Pack's probability, else og's judgement of the
+            // stated parts (see [`match_code::score`]).
             score: properties
                 .confidence
-                .map(|confidence| (confidence * 100.0).round().clamp(0.0, 100.0) as u8),
+                .map(|confidence| (confidence * 100.0).round().clamp(0.0, 100.0) as u8)
+                .or_else(|| match_code::score(judged)),
             address: ResponseAddress {
                 formatted_address: Some(properties.label.clone()),
                 formatted_street_address: street_line,
@@ -366,11 +465,11 @@ impl Feature {
                 postal_code_ext,
                 country,
             },
-            address_lines: Vec::new(),
+            address_lines: properties.address_lines.clone(),
             location: Some(Location {
                 explanation: LocationExplanation {
-                    kind: location_type(layer, &properties.accuracy),
-                    designation: (properties.accuracy == "centroid").then_some("CENTROID"),
+                    kind: location_type(layer, accuracy),
+                    designation: (properties.accuracy == Accuracy::Centroid).then_some("CENTROID"),
                     additional_metadata: BTreeMap::from([(
                         "SOURCE",
                         properties.source.dataset.clone(),
@@ -380,7 +479,7 @@ impl Feature {
             }),
             explanation: Explanation {
                 address_match: AddressMatch {
-                    kind: match_type(layer, &properties.accuracy),
+                    kind: match_type(layer, accuracy),
                     description: Vec::new(),
                 },
             },
@@ -389,25 +488,28 @@ impl Feature {
                 encode_parts(&properties.id, Some(properties.layer), &properties.label),
             )]),
         };
+        let holds = Holds::of(&candidate.address);
+        candidate.explanation.address_match.description = describe(judged, &holds);
         if product == Product::Verify {
-            self.as_verified(&mut candidate);
+            // Verify standardizes an address and does not place it.
+            candidate.location = None;
+            if let Some(code) = MatchCode::derive(judged, holds, candidate.score) {
+                candidate
+                    .custom_fields
+                    .insert(SIMPLE_MATCH_CODE, code.simple());
+                candidate
+                    .custom_fields
+                    .insert(EXTENDED_MATCH_CODE, code.extended());
+            }
         }
         candidate
     }
+}
 
-    /// A geocode candidate as verify answers it. The address standardized
-    /// to og's record and how each stated part matched it, with no point.
-    /// What verify adds from postal registers, such as deliverability and
-    /// carrier routes, og has no data for, so those fields are absent.
-    fn as_verified(&self, candidate: &mut Candidate) {
-        let properties = &self.properties;
-        candidate.location = None;
-        candidate
-            .address_lines
-            .clone_from(&properties.address_lines);
-        let judged = properties.matched.unwrap_or_default();
-        let address = &candidate.address;
-        let holds = Holds {
+impl Holds {
+    /// What a result's address holds, for the parts og can fill.
+    fn of(address: &ResponseAddress) -> Self {
+        Self {
             housenumber: address.address_number.is_some(),
             street: address.street.is_some(),
             unit: address.unit.is_some(),
@@ -417,37 +519,39 @@ impl Feature {
             postcode: address.postal_code.is_some(),
             postcode_ext: address.postal_code_ext.is_some(),
             country: address.country.is_some(),
-        };
-        let parts = [
-            ("addressNumber", judged.housenumber, holds.housenumber),
-            ("street", judged.street, holds.street),
-            ("unitMatch", judged.unit, holds.unit),
-            ("city", judged.locality, holds.city),
-            ("admin1", judged.region, holds.region),
-            ("postalCode", judged.postcode, holds.postcode),
-            ("country", judged.country, holds.country),
-        ];
-        candidate.explanation.address_match.description = parts
-            .into_iter()
-            .map(|(label, judged, holds)| MatchDescription {
-                label,
-                match_type: match (judged, holds) {
-                    (Some(Judged::Matched), _) => "EXACT",
-                    (Some(Judged::Partial), _) => "PARTIAL",
-                    (None, true) => "ADDED",
-                    (Some(Judged::Unmatched) | None, _) => "NONE",
-                },
-            })
-            .collect();
-        if let Some(code) = MatchCode::derive(judged, holds, properties.confidence) {
-            candidate
-                .custom_fields
-                .insert(SIMPLE_MATCH_CODE, code.simple());
-            candidate
-                .custom_fields
-                .insert(EXTENDED_MATCH_CODE, code.extended());
         }
     }
+}
+
+/// How each part matched, as Precisely's `MatchDescription` names it. Only
+/// og's own `matched` is `EXACT`; a part the request left out that the
+/// result fills is `ADDED`. Empty when og judged no part, as of a record
+/// looked up by its key.
+fn describe(judged: QueryMatch, holds: &Holds) -> Vec<MatchDescription> {
+    if judged.is_empty() {
+        return Vec::new();
+    }
+    [
+        ("addressNumber", judged.housenumber, holds.housenumber),
+        ("street", judged.street, holds.street),
+        ("unitMatch", judged.unit, holds.unit),
+        ("city", judged.locality, holds.city),
+        ("admin1", judged.region, holds.region),
+        ("postalCode", judged.postcode, holds.postcode),
+        ("country", judged.country, holds.country),
+    ]
+    .into_iter()
+    .map(|(label, judged, holds)| MatchDescription {
+        label,
+        match_type: match judged {
+            Some(PartMatch::Matched) => "EXACT",
+            Some(PartMatch::Partial) => "PARTIAL",
+            Some(PartMatch::Unmatched) => "NONE",
+            None if holds => "ADDED",
+            None => "NONE",
+        },
+    })
+    .collect()
 }
 
 /// The keys a verify result's Global Match Codes are under.

@@ -260,12 +260,58 @@ fn given(value: Option<&str>) -> Option<&str> {
 #[serde(rename_all = "camelCase")]
 struct Preferences {
     max_results: Option<i64>,
+    distance: Option<Distance>,
+}
+
+/// Precisely's `Distance`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Distance {
+    value: f64,
+    distance_unit: Option<DistanceUnit>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+enum DistanceUnit {
+    Foot,
+    Meter,
+    Mile,
+    Kilometer,
+}
+
+impl DistanceUnit {
+    const fn metres(self) -> f64 {
+        match self {
+            Self::Foot => 0.3048,
+            Self::Meter => 1.0,
+            Self::Mile => 1609.344,
+            Self::Kilometer => 1000.0,
+        }
+    }
 }
 
 /// Precisely answers one candidate unless asked for more.
 const DEFAULT_MAX_RESULTS: i64 = 1;
 
 impl Preferences {
+    /// The search radius in metres, when the request states one. Precisely
+    /// measures in metres unless told otherwise.
+    fn distance_m(&self) -> Result<Option<f64>, VendorError> {
+        let Some(distance) = &self.distance else {
+            return Ok(None);
+        };
+        if !(distance.value.is_finite() && distance.value > 0.0) {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                "Invalid value for distance (DIS-LI-1018)",
+            ));
+        }
+        let unit = distance.distance_unit.unwrap_or(DistanceUnit::Meter);
+        Ok(Some(distance.value * unit.metres()))
+    }
+
     fn max_results(&self) -> Result<usize, VendorError> {
         let max = self.max_results.unwrap_or(DEFAULT_MAX_RESULTS);
         usize::try_from(max)

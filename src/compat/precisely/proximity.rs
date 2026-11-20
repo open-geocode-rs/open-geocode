@@ -14,8 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Failure, country_code, error, given, read_json,
-    realtime::internal,
-    result::{self, Product},
+    result::{self, Feature, Product},
 };
 use crate::compat::{Args, VendorError, native};
 use crate::runtime::AppState;
@@ -88,6 +87,9 @@ fn metres_per(unit: &str) -> Option<f64> {
     })
 }
 
+/// The datasets a request may name: the sources of og's addresses.
+const DATASETS: [&str; 2] = ["osm", "openaddresses"];
+
 /// The unit a distance comes back in when the request names none. The
 /// documented answer measures kilometres.
 const DEFAULT_UNIT: &str = "KILOMETER";
@@ -102,15 +104,31 @@ pub(super) async fn proximity_search(
     let (Some(preferences), Some(location)) = (body.preferences, body.location) else {
         return Err(not_valid());
     };
-    if given(preferences.dataset.as_deref()).is_none() {
+    let Some(dataset) = given(preferences.dataset.as_deref()) else {
         return Err(invalid(
             "Dataset is not provided in the request (DIS-LI-1031)",
         ));
+    };
+    // og holds no reference dataset of its own; the addresses it searches
+    // come from OSM or OpenAddresses, and only those two can be asked for.
+    let dataset = dataset.to_ascii_lowercase();
+    if !DATASETS.contains(&dataset.as_str()) {
+        return Err(invalid(&format!(
+            "Dataset {dataset} is not held by this server, which searches the osm and \
+             openaddresses addresses of its Pack (DIS-LI-1031)"
+        )));
     }
-    super::Preferences {
-        max_results: preferences.max_results,
+    if preferences.max_results.is_some_and(|max| max < 1) {
+        return Err(invalid("Invalid value for maxResults (DIS-LI-1036)"));
     }
-    .max_results()?;
+    // og's reverse geocode answers the one nearest address, so more cannot
+    // be promised.
+    if preferences.max_results.is_some_and(|max| max > 1) {
+        return Err(invalid(
+            "Invalid value for maxResults, this server answers the one nearest address \
+             (DIS-LI-1036)",
+        ));
+    }
     let country = given(location.country.as_deref())
         .ok_or_else(|| invalid("Country is not provided in the request (DIS-LI-1015)"))?;
     let (Some(lon), Some(lat)) = (location.longitude, location.latitude) else {
@@ -134,7 +152,11 @@ pub(super) async fn proximity_search(
     let collection = native::reverse(&state, args)
         .await
         .map_err(|problem| Failure::of(&problem, Some(country)).into_error(problem))?;
-    let features = result::features(&collection.features).map_err(internal)?;
+    let features = collection
+        .features
+        .iter()
+        .map(Feature::from)
+        .collect::<Vec<_>>();
     let wanted = country_code(country);
     let results = features
         .iter()
@@ -147,6 +169,9 @@ pub(super) async fn proximity_search(
                 .and_then(|country| country.iso_alpha2_code.as_deref());
             // An address over the border is not in the country asked for.
             if alpha2.is_some_and(|alpha2| !alpha2.eq_ignore_ascii_case(&wanted)) {
+                return None;
+            }
+            if !feature.is_from(&dataset) {
                 return None;
             }
             let distance_m = feature.distance_m()?;

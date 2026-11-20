@@ -10,8 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Failure, Preferences, country_code, error, given, read_json,
-    realtime::internal,
-    result::{self, AdminField, CountryField, Feature, Product, SimpleFeature},
+    result::{AdminField, CountryField, Feature, Product, SimpleFeature},
 };
 use crate::compat::{Args, VendorError, native};
 use crate::runtime::AppState;
@@ -168,7 +167,11 @@ pub(super) async fn postal_city(
     let collection = native::autocomplete(&state, args)
         .await
         .map_err(|problem| Failure::of(&problem, Some(country)).into_error(problem))?;
-    let features = result::features(&collection.features).map_err(internal)?;
+    let features = collection
+        .features
+        .iter()
+        .map(Feature::from)
+        .collect::<Vec<_>>();
     let predictions = features
         .iter()
         .map(|feature| prediction(feature, kind))
