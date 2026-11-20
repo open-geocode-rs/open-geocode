@@ -505,7 +505,7 @@
                 "type": "boolean"
               },
               "highlights": {
-                "description": "The parts of `label` the typed text matched, in order, none\noverlapping. Present on `/autocomplete` results, the only ones found\nby text still being typed. Absent when no typed word can be placed\nin the label, as on a place suggested for its category.",
+                "description": "The parts of `label` the typed text matched, in order, none\noverlapping. Present on `/autocomplete` results, the only ones found\nby text still being typed. A place suggested for the kind the text\nnames is marked where the typed words lie in its label too. Absent\nwhen no typed word can be placed in the label.",
                 "items": {
                   "$ref": "#/components/schemas/Highlight"
                 },

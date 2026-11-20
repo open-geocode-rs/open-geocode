@@ -9664,6 +9664,15 @@ pub(crate) fn autocomplete_tokens(query: &str) -> Vec<String> {
     search_key(query.trim()).map_or_else(Vec::new, |key| autocomplete_query_tokens(&key))
 }
 
+/// Where the words of `query`, typed so far, lie in a suggestion's `label`,
+/// each placed on its own and the last as it may be cut short. For a
+/// suggestion found other than by its text, such as a place of the kind the
+/// query names, whose label the text search never matched.
+pub(crate) fn typed_highlights(query: &str, label: &str) -> Vec<Highlight> {
+    let words = autocomplete_tokens(query);
+    highlight::Highlighter::new(Completion::AllWords, None, &words, true).ranges(label)
+}
+
 pub(crate) fn effective_autocomplete_limit(limit: usize) -> usize {
     let limit = effective_limit(limit);
     limit.min(MAX_AUTOCOMPLETE_LIMIT)

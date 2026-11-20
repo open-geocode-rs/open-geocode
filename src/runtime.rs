@@ -51,6 +51,7 @@ use crate::{
         AddressGeocodeOptions, BIAS_RADIUS_M, BoundingBox, DEFAULT_SEARCH_LIMIT,
         TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher,
         autocomplete_tokens, category_typo, effective_autocomplete_limit, name_starts_as, suggest,
+        typed_highlights,
     },
     spatial_index::haversine_m,
     stop::{self, CancelOnDrop, Stop},
@@ -1194,6 +1195,9 @@ fn nearest_of_category(
     )?;
     if hits.is_empty() {
         return Ok(named);
+    }
+    for hit in &mut hits {
+        hit.highlights = typed_highlights(&options.query, &hit.record.label);
     }
     for hit in named {
         if hits.len() >= limit {
@@ -3684,6 +3688,14 @@ mod router_tests {
                 (
                     serde_json::json!("Lantern Cafe, Toronto"),
                     Some(serde_json::json!([range(0, 7)])),
+                ),
+            ),
+            // Found as a place of the kind typed, and marked all the same.
+            (
+                "/autocomplete?q=cafe&focus=-79.4,43.0",
+                (
+                    serde_json::json!("Lantern Cafe, Toronto"),
+                    Some(serde_json::json!([range(8, 12)])),
                 ),
             ),
             ("/geocode?q=10%20King%20Street%20West", (house, None)),

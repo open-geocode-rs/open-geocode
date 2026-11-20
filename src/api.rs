@@ -334,8 +334,9 @@ pub struct ForwardProperties {
     pub matched: Option<QueryMatch>,
     /// The parts of `label` the typed text matched, in order, none
     /// overlapping. Present on `/autocomplete` results, the only ones found
-    /// by text still being typed. Absent when no typed word can be placed
-    /// in the label, as on a place suggested for its category.
+    /// by text still being typed. A place suggested for the kind the text
+    /// names is marked where the typed words lie in its label too. Absent
+    /// when no typed word can be placed in the label.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schema(value_type = Option<Vec<Highlight>>)]
     pub highlights: Vec<Highlight>,
