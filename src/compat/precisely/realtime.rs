@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Failure, Preferences, country_code, error, given, read_json,
-    result::{self, Candidate, Feature, Product},
+    result::{Candidate, Feature, Product},
 };
 use crate::{
     compat::{Args, VendorError, decode_id, native},
@@ -126,14 +126,16 @@ struct ReverseRequest {
     locations: Vec<InputLocation>,
 }
 
-/// `LocationDetail`. Its `country` is not read, since og's reverse geocode
-/// finds the country from the point.
+/// `LocationDetail`. og finds the country from the point, so a stated
+/// `country` keeps only results in it, as a point near a border may answer
+/// with the other side.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InputLocation {
     address_id: Option<String>,
     longitude: Option<f64>,
     latitude: Option<f64>,
+    country: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,21 +230,18 @@ impl Outcome {
         Self::failed(address_id, Failure::of(&problem, country), Some(problem))
     }
 
-    fn of_features<T: Serialize>(
+    fn of_features<'a, T: 'a>(
         address_id: Option<String>,
-        features: &[T],
+        features: &'a [T],
         max: usize,
         product: Product,
-    ) -> Result<Self, VendorError> {
-        let features = result::features(features).map_err(internal)?;
-        Ok(Self::found(address_id, &features, max, product))
+    ) -> Self
+    where
+        &'a T: Into<Feature>,
+    {
+        let features = features.iter().map(Into::into).collect::<Vec<_>>();
+        Self::found(address_id, &features, max, product)
     }
-}
-
-/// og's own answer did not read back as og's shape. A bug, logged as one.
-pub(super) fn internal(cause: serde_json::Error) -> VendorError {
-    let problem = Problem::internal(cause.into());
-    Failure::of(&problem, None).into_error(problem)
 }
 
 fn args(params: Vec<(&'static str, String)>) -> Args {
@@ -362,7 +361,7 @@ async fn addresses(
         outcomes.push(
             match native::geocode(&state, args(address.geocode_params(max))).await {
                 Ok(collection) => {
-                    Outcome::of_features(address_id, &collection.features, max, product)?
+                    Outcome::of_features(address_id, &collection.features, max, product)
                 }
                 Err(problem) => Outcome::refused(address_id, problem, address.country()),
             },
@@ -389,18 +388,38 @@ pub(super) async fn reverse(
     let id = request_id(&request);
     let body = read_json::<ReverseRequest>(&state, request, "INVALID_REQUEST").await?;
     let max = body.preferences.max_results()?;
+    let radius_m = body.preferences.distance_m()?;
     let mut outcomes = Vec::new();
     for location in checked(body.locations)? {
         let args = Args::new()
             .maybe("lon", location.longitude.map(|lon| lon.to_string()))
             .maybe("lat", location.latitude.map(|lat| lat.to_string()));
+        let wanted = given(location.country.as_deref()).map(country_code);
         outcomes.push(match native::reverse(&state, args).await {
-            Ok(collection) => Outcome::of_features(
-                location.address_id,
-                &collection.features,
-                max,
-                Product::Geocode,
-            )?,
+            Ok(collection) => {
+                // A result past the search radius is not one Precisely would
+                // find; an area holds the point, so it has no distance.
+                let features = collection
+                    .features
+                    .iter()
+                    .map(Feature::from)
+                    .filter(|feature| {
+                        radius_m.is_none_or(|radius| {
+                            feature
+                                .distance_m()
+                                .is_none_or(|distance| distance <= radius)
+                        })
+                    })
+                    .filter(|feature| {
+                        wanted.as_deref().is_none_or(|wanted| {
+                            feature
+                                .country_code()
+                                .is_some_and(|code| code.eq_ignore_ascii_case(wanted))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Outcome::found(location.address_id, &features, max, Product::Geocode)
+            }
             Err(problem) => Outcome::refused(location.address_id, problem, None),
         });
     }
@@ -440,7 +459,7 @@ pub(super) async fn lookup(
                 None => Outcome::found(None, &[], 1, Product::Geocode),
                 Some(og_id) => match native::by_id(&state, &og_id, None).await {
                     Ok(feature) => {
-                        Outcome::of_features(None, feature.as_slice(), 1, Product::Geocode)?
+                        Outcome::of_features(None, feature.as_slice(), 1, Product::Geocode)
                     }
                     Err(problem) => Outcome::refused(None, problem, None),
                 },
@@ -489,7 +508,11 @@ pub(super) async fn autocomplete(
     let collection = native::autocomplete(&state, args)
         .await
         .map_err(|problem| Failure::of(&problem, address.country()).into_error(problem))?;
-    let features = result::features(&collection.features).map_err(internal)?;
+    let features = collection
+        .features
+        .iter()
+        .map(Feature::from)
+        .collect::<Vec<_>>();
     let predictions = features
         .iter()
         .map(|feature| Prediction {

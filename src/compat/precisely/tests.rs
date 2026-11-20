@@ -357,7 +357,23 @@ fn assert_carries(feature: &Value, result: &Value) {
     );
 }
 
-fn address_result(score: &Value) -> Value {
+/// The address result, `described` its matchType per part as og judged it,
+/// in Precisely's order.
+fn address_result(score: &Value, described: &[&str; 7]) -> Value {
+    let labels = [
+        "addressNumber",
+        "street",
+        "unitMatch",
+        "city",
+        "admin1",
+        "postalCode",
+        "country",
+    ];
+    let description = labels
+        .iter()
+        .zip(described.iter())
+        .map(|(label, kind)| json!({"label": label, "matchType": kind}))
+        .collect::<Vec<_>>();
     json!({
         "score": score,
         "address": {
@@ -391,7 +407,8 @@ fn address_result(score: &Value) -> Value {
                 "geometry": {"type": "Point", "coordinates": [-79.3817, 43.6493]},
             },
         },
-        "explanation": {"addressMatch": {"type": "ADDRESS"}},
+        "addressLines": ["Unit 5", "100 King Street West", "Toronto, ON M5X 1A9", "Canada"],
+        "explanation": {"addressMatch": {"type": "ADDRESS", "description": description}},
         "customFields": {"PB_KEY": address_vendor_id("osm:node:10")},
     })
 }
@@ -443,9 +460,15 @@ async fn geocode_answers_each_address_in_order() {
     assert_eq!(
         reply.json(),
         json!({"responses": [
-            {"addressId": "1", "status": "OK", "results": [address_result(&score)]},
+            {"addressId": "1", "status": "OK", "results": [address_result(
+                &score,
+                &["EXACT", "EXACT", "ADDED", "ADDED", "ADDED", "ADDED", "ADDED"],
+            )]},
             {"addressId": "2", "status": "ZERO_RESULTS", "results": []},
-            {"addressId": "3", "status": "OK", "results": [address_result(&structured_score)]},
+            {"addressId": "3", "status": "OK", "results": [address_result(
+                &structured_score,
+                &["EXACT", "EXACT", "ADDED", "EXACT", "ADDED", "EXACT", "ADDED"],
+            )]},
         ]})
     );
 }
@@ -546,6 +569,7 @@ async fn a_poi_says_what_it_is_and_where() {
                 "feature": {"type": "Feature", "properties": {"crsName": "epsg:4326"},
                             "geometry": {"type": "Point", "coordinates": [-79.383, 43.649]}},
             },
+            "addressLines": ["120 King Street West", "Toronto, ON M5X 1A9", "Canada"],
             "explanation": {"addressMatch": {"type": "POI"}},
             "customFields": {"PB_KEY": encode_parts("osm:way:11", Some(Layer::Poi), "")},
         }]}})
@@ -700,15 +724,22 @@ async fn reverse_geocode_answers_each_point() {
         &router,
         "/v1/reverse-geocode",
         &json!({"locations": [
-            {"addressId": "a", "longitude": -79.3817, "latitude": 43.6493, "country": "USA"},
+            {"addressId": "a", "longitude": -79.3817, "latitude": 43.6493, "country": "CAN"},
             {"addressId": "b", "latitude": 43.6493, "country": "CAN"},
             {"addressId": "c", "longitude": -79.3817, "latitude": 91.0, "country": "CAN"},
+            {"addressId": "d", "longitude": -79.3817, "latitude": 43.6493, "country": "USA"},
         ]}),
     )
     .await;
     assert_eq!(reply.status, StatusCode::PARTIAL_CONTENT);
-    let mut expected = address_result(&json!(null));
+    // A point judges no stated part, so the result has no score and no
+    // match description.
+    let mut expected = address_result(&json!(null), &["NONE"; 7]);
     expected.as_object_mut().expect("result").remove("score");
+    expected["explanation"]["addressMatch"]
+        .as_object_mut()
+        .expect("addressMatch")
+        .remove("description");
     assert_eq!(
         reply.json(),
         json!({"responses": [
@@ -717,8 +748,19 @@ async fn reverse_geocode_answers_each_point() {
              "errorMessage": "could not parse query parameters (DIS-LI-1018)"},
             {"addressId": "c", "status": "INVALID_REQUEST",
              "errorMessage": "coordinate out of range (DIS-LI-1018)"},
+            // A point in Canada has no answer in the United States.
+            {"addressId": "d", "status": "ZERO_RESULTS", "results": []},
         ]})
     );
+    // Past the search radius is nothing.
+    let near = post(
+        &router,
+        "/v1/reverse-geocode",
+        &json!({"preferences": {"distance": {"value": 0.001, "distanceUnit": "METER"}},
+                "locations": [{"longitude": -79.3816, "latitude": 43.6494, "country": "CAN"}]}),
+    )
+    .await;
+    assert_eq!(near.json()["responses"][0]["status"], "ZERO_RESULTS");
 }
 
 #[tokio::test]
@@ -1534,8 +1576,7 @@ async fn proximity_search_finds_the_nearest_address() {
     let search = |distance: Value, country: &str| {
         let router = router.clone();
         let body = json!({
-            "preferences": {"dataset": "premium-address-points", "maxResults": 3,
-                            "distance": distance},
+            "preferences": {"dataset": "osm", "maxResults": 1, "distance": distance},
             "location": {"addressId": "7", "latitude": 43.6494, "longitude": -79.3816,
                          "country": country},
         });
@@ -1585,20 +1626,32 @@ async fn proximity_search_finds_the_nearest_address() {
             "Dataset is not provided in the request (DIS-LI-1031)",
         ),
         (
-            json!({"preferences": {"dataset": "d"}, "location": {"latitude": 1, "longitude": 1}}),
+            json!({"preferences": {"dataset": "premium-address-points"},
+                   "location": {"latitude": 1, "longitude": 1, "country": "CA"}}),
+            "Dataset premium-address-points is not held by this server, which searches the \
+             osm and openaddresses addresses of its Pack (DIS-LI-1031)",
+        ),
+        (
+            json!({"preferences": {"dataset": "osm", "maxResults": 3},
+                   "location": {"latitude": 1, "longitude": 1, "country": "CA"}}),
+            "Invalid value for maxResults, this server answers the one nearest address \
+             (DIS-LI-1036)",
+        ),
+        (
+            json!({"preferences": {"dataset": "osm"}, "location": {"latitude": 1, "longitude": 1}}),
             "Country is not provided in the request (DIS-LI-1015)",
         ),
         (
-            json!({"preferences": {"dataset": "d"}, "location": {"latitude": 1, "country": "CA"}}),
+            json!({"preferences": {"dataset": "osm"}, "location": {"latitude": 1, "country": "CA"}}),
             "Request Body is not valid (DIS-LI-1018)",
         ),
         (
-            json!({"preferences": {"dataset": "d", "distance": {"value": 1, "distanceUnit": "CUBIT"}},
+            json!({"preferences": {"dataset": "osm", "distance": {"value": 1, "distanceUnit": "CUBIT"}},
                    "location": {"latitude": 1, "longitude": 1, "country": "CA"}}),
             "Request Body is not valid (DIS-LI-1018)",
         ),
         (
-            json!({"preferences": {"dataset": "d", "maxResults": 0},
+            json!({"preferences": {"dataset": "osm", "maxResults": 0},
                    "location": {"latitude": 1, "longitude": 1, "country": "CA"}}),
             "Invalid value for maxResults (DIS-LI-1036)",
         ),
