@@ -16,9 +16,10 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use crate::{
-    compat::{decode_id, encode_parts, iso},
+    compat::{decode_id, encode_parts},
     confidence::{FEATURES, Model},
     context::{AdminContextTuple, RecordContext},
+    iso,
     limits::Limits,
     pack::Writer,
     record::{

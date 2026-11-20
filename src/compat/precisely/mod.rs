@@ -235,9 +235,9 @@ fn country_code(country: &str) -> String {
     let country = country.trim();
     if country.len() == 3 {
         let mapped = if country.bytes().all(|byte| byte.is_ascii_digit()) {
-            super::iso::alpha2_of_numeric(country)
+            crate::iso::alpha2_of_numeric(country)
         } else {
-            super::iso::alpha2_of(country)
+            crate::iso::alpha2_of(country)
         };
         if let Some(alpha2) = mapped {
             return alpha2.to_string();

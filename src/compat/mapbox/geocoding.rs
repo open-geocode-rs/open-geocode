@@ -25,11 +25,12 @@ use crate::{
         ReverseCollection,
     },
     batch::map_in_order,
-    compat::{Args, decode_id, encode_area_id, encode_id, iso, native},
+    compat::{Args, decode_id, encode_area_id, encode_id, native},
     http::{
         batch::{self as og_batch, Prepared, RawItem},
         problem::Problem,
     },
+    iso,
     runtime::{self, AppState, GeocodeRequest, Named, PlacesRequest},
     stop::CancelOnDrop,
 };

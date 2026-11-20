@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use super::match_code::{Holds, MatchCode};
 use crate::{
     api::{self, Accuracy, PartMatch, QueryMatch},
-    compat::{encode_parts, iso},
+    compat::encode_parts,
+    iso,
     record::Layer,
 };
 

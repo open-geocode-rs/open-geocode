@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     api::{self, Accuracy, ForwardFeature, Highlight, PartMatch, QueryMatch, ReverseFeature},
-    compat::{encode_parts, iso},
+    compat::encode_parts,
+    iso,
     record::{Contact, Layer},
     spatial_index::haversine_m,
 };

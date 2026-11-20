@@ -148,9 +148,8 @@ impl Qualified {
     fn country_code(&self) -> Option<&'static str> {
         let country = self.country.as_deref()?.trim();
         match country.len() {
-            2 => crate::compat::iso::alpha3(&country.to_ascii_uppercase())
-                .and_then(crate::compat::iso::alpha2_of),
-            3 => crate::compat::iso::alpha2_of(country),
+            2 => crate::iso::alpha3(&country.to_ascii_uppercase()).and_then(crate::iso::alpha2_of),
+            3 => crate::iso::alpha2_of(country),
             _ => None,
         }
     }
