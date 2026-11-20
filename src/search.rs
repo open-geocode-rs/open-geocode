@@ -519,7 +519,8 @@ impl TextSearcher {
 
     /// Rate each of `hits`, ranked best first, against the hit after it:
     /// what [`Features`] search could not know of one hit alone, then the
-    /// confidence when the Pack has a model.
+    /// confidence when the Pack has a model and the hit answers a numbered
+    /// address.
     fn rate(&self, hits: &mut [TextSearchHit]) {
         for index in 0..hits.len() {
             let next = hits.get(index + 1).map(|next| next.score);
@@ -534,10 +535,15 @@ impl TextSearcher {
                 .record
                 .point
                 .map(|point| Accuracy::of(point.precision, &hit.record.source));
-            // A fallback is not what the query asks for, by what it is.
-            hit.confidence = self.confidence.as_ref().map(|model| match hit.fallback {
-                true => 0.0,
-                false => model.rate(&hit.features),
+            // A fallback is not what the query asks for, by what it is. The
+            // model is fitted to answers to numbered addresses, so it rates
+            // only an answer to a query that states a house number.
+            hit.confidence = self.confidence.as_ref().and_then(|model| {
+                match (hit.fallback, hit.features.number.is_some()) {
+                    (true, _) => Some(0.0),
+                    (false, true) => Some(model.rate(&hit.features)),
+                    (false, false) => None,
+                }
             });
         }
     }
@@ -2123,6 +2129,8 @@ impl TextSearcher {
         };
         crate::stop::check()?;
         let first_query = first_plan.text();
+        let first_plan_numbered = first_plan.house_number.is_some();
+        let seeks_place = choose::Named::of(first_plan).seeks_place();
         let stated = first_plan
             .context
             .iter()
@@ -2213,7 +2221,12 @@ impl TextSearcher {
             let answer = self.structured_stage(&cx, &mut accept, &mut declined)?;
             let spent = start.elapsed();
             match answer {
-                Some(answer) if answer.1.len() >= wanted => return Ok(finish(answer)),
+                // A query for places only is not settled by the streets of a
+                // reading that takes its town for a road ("Exeter, RI"), so
+                // the text search still looks for the place itself.
+                Some(answer) if answer.1.len() >= wanted && !seeks_place => {
+                    return Ok(finish(answer));
+                }
                 // Fewer answers than asked for: they come first, and the text
                 // search gives the rest.
                 Some(answer) => first = Some(answer),
@@ -2268,7 +2281,10 @@ impl TextSearcher {
                 }
             }
         }
-        let (query, hits) = match &self.ranker {
+        // The ranker is fitted to queries for numbered addresses, so it
+        // orders only those. A query for a town or a street keeps the order
+        // the query's own words give.
+        let (query, hits) = match self.ranker.as_ref().filter(|_| first_plan_numbered) {
             Some(ranker) => pool.ranked(ranker, &readings, limit),
             None => pool.chosen(&readings, limit),
         }
@@ -10823,16 +10839,21 @@ mod tests {
             .save(&pack)
             .expect("save");
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
-        for query in ["10 King Street", "99 King Street", "King"] {
+        for query in ["10 King Street", "99 King Street"] {
             let hits = search(&searcher, query);
             assert!(!hits.is_empty(), "{query}");
             for hit in hits {
                 let confidence = hit
                     .confidence
-                    .expect("a calibrated Pack rates every answer");
+                    .expect("a calibrated Pack rates every answer to a numbered address");
                 assert!((0.0..=1.0).contains(&confidence), "{query}: {confidence}");
             }
         }
+        // The model is fitted to numbered addresses, so it rates nothing a
+        // query for a street or a town finds.
+        let hits = search(&searcher, "King");
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|hit| hit.confidence.is_none()));
         let suggestions = searcher
             .autocomplete(&TextAutocompleteOptions {
                 query: "10 King St".to_string(),
