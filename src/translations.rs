@@ -571,21 +571,26 @@ impl Translations {
     pub fn street_near(&self, language: &str, name: &str, lon: f64, lat: f64) -> Option<&str> {
         let table = self.table(language)?;
         let bytes: &[u8] = &self.bytes;
-        let (mut low, mut high) = (0, count(table, 1));
+        // Lower bound: the first entry whose text is not less than `name`.
+        // The earlier search stopped on the first equal entry it found, at
+        // `middle`, and then scanned from `low`, so entries below `name` in
+        // `[low, middle)` made the first `text != name` break the loop and
+        // return nothing. A small table happened to land on the match; a
+        // large one did not, which is why only the full build failed.
+        let count = count(table, 1);
+        let mut low = 0;
+        let mut high = count;
         while low < high {
             let middle = low + (high - low) / 2;
             let text = table.text(bytes, 1, middle * 2)?;
-            match text.cmp(name.as_bytes()) {
-                std::cmp::Ordering::Less => low = middle + 1,
-                std::cmp::Ordering::Greater => high = middle,
-                std::cmp::Ordering::Equal => break,
+            if text < name.as_bytes() {
+                low = middle + 1;
+            } else {
+                high = middle;
             }
         }
-        if low == high {
-            return None;
-        }
         let mut found: Option<(&str, f64)> = None;
-        for index in low..high {
+        for index in low..count {
             let text = table.text(bytes, 1, index * 2)?;
             if text != name.as_bytes() {
                 break;
@@ -610,6 +615,7 @@ impl Translations {
         }
         found.map(|(translated, _)| translated)
     }
+
 
     fn table(&self, language: &str) -> Option<&Table> {
         let index = self
@@ -880,6 +886,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_large_table_finds_a_match_that_sorts_after_many_others() {
+        let mut block = Vec::new();
+        for id in 1..=200 {
+            block.push(node(id, 39.47 + id as f64 * 0.001, -0.37, &[]));
+        }
+        for id in 1..=200 {
+            block.push(street(id + 1000, &[id], "Aaaa", "Primero"));
+        }
+        block.push(node(201, 39.48, -0.38, &[]));
+        block.push(node(202, 39.4801, -0.3801, &[]));
+        block.push(street(2001, &[201, 202], "Carrer Major", "Calle Mayor"));
+        let translations = built(&[block], &["es"]);
+        assert_eq!(
+            translations.street_near("es", "Carrer Major", -0.38, 39.48),
+            Some("Calle Mayor")
+        );
+    }
     #[test]
     fn a_street_whose_node_is_missing_from_the_extract_does_not_panic() {
         let translations = built(&examples(), &["es"]);
