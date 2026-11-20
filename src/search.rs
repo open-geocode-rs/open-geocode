@@ -7766,8 +7766,8 @@ fn number_match(record: &Summary, number: &HouseNumber, ranking: &Ranking) -> Pa
 
 /// How a record answers the subject of `plan`, which is its `part`. The
 /// words of the record's street, or of its name when the plan seeks a
-/// place, have each subject word as written or as the word it abbreviates,
-/// some a typo away or missing, or none of them. A record with no street
+/// place, have each subject word as written, as the word it abbreviates or
+/// as its abbreviation, some a typo away or missing, or none of them. A record with no street
 /// answers no street. `None` for a place the plan seeks when the record is
 /// no such place, since where it lies was not judged.
 fn subject_match(part: Label, plan: &QueryPlan, record: &Summary) -> Option<PartMatch> {
@@ -7786,7 +7786,8 @@ fn subject_match(part: Label, plan: &QueryPlan, record: &Summary) -> Option<Part
     let (mut written, mut near) = (0, 0);
     for word in &plan.subject {
         let has = |form: &String| label.contains(&form.as_str());
-        if has(&word.text) || lattice::other_forms(&word.text).iter().any(has) {
+        // Records write either form, "Queen St W" or "Queen Street West".
+        if has(&word.text) || lattice::forms_both_ways(&word.text).iter().any(has) {
             written += 1;
         } else if word.corrected.as_ref().is_some_and(has)
             || label
