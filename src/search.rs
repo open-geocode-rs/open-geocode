@@ -614,8 +614,8 @@ impl TextSearcher {
 
     /// `hits` with each Wikidata item once, at its best place, cut to
     /// `limit`: one place mapped twice, as a node and a boundary, is one
-    /// answer. It is the boundary, which carries the place's extent and is
-    /// the area the place's addresses lie in, at the better place of the two.
+    /// answer. Of an area it is the boundary, which carries the area's extent
+    /// and is the area its addresses lie in, at the better place of the two.
     fn one_per_item(&self, hits: &mut Vec<TextSearchHit>, limit: usize) -> Result<()> {
         let records = self.pack.records();
         let mut at = HashMap::new();
@@ -627,8 +627,14 @@ impl TextSearcher {
             };
             match at.get(&item) {
                 Some(&held) => {
+                    // Only an area takes its boundary's place: a POI drawn
+                    // as a building is still named as its node is.
                     let place: &mut TextSearchHit = &mut kept[held];
-                    if place.record.bbox.is_none() && hit.record.bbox.is_some() {
+                    if place.record.layer == hit.record.layer
+                        && place.record.layer != Layer::Poi.as_str()
+                        && place.record.bbox.is_none()
+                        && hit.record.bbox.is_some()
+                    {
                         *place = hit;
                     }
                 }
@@ -13531,6 +13537,59 @@ mod tests {
             .map(|hit| (hit.record.id.as_str(), hit.record.bbox.is_some()))
             .collect::<Vec<_>>();
         assert_eq!(ids, [("osm:relation:7", true)]);
+    }
+
+    #[test]
+    fn a_poi_mapped_as_a_node_and_a_building_answers_the_node() {
+        let pack = TempPack::new("poi-node-and-building");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        let station = |object_type, name: &str| {
+            Record::Poi(PoiRecord {
+                alt_names: Vec::new(),
+                name: name.to_string(),
+                category: "railway:station".to_string(),
+                address: None,
+                geometry: point_geometry(-71.41, 41.82),
+                location_precision: crate::record::LocationPrecision::Point,
+                source: SourceProvenance::osm(object_type, 9),
+                prominence: Prominence {
+                    importance: 10,
+                    linked: true,
+                    languages: 2,
+                },
+                wikidata: Some(9),
+                brand: None,
+                details: None,
+                aliases: Vec::new(),
+            })
+        };
+        writer
+            .write(&station(ObjectType::Node, "Providence"), None)
+            .expect("node");
+        let building = writer
+            .write(&station(ObjectType::Way, "Union Station Providence"), None)
+            .expect("building");
+        writer.set_extents(vec![(
+            building,
+            [-714_200_000, 418_100_000, -714_000_000, 418_300_000],
+        )]);
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&pack.0).expect("searcher").places();
+        let hits = searcher
+            .search(&TextSearchOptions {
+                query: "Providence".to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            })
+            .expect("search");
+        let ids = hits
+            .iter()
+            .map(|hit| hit.record.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["osm:node:9"]);
     }
 
     #[test]
