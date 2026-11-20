@@ -4425,12 +4425,14 @@ impl TextSearcher {
             .tagger
             .parse_explained_n(query_text, STRUCTURED_READINGS);
         let mut from_text = Vec::<bool>::new();
+        let breaks = Tokens::new(query_text).breaks;
         for (index, parsed) in parsed.into_iter().enumerate() {
             let written = self.written_country(&parsed.pieces);
             let read = country_not_town(parsed.pieces, written, parsed.country);
-            let plan = QueryPlan::from_tagged(&read, &parsed.corrections, context, |word| {
-                self.tagger.dictionaries().describes_street(word)
-            });
+            let plan =
+                QueryPlan::from_tagged(&read, &parsed.corrections, &breaks, context, |word| {
+                    self.tagger.dictionaries().describes_street(word)
+                });
             if let Some(plan) = plan.map(|plan| self.with_number_forms(plan)).transpose()?
                 && !plans.contains(&plan)
             {
@@ -4982,10 +4984,12 @@ impl TextSearcher {
         let states = |label: Label| plan.context.iter().any(|part| part.label == label);
         let (states_region, states_country) = (states(Label::Region), states(Label::Country));
         let part = |label: Label, standing: Option<Standing>| {
+            // A part the parser corrected, or whose words the query splits
+            // with a comma, is not the name as the query writes it.
             let respelt = plan
                 .context
                 .iter()
-                .any(|part| part.label == label && part.respelt);
+                .any(|part| part.label == label && (part.respelt || part.split));
             match Standing::part(standing) {
                 PartMatch::Matched if respelt => PartMatch::Partial,
                 part => part,
@@ -6239,12 +6243,17 @@ impl TextSearcher {
                 exact.0 && (known || (streets && hit.record.layer == Layer::Street.as_str()))
             });
             // The query is wholly one of each one's names, so it states the
-            // part the place is and that part matches.
+            // part the place is and that part matches, unless the query
+            // splits the name with a comma.
+            let split = Tokens::new(query_text).breaks.contains(&true);
             for hit in &mut hits {
                 if let Some(slot) =
                     named_part(&hit.record.layer).and_then(|part| part_of(&mut hit.matched, part))
                 {
-                    *slot = Some(PartMatch::Matched);
+                    *slot = Some(match split {
+                        true => PartMatch::Partial,
+                        false => PartMatch::Matched,
+                    });
                 }
             }
         }
@@ -7965,9 +7974,11 @@ fn subject_match(
                 && dictionaries.is_street_type(word)
                 && !dictionaries.is_direction(word))
     });
+    // Words the query splits with a comma are not the name as written.
+    let as_written = !plan.subject_part.1.0;
     Some(match (written, near) {
         (0, 0) => PartMatch::Unmatched,
-        (written, _) if written == plan.subject.len() && whole => PartMatch::Matched,
+        (written, _) if written == plan.subject.len() && whole && as_written => PartMatch::Matched,
         _ => PartMatch::Partial,
     })
 }
@@ -9853,7 +9864,12 @@ struct QueryPlan {
 /// Equal to every other, so readings that seek the same words run one
 /// search, whichever part the parser took the words for.
 #[derive(Debug, Clone, Copy, Default)]
-struct SubjectPart(Option<Label>);
+struct SubjectPart(Option<Label>, Split);
+
+/// Whether the query writes a field break (a comma) between the words of a
+/// part: read as one name, it is not the name as written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Split(bool);
 
 impl PartialEq for SubjectPart {
     fn eq(&self, _: &Self) -> bool {
@@ -9914,6 +9930,9 @@ struct ContextPart {
     /// Whether `words` are the corrected ones, not the query's (see
     /// [`TextSearcher::spelt`]).
     respelt: bool,
+    /// Whether the query writes a field break (a comma) between its words:
+    /// "East, Providence" is read as one town, but not written as one.
+    split: bool,
 }
 
 impl ContextPart {
@@ -9926,6 +9945,7 @@ impl ContextPart {
             words,
             corrected: None,
             respelt: false,
+            split: false,
         })
     }
 
@@ -10106,6 +10126,7 @@ impl QueryPlan {
     fn from_tagged(
         tokens: &[Tagged],
         corrections: &[Option<String>],
+        breaks: &[bool],
         context: &[ContextPart],
         describes_street: impl Fn(&str) -> bool,
     ) -> Option<Self> {
@@ -10121,10 +10142,16 @@ impl QueryPlan {
         // Each run of one label, as written and, when the parser corrected
         // a word of it, as corrected.
         let mut runs = Vec::<(Label, Vec<String>, Option<Vec<String>>)>::new();
+        // The runs a field break falls inside, by index.
+        let mut split = HashSet::new();
         for (index, tagged) in tokens.iter().enumerate() {
             let correction = corrections.get(index).cloned().flatten();
+            let at = runs.len().saturating_sub(1);
             match runs.last_mut() {
                 Some((label, words, corrected)) if *label == tagged.label => {
+                    if breaks.get(index).copied().unwrap_or(false) {
+                        split.insert(at);
+                    }
                     if let Some(correction) = correction {
                         corrected
                             .get_or_insert_with(|| words.clone())
@@ -10154,7 +10181,8 @@ impl QueryPlan {
                 _ => None,
             })
             .filter(|word| word.chars().any(|character| character.is_ascii_digit()));
-        for (label, words, corrected) in runs {
+        for (run, (label, words, corrected)) in runs.into_iter().enumerate() {
+            let split = split.contains(&run);
             match label {
                 Label::HouseNumber if plan.house_number.is_none() => {
                     // "993.5" and "81 к1" are each one house number.
@@ -10231,6 +10259,7 @@ impl QueryPlan {
                                 words,
                                 corrected,
                                 respelt: false,
+                                split,
                             });
                         }
                     }
@@ -10241,6 +10270,7 @@ impl QueryPlan {
                         words,
                         corrected,
                         respelt: false,
+                        split,
                     });
                 }
             }
@@ -10258,7 +10288,7 @@ impl QueryPlan {
         }
         let named = street.iter().any(|word| !describes_street(&word.text));
         if tokens.iter().any(|tagged| tagged.label == Label::Street) && !street.is_empty() {
-            plan.subject_part = SubjectPart(Some(Label::Street));
+            plan.subject_part = SubjectPart(Some(Label::Street), Split::default());
         }
         plan.subject = street
             .into_iter()
@@ -10273,7 +10303,7 @@ impl QueryPlan {
             // seeks the first; a house number alone is sought as a word.
             let words = if !plan.context.is_empty() {
                 let part = plan.context.remove(0);
-                plan.subject_part = SubjectPart(Some(part.label));
+                plan.subject_part = SubjectPart(Some(part.label), Split(part.split));
                 Word::paired(part.words, part.corrected)
             } else if let Some(number) = plan.house_number.take() {
                 let words = number.text.split_whitespace().map(str::to_string);
@@ -10444,7 +10474,7 @@ impl QueryPlan {
             _ => 3,
         };
         let mut plans = Vec::new();
-        let mut add = |words: Vec<String>, label: Label| {
+        let mut add = |words: Vec<String>, label: Label, split: bool| {
             let context = self
                 .context
                 .iter()
@@ -10466,16 +10496,16 @@ impl QueryPlan {
                 Self {
                     subject,
                     context,
-                    subject_part: SubjectPart(Some(label)),
+                    subject_part: SubjectPart(Some(label), Split(split)),
                     ..Self::default()
                 },
                 area_layers(label),
             ));
         };
         for part in self.context.iter().rev().filter(|part| part.is_postcode()) {
-            add(part.words.clone(), Label::Postcode);
+            add(part.words.clone(), Label::Postcode, part.split);
             if part.words.len() > 1 {
-                add(vec![part.words[0].clone()], Label::Postcode);
+                add(vec![part.words[0].clone()], Label::Postcode, false);
             }
         }
         for part in self
@@ -10485,12 +10515,12 @@ impl QueryPlan {
         {
             let named = names(part).map_or_else(|| vec![part.words.clone()], |names| names.names);
             for name in named {
-                add(name, Label::Locality);
+                add(name, Label::Locality, part.split);
             }
         }
         for label in [Label::Region, Label::Country] {
             for part in self.context.iter().filter(|part| part.label == label) {
-                add(part.words.clone(), label);
+                add(part.words.clone(), label, part.split);
             }
         }
         plans
@@ -11172,7 +11202,7 @@ mod tests {
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         let search = |reading: &str, placed: &[&str]| {
-            let plan = QueryPlan::from_tagged(&tagged(reading), &[], &[], |word| {
+            let plan = QueryPlan::from_tagged(&tagged(reading), &[], &[], &[], |word| {
                 searcher.describes_street(word)
             })
             .expect("plan");
@@ -14717,7 +14747,8 @@ mod tests {
     #[test]
     fn a_number_the_parser_labels_is_kept_with_its_designator_or_suffix() {
         let number = |text: &str| {
-            let plan = QueryPlan::from_tagged(&tagged(text), &[], &[], |_| false).expect("plan");
+            let plan =
+                QueryPlan::from_tagged(&tagged(text), &[], &[], &[], |_| false).expect("plan");
             // A run a number starts is sought whole first, then as the
             // number it starts with.
             let plan = plan.with_base_house_number().unwrap_or(plan);
@@ -14748,7 +14779,7 @@ mod tests {
     #[test]
     fn a_unit_is_read_from_a_letter_or_a_word_glued_to_the_number() {
         let unit = |text: &str| {
-            QueryPlan::from_tagged(&tagged(text), &[], &[], |_| false)
+            QueryPlan::from_tagged(&tagged(text), &[], &[], &[], |_| false)
                 .expect("plan")
                 .unit
         };
@@ -14804,8 +14835,9 @@ mod tests {
 
     #[test]
     fn plans_numbers_units_streets_and_places_from_labelled_tokens() {
-        let plan =
-            |text: &str| QueryPlan::from_tagged(&tagged(text), &[], &[], |_| false).expect("plan");
+        let plan = |text: &str| {
+            QueryPlan::from_tagged(&tagged(text), &[], &[], &[], |_| false).expect("plan")
+        };
         let subject = |plan: &QueryPlan| {
             plan.subject
                 .iter()
@@ -14823,6 +14855,7 @@ mod tests {
             words: words.iter().map(|word| word.to_string()).collect(),
             corrected: None,
             respelt: false,
+            split: false,
         };
 
         let floor =
@@ -14942,6 +14975,7 @@ mod tests {
         let places = QueryPlan::from_tagged(
             &tagged("seaforth/locality huron/locality east/locality"),
             &[],
+            &[],
             &[part(Label::Region, &["ontario"])],
             |_| false,
         )
@@ -14953,7 +14987,7 @@ mod tests {
             (number.house_number.clone(), subject(&number)),
             (None, words(&["670"]))
         );
-        assert!(QueryPlan::from_tagged(&[], &[], &[], |_| false).is_none());
+        assert!(QueryPlan::from_tagged(&[], &[], &[], &[], |_| false).is_none());
     }
 
     #[test]
@@ -15166,9 +15200,26 @@ mod tests {
     }
 
     #[test]
+    fn a_part_the_query_splits_with_a_comma_is_marked_split() {
+        let text = "154/house_number pond/street road/street east/locality providence/locality";
+        let plan = |breaks: &[bool]| {
+            QueryPlan::from_tagged(&tagged(text), &[], breaks, &[], |_| false).expect("plan")
+        };
+        // "154 Pond Road East, Providence": the comma falls inside the town.
+        let written = plan(&[false, false, false, false, true]);
+        assert!(written.context[0].split);
+        let whole = plan(&[false, false, false, true, false]);
+        assert!(
+            !whole.context[0].split,
+            "a break before the town is no split"
+        );
+    }
+
+    #[test]
     fn a_run_falls_back_to_the_plot_number_it_starts_with() {
         let plan = QueryPlan::from_tagged(
             &tagged("12к2/house_number строение/house_number 1/house_number вавилова/street"),
+            &[],
             &[],
             &[],
             |_| false,
@@ -15604,7 +15655,7 @@ mod tests {
     }
 
     fn reading_plan(searcher: &TextSearcher, reading: &str) -> QueryPlan {
-        let plan = QueryPlan::from_tagged(&tagged(reading), &[], &[], |word| {
+        let plan = QueryPlan::from_tagged(&tagged(reading), &[], &[], &[], |word| {
             searcher.describes_street(word)
         })
         .expect("plan");
@@ -17203,6 +17254,25 @@ mod tests {
         assert!(
             towns.contains(&("osm:relation:2".to_string(), Some(Partial))),
             "{towns:?}"
+        );
+        // Written with a comma between its words, a name is not written
+        // whole, whatever reads them as one town.
+        let split = searcher
+            .search(&TextSearchOptions {
+                query: "West, Franconia".to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            })
+            .expect("search")
+            .into_iter()
+            .map(|hit| (hit.record.id, hit.matched.locality))
+            .collect::<Vec<_>>();
+        assert!(
+            !split.contains(&("osm:relation:2".to_string(), Some(Matched))),
+            "{split:?}"
         );
 
         let fields = searcher
