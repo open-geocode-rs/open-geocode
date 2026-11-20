@@ -179,7 +179,7 @@ const fn category(
 /// og's categories under a canonical id. A listed id names its own. Any
 /// other names what its words name in og's catalog, in any language the
 /// catalog has, and `None` when they name no kind of place.
-fn og_categories(id: &str) -> Option<Vec<&'static str>> {
+pub(super) fn og_categories(id: &str) -> Option<Vec<&'static str>> {
     let id = id.trim().to_ascii_lowercase();
     if let Some(listed) = CATEGORIES.iter().find(|category| category.id == id) {
         return Some(listed.og.to_vec());
