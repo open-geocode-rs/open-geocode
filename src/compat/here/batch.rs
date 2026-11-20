@@ -336,7 +336,7 @@ pub(super) fn date_time(seconds: u64) -> String {
     let days = seconds / 86_400;
     let rest = seconds % 86_400;
     // Civil date of a day count since 1970-01-01, in the proleptic
-    // Gregorian calendar (Howard Hinnant's `civil_from_days`).
+    // Gregorian calendar.
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let day_of_era = z.rem_euclid(146_097);
