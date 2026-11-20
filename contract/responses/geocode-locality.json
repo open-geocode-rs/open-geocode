@@ -20,6 +20,9 @@
         "id": "osm:relation:3",
         "label": "Toronto",
         "layer": "locality",
+        "match": {
+          "locality": "matched"
+        },
         "name": "Toronto",
         "score": 1.8413742,
         "source": {

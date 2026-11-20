@@ -532,7 +532,7 @@ async fn geocode_answers_here_items() {
         reply.json(),
         json!({"items": [king(json!({"distance": 407, "scoring": {
             "queryScore": 1.0,
-            "fieldScore": {"streets": [1.0], "houseNumber": 1.0},
+            "fieldScore": {"streets": [1.0], "houseNumber": 1.0, "country": 1.0},
         }}))]})
     );
 
@@ -555,7 +555,7 @@ async fn geocode_reads_qualified_queries() {
     let router = pack.router();
     let scored = json!({"scoring": {
         "queryScore": 1.0,
-        "fieldScore": {"streets": [1.0], "houseNumber": 1.0, "postalCode": 1.0},
+        "fieldScore": {"streets": [1.0], "houseNumber": 1.0, "postalCode": 1.0, "country": 1.0},
     }});
 
     // A street with no text is og's structured geocode.
@@ -571,7 +571,12 @@ async fn geocode_reads_qualified_queries() {
     // Text and qualified parts together are one text.
     let hybrid = "/compat/here/v1/geocode?q=10+King&qq=street%3DStreet%3BpostalCode%3DM5V+1A1";
     let reply = get(&router, hybrid).await;
-    assert_eq!(reply.json()["items"][0], king(scored));
+    let mut unfiltered = scored;
+    unfiltered["scoring"]["fieldScore"]
+        .as_object_mut()
+        .expect("field scores")
+        .remove("country");
+    assert_eq!(reply.json()["items"][0], king(unfiltered));
 
     let reply = get(&router, "/compat/here/v1/geocode?qq=floor%3D3").await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);

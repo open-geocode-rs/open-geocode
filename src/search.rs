@@ -34,7 +34,7 @@ use crate::{
     parse::{
         lattice::{
             self, CountryCode, Explanation, LabelSet, LatticeTagger, Tokens, automaton_builder,
-            dictionary::{Field as NameField, designates_unit},
+            dictionary::{Dictionaries, Field as NameField, designates_unit},
             dictionary_key, glued_stem,
         },
         types::{Label, Tagged},
@@ -559,6 +559,9 @@ impl TextSearcher {
         let mut named = self.places_by_name(query_text, &filters, options.focus, limit)?;
         if named.len() >= limit {
             self.rate(&mut named);
+            if !self.places {
+                stated_country(&options.countries, &mut named);
+            }
             return Ok(named);
         }
         let (_, mut hits) = self.search_variants(
@@ -593,6 +596,9 @@ impl TextSearcher {
         }
         self.one_per_item(&mut hits, limit)?;
         self.rate(&mut hits);
+        if !self.places {
+            stated_country(&options.countries, &mut hits);
+        }
         Ok(hits)
     }
 
@@ -756,6 +762,7 @@ impl TextSearcher {
             hits = self.fallback(address, &context, &filters, None, 2)?;
         }
         self.rate(&mut hits);
+        stated_country(&options.countries, &mut hits);
         Ok(hits
             .into_iter()
             .next()
@@ -4980,7 +4987,7 @@ impl TextSearcher {
         };
         if let Some(subject) = plan.subject_part.0
             && let Some(slot) = part_of(&mut matched, subject)
-            && let Some(how) = subject_match(subject, plan, &hit.record)
+            && let Some(how) = subject_match(subject, plan, &hit.record, self.tagger.dictionaries())
         {
             *slot = Some(slot.map_or(how, |held| held.max(how)));
         }
@@ -6176,6 +6183,15 @@ impl TextSearcher {
                 let (exact, _, _, _, _, known) = order[&hit.record_id];
                 exact.0 && (known || (streets && hit.record.layer == Layer::Street.as_str()))
             });
+            // The query is wholly one of each one's names, so it states the
+            // part the place is and that part matches.
+            for hit in &mut hits {
+                if let Some(slot) =
+                    named_part(&hit.record.layer).and_then(|part| part_of(&mut hit.matched, part))
+                {
+                    *slot = Some(PartMatch::Matched);
+                }
+            }
         }
         self.one_per_item(&mut hits, limit)?;
         Ok(hits)
@@ -7838,10 +7854,19 @@ fn number_match(record: &Summary, number: &HouseNumber, ranking: &Ranking) -> Pa
 /// How a record answers the subject of `plan`, which is its `part`. The
 /// words of the record's street, or of its name when the plan seeks a
 /// place, have each subject word as written, as the word it abbreviates or
-/// as its abbreviation, some a typo away or missing, or none of them. A record with no street
-/// answers no street. `None` for a place the plan seeks when the record is
-/// no such place, since where it lies was not judged.
-fn subject_match(part: Label, plan: &QueryPlan, record: &Summary) -> Option<PartMatch> {
+/// as its abbreviation, some a typo away or missing, or none of them. Every
+/// subject word written is a match only when the query also writes every
+/// word of the name, bar a street's type, which a query often leaves out:
+/// "Providence" names East Providence and Main Street names North Main
+/// Street in part. A record with no street answers no street. `None` for a
+/// place the plan seeks when the record is no such place, since where it
+/// lies was not judged.
+fn subject_match(
+    part: Label,
+    plan: &QueryPlan,
+    record: &Summary,
+    dictionaries: &Dictionaries,
+) -> Option<PartMatch> {
     let named = if part != Label::Street {
         area_layers(part)
             .iter()
@@ -7854,24 +7879,67 @@ fn subject_match(part: Label, plan: &QueryPlan, record: &Summary) -> Option<Part
     };
     let key = search_key(named).unwrap_or_default();
     let label = key.split_whitespace().collect::<Vec<_>>();
+    let mut covered = vec![false; label.len()];
     let (mut written, mut near) = (0, 0);
     for word in &plan.subject {
-        let has = |form: &String| label.contains(&form.as_str());
         // Records write either form, "Queen St W" or "Queen Street West".
-        if has(&word.text) || lattice::forms_both_ways(&word.text).iter().any(has) {
+        let forms = lattice::forms_both_ways(&word.text);
+        let as_written = |label: &str| label == word.text || forms.iter().any(|form| form == label);
+        let close = |label: &str| {
+            word.corrected.as_deref() == Some(label) || typo_distance(&word.text, label).is_some()
+        };
+        if let Some(at) = label.iter().position(|label| as_written(label)) {
             written += 1;
-        } else if word.corrected.as_ref().is_some_and(has)
-            || label
-                .iter()
-                .any(|label| typo_distance(&word.text, label).is_some())
-        {
+            covered[at] = true;
+        } else if let Some(at) = label.iter().position(|label| close(label)) {
             near += 1;
+            covered[at] = true;
         }
     }
+    let whole = label.iter().zip(&covered).all(|(word, covered)| {
+        // "South" is a type in some languages and a direction here.
+        *covered
+            || (part == Label::Street
+                && dictionaries.is_street_type(word)
+                && !dictionaries.is_direction(word))
+    });
     Some(match (written, near) {
         (0, 0) => PartMatch::Unmatched,
-        (written, _) if written == plan.subject.len() => PartMatch::Matched,
+        (written, _) if written == plan.subject.len() && whole => PartMatch::Matched,
         _ => PartMatch::Partial,
+    })
+}
+
+/// Marks the country matched on each of `hits` when the request names the
+/// countries to answer from: it states the country, and every hit lies in
+/// one it names.
+fn stated_country(countries: &[String], hits: &mut [TextSearchHit]) {
+    if countries.is_empty() {
+        return;
+    }
+    for hit in hits {
+        hit.matched.country.get_or_insert(PartMatch::Matched);
+    }
+}
+
+/// The address part a record of `layer` is when a query names it, the
+/// first whose layers hold it (see [`area_layers`]). `None` for a POI or an
+/// address, which no one part names.
+fn named_part(layer: &str) -> Option<Label> {
+    if layer == Layer::Street.as_str() {
+        return Some(Label::Street);
+    }
+    [
+        Label::Locality,
+        Label::Region,
+        Label::Postcode,
+        Label::Country,
+    ]
+    .into_iter()
+    .find(|label| {
+        area_layers(*label)
+            .iter()
+            .any(|area| area.as_str() == layer)
     })
 }
 
@@ -16703,10 +16771,23 @@ mod tests {
             town_at,
             None,
         );
+        // A town whose name holds the other's and a word more.
+        let west = place(
+            &mut writer,
+            Locality,
+            "West Franconia",
+            ObjectType::Relation,
+            2,
+            [-78.0, 39.5],
+            None,
+        );
         writer.set_context_names(
-            [(town, vec!["Franconia".to_string()])]
-                .into_iter()
-                .collect(),
+            [
+                (town, vec!["Franconia".to_string()]),
+                (west, vec!["West Franconia".to_string()]),
+            ]
+            .into_iter()
+            .collect(),
         );
         writer
             .write(
@@ -16922,8 +17003,13 @@ mod tests {
                 true,
                 stated(&[&missed[..], &[(postcode, Matched)]].concat()),
             ),
-            // Found by its whole name, so no reading was judged.
-            ("Franconia", "osm:relation:1", false, QueryMatch::default()),
+            // The whole query is the town's name, so it states the town.
+            (
+                "Franconia",
+                "osm:relation:1",
+                false,
+                stated(&[(locality, Matched)]),
+            ),
         ] {
             assert_eq!(
                 searched(query),
@@ -16931,6 +17017,20 @@ mod tests {
                 "{query}"
             );
         }
+
+        // Both towns hold the word, and only one is named by it whole.
+        let towns = answer_plan(&searcher, &reading_plan(&searcher, "franconia/locality"))
+            .into_iter()
+            .map(|hit| (hit.record.id, hit.matched.locality))
+            .collect::<Vec<_>>();
+        assert!(
+            towns.contains(&("osm:relation:1".to_string(), Some(Matched))),
+            "{towns:?}"
+        );
+        assert!(
+            towns.contains(&("osm:relation:2".to_string(), Some(Partial))),
+            "{towns:?}"
+        );
 
         let fields = searcher
             .geocode_address(&AddressGeocodeOptions {
