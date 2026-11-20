@@ -200,6 +200,29 @@ struct Translation {
 #[derive(Clone, Copy)]
 struct Naming<'a> {
     codes: &'a [String],
+    /// Finds the record a stated postcode names.
+    searcher: &'a crate::search::TextSearcher,
+}
+
+impl Naming<'_> {
+    /// The postcode layer with the id of the record og derived for it in
+    /// the result's country. One og derived no record for keeps no id.
+    fn postcode(&self, context: &mut super::Context<super::Area>) -> crate::Result<()> {
+        let country = context
+            .country
+            .as_ref()
+            .and_then(|country| country.country_code.clone());
+        let Some(postcode) = context.postcode.as_mut().filter(|area| area.id.is_none()) else {
+            return Ok(());
+        };
+        let found = self
+            .searcher
+            .postcode_record_id(&postcode.name, country.as_deref())?;
+        postcode.id = found.map(|id| {
+            crate::compat::encode_parts(&id, Some(crate::record::Layer::Postcode), &postcode.name)
+        });
+        Ok(())
+    }
 }
 
 /// What og named a layer's record besides its name in the first language
@@ -263,7 +286,7 @@ impl Naming<'_> {
 const TRANSLATED_LAYERS: [&str; 5] = ["neighborhood", "place", "district", "region", "country"];
 
 impl Feature {
-    fn of(found: Found, naming: Naming) -> Self {
+    fn of(found: Found, naming: Naming) -> crate::Result<Self> {
         let common = found.common;
         // What og named each area, by the id its layer carries. A result
         // that is an area is its own layer.
@@ -299,11 +322,13 @@ impl Feature {
                 translations,
             }
         };
+        let mut context = translated.context;
+        naming.postcode(&mut context)?;
         let match_code = found
             .matched
             .filter(|_| translated.feature_type == "address")
             .map(|matched| MatchCode::of(*matched, common));
-        Self {
+        Ok(Self {
             kind: "Feature",
             id: translated.mapbox_id.clone(),
             geometry: Geometry::point(found.coordinates),
@@ -315,40 +340,49 @@ impl Feature {
                 coordinates: translated.coordinates,
                 place_formatted: translated.place_formatted,
                 match_code,
-                context: translated.context.map_named(layer),
+                // Geocoding names each context layer by its record's id.
+                context: context.recorded().map_named(layer),
                 bbox: translated
                     .bbox
                     .filter(|_| BOXED.contains(&translated.feature_type)),
             },
-        }
+        })
     }
 }
 
 impl Collection {
-    fn forward(collection: &ForwardCollection, types: Option<&Types>, naming: Naming) -> Self {
-        Self {
+    fn forward(
+        collection: &ForwardCollection,
+        types: Option<&Types>,
+        naming: Naming,
+    ) -> crate::Result<Self> {
+        Ok(Self {
             kind: "FeatureCollection",
             features: collection
                 .features
                 .iter()
                 .filter(|feature| admitted(types, &feature.properties.common))
                 .map(|feature| Feature::of(Found::forward(feature), naming))
-                .collect(),
+                .collect::<crate::Result<_>>()?,
             attribution: attribution(&collection.geocoding.attribution),
-        }
+        })
     }
 
-    fn reverse(collection: &ReverseCollection, types: Option<&Types>, naming: Naming) -> Self {
-        Self {
+    fn reverse(
+        collection: &ReverseCollection,
+        types: Option<&Types>,
+        naming: Naming,
+    ) -> crate::Result<Self> {
+        Ok(Self {
             kind: "FeatureCollection",
             features: collection
                 .features
                 .iter()
                 .filter(|feature| admitted(types, &feature.properties.common))
                 .map(|feature| Feature::of(Found::reverse(feature), naming))
-                .collect(),
+                .collect::<crate::Result<_>>()?,
             attribution: attribution(&collection.geocoding.attribution),
-        }
+        })
     }
 }
 
@@ -435,22 +469,24 @@ async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compa
     let types = plan.types.as_ref();
     let naming = Naming {
         codes: &plan.languages,
+        searcher: state.searcher(),
     };
     let failed = |problem| Api::Geocoding.failed(problem);
+    let translated = |collection: crate::Result<Collection>| {
+        collection.map_err(|error| failed(crate::http::problem::Problem::from(error)))
+    };
     match plan.lookup {
-        Lookup::Geocode(args) => native::geocode(state, args)
-            .await
-            .map(|collection| Collection::forward(&collection, types, naming))
-            .map_err(failed),
+        Lookup::Geocode(args) => {
+            let found = native::geocode(state, args).await.map_err(failed)?;
+            translated(Collection::forward(&found, types, naming))
+        }
         Lookup::Id { named, lang, text } => {
-            match native::lookup(state, &named, lang.as_deref()).await {
-                Ok(Some(collection)) => Ok(Collection::forward(&collection, types, naming)),
-                Ok(None) => native::geocode(state, text)
-                    .await
-                    .map(|collection| Collection::forward(&collection, types, naming))
-                    .map_err(failed),
-                Err(problem) => Err(failed(problem)),
-            }
+            let found = match native::lookup(state, &named, lang.as_deref()).await {
+                Ok(Some(collection)) => collection,
+                Ok(None) => native::geocode(state, text).await.map_err(failed)?,
+                Err(problem) => return Err(failed(problem)),
+            };
+            translated(Collection::forward(&found, types, naming))
         }
         Lookup::Typed {
             geocode,
@@ -459,7 +495,7 @@ async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compa
         } => {
             let found = native::geocode(state, geocode).await.map_err(failed)?;
             if reads_whole(&found) {
-                return Ok(Collection::forward(&found, types, naming));
+                return translated(Collection::forward(&found, types, naming));
             }
             let mut completed = native::autocomplete(state, complete)
                 .await
@@ -469,15 +505,13 @@ async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compa
                 .features
                 .retain(|feature| feature.properties.common.layer != crate::record::Layer::Poi);
             completed.features.truncate(limit);
-            Ok(Collection::forward(&completed, types, naming))
+            translated(Collection::forward(&completed, types, naming))
         }
-        Lookup::Reverse { args, countries } => native::reverse(state, args)
-            .await
-            .map(|mut collection| {
-                super::keep_countries(&mut collection, &countries);
-                Collection::reverse(&collection, types, naming)
-            })
-            .map_err(failed),
+        Lookup::Reverse { args, countries } => {
+            let mut found = native::reverse(state, args).await.map_err(failed)?;
+            super::keep_countries(&mut found, &countries);
+            translated(Collection::reverse(&found, types, naming))
+        }
     }
 }
 
@@ -771,7 +805,10 @@ pub(super) async fn batch(
 
     let mut batch = Vec::with_capacity(answers.len());
     for ((answer, types), codes) in answers.into_iter().zip(&types).zip(&languages) {
-        let naming = Naming { codes };
+        let naming = Naming {
+            codes,
+            searcher: state.searcher(),
+        };
         batch.push(
             match answer.map_err(|problem| Api::Geocoding.failed(problem))? {
                 Answer::Forward(collection) => {
@@ -780,7 +817,8 @@ pub(super) async fn batch(
                 Answer::Reverse(collection) => {
                     Collection::reverse(&collection, types.as_ref(), naming)
                 }
-            },
+            }
+            .map_err(|error| Api::Geocoding.failed(crate::http::problem::Problem::from(error)))?,
         );
     }
     Ok(Json(Batch { batch }))

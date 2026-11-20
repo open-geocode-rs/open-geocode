@@ -16,9 +16,10 @@ use crate::{
     limits::Limits,
     pack::Writer,
     record::{
-        AddressComponents, AddressRecord, Brand, Contact, Entrance, InterpolationAddressComponents,
-        InterpolationRange, InterpolationRecord, Layer, LocationPrecision, ObjectType, PlaceLayer,
-        PlaceRecord, PoiDetails, PoiRecord, Record, SourceProvenance, point_geometry,
+        AddressComponents, AddressRecord, Brand, Contact, DerivedSourceProvenance, Entrance,
+        InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
+        LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, PoiDetails, PoiRecord,
+        PostcodeRecord, Record, SourceProvenance, point_geometry,
     },
     runtime::{AppState, build_router},
 };
@@ -141,6 +142,19 @@ fn write_pack() -> Pack {
         flags: 0,
         zone: None,
     });
+    // The postcode the addresses state, as a build derives it from them.
+    writer
+        .write(
+            &PostcodeRecord {
+                postcode: "M5V 1A1".to_string(),
+                country: crate::parse::lattice::CountryCode::parse("CA"),
+                geometry: point_geometry(-79.0, 43.0),
+                source: DerivedSourceProvenance::osm_address_records(2),
+            }
+            .into(),
+            context.clone(),
+        )
+        .expect("postcode");
     let king = AddressComponents {
         areas: Vec::new(),
         number: "10".to_string(),
@@ -370,9 +384,18 @@ async fn geocoding_forward_answers_an_address_in_mapbox_shape() {
                             "address_number": "10",
                             "street_name": "King Street",
                         },
-                        "secondary_address": {"name": "2"},
+                        // The address states the flat, so it is the flat's record.
+                        "secondary_address": {"mapbox_id": address, "name": "2"},
                         "street": {"mapbox_id": address, "name": "King Street"},
-                        "postcode": {"name": "M5V 1A1"},
+                        // The postcode record og derived from its addresses.
+                        "postcode": {
+                            "mapbox_id": encode_parts(
+                                "derived:osm:postcode:ca:M5V%201A1",
+                                Some(Layer::Postcode),
+                                "M5V 1A1",
+                            ),
+                            "name": "M5V 1A1",
+                        },
                     })),
                 },
             }],
@@ -1042,6 +1065,7 @@ async fn search_box_suggest_then_retrieve() {
                 "full_address": "12 King Street, Unit A, Toronto, M5V 1A1",
                 "place_formatted": "Toronto, M5V 1A1",
                 "context": context,
+                "language": "en",
                 "maki": "cafe",
                 "brand": ["Queen Coffee"],
                 "poi_category": ["Coffee", "Cafe", "Food and Drink"],

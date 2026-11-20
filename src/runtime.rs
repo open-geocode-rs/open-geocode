@@ -211,6 +211,10 @@ impl AppState {
         &self.error_log
     }
 
+    pub(crate) fn searcher(&self) -> &TextSearcher {
+        &self.searcher
+    }
+
     pub(crate) fn pack(&self) -> &Reader {
         &self.pack
     }
