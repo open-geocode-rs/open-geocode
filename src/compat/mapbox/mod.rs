@@ -272,30 +272,6 @@ fn accuracy(api: Api, common: &Common) -> Option<&'static str> {
     }
 }
 
-/// og's reverse answer, its areas given the context of the point. og
-/// gives an area at a point no context of its own, though every result of
-/// one answer lies at that point, so the areas holding the address or
-/// street hold the smaller areas too. [`context`] keeps of it only the
-/// tiers above each area.
-fn at_point(collection: &ReverseCollection) -> ReverseCollection {
-    let mut collection = collection.clone();
-    let shared = collection
-        .features
-        .iter()
-        .map(|feature| &feature.properties.common.context)
-        .find(|context| !context.is_empty())
-        .cloned();
-    if let Some(shared) = shared {
-        for feature in &mut collection.features {
-            let context = &mut feature.properties.common.context;
-            if context.is_empty() {
-                context.clone_from(&shared);
-            }
-        }
-    }
-    collection
-}
-
 /// The code of the country a reverse point lies in: of the country its
 /// results lie in, or of the country og answers as one of them.
 fn point_country(collection: &ReverseCollection) -> Option<&str> {

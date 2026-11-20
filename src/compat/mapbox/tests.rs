@@ -52,7 +52,8 @@ fn write_pack() -> Pack {
         uuid::Uuid::new_v4()
     ));
     let mut writer = Writer::create(&dir).expect("writer");
-    let place = |writer: &mut Writer, layer, name: &str, id, lon| {
+    // Each area lies in the areas written before it, as a build gives it.
+    let place = |writer: &mut Writer, layer, name: &str, id, lon, within: &[(PlaceLayer, u64)]| {
         writer
             .write(
                 &Record::Place(
@@ -67,19 +68,46 @@ fn write_pack() -> Pack {
                         wikidata: None,
                     },
                 ),
-                None,
+                (!within.is_empty()).then(|| RecordContext {
+                    admin_context: AdminContextTuple::from_tiers(within.iter().copied()),
+                    flags: 0,
+                    zone: None,
+                }),
             )
             .expect("place")
     };
-    let country = place(&mut writer, PlaceLayer::Country, "Canada", 1, -80.0);
-    let region = place(&mut writer, PlaceLayer::Region, "Ontario", 2, -79.5);
-    let locality = place(&mut writer, PlaceLayer::Locality, "Toronto", 3, -79.2);
+    let country = place(&mut writer, PlaceLayer::Country, "Canada", 1, -80.0, &[]);
+    let in_country = [(PlaceLayer::Country, country)];
+    let region = place(
+        &mut writer,
+        PlaceLayer::Region,
+        "Ontario",
+        2,
+        -79.5,
+        &in_country,
+    );
+    let in_region = [in_country[0], (PlaceLayer::Region, region)];
+    let locality = place(
+        &mut writer,
+        PlaceLayer::Locality,
+        "Toronto",
+        3,
+        -79.2,
+        &in_region,
+    );
     // Drawn as an outline, so og knows its box.
     writer.set_extents(vec![(
         locality,
         [-793_000_000, 429_000_000, -789_000_000, 431_000_000],
     )]);
-    let neighbourhood = place(&mut writer, PlaceLayer::Neighbourhood, "Downtown", 4, -79.1);
+    let neighbourhood = place(
+        &mut writer,
+        PlaceLayer::Neighbourhood,
+        "Downtown",
+        4,
+        -79.1,
+        &[in_region[0], in_region[1], (PlaceLayer::Locality, locality)],
+    );
     writer.set_country_codes(
         [(
             country,
@@ -693,9 +721,8 @@ async fn geocoding_reverse_lists_the_areas_holding_the_point() {
         types,
         ["address", "neighborhood", "place", "region", "country"]
     );
-    // og gives a reverse area no context of its own. Every result lies at
-    // the point, so the town is its own layer, held by the region and
-    // country holding the point, and holds none of the smaller areas.
+    // The town is its own layer, held by the region and country, and holds
+    // none of the smaller areas.
     let held = areas();
     assert_eq!(
         body["features"][2]["properties"]["context"],
