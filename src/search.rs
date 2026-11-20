@@ -903,7 +903,82 @@ impl TextSearcher {
                 return Ok(hits);
             }
         }
-        Ok(Vec::new())
+        self.autocomplete_address(options)
+    }
+
+    // An incomplete address must not trigger a geocoding retry on each keystroke.
+    // Try only the best reading and keep only its house number on its stated street and locality.
+    fn autocomplete_address(
+        &self,
+        options: &TextAutocompleteOptions,
+    ) -> Result<Vec<TextSearchHit>> {
+        let mut words = options.query.split_whitespace();
+        if self.places
+            || options
+                .layer
+                .as_deref()
+                .is_some_and(|layer| layer != Layer::Address.as_str())
+            || words.clone().take(3).count() < 3
+            || !words.any(|word| is_numeric_token(word.trim_matches(',')))
+        {
+            return Ok(Vec::new());
+        }
+
+        crate::stop::check()?;
+        let query = clean_query(options.query.trim());
+        let (plans, ..) = self.readings(&query, &[], Parses::Numbered)?;
+        let Some(plan) = plans.first() else {
+            return Ok(Vec::new());
+        };
+        let Some(number) = plan
+            .house_number
+            .as_ref()
+            .filter(|number| number.plain().is_some())
+        else {
+            return Ok(Vec::new());
+        };
+        if plan.unit.is_some() || plan.subject_part.0 != Some(Label::Street) {
+            return Ok(Vec::new());
+        }
+        let placed = self.known_area_words(
+            plan.context
+                .iter()
+                .filter(|part| part.label == Label::Locality)
+                .flat_map(|part| &part.words),
+        )?;
+        if placed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        crate::stop::check()?;
+        let filters = Filters::new(
+            Some(Layer::Address.as_str()),
+            &options.countries,
+            options.bbox,
+        );
+        let (mut hits, _) = self.search_plan(
+            plan,
+            &placed,
+            Scope::Scoped,
+            &QueryWords::new(&query),
+            &filters,
+            options.focus,
+            1,
+            &Session::new(self.budget),
+            &mut |_, _, _, hit| {
+                Ok(hit.record.layer == Layer::Address.as_str()
+                    && hit.record.address.housenumber.as_deref() == Some(number.text.as_str()))
+            },
+        )?;
+        hits.retain(|hit| {
+            hit.matched.street == Some(PartMatch::Matched)
+                && hit.matched.locality == Some(PartMatch::Matched)
+        });
+        self.rate(&mut hits, Numbered::Yes);
+        for hit in &mut hits {
+            hit.highlights = typed_highlights(&query, &hit.record.label);
+        }
+        Ok(hits)
     }
 
     fn autocomplete_as(
@@ -9786,7 +9861,7 @@ pub fn suggest(
         }
         return Ok(mixed);
     }
-    Ok(Vec::new())
+    addresses.autocomplete_address(options)
 }
 
 /// The kinds of place a one-word query names through a typo ("pharmcy"),
@@ -14686,6 +14761,101 @@ mod tests {
         );
         // 81 and 91 are on different Victoria Streets.
         assert_eq!(top("85 Victoria St").layer, "street");
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn autocomplete_recovers_a_house_number_on_its_stated_street_and_locality() {
+        let temp_dir = temp_pack_path("autocomplete-neighbours");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        let street_name = "Haynes Street Southwest";
+        let mut street = street_record("osm:way:1", street_name);
+        street.geometry = line(-84.4, [33.75, 33.76]);
+        street.representative_point = [-84.4, 33.755];
+        writer.write(&street.into(), None).expect("street");
+        for (id, number, lat) in [
+            ("osm:node:11", "181", 33.751),
+            ("osm:node:12", "197", 33.753),
+        ] {
+            let mut record =
+                address_record(id, "", number, street_name, Some("Atlanta"), Some("30313"));
+            record.geometry = point_geometry(-84.4001, lat);
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        let places = searcher.places();
+        let options = TextAutocompleteOptions {
+            query: "189 Haynes St SW Atlanta".to_string(),
+            limit: 5,
+            layer: None,
+            countries: Vec::new(),
+            focus: None,
+            bbox: None,
+        };
+        let estimate_id = "derived:estimate:189:osm:node:11:osm:node:12";
+        for hit in [
+            searcher
+                .autocomplete(&options)
+                .expect("address suggestions"),
+            suggest(&searcher, &places, &options).expect("mixed suggestions"),
+        ] {
+            assert_eq!(hit.len(), 1);
+            assert_eq!(hit[0].record.id, estimate_id);
+            assert_eq!(
+                hit[0].record.point.expect("point").precision,
+                PointPrecision::Estimated
+            );
+        }
+
+        let suggest_for = |query: &str| {
+            suggest(
+                &searcher,
+                &places,
+                &TextAutocompleteOptions {
+                    query: query.to_string(),
+                    ..options.clone()
+                },
+            )
+            .expect("mixed suggestions")
+        };
+        assert_eq!(
+            suggest_for("181 Haynes St SW Atlanta")[0].record.id,
+            "osm:node:11"
+        );
+        for query in [
+            "189 Haynes St SW",
+            "189 Haynes St SW Atlan",
+            "189 Haynes St NE Atlanta",
+            "189 Haynes St SW Boston",
+            "199 Haynes St SW Atlanta",
+        ] {
+            assert!(
+                !suggest_for(query)
+                    .iter()
+                    .any(|hit| hit.record.id.starts_with("derived:estimate:")),
+                "{query}"
+            );
+        }
+
+        for excluded in [
+            TextAutocompleteOptions {
+                countries: vec!["CA".to_string()],
+                ..options.clone()
+            },
+            TextAutocompleteOptions {
+                layer: Some("street".to_string()),
+                ..options
+            },
+        ] {
+            assert!(
+                searcher
+                    .autocomplete(&excluded)
+                    .expect("suggestions")
+                    .is_empty()
+            );
+        }
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
