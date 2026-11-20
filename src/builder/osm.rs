@@ -2434,7 +2434,7 @@ impl AddressBook {
     /// The records of `batch`, each address read from the book. A batch
     /// comes in record order, where an address group is one run, so each
     /// chunk it needs is read once.
-    fn records(&self, batch: Vec<PendingRecord>) -> Result<Vec<(Record, Option<ContextOrigin>)>> {
+    fn records(&self, batch: Vec<PendingRecord>) -> Result<Vec<Record>> {
         let mut address_chunks = Vec::new();
         let mut postcode_chunks = Vec::new();
         for pending in &batch {
@@ -2464,7 +2464,7 @@ impl AddressBook {
                         Record::Address(record)
                     }
                 };
-                Ok((record, pending.origin))
+                Ok(record)
             })
             .collect()
     }
@@ -3066,8 +3066,7 @@ impl Zoning {
 
 /// Write sorted records in batches, computing admin context in parallel, and
 /// offer each record to the parser's training sample under the country it
-/// lies in. Boundary and derived-country records describe context and get
-/// none, but are offered under the country their point lies in.
+/// lies in. An area record's context holds only the areas broader than it.
 #[allow(clippy::too_many_arguments)]
 fn write_ordered(
     writer: &mut Writer,
@@ -3102,7 +3101,7 @@ fn write_ordered(
                         None => batch
                             .into_iter()
                             .map(|pending| match pending.body {
-                                Body::Record(record) => Ok((*record, pending.origin)),
+                                Body::Record(record) => Ok(*record),
                                 Body::Address(_) => Err(Error::Decode(
                                     "a placed address is written without its address book",
                                 )),
@@ -3112,7 +3111,7 @@ fn write_ordered(
                     .and_then(|batch| {
                         let (batch, countries): (Vec<_>, Vec<_>) = batch
                             .into_par_iter()
-                            .map(|(mut record, origin)| {
+                            .map(|mut record| {
                                 let known = match &mut record {
                                     Record::Poi(poi) => Some((&mut poi.prominence, poi.wikidata)),
                                     Record::Place(_, place) => {
@@ -3132,11 +3131,21 @@ fn write_ordered(
                                 let country = located
                                     .as_ref()
                                     .and_then(|context| context.admin_context.country_record_id());
-                                let mut context: Option<RecordContext> = match origin {
-                                    Some(_) => None,
-                                    None => located,
+                                // An area lies only in the areas broader than
+                                // it that hold it, which its point alone does
+                                // not say.
+                                let mut context: Option<RecordContext> = match &record {
+                                    Record::Place(tier, place) => {
+                                        index.area_context(*tier, &record, &place.source)
+                                    }
+                                    _ => located,
                                 };
-                                if let (Some(zoning), Some(context)) = (zoning, &mut context) {
+                                // An area's zone is the one it lies wholly in,
+                                // which the zoning's areas say, never the zone
+                                // at its point.
+                                if let (Some(zoning), Some(context)) = (zoning, &mut context)
+                                    && !matches!(record, Record::Place(..))
+                                {
                                     zoning.stamp(&record, context);
                                 }
                                 ((record, context), country)
@@ -5207,6 +5216,110 @@ mod tests {
         )
         .expect("zones");
         (input, zones)
+    }
+
+    #[test]
+    fn a_built_area_lies_in_the_areas_broader_than_it() {
+        let dir = temp_dir("area-context");
+        let (input, _) = town_in_two_zones(&dir);
+        build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let record = |id: &str| {
+            reader
+                .find_by_source_id(id)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{id} is in the Pack"))
+        };
+        let chain = |id: &str| {
+            reader
+                .boundary_context(record(id))
+                .expect("context")
+                .map(|context| {
+                    context
+                        .admin_context
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.record_id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let (town, suburb) = (record("osm:relation:900"), record("osm:way:101"));
+        // The suburb lies in the town, the town in nothing broader, and
+        // neither names itself or the finer area its point falls in.
+        assert_eq!(chain("osm:way:101"), [town]);
+        assert_eq!(chain("osm:relation:900"), Vec::<RecordId>::new());
+        assert!(chain("osm:node:10").contains(&suburb));
+    }
+
+    #[test]
+    fn an_area_lies_only_in_the_areas_that_hold_it() {
+        let dir = temp_dir("island-context");
+        let input = dir.join("island.osm.pbf");
+        // A town on an island that reaches past it on both sides, with the
+        // island's point in the town.
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(1, 52.0, 4.0, &[]),
+                    node(2, 52.0, 4.2, &[]),
+                    node(3, 52.1, 4.2, &[]),
+                    node(4, 52.1, 4.0, &[]),
+                    node(5, 51.99, 3.95, &[]),
+                    node(6, 51.99, 4.3, &[]),
+                    node(7, 52.11, 4.3, &[]),
+                    node(8, 52.11, 3.95, &[]),
+                ],
+                vec![
+                    way(100, &[1, 2, 3, 4, 1], &[]),
+                    way(
+                        101,
+                        &[5, 6, 7, 8, 5],
+                        &[("place", "island"), ("name", "Groot Eiland")],
+                    ),
+                ],
+                vec![relation(
+                    900,
+                    &[(100, "outer")],
+                    &[
+                        ("boundary", "administrative"),
+                        ("admin_level", "8"),
+                        ("name", "Havenstad"),
+                    ],
+                )],
+            ],
+        );
+        build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let island = reader
+            .find_by_source_id("osm:way:101")
+            .expect("lookup")
+            .expect("the island is in the Pack");
+        let point = reader
+            .record_summary(island)
+            .expect("summary")
+            .point
+            .expect("point");
+        assert!(
+            (4.0..4.2).contains(&point.lon) && (52.0..52.1).contains(&point.lat),
+            "the island's point is in the town"
+        );
+        let chain = reader
+            .boundary_context(island)
+            .expect("context")
+            .map_or(0, |context| context.admin_context.entries().len());
+        assert_eq!(chain, 0, "the town does not hold the island");
     }
 
     #[test]

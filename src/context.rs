@@ -225,6 +225,27 @@ impl AdminContextTuple {
         self.entries.iter().rev().map(|entry| entry.record_id)
     }
 
+    /// The areas of the chain an area of `tier` lies in: those whose every
+    /// tier is broader than `tier`. The area itself, another boundary of its
+    /// tier and every finer area its point falls in are left out, since none
+    /// of them holds it.
+    #[must_use]
+    pub fn above(&self, tier: PlaceLayer) -> Self {
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .filter(|entry| entry.tiers.iter().all(|held| held < tier))
+                .copied()
+                .collect(),
+        }
+    }
+
+    /// Keeps only the areas `keep` says to.
+    pub fn retain(&mut self, keep: impl FnMut(&AdminEntry) -> bool) {
+        self.entries.retain(keep);
+    }
+
     pub fn country_record_id(&self) -> Option<RecordId> {
         self.get(PlaceLayer::Country)
     }
