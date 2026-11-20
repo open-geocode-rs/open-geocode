@@ -16,11 +16,14 @@ use serde_json::Value;
 use tokio::task;
 
 use super::{
-    Api, Context, Coordinates, Geometry, LayerFields, Params, Translated, Types, address_line,
-    admitted, attribution, error,
+    Api, Context, Coordinates, Found, Geometry, LayerFields, Params, Translated, Types,
+    address_line, admitted, attribution, error,
 };
 use crate::{
-    api::{Common, ContextArea, ForwardCollection, Languages, ReverseCollection},
+    api::{
+        Accuracy, Common, ContextArea, ForwardCollection, Languages, PartMatch, QueryMatch,
+        ReverseCollection,
+    },
     batch::map_in_order,
     compat::{Args, decode_id, encode_area_id, encode_id, iso, native},
     http::{
@@ -36,7 +39,19 @@ use crate::{
 const BATCH_RETRY_AFTER_SECONDS: u32 = 1;
 
 /// Mapbox's forward default; og's own would let the server choose.
-const DEFAULT_FORWARD_LIMIT: &str = "5";
+const DEFAULT_LIMIT: usize = 5;
+
+/// `autocomplete`, on unless sent `false`.
+fn typed(params: &Params) -> Result<bool, crate::compat::VendorError> {
+    match params.get("autocomplete") {
+        None => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Some(value) => Err(Api::Geocoding.invalid(format!(
+            "autocomplete must be true or false, not \"{value}\""
+        ))),
+    }
+}
 
 /// Mapbox's cap on the languages one request names.
 const MAX_LANGUAGES: usize = 20;
@@ -69,8 +84,99 @@ struct Properties {
     coordinates: Coordinates,
     #[serde(skip_serializing_if = "Option::is_none")]
     place_formatted: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_code: Option<MatchCode>,
     context: Context<Layer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bbox: Option<[f64; 4]>,
 }
+
+/// How an address feature answers each part of a forward query, in
+/// Mapbox's words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct MatchCode {
+    address_number: &'static str,
+    street: &'static str,
+    postcode: &'static str,
+    place: &'static str,
+    region: &'static str,
+    country: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secondary_address: Option<&'static str>,
+    confidence: &'static str,
+}
+
+impl MatchCode {
+    /// og's `match` of an address as Mapbox's `match_code`. A part the query
+    /// does not state is `unmatched`, Mapbox's word for one not in the
+    /// input, except a country og fills from where the address lies,
+    /// `inferred`. og judges no sub-city part, Mapbox's `locality`, so it
+    /// is not sent. A partial number is `plausible` only where it is
+    /// interpolated; any other partial part is not the one asked for.
+    fn of(found: QueryMatch, common: &Common) -> Self {
+        let stated = |part: Option<PartMatch>| match part {
+            Some(PartMatch::Matched) => "matched",
+            Some(PartMatch::Partial | PartMatch::Unmatched) | None => "unmatched",
+        };
+        let address_number = match found.housenumber {
+            Some(PartMatch::Partial) if common.accuracy == Accuracy::Interpolated => "plausible",
+            part => stated(part),
+        };
+        let country = match found.country {
+            None if common.context.country.is_some() => "inferred",
+            part => stated(part),
+        };
+        Self {
+            address_number,
+            street: stated(found.street),
+            postcode: stated(found.postcode),
+            place: stated(found.locality),
+            region: stated(found.region),
+            country,
+            secondary_address: found.unit.map(|part| stated(Some(part))),
+            confidence: confidence(found, address_number),
+        }
+    }
+}
+
+/// Mapbox's confidence from how many stated parts changed. A part the query
+/// does not state did not change. A changed house number or region is
+/// `low`, as is a change to three or more of the others. Two are `medium`,
+/// one `high`, none `exact`. An interpolated number is not a change.
+fn confidence(found: QueryMatch, address_number: &str) -> &'static str {
+    let changed = |part: Option<PartMatch>| part.is_some_and(|part| part != PartMatch::Matched);
+    let number_changed = changed(found.housenumber) && address_number != "plausible";
+    if number_changed || changed(found.region) {
+        return "low";
+    }
+    let others = [
+        found.street,
+        found.unit,
+        found.locality,
+        found.postcode,
+        found.country,
+    ]
+    .into_iter()
+    .filter(|part| changed(*part))
+    .count();
+    match others {
+        0 => "exact",
+        1 => "high",
+        2 => "medium",
+        _ => "low",
+    }
+}
+
+/// Feature types whose `bbox` Geocoding sends.
+const BOXED: [&str; 7] = [
+    "country",
+    "region",
+    "postcode",
+    "district",
+    "place",
+    "locality",
+    "neighborhood",
+];
 
 /// A Geocoding context layer, keyed `mapbox_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -157,7 +263,8 @@ impl Naming<'_> {
 const TRANSLATED_LAYERS: [&str; 5] = ["neighborhood", "place", "district", "region", "country"];
 
 impl Feature {
-    fn of(common: &Common, coordinates: [f64; 2], naming: Naming) -> Self {
+    fn of(found: Found, naming: Naming) -> Self {
+        let common = found.common;
         // What og named each area, by the id its layer carries. A result
         // that is an area is its own layer.
         let context = &common.context;
@@ -173,7 +280,7 @@ impl Feature {
         .map(|area| (encode_area_id(area), Names::of_area(area)))
         .collect::<HashMap<_, _>>();
         areas.insert(encode_id(common), Names::of_result(common));
-        let translated = Translated::of(common, coordinates);
+        let translated = Translated::of(Api::Geocoding, found);
         let layer = |key: &str, area: super::Area| {
             let (mapbox_id, fields) = area.split();
             let translations = TRANSLATED_LAYERS
@@ -192,10 +299,14 @@ impl Feature {
                 translations,
             }
         };
+        let match_code = found
+            .matched
+            .filter(|_| translated.feature_type == "address")
+            .map(|matched| MatchCode::of(*matched, common));
         Self {
             kind: "Feature",
             id: translated.mapbox_id.clone(),
-            geometry: Geometry::point(coordinates),
+            geometry: Geometry::point(found.coordinates),
             properties: Properties {
                 mapbox_id: translated.mapbox_id,
                 feature_type: translated.feature_type,
@@ -203,7 +314,11 @@ impl Feature {
                 name: translated.name,
                 coordinates: translated.coordinates,
                 place_formatted: translated.place_formatted,
+                match_code,
                 context: translated.context.map_named(layer),
+                bbox: translated
+                    .bbox
+                    .filter(|_| BOXED.contains(&translated.feature_type)),
             },
         }
     }
@@ -217,32 +332,21 @@ impl Collection {
                 .features
                 .iter()
                 .filter(|feature| admitted(types, &feature.properties.common))
-                .map(|feature| {
-                    Feature::of(
-                        &feature.properties.common,
-                        feature.geometry.coordinates,
-                        naming,
-                    )
-                })
+                .map(|feature| Feature::of(Found::forward(feature), naming))
                 .collect(),
             attribution: attribution(&collection.geocoding.attribution),
         }
     }
 
     fn reverse(collection: &ReverseCollection, types: Option<&Types>, naming: Naming) -> Self {
+        let collection = &super::at_point(collection);
         Self {
             kind: "FeatureCollection",
             features: collection
                 .features
                 .iter()
                 .filter(|feature| admitted(types, &feature.properties.common))
-                .map(|feature| {
-                    Feature::of(
-                        &feature.properties.common,
-                        feature.geometry.coordinates,
-                        naming,
-                    )
-                })
+                .map(|feature| Feature::of(Found::reverse(feature), naming))
                 .collect(),
             attribution: attribution(&collection.geocoding.attribution),
         }
@@ -253,6 +357,13 @@ impl Collection {
 #[derive(Debug)]
 enum Lookup {
     Geocode(Args),
+    /// Free text with `autocomplete` on, Mapbox's default: the geocode when
+    /// it reads the whole query, else what the text so far completes to.
+    Typed {
+        geocode: Args,
+        complete: Args,
+        limit: usize,
+    },
     /// A `mapbox_id` sent as `q`, looked up by its og id. `text` is `q` as
     /// a plain search, for an id og could never have issued.
     Id {
@@ -260,7 +371,11 @@ enum Lookup {
         lang: Option<String>,
         text: Args,
     },
-    Reverse(Args),
+    /// `countries` are the codes `country` keeps, none for any.
+    Reverse {
+        args: Args,
+        countries: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -338,11 +453,85 @@ async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compa
                 Err(problem) => Err(failed(problem)),
             }
         }
-        Lookup::Reverse(args) => native::reverse(state, args)
+        Lookup::Typed {
+            geocode,
+            complete,
+            limit,
+        } => {
+            let found = native::geocode(state, geocode).await.map_err(failed)?;
+            if reads_whole(&found) {
+                return Ok(Collection::forward(&found, types, naming));
+            }
+            let mut completed = native::autocomplete(state, complete)
+                .await
+                .map_err(failed)?;
+            // Geocoding answers no POIs.
+            completed
+                .features
+                .retain(|feature| feature.properties.common.layer != crate::record::Layer::Poi);
+            completed.features.truncate(limit);
+            Ok(Collection::forward(&completed, types, naming))
+        }
+        Lookup::Reverse { args, countries } => native::reverse(state, args)
             .await
-            .map(|collection| Collection::reverse(&collection, types, naming))
+            .map(|mut collection| {
+                super::keep_countries(&mut collection, &countries);
+                Collection::reverse(&collection, types, naming)
+            })
             .map_err(failed),
     }
+}
+
+/// Whether the geocode answers the query as typed, so nothing is left to
+/// complete. Its best answer is no stand-in area, and either matched every
+/// part the query states, or read a house number on the street it names.
+/// An address of the stated number and street in another town is still
+/// the address asked for, and its `match_code` says which part changed.
+/// One found by its whole name states no part.
+fn reads_whole(found: &ForwardCollection) -> bool {
+    found.features.first().is_some_and(|best| {
+        !best.properties.fallback
+            && best.properties.matched.as_ref().is_none_or(|parts| {
+                let addressed = parts.street == Some(PartMatch::Matched)
+                    && parts
+                        .housenumber
+                        .is_some_and(|number| number != PartMatch::Unmatched);
+                addressed
+                    || [
+                        parts.housenumber,
+                        parts.street,
+                        parts.unit,
+                        parts.locality,
+                        parts.region,
+                        parts.postcode,
+                        parts.country,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .all(|part| part == PartMatch::Matched)
+            })
+    })
+}
+
+/// Geocoding forward's largest `limit`.
+const MAX_FORWARD_LIMIT: usize = 10;
+/// Geocoding reverse's largest `limit`.
+const MAX_REVERSE_LIMIT: usize = 5;
+
+/// `limit` checked against Mapbox's range.
+fn limit(params: &Params, max: usize) -> Result<Option<usize>, crate::compat::VendorError> {
+    params
+        .get("limit")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|limit| (1..=max).contains(limit))
+                .ok_or_else(|| {
+                    Api::Geocoding.invalid(format!("limit must be a number between 1 and {max}"))
+                })
+        })
+        .transpose()
 }
 
 /// The structured-input parameters. Any of them, without `q`, makes a
@@ -364,25 +553,31 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
     let languages = languages(params)?;
     let lang = (!languages.is_empty()).then(|| languages.join(","));
     let layer = types.as_ref().and_then(Types::og_layer);
-    let text = |q: &str| {
+    let wanted = limit(params, MAX_FORWARD_LIMIT)?;
+    let limited = |q: &str, limit: usize| {
         Args::new()
             .set("q", q)
-            .set(
-                "limit",
-                params.get("limit").unwrap_or(DEFAULT_FORWARD_LIMIT),
-            )
+            .set("limit", limit.to_string())
             .maybe("country", params.get("country"))
             .maybe("focus", params.focus())
             .maybe("bbox", params.get("bbox"))
             .maybe("layer", layer)
             .maybe("lang", lang.clone())
     };
+    let text = |q: &str| limited(q, wanted.unwrap_or(DEFAULT_LIMIT));
     if let Some(q) = params.get("q") {
         let lookup = match decode_id(q) {
             Some(named) => Lookup::Id {
                 named,
                 lang: lang.clone(),
                 text: text(q),
+            },
+            None if typed(params)? => Lookup::Typed {
+                geocode: text(q),
+                // POIs are dropped from what the text completes to, so as
+                // many are asked for as Geocoding may answer.
+                complete: limited(q, MAX_FORWARD_LIMIT),
+                limit: wanted.unwrap_or(DEFAULT_LIMIT),
             },
             None => Lookup::Geocode(text(q)),
         };
@@ -435,10 +630,7 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
             .join(", ");
             let args = Args::new()
                 .set("q", named)
-                .set(
-                    "limit",
-                    params.get("limit").unwrap_or(DEFAULT_FORWARD_LIMIT),
-                )
+                .set("limit", wanted.unwrap_or(DEFAULT_LIMIT).to_string())
                 .maybe("country", code)
                 .maybe("focus", params.focus())
                 .maybe("bbox", params.get("bbox"))
@@ -470,9 +662,7 @@ fn reverse_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
     // og answers one result per hierarchy level, Mapbox's `limit=1`, and at
     // most one of a single type. A larger limit is checked as Mapbox checks
     // it and then answered with what og has.
-    let limit = params
-        .get("limit")
-        .and_then(|limit| limit.parse::<u64>().ok());
+    let limit = limit(params, MAX_REVERSE_LIMIT)?;
     let single = types.as_ref().is_some_and(|types| types.0.len() == 1);
     if limit.is_some_and(|limit| limit > 1) && !single {
         return Err(Api::Geocoding.invalid(
@@ -483,10 +673,13 @@ fn reverse_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
     let args = Args::new()
         .maybe("lon", params.get("longitude"))
         .maybe("lat", params.get("latitude"))
-        .maybe("layer", types.as_ref().and_then(Types::og_layer))
+        .maybe("layer", types.as_ref().and_then(Types::reverse_layer))
         .maybe("lang", (!languages.is_empty()).then(|| languages.join(",")));
     Ok(Plan {
-        lookup: Lookup::Reverse(args),
+        lookup: Lookup::Reverse {
+            args,
+            countries: super::countries(Api::Geocoding, params)?,
+        },
         types,
         languages,
     })
@@ -506,7 +699,8 @@ enum Checked {
     /// The geocode of the label a vendor id carries, kept to the record the
     /// id names (see [`native::keep_named`]).
     Labelled(Named<GeocodeRequest>, crate::compat::OgRef),
-    Reverse(Named<GeocodeOptions>),
+    /// The reverse lookup and the countries `country` keeps.
+    Reverse(Named<GeocodeOptions>, Vec<String>),
 }
 
 /// Where a query reads in the Pack, so neighbours run together.
@@ -629,7 +823,9 @@ fn check(state: &AppState, lookup: Lookup) -> Result<Checked, crate::compat::Ven
         }
     }
     let checked = match lookup {
-        Lookup::Geocode(args) => {
+        // og's batch engine has no autocomplete, so a batch query is read
+        // whole, as `autocomplete=false` reads it.
+        Lookup::Geocode(args) | Lookup::Typed { geocode: args, .. } => {
             prepared(og_batch::prepare(state, runtime::GEOCODE, &[], item(args)))
                 .map(Checked::Geocode)
         }
@@ -656,9 +852,9 @@ fn check(state: &AppState, lookup: Lookup) -> Result<Checked, crate::compat::Ven
                 Err(problem) => Err(problem),
             }
         }
-        Lookup::Reverse(args) => {
+        Lookup::Reverse { args, countries } => {
             prepared(og_batch::prepare(state, runtime::REVERSE, &[], item(args)))
-                .map(Checked::Reverse)
+                .map(|options| Checked::Reverse(options, countries))
         }
     };
     checked.map_err(|problem| Api::Geocoding.failed(problem))
@@ -679,7 +875,7 @@ fn place(query: &Checked) -> Place {
         Checked::Geocode(request) | Checked::Labelled(request, _) => {
             Place::Geocode((runtime::GEOCODE.place)(request))
         }
-        Checked::Reverse(options) => Place::Reverse((runtime::REVERSE.place)(options)),
+        Checked::Reverse(options, _) => Place::Reverse((runtime::REVERSE.place)(options)),
     }
 }
 
@@ -712,14 +908,17 @@ fn look_up(state: &AppState, query: &Checked, cancel: &Arc<AtomicBool>) -> Resul
             native::keep_named(&mut collection, named);
             Answer::Forward(collection)
         }),
-        Checked::Reverse(options) => outcome(og_batch::look_up(
+        Checked::Reverse(options, countries) => outcome(og_batch::look_up(
             state,
             runtime::REVERSE,
             None,
             options.clone(),
             cancel,
         ))
-        .map(Answer::Reverse),
+        .map(|mut collection| {
+            super::keep_countries(&mut collection, countries);
+            Answer::Reverse(collection)
+        }),
     }
 }
 
