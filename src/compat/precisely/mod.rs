@@ -46,15 +46,15 @@ pub(crate) fn router() -> Router<AppState> {
             "/v1/autocomplete",
             post(realtime::autocomplete).fallback(not_found),
         )
-        // Same request and response as `/v1/autocomplete`; v2 adds a
-        // filter or bias og cannot honour.
+        // Same request and response as `/v1/autocomplete`, the one schema
+        // Precisely documents for both.
         .route(
             "/v1/express-autocomplete",
             post(realtime::autocomplete).fallback(not_found),
         )
         .route(
             "/v2/express-autocomplete",
-            post(realtime::autocomplete).fallback(not_found),
+            post(realtime::express_autocomplete_v2).fallback(not_found),
         )
         .route(
             "/v1/autocomplete/postal-city",
@@ -266,6 +266,9 @@ struct Preferences {
     /// for none.
     #[serde(rename = "originXY", default)]
     origin_xy: Vec<f64>,
+    /// Read only to tell it was sent (see
+    /// [`realtime::express_autocomplete_v2`]).
+    filter_bias: Option<serde::de::IgnoredAny>,
 }
 
 /// Precisely's `Distance`.

@@ -523,6 +523,24 @@ pub(super) async fn autocomplete(
     complete(&state, body).await
 }
 
+/// `/v2/express-autocomplete`, v1's request with `filterBias` added. og's
+/// autocomplete has no field filter or bias, so one sent is refused rather
+/// than answered as if it held.
+pub(super) async fn express_autocomplete_v2(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Json<AutocompleteResponse>, VendorError> {
+    let body = read_json::<AutocompleteRequest>(&state, request, "INVALID_REQUEST").await?;
+    if body.preferences.filter_bias.is_some() {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "filterBias is not supported by this server (DIS-LI-1018)",
+        ));
+    }
+    complete(&state, body).await
+}
+
 async fn complete(
     state: &AppState,
     body: AutocompleteRequest,
