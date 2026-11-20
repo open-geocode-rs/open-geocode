@@ -227,7 +227,6 @@ impl Collection {
     }
 
     fn reverse(collection: &ReverseCollection, types: Option<&Types>) -> Self {
-        let collection = &super::at_point(collection);
         Self::of(
             collection.features.iter().map(Found::reverse),
             types,

@@ -339,7 +339,6 @@ impl Collection {
     }
 
     fn reverse(collection: &ReverseCollection, types: Option<&Types>, naming: Naming) -> Self {
-        let collection = &super::at_point(collection);
         Self {
             kind: "FeatureCollection",
             features: collection
