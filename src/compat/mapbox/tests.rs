@@ -916,7 +916,7 @@ async fn geocoding_batch_refuses_bad_input_whole() {
         ),
         (
             r#"[{"q": "a"}, {"longitude": 500, "latitude": 0}]"#,
-            "coordinate out of range",
+            "Longitude must be a number between -180 and 180",
         ),
     ] {
         let (status, error) = send(&router, "POST", batch, Some(body)).await;
@@ -953,7 +953,7 @@ async fn geocoding_errors_are_mapbox_errors() {
         (
             format!("{base}/forward?q=a&bbox=1,2"),
             StatusCode::UNPROCESSABLE_ENTITY,
-            "bbox must be 4 comma-separated numbers, min_lon,min_lat,max_lon,max_lat",
+            "BBox is not valid. Must be an array of format [minX, minY, maxX, maxY]",
         ),
         (
             format!("{base}/forward?q=a&limit=11"),
@@ -983,7 +983,7 @@ async fn geocoding_errors_are_mapbox_errors() {
         (
             format!("{base}/reverse?longitude=-79"),
             StatusCode::UNPROCESSABLE_ENTITY,
-            "could not parse query parameters",
+            "Latitude must be a number between -90 and 90",
         ),
         (
             format!("{base}/nothing"),
@@ -1306,7 +1306,7 @@ async fn search_box_errors_are_mapbox_errors() {
         (
             format!("{base}/suggest?q=a&proximity=1"),
             StatusCode::BAD_REQUEST,
-            "focus must be 2 comma-separated numbers, lon,lat",
+            "Proximity must be an array in the form [lon, lat]",
         ),
         (
             format!("{base}/retrieve/bm90LW9ncw"),
@@ -1346,7 +1346,7 @@ async fn search_box_errors_are_mapbox_errors() {
         (
             format!("{base}/category/coffee?proximity=1"),
             StatusCode::BAD_REQUEST,
-            "focus must be 2 comma-separated numbers, lon,lat",
+            "Proximity must be an array in the form [lon, lat]",
         ),
         (
             format!("{base}/details"),

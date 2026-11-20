@@ -886,7 +886,6 @@ struct Collection {
 struct RowProblem {
     status: u16,
     error_code: String,
-    detail: Option<String>,
     #[serde(default)]
     invalid_params: Vec<RowParam>,
 }
@@ -924,15 +923,9 @@ fn output_rows(line: ResultLine, product: Product) -> io::Result<Vec<u8>> {
                         .iter()
                         .map(|param| param.name.as_str())
                         .collect::<Vec<_>>();
-                    Failure::from_parts(
-                        problem.status,
-                        &problem.error_code,
-                        problem.detail.as_deref(),
-                        &params,
-                        None,
-                    )
+                    Failure::from_parts(problem.status, &problem.error_code, &params, None)
                 }
-                None => Failure::from_parts(500, "internal_error", None, &[], None),
+                None => Failure::from_parts(500, "internal_error", &[], None),
             };
             row(failure.status, &failure.message, blank)?;
         }

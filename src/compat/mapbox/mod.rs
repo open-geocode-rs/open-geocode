@@ -126,11 +126,87 @@ impl Params {
             .filter(|value| !value.is_empty())
     }
 
-    /// `proximity` as og's `focus`. `ip` asks for the caller's own location,
-    /// which og has no way to know, so it biases nothing.
-    fn focus(&self) -> Option<&str> {
-        self.get("proximity")
+    /// `proximity` as og's `focus`, checked in Mapbox's words. `ip` asks
+    /// for the caller's own location, which og has no way to know, so it
+    /// biases nothing.
+    fn focus(&self, api: Api) -> Result<Option<String>, VendorError> {
+        let Some(value) = self
+            .get("proximity")
             .filter(|value| !value.eq_ignore_ascii_case("ip"))
+        else {
+            return Ok(None);
+        };
+        let numbers = numbers(value)
+            .filter(|numbers| numbers.len() == 2)
+            .ok_or_else(|| api.invalid("Proximity must be an array in the form [lon, lat]"))?;
+        let (lon, lat) = (numbers[0], numbers[1]);
+        if !(-180.0..=180.0).contains(&lon) {
+            return Err(api.invalid("Proximity lon value must be a number between -180 and 180"));
+        }
+        if !(-90.0..=90.0).contains(&lat) {
+            return Err(api.invalid("Proximity lat value must be a number between -90 and 90"));
+        }
+        Ok(Some(format!("{lon},{lat}")))
+    }
+
+    /// A reverse request's `longitude` and `latitude` as og's `lon` and
+    /// `lat`, checked in the words Mapbox uses for its other coordinates.
+    fn point(&self, api: Api) -> Result<(String, String), VendorError> {
+        let coordinate = |name: &str, label: &str, bound: f64| {
+            self.get(name)
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && (-bound..=bound).contains(value))
+                .map(|value| value.to_string())
+                .ok_or_else(|| {
+                    api.invalid(format!(
+                        "{label} must be a number between -{bound} and {bound}"
+                    ))
+                })
+        };
+        Ok((
+            coordinate("longitude", "Longitude", 180.0)?,
+            coordinate("latitude", "Latitude", 90.0)?,
+        ))
+    }
+
+    /// `bbox` as og's, checked in Mapbox's words.
+    fn bbox(&self, api: Api) -> Result<Option<String>, VendorError> {
+        let Some(value) = self.get("bbox") else {
+            return Ok(None);
+        };
+        let numbers = numbers(value)
+            .filter(|numbers| numbers.len() == 4)
+            .ok_or_else(|| {
+                api.invalid(
+                    "BBox is not valid. Must be an array of format [minX, minY, maxX, maxY]",
+                )
+            })?;
+        let [min_x, min_y, max_x, max_y] = [numbers[0], numbers[1], numbers[2], numbers[3]];
+        for (name, value) in [("minX", min_x), ("maxX", max_x)] {
+            if !(-180.0..=180.0).contains(&value) {
+                return Err(api.invalid(format!(
+                    "BBox {name} value must be a number between -180 and 180"
+                )));
+            }
+        }
+        for (name, value) in [("minY", min_y), ("maxY", max_y)] {
+            if !(-90.0..=90.0).contains(&value) {
+                return Err(api.invalid(format!(
+                    "BBox {name} value must be a number between -90 and 90"
+                )));
+            }
+        }
+        for (low, high, low_value, high_value) in [
+            ("minX", "maxX", min_x, max_x),
+            ("minY", "maxY", min_y, max_y),
+        ] {
+            if low_value > high_value {
+                return Err(api.invalid(format!(
+                    "BBox {low} value cannot be greater than {high} value"
+                )));
+            }
+        }
+        Ok(Some(format!("{min_x},{min_y},{max_x},{max_y}")))
     }
 
     fn types(&self, api: Api) -> Result<Option<Types>, VendorError> {
@@ -394,6 +470,19 @@ impl<'a> Found<'a> {
             distance_m: None,
         }
     }
+}
+
+/// Comma-separated finite numbers, `None` when any part is not one.
+fn numbers(value: &str) -> Option<Vec<f64>> {
+    value
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|number| number.is_finite())
+        })
+        .collect()
 }
 
 /// og's box as Mapbox's `[minLon, minLat, maxLon, maxLat]`. Mapbox's box

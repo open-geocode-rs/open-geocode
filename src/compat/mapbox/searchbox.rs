@@ -374,8 +374,8 @@ pub(super) async fn suggest(
         .set("q", q)
         .maybe("limit", asked.fetch())
         .maybe("country", params.get("country"))
-        .maybe("focus", params.focus())
-        .maybe("bbox", params.get("bbox"))
+        .maybe("focus", params.focus(Api::SearchBox)?)
+        .maybe("bbox", params.bbox(Api::SearchBox)?)
         .maybe("layer", types.as_ref().and_then(Types::og_layer))
         .set("lang", language(&params));
     let mut collection = native::autocomplete(&state, args).await.map_err(failed)?;
@@ -443,8 +443,8 @@ pub(super) async fn forward(
         .set("q", q)
         .maybe("limit", asked.fetch())
         .maybe("country", params.get("country"))
-        .maybe("focus", params.focus())
-        .maybe("bbox", params.get("bbox"))
+        .maybe("focus", params.focus(Api::SearchBox)?)
+        .maybe("bbox", params.bbox(Api::SearchBox)?)
         .set("lang", language(&params));
     let autocomplete = params
         .get("auto_complete")
@@ -472,9 +472,10 @@ pub(super) async fn reverse(
     let params = Params::from_query(Api::SearchBox, query)?;
     let types = params.types(Api::SearchBox)?;
     let countries = super::countries(Api::SearchBox, &params)?;
+    let (lon, lat) = params.point(Api::SearchBox)?;
     let args = Args::new()
-        .maybe("lon", params.get("longitude"))
-        .maybe("lat", params.get("latitude"))
+        .set("lon", lon)
+        .set("lat", lat)
         .maybe("layer", types.as_ref().and_then(Types::reverse_layer))
         .set("lang", language(&params));
     let mut collection = native::reverse(&state, args).await.map_err(failed)?;

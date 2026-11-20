@@ -272,7 +272,7 @@ pub(super) async fn search(
         }
     }
     let radius = params.get("radius").map(radius_metres).transpose()?;
-    if radius.is_some() && params.focus().is_none() {
+    if radius.is_some() && params.focus(Api::SearchBox)?.is_none() {
         return Err(Api::SearchBox.invalid("radius needs proximity"));
     }
     let excluded = params
@@ -288,9 +288,9 @@ pub(super) async fn search(
     let args = Args::new()
         .maybe("limit", params.get("limit"))
         .maybe("country", params.get("country"))
-        .maybe("focus", params.focus())
+        .maybe("focus", params.focus(Api::SearchBox)?)
         .maybe("radius", radius.map(|metres| metres.to_string()))
-        .maybe("bbox", params.get("bbox"))
+        .maybe("bbox", params.bbox(Api::SearchBox)?)
         .set("lang", searchbox::language(&params));
     let mut collection = native::of_categories(&state, categories, args)
         .await

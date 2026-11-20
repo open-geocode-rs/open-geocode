@@ -617,13 +617,14 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
     let lang = (!languages.is_empty()).then(|| languages.join(","));
     let layer = types.as_ref().and_then(Types::og_layer);
     let wanted = limit(params, MAX_FORWARD_LIMIT)?;
+    let (focus, bbox) = (params.focus(Api::Geocoding)?, params.bbox(Api::Geocoding)?);
     let limited = |q: &str, limit: usize| {
         Args::new()
             .set("q", q)
             .set("limit", limit.to_string())
             .maybe("country", params.get("country"))
-            .maybe("focus", params.focus())
-            .maybe("bbox", params.get("bbox"))
+            .maybe("focus", focus.clone())
+            .maybe("bbox", bbox.clone())
             .maybe("layer", layer)
             .maybe("lang", lang.clone())
     };
@@ -695,8 +696,8 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
                 .set("q", named)
                 .set("limit", wanted.unwrap_or(DEFAULT_LIMIT).to_string())
                 .maybe("country", code)
-                .maybe("focus", params.focus())
-                .maybe("bbox", params.get("bbox"))
+                .maybe("focus", params.focus(Api::Geocoding)?)
+                .maybe("bbox", params.bbox(Api::Geocoding)?)
                 .maybe("layer", layer)
                 .maybe("lang", lang.clone());
             Lookup::Geocode(args)
@@ -733,9 +734,10 @@ fn reverse_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
     }
     let languages = languages(params)?;
     let layer = types.as_ref().and_then(Types::reverse_layer);
+    let (lon, lat) = params.point(Api::Geocoding)?;
     let args = Args::new()
-        .maybe("lon", params.get("longitude"))
-        .maybe("lat", params.get("latitude"))
+        .set("lon", lon)
+        .set("lat", lat)
         .maybe("layer", layer)
         .maybe(
             "limit",

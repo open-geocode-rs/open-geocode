@@ -797,7 +797,7 @@ async fn a_failed_item_makes_the_answer_partial() {
              "errorMessage": "Not able to identify ABC country (DIS-LI-1016)"},
             {"addressId": "2", "status": "ZERO_RESULTS", "results": []},
             {"addressId": "3", "status": "INVALID_REQUEST",
-             "errorMessage": "q must not be empty (DIS-LI-1018)"},
+             "errorMessage": "Request Body is not valid (DIS-LI-1018)"},
         ]})
     );
 }
@@ -935,9 +935,9 @@ async fn reverse_geocode_answers_each_point() {
         json!({"responses": [
             {"addressId": "a", "status": "OK", "results": [expected]},
             {"addressId": "b", "status": "INVALID_REQUEST",
-             "errorMessage": "could not parse query parameters (DIS-LI-1018)"},
+             "errorMessage": "Request Body is not valid (DIS-LI-1018)"},
             {"addressId": "c", "status": "INVALID_REQUEST",
-             "errorMessage": "coordinate out of range (DIS-LI-1018)"},
+             "errorMessage": "Request Body is not valid (DIS-LI-1018)"},
             // A point in Canada has no answer in the United States.
             {"addressId": "d", "status": "ZERO_RESULTS", "results": []},
         ]})
@@ -1230,7 +1230,7 @@ async fn a_bulk_job_runs_on_og_jobs_and_downloads_as_precisely_csv() {
             format!(
                 "A3,INVALID_REQUEST,Not able to identify requested country (DIS-LI-1016),{blank}"
             ),
-            format!("A4,INVALID_REQUEST,q must not be empty (DIS-LI-1018),{blank}"),
+            format!("A4,INVALID_REQUEST,Request Body is not valid (DIS-LI-1018),{blank}"),
         ]
     );
 

@@ -145,7 +145,6 @@ impl Failure {
         Self::from_parts(
             problem.status(),
             problem.error_code().as_str(),
-            problem.detail(),
             &params,
             country,
         )
@@ -154,7 +153,6 @@ impl Failure {
     pub(super) fn from_parts(
         status: u16,
         code: &str,
-        detail: Option<&str>,
         params: &[&str],
         country: Option<&str>,
     ) -> Self {
@@ -187,13 +185,12 @@ impl Failure {
                 "SERVICE_UNAVAILABLE",
                 UNAVAILABLE_MESSAGE.to_string(),
             ),
+            // Precisely words every other refusal one way; og's own words
+            // stay in og's log, never in a Precisely answer.
             (400..500, _) => (
                 StatusCode::BAD_REQUEST,
                 "INVALID_REQUEST",
-                match detail {
-                    Some(detail) => format!("{detail} (DIS-LI-1018)"),
-                    None => "Request Body is not valid (DIS-LI-1018)".to_string(),
-                },
+                "Request Body is not valid (DIS-LI-1018)".to_string(),
             ),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
