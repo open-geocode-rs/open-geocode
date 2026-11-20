@@ -851,6 +851,50 @@ async fn autosuggest_autocomplete_and_discover() {
     let reply = get(&router, "/compat/here/v1/autosuggest?q=+&at=43,-79").await;
     assert_eq!(reply.json(), json!({"items": [], "queryTerms": []}));
 
+    // A page past what og answers, and a route to search along, are refused.
+    for (uri, param) in [
+        (
+            "/compat/here/v1/autosuggest?q=Queen&at=43,-79&limit=21",
+            "limit",
+        ),
+        (
+            "/compat/here/v1/autosuggest?q=Queen&at=43,-79&limit=10&offset=15",
+            "offset",
+        ),
+        (
+            "/compat/here/v1/discover?q=Queen&at=43,-79&limit=51",
+            "limit",
+        ),
+    ] {
+        let reply = get(&router, uri).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(
+            reply.json()["title"],
+            format!("Illegal input for parameter '{param}'"),
+            "{uri}"
+        );
+    }
+    for path in ["discover", "autosuggest"] {
+        let uri = format!("/compat/here/v1/{path}?q=Queen&at=43,-79");
+        let form = "application/x-www-form-urlencoded";
+        let reply = send(
+            &router,
+            "POST",
+            &uri,
+            Some((form, "route=BFoz5xJ67i1B1B7PzIhaxL7Y")),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(reply.json()["title"], "Illegal input for parameter 'route'");
+        let reply = send(&router, "POST", &uri, Some((form, "limit=1"))).await;
+        assert_eq!(
+            reply.json()["title"],
+            "Parameter 'limit' is not allowed in the request body"
+        );
+        let reply = send(&router, "POST", &uri, Some((form, ""))).await;
+        assert_eq!(reply.status, StatusCode::OK, "{path}");
+    }
+
     // Autocomplete is addresses alone, with no position.
     let reply = get(&router, "/compat/here/v1/autocomplete?q=Queen").await;
     assert_eq!(reply.json(), json!({"items": [queen]}));
@@ -884,7 +928,7 @@ async fn browse_answers_the_places_around_a_point_by_kind_and_name() {
         "at=43,-79",
         "at=43,-79&categories=600-6300-0244",
         "at=43,-79&categories=600-6300,100",
-        "at=43,-79&categories=600,!100-1000-0009&limit=100",
+        "at=43,-79&categories=600,!100-1000-0009&limit=50",
         "at=43,-79&name=queen%20bak",
         "at=43,-79&in=countryCode:CAN",
         "at=43,-79&in=circle:43,-79.005;r=100",
@@ -899,7 +943,7 @@ async fn browse_answers_the_places_around_a_point_by_kind_and_name() {
     assert_eq!(reply.json(), found);
 
     // Another kind, a kind og has none of, the kind left out, another name,
-    // another country, outside the area, and a chain or food type asked for.
+    // another country and outside the area.
     for query in [
         "at=43,-79&categories=100-1000-0000",
         "at=43,-79&categories=999-9999-9999",
@@ -908,13 +952,39 @@ async fn browse_answers_the_places_around_a_point_by_kind_and_name() {
         "at=43,-79&in=countryCode:FRA",
         "at=43,-79&in=circle:43,-79;r=100",
         "at=43,-79&in=bbox:0,0,1,1",
-        "at=43,-79&chains=1566",
-        "at=43,-79&foodTypes=800-067",
     ] {
         let reply = get(&router, &format!("{base}?{query}")).await;
         assert_eq!(reply.status, StatusCode::OK, "{query}");
         assert_eq!(reply.json(), json!({"items": []}), "{query}");
     }
+    // What og cannot honour is refused, never answered as nothing there: a
+    // chain or food type asked for, a page past og's 50 results, a route.
+    for (query, param) in [
+        ("at=43,-79&chains=1566", "chains"),
+        ("at=43,-79&foodTypes=800-067", "foodTypes"),
+        ("at=43,-79&limit=100", "limit"),
+        ("at=43,-79&limit=20&offset=40", "offset"),
+    ] {
+        let reply = get(&router, &format!("{base}?{query}")).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{query}");
+        assert_eq!(
+            reply.json()["title"],
+            format!("Illegal input for parameter '{param}'"),
+            "{query}"
+        );
+    }
+    let reply = send(
+        &router,
+        "POST",
+        &format!("{base}?at=43,-79"),
+        Some((
+            "application/x-www-form-urlencoded",
+            "route=BFoz5xJ67i1B1B7PzIhaxL7Y",
+        )),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.json()["title"], "Illegal input for parameter 'route'");
 
     let reply = get(&router, &format!("{base}?at=43,-79&offset=0&limit=1")).await;
     assert_eq!(
