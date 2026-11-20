@@ -201,6 +201,8 @@ impl Place {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct GeocodeResult {
+    pub(super) place: String,
+    pub(super) place_id: String,
     pub(super) location: LatLng,
     pub(super) granularity: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,6 +223,7 @@ pub(super) struct GeocodeResult {
 
 impl GeocodeResult {
     pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
+        let place_id = encode_id(common);
         let mut postal_address = postal_address(common);
         let formatted_address = if common.layer == Layer::Address
             && compat::country_code(&common.context) == Some("US")
@@ -233,6 +236,8 @@ impl GeocodeResult {
             formatted_address(common)
         };
         Self {
+            place: format!("places/{place_id}"),
+            place_id,
             location: LatLng::of(coordinates),
             granularity: granularity(common.accuracy),
             formatted_address,

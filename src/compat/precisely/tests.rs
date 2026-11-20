@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use crate::{
-    compat::encode_parts,
+    compat::{decode_id, encode_parts},
     confidence::{FEATURES, Model},
     context::{AdminContextTuple, RecordContext},
     iso,
@@ -67,8 +67,11 @@ impl Fixture {
     }
 }
 
-/// A legacy lookup reference for a fixture address absent from the catalogue.
-fn legacy_address_key(og_id: &str) -> String {
+/// Canada > Ontario > Toronto, with every area tier a Precisely address has
+/// a slot for, and an address, a bakery and a numbered range in it.
+/// The vendor id og issues for an address of the fixture: its og id, its
+/// layer and its label, since the catalogue holds no address.
+fn address_vendor_id(og_id: &str) -> String {
     let label = match og_id {
         "osm:node:10" => "100 King Street West, Unit 5, ON, M5X 1A9",
         _ => panic!("{og_id} is no address of the fixture"),
@@ -76,7 +79,6 @@ fn legacy_address_key(og_id: &str) -> String {
     encode_parts(og_id, Some(Layer::Address), label)
 }
 
-/// Every area tier of a Precisely address, with a bakery and a numbered range.
 fn write_pack(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
     let mut writer = Writer::create(dir).expect("writer");
@@ -311,7 +313,16 @@ fn assert_carries(
             seen.insert(name);
         }
     };
-    assert!(result["customFields"].get("PB_KEY").is_none());
+    assert_eq!(
+        decode_id(
+            result["customFields"]["PB_KEY"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no PB_KEY on {result} for {feature}"))
+        )
+        .map(|named| named.id().to_string())
+        .as_deref(),
+        properties["id"].as_str()
+    );
     assert_eq!(carried["formattedAddress"], properties["label"]);
     assert_eq!(
         result["location"]["feature"]["geometry"]["coordinates"],
@@ -521,6 +532,7 @@ fn address_result(score: &Value, described: &[&str; 7]) -> Value {
         },
         "addressLines": ["Unit 5", "100 King Street West", "Toronto, ON M5X 1A9", "Canada"],
         "explanation": {"addressMatch": {"type": "ADDRESS", "description": description}},
+        "customFields": {"PB_KEY": address_vendor_id("osm:node:10")},
     })
 }
 
@@ -658,14 +670,12 @@ async fn every_og_value_lands_in_its_precisely_slot() {
     // country keeps the house, the region and the country.
     assert_eq!(results.len(), 3, "{og}");
     for result in results {
+        let key = result["customFields"]["PB_KEY"].as_str().expect("PB_KEY");
+        let id = decode_id(key).expect("og's key").id().to_string();
         let feature = features
             .iter()
-            .find(|feature| {
-                feature["properties"]["label"] == result["address"]["formattedAddress"]
-                    && feature["geometry"]["coordinates"]
-                        == result["location"]["feature"]["geometry"]["coordinates"]
-            })
-            .unwrap_or_else(|| panic!("{result} is not in {og}"));
+            .find(|feature| feature["properties"]["id"] == id.as_str())
+            .unwrap_or_else(|| panic!("{id} is not in {og}"));
         assert_carries(Route::Reverse, feature, result, &mut seen);
     }
 
@@ -749,6 +759,7 @@ async fn a_poi_says_what_it_is_and_where() {
             },
             "addressLines": ["120 King Street West", "Toronto, ON M5X 1A9", "Canada"],
             "explanation": {"addressMatch": {"type": "POI"}},
+            "customFields": {"PB_KEY": encode_parts("osm:way:11", Some(Layer::Poi), "")},
         }]}})
     );
 
@@ -952,7 +963,7 @@ async fn reverse_geocode_answers_each_point() {
 }
 
 #[tokio::test]
-async fn lookup_accepts_a_previously_issued_og_reference() {
+async fn lookup_finds_a_record_by_the_pb_key_og_issued() {
     let fixture = Fixture::new("lookup");
     let router = fixture.router();
     let reply = post(
@@ -977,7 +988,7 @@ async fn lookup_accepts_a_previously_issued_og_reference() {
     let reply = post(
         &router,
         "/v1/lookup",
-        &json!({"keys": [{"key": legacy_address_key("osm:node:10"), "type": "PB_KEY", "country": "CAN"}]}),
+        &json!({"keys": [{"key": address_vendor_id("osm:node:10"), "type": "PB_KEY", "country": "CAN"}]}),
     )
     .await;
     let found = &reply.json()["responses"][0];
@@ -986,7 +997,10 @@ async fn lookup_accepts_a_previously_issued_og_reference() {
         found["results"][0]["address"]["formattedAddress"],
         "100 King Street West, Unit 5, ON, M5X 1A9"
     );
-    assert!(found["results"][0]["customFields"].get("PB_KEY").is_none());
+    assert_eq!(
+        found["results"][0]["customFields"]["PB_KEY"],
+        address_vendor_id("osm:node:10")
+    );
 
     let reply = post(
         &router,
@@ -1205,7 +1219,8 @@ async fn a_bulk_job_runs_on_og_jobs_and_downloads_as_precisely_csv() {
             "A1,OK,,{score},\"100 King Street West, Unit 5, ON, M5X 1A9\",\"100 King Street West, Unit 5\",\
              \"ON, M5X 1A9\",100,King Street West,5,,Financial District,Old Toronto,\
              Toronto,Toronto Division,Ontario,ON,M5X 1A9,,CAN,Canada,CA,124,43.6493,-79.3817,\
-             epsg:4326,Point,ADDRESS_POINT,ADDRESS,"
+             epsg:4326,Point,ADDRESS_POINT,ADDRESS,\"{{\"\"pbKey\"\":\"\"{}\"\"}}\"",
+            address_vendor_id("osm:node:10")
         )
     );
     let blank = ",".repeat(super::result::Product::Geocode.columns().len() - 4);
@@ -1566,6 +1581,7 @@ fn verified_result(score: &Value, stated: &[&str], codes: [&str; 2]) -> Value {
             {"label": "country", "matchType": match_type("country")},
         ]}},
         "customFields": {
+            "PB_KEY": address_vendor_id("osm:node:10"),
             "SIMPLE_MATCH_CODE": codes[0],
             "EXTENDED_MATCH_CODE": codes[1],
         },
@@ -1804,6 +1820,7 @@ async fn proximity_search_finds_the_nearest_address() {
             "distance": metres / 1000.0,
             "location": {"latitude": 43.6493, "longitude": -79.3817},
             "metadata": {
+                "PBKEY": address_vendor_id("osm:node:10"),
                 "FORMATTEDADDRESS": "100 King Street West, Unit 5, ON, M5X 1A9",
                 "ADDRLINE1": "100 King Street West, Unit 5",
                 "ADDNUMBER": "100",
@@ -1991,7 +2008,8 @@ async fn a_bulk_verify_job_writes_verify_output() {
              \"ON, M5X 1A9\",100,King Street West,5,,Financial District,Old Toronto,\
              Toronto,Toronto Division,Ontario,ON,M5X 1A9,,CAN,Canada,CA,124,,,,ADDRESS,\
              \"{{\"\"extendedMatchCode\"\":\"\"V4-D0M0B0U6F0G0P4S4Q0X0A6T4E0R6W0Z4Y0C4-{stars}\"\",\
-             \"\"simpleMatchCode\"\":\"\"V4-P4S4A6T4R6Z4C4-{stars}\"\"}}\""
+             \"\"pbKey\"\":\"\"{}\"\",\"\"simpleMatchCode\"\":\"\"V4-P4S4A6T4R6Z4C4-{stars}\"\"}}\"",
+            address_vendor_id("osm:node:10")
         )
     );
     let blank = ",".repeat(super::result::Product::Verify.columns().len() - 4);

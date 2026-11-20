@@ -47,7 +47,7 @@ pub(crate) fn router() -> Router<AppState> {
         .nest("/compat/precisely", precisely::router())
 }
 
-/// A record's id as a vendor id (see [`OgRef`]).
+/// An og reference for a record in a vendor-compatible response.
 pub(crate) fn encode_id(common: &crate::api::Common) -> String {
     encode_parts(&common.id, Some(common.layer), &common.label)
 }
@@ -107,6 +107,8 @@ impl CatalogueId {
 /// break.
 const SEPARATOR: char = '\n';
 
+const OG_ID_PREFIX: &str = "og_";
+
 impl OgRef {
     fn of(id: &str, layer: Option<Layer>, label: &str) -> Self {
         // An area's id is the same whether it is the answer or holds it.
@@ -153,14 +155,19 @@ impl OgRef {
             text.push(SEPARATOR);
             text.push_str(label);
         }
-        URL_SAFE_NO_PAD.encode(text)
+        let mut reference = String::from(OG_ID_PREFIX);
+        URL_SAFE_NO_PAD.encode_string(text, &mut reference);
+        reference
     }
 }
 
 /// What a vendor id names, or `None` for one og never issued: one whose id
 /// is not og's, or that asks the catalogue for a record it cannot hold.
 pub(crate) fn decode_id(vendor_id: &str) -> Option<OgRef> {
-    let bytes = URL_SAFE_NO_PAD.decode(vendor_id.trim()).ok()?;
+    let id = vendor_id.trim();
+    // Keep references issued before the provider prefix was added usable.
+    let payload = id.strip_prefix(OG_ID_PREFIX).unwrap_or(id);
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let text = String::from_utf8(bytes).ok()?;
     let mut parts = text.splitn(3, SEPARATOR);
     let id = parts.next()?;
@@ -507,6 +514,10 @@ mod tests {
         let poi = encode_parts("osm:node:7", Some(Layer::Poi), "Diner, 25 Dorrance Street");
         let address = encode_parts("osm:node:7", Some(Layer::Address), "25 Dorrance Street");
         assert_ne!(poi, address, "one node, two records");
+        for id in [&poi, &address] {
+            let legacy = id.strip_prefix("og_").expect("og-issued prefix");
+            assert_eq!(decode_id(id), decode_id(legacy));
+        }
         assert!(matches!(decode_id(&poi), Some(OgRef::Catalogued { .. })));
         assert_eq!(
             decode_id(&address),

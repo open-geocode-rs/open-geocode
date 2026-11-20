@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::match_code::{Holds, MatchCode};
 use crate::{
     api::{self, Accuracy, PartMatch, QueryMatch},
+    compat::encode_parts,
     iso,
     record::Layer,
 };
@@ -39,6 +40,7 @@ struct Geometry {
 
 #[derive(Debug, Deserialize)]
 struct Properties {
+    id: String,
     layer: Layer,
     accuracy: Accuracy,
     name: String,
@@ -130,6 +132,7 @@ impl Feature {
         Self {
             geometry: Geometry { coordinates },
             properties: Properties {
+                id: common.id.clone(),
                 layer: common.layer,
                 accuracy: common.accuracy,
                 name: common.name.clone(),
@@ -205,7 +208,6 @@ pub(super) struct Candidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) location: Option<Location>,
     pub(super) explanation: Explanation,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) custom_fields: BTreeMap<&'static str, String>,
 }
 
@@ -336,6 +338,9 @@ pub(super) struct MatchDescription {
 
 /// og's coordinates are WGS 84 longitude and latitude.
 const CRS_NAME: &str = "epsg:4326";
+
+/// The compatibility field carrying the og reference for lookup.
+pub(super) const ID_FIELD: &str = "PB_KEY";
 
 impl Feature {
     /// The label, as an autocomplete `prediction` shows it.
@@ -565,7 +570,10 @@ impl Feature {
                     description: Vec::new(),
                 },
             },
-            custom_fields: BTreeMap::new(),
+            custom_fields: BTreeMap::from([(
+                ID_FIELD,
+                encode_parts(&properties.id, Some(properties.layer), &properties.label),
+            )]),
         };
         let holds = Holds::of(&candidate.address);
         candidate.explanation.address_match.description = describe(judged, &holds);
@@ -775,6 +783,7 @@ impl Candidate {
         };
         // Bulk output names custom fields in camelCase, unlike real time.
         let custom_fields = [
+            (ID_FIELD, "pbKey"),
             (SIMPLE_MATCH_CODE, "simpleMatchCode"),
             (EXTENDED_MATCH_CODE, "extendedMatchCode"),
         ]

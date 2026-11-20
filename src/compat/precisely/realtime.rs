@@ -442,8 +442,7 @@ pub(super) async fn reverse(
     ))
 }
 
-/// Key types Precisely documents. Existing clients can still supply
-/// previously issued og references as lookup input.
+/// Key types Precisely documents. The `PB_KEY` route resolves og references.
 const KEY_TYPES: [&str; 5] = ["PB_KEY", "GNAF_PID", "UDPRN", "UPRN", "EIR_CODE"];
 
 pub(super) async fn lookup(

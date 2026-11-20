@@ -182,6 +182,10 @@ pub(super) async fn proximity_search(
                 field.as_ref().map(|field| field.long_name.clone())
             };
             let metadata = [
+                (
+                    "PBKEY",
+                    candidate.custom_fields.get(result::ID_FIELD).cloned(),
+                ),
                 ("FORMATTEDADDRESS", address.formatted_address.clone()),
                 ("ADDRLINE1", address.formatted_street_address.clone()),
                 ("ADDNUMBER", address.address_number.clone()),
