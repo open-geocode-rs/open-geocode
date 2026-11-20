@@ -520,30 +520,61 @@ async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compa
 /// part the query states, or read a house number on the street it names.
 /// An address of the stated number and street in another town is still
 /// the address asked for, and its `match_code` says which part changed.
-/// One found by its whole name states no part.
+/// One found by its whole name states the part it is. An answer og judged
+/// on no part says nothing of the query, so it is left to completion.
 fn reads_whole(found: &ForwardCollection) -> bool {
     found.features.first().is_some_and(|best| {
-        !best.properties.fallback
-            && best.properties.matched.as_ref().is_none_or(|parts| {
-                let addressed = parts.street == Some(PartMatch::Matched)
-                    && parts
-                        .housenumber
-                        .is_some_and(|number| number != PartMatch::Unmatched);
-                addressed
-                    || [
-                        parts.housenumber,
-                        parts.street,
-                        parts.unit,
-                        parts.locality,
-                        parts.region,
-                        parts.postcode,
-                        parts.country,
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .all(|part| part == PartMatch::Matched)
-            })
+        answers_whole(best.properties.fallback, best.properties.matched.as_ref())
     })
+}
+
+/// [`reads_whole`] of one answer, by whether it is a stand-in area and how
+/// og judged the parts the query states.
+fn answers_whole(fallback: bool, matched: Option<&QueryMatch>) -> bool {
+    !fallback
+        && matched.is_some_and(|parts| {
+            let addressed = parts.street == Some(PartMatch::Matched)
+                && parts
+                    .housenumber
+                    .is_some_and(|number| number != PartMatch::Unmatched);
+            addressed
+                || [
+                    parts.housenumber,
+                    parts.street,
+                    parts.unit,
+                    parts.locality,
+                    parts.region,
+                    parts.postcode,
+                    parts.country,
+                ]
+                .into_iter()
+                .flatten()
+                .all(|part| part == PartMatch::Matched)
+        })
+}
+
+#[cfg(test)]
+mod whole_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_answer_judged_on_what_the_query_states_reads_it_whole() {
+        let parts = |street, locality| QueryMatch {
+            street,
+            locality,
+            ..QueryMatch::default()
+        };
+        let town = parts(None, Some(PartMatch::Matched));
+        assert!(answers_whole(false, Some(&town)));
+        // "Provid" may answer a street og judged on nothing, which is no
+        // reading of the whole text, so the text is completed instead.
+        assert!(!answers_whole(false, None));
+        assert!(!answers_whole(
+            false,
+            Some(&parts(Some(PartMatch::Partial), None))
+        ));
+        assert!(!answers_whole(true, Some(&town)));
+    }
 }
 
 /// Geocoding forward's largest `limit`.
