@@ -64,7 +64,6 @@ struct Properties {
 struct Address {
     housenumber: Option<String>,
     unit: Option<String>,
-    unit_type: Option<String>,
     street: Option<String>,
     place: Option<String>,
     #[serde(default)]
@@ -141,7 +140,6 @@ impl Feature {
                 address: Address {
                     housenumber: address.housenumber.clone(),
                     unit: address.unit.clone(),
-                    unit_type: address.unit_type.clone(),
                     street: address.street.clone(),
                     place: address.place.clone(),
                     areas: address.areas.clone(),
@@ -503,6 +501,7 @@ impl Feature {
             (None, None)
         };
         let judged = properties.matched.unwrap_or_default();
+        let kind = address.unit.as_deref().and_then(unit_type);
         let mut candidate = Candidate {
             score: properties
                 .confidence
@@ -515,7 +514,7 @@ impl Feature {
                 street,
                 // The unit's type apart from its value: `STE` and `300` of
                 // `STE 300`.
-                unit: match (&address.unit, &address.unit_type) {
+                unit: match (&address.unit, &kind) {
                     (Some(unit), Some(kind)) => unit
                         .strip_prefix(kind.as_str())
                         .map(str::trim)
@@ -524,7 +523,7 @@ impl Feature {
                         .or_else(|| Some(unit.clone())),
                     (unit, _) => unit.clone(),
                 },
-                unit_type: address.unit_type.clone(),
+                unit_type: kind,
                 place_name: (layer == "poi").then(|| properties.name.clone()),
                 neighborhood: admin(neighborhood),
                 suburb: admin(suburb),
@@ -949,5 +948,55 @@ mod tests {
             assert_eq!(location_type(layer, accuracy), kind, "{layer} {accuracy}");
             assert_eq!(match_type(layer, accuracy), matched, "{layer} {accuracy}");
         }
+    }
+}
+
+/// Words a unit starts with that say what kind of unit it is.
+const UNIT_TYPES: [&str; 18] = [
+    "apartment",
+    "apt",
+    "building",
+    "bldg",
+    "flat",
+    "floor",
+    "fl",
+    "level",
+    "lot",
+    "office",
+    "room",
+    "rm",
+    "shop",
+    "space",
+    "ste",
+    "suite",
+    "unit",
+    "#",
+];
+
+/// `unit`'s designator as written, such as `Apt` of `Apt 4`, for
+/// Precisely's `unitType`. `None` when the unit starts with none, or is
+/// only one.
+fn unit_type(unit: &str) -> Option<String> {
+    let mut words = unit.split_whitespace();
+    let first = words.next()?;
+    // A designator with nothing after it is the whole unit, not its type.
+    words.next()?;
+    let key = first.trim_end_matches('.').to_lowercase();
+    UNIT_TYPES
+        .contains(&key.as_str())
+        .then(|| first.to_string())
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::unit_type;
+
+    #[test]
+    fn a_unit_names_its_type_only_when_it_starts_with_one() {
+        assert_eq!(unit_type("Apt 4").as_deref(), Some("Apt"));
+        assert_eq!(unit_type("Ste. 200").as_deref(), Some("Ste."));
+        assert_eq!(unit_type("4"), None);
+        assert_eq!(unit_type("Penthouse B"), None);
+        assert_eq!(unit_type("Suite"), None);
     }
 }

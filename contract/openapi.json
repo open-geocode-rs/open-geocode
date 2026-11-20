@@ -76,11 +76,6 @@
           },
           "unit": {
             "type": "string"
-          },
-          "unit_type": {
-            "description": "`unit`'s designator as written, such as `Apt` of `Apt 4`. Absent\nwhen the unit starts with none.",
-            "example": "Apt",
-            "type": "string"
           }
         },
         "type": "object"

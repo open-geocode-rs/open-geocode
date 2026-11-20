@@ -529,11 +529,6 @@ pub struct Address {
     pub postcode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
-    /// `unit`'s designator as written, such as `Apt` of `Apt 4`. Absent
-    /// when the unit starts with none.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = "Apt")]
-    pub unit_type: Option<String>,
     /// `street` split into its parts as written. Absent when the street has
     /// no type or direction to split off, such as `Broadway`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -557,30 +552,8 @@ pub struct StreetParts {
     pub suffix: Option<String>,
 }
 
-/// Words a unit starts with that say what kind of unit it is.
-const UNIT_TYPES: [&str; 18] = [
-    "apartment",
-    "apt",
-    "building",
-    "bldg",
-    "flat",
-    "floor",
-    "fl",
-    "level",
-    "lot",
-    "office",
-    "room",
-    "rm",
-    "shop",
-    "space",
-    "ste",
-    "suite",
-    "unit",
-    "#",
-];
-
 impl Address {
-    /// Fills the parts read from `street` and `unit`.
+    /// Fills the parts read from `street`.
     pub fn with_parts(mut self) -> Self {
         self.street_parts = self
             .street
@@ -592,16 +565,6 @@ impl Address {
                 kind: parts.kind.map(str::to_string),
                 suffix: parts.suffix.map(str::to_string),
             });
-        self.unit_type = self.unit.as_deref().and_then(|unit| {
-            let mut words = unit.split_whitespace();
-            let first = words.next()?;
-            // A designator with nothing after it is the whole unit, not its type.
-            words.next()?;
-            let key = first.trim_end_matches('.').to_lowercase();
-            UNIT_TYPES
-                .contains(&key.as_str())
-                .then(|| first.to_string())
-        });
         self
     }
 
@@ -1465,23 +1428,6 @@ mod tests {
                 Highlight { start: 39, end: 44 }
             ]
         );
-    }
-
-    #[test]
-    fn a_unit_names_its_type_only_when_it_starts_with_one() {
-        let unit_type = |unit: &str| {
-            Address {
-                unit: Some(unit.to_string()),
-                ..Address::default()
-            }
-            .with_parts()
-            .unit_type
-        };
-        assert_eq!(unit_type("Apt 4").as_deref(), Some("Apt"));
-        assert_eq!(unit_type("Ste. 200").as_deref(), Some("Ste."));
-        assert_eq!(unit_type("4"), None);
-        assert_eq!(unit_type("Penthouse B"), None);
-        assert_eq!(unit_type("Suite"), None);
     }
 
     /// Twenty distinct codes, the cap, are read in the order given.
