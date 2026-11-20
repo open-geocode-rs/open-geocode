@@ -614,23 +614,32 @@ impl TextSearcher {
 
     /// `hits` with each Wikidata item once, at its best place, cut to
     /// `limit`: one place mapped twice, as a node and a boundary, is one
-    /// answer.
+    /// answer. It is the boundary, which carries the place's extent and is
+    /// the area the place's addresses lie in, at the better place of the two.
     fn one_per_item(&self, hits: &mut Vec<TextSearchHit>, limit: usize) -> Result<()> {
         let records = self.pack.records();
-        let mut items = HashSet::new();
-        let mut kept = 0;
-        let mut keep = Vec::with_capacity(hits.len());
-        for hit in hits.iter() {
-            let first = kept < limit
-                && match records.wikidata(hit.record_id)? {
-                    Some(item) => items.insert(item),
-                    None => true,
-                };
-            kept += usize::from(first);
-            keep.push(first);
+        let mut at = HashMap::new();
+        let mut kept = Vec::<TextSearchHit>::with_capacity(hits.len());
+        for hit in hits.drain(..) {
+            let Some(item) = records.wikidata(hit.record_id)? else {
+                kept.push(hit);
+                continue;
+            };
+            match at.get(&item) {
+                Some(&held) => {
+                    let place: &mut TextSearchHit = &mut kept[held];
+                    if place.record.bbox.is_none() && hit.record.bbox.is_some() {
+                        *place = hit;
+                    }
+                }
+                None => {
+                    at.insert(item, kept.len());
+                    kept.push(hit);
+                }
+            }
         }
-        let mut keep = keep.into_iter();
-        hits.retain(|_| keep.next().unwrap_or(false));
+        kept.truncate(limit);
+        *hits = kept;
         Ok(())
     }
 
@@ -13396,6 +13405,59 @@ mod tests {
 
     /// A place named in a query is the one near the caller when there is one,
     /// else the best known: from Seattle "amsterdam" is in the Netherlands.
+    #[test]
+    fn a_place_mapped_as_a_node_and_a_boundary_answers_the_boundary() {
+        let pack = TempPack::new("node-and-boundary");
+        let mut writer = Writer::create(&pack.0).expect("writer");
+        let town = |object_type, prominence| {
+            Record::Place(
+                PlaceLayer::Locality,
+                crate::record::PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: "Exeter".to_string(),
+                    place_type: "town".to_string(),
+                    geometry: point_geometry(-71.6, 41.58),
+                    source: SourceProvenance::osm(object_type, 7),
+                    prominence,
+                    wikidata: Some(7),
+                },
+            )
+        };
+        // The node labels the boundary and is the better known of the two.
+        let known = Prominence {
+            importance: 40,
+            linked: true,
+            languages: 10,
+        };
+        writer
+            .write(&town(ObjectType::Node, known), None)
+            .expect("node");
+        let boundary = writer
+            .write(&town(ObjectType::Relation, Prominence::default()), None)
+            .expect("boundary");
+        writer.set_extents(vec![(
+            boundary,
+            [-717_900_000, 415_000_000, -715_000_000, 416_000_000],
+        )]);
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+        let hits = searcher
+            .search(&TextSearchOptions {
+                query: "Exeter".to_string(),
+                limit: 5,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            })
+            .expect("search");
+        let ids = hits
+            .iter()
+            .map(|hit| (hit.record.id.as_str(), hit.record.bbox.is_some()))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [("osm:relation:7", true)]);
+    }
+
     #[test]
     fn a_named_place_is_near_else_best_known() {
         let pack = TempPack::new("place-point");
