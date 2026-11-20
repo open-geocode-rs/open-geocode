@@ -221,7 +221,7 @@
             "type": "string"
           },
           "label": {
-            "description": "One-line display label: `name` followed by its location.",
+            "description": "One-line display label: `name` followed by its location. With\n`lang`, each part that names the result or one of its areas is that\nname in the language asked, as `name` and `context` are.",
             "type": "string"
           },
           "layer": {
