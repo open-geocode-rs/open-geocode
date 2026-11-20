@@ -521,7 +521,7 @@ impl TextSearcher {
     /// what [`Features`] search could not know of one hit alone, then the
     /// confidence when the Pack has a model and the hit answers a numbered
     /// address.
-    fn rate(&self, hits: &mut [TextSearchHit]) {
+    fn rate(&self, hits: &mut [TextSearchHit], numbered: Numbered) {
         for index in 0..hits.len() {
             let next = hits.get(index + 1).map(|next| next.score);
             let hit = &mut hits[index];
@@ -537,18 +537,24 @@ impl TextSearcher {
                 .map(|point| Accuracy::of(point.precision, &hit.record.source));
             // A fallback is not what the query asks for, by what it is. The
             // model is fitted to answers to numbered addresses, so it rates
-            // only an answer to a query that states a house number.
-            hit.confidence = self.confidence.as_ref().and_then(|model| {
-                match (hit.fallback, hit.features.number.is_some()) {
-                    (true, _) => Some(0.0),
-                    (false, true) => Some(model.rate(&hit.features)),
-                    (false, false) => None,
-                }
-            });
+            // every answer to a query that states a house number, whichever
+            // reading found it, and none to one that does not.
+            hit.confidence =
+                self.confidence
+                    .as_ref()
+                    .and_then(|model| match (hit.fallback, numbered) {
+                        (true, _) => Some(0.0),
+                        (false, Numbered::Yes) => Some(model.rate(&hit.features)),
+                        (false, Numbered::No) => None,
+                    });
         }
     }
 
     pub fn search(&self, options: &TextSearchOptions) -> Result<Vec<TextSearchHit>> {
+        self.search_at(options, Depth::Query)
+    }
+
+    fn search_at(&self, options: &TextSearchOptions, depth: Depth) -> Result<Vec<TextSearchHit>> {
         let limit = effective_limit(options.limit);
         if limit == 0 {
             return Ok(Vec::new());
@@ -568,13 +574,14 @@ impl TextSearcher {
         // and adds nothing once names fill the limit.
         let mut named = self.places_by_name(query_text, &filters, options.focus, limit)?;
         if named.len() >= limit {
-            self.rate(&mut named);
+            // A query that is wholly a place's name states no house number.
+            self.rate(&mut named, Numbered::No);
             if !self.places {
                 stated_country(&options.countries, &mut named);
             }
             return Ok(named);
         }
-        let (_, mut hits) = self.search_variants(
+        let variants = self.search_variants(
             query_text,
             &[],
             &filters,
@@ -585,12 +592,11 @@ impl TextSearcher {
             Some(limit),
             |_, _, _, _| Ok(true),
         )?;
+        let mut hits = variants.hits;
         if hits.is_empty() && filters.layer.is_none() {
             hits = self.fallback(query_text, &[], &filters, options.focus, limit + 1)?;
         }
-        if let Some(named) = NAMED.with(RefCell::take) {
-            named.choose(&mut hits);
-        }
+        variants.named.choose(&mut hits);
         // No ranker knows places yet: a place whose name the query covers
         // fully beats one that only repeats a street's words.
         if self.places {
@@ -604,8 +610,11 @@ impl TextSearcher {
             hits.retain(|hit| seen.insert(hit.record_id));
             hits.splice(0..0, named);
         }
+        if let Some(order) = &variants.order {
+            self.order_by_names(order, options, depth, &mut hits)?;
+        }
         self.one_per_item(&mut hits, limit)?;
-        self.rate(&mut hits);
+        self.rate(&mut hits, variants.numbered);
         if !self.places {
             stated_country(&options.countries, &mut hits);
         }
@@ -663,17 +672,19 @@ impl TextSearcher {
         }
         let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
         let mut pooled = Vec::new();
-        let (_, mut hits) = self.search_variants(
-            query_text,
-            &[],
-            &filters,
-            options.focus,
-            limit + 1,
-            Parses::All,
-            Some(&mut pooled),
-            None,
-            |_, _, _, _| Ok(true),
-        )?;
+        let mut hits = self
+            .search_variants(
+                query_text,
+                &[],
+                &filters,
+                options.focus,
+                limit + 1,
+                Parses::All,
+                Some(&mut pooled),
+                None,
+                |_, _, _, _| Ok(true),
+            )?
+            .hits;
         hits.truncate(limit);
         Ok((hits, pooled))
     }
@@ -729,7 +740,12 @@ impl TextSearcher {
         // [`Self::region_agreement`]).
         let places = self.stated_places(&context);
         // Two at least, so the one answer given has a margin over the next.
-        let (query, mut hits) = self.search_variants(
+        let Variants {
+            query,
+            mut hits,
+            numbered,
+            ..
+        } = self.search_variants(
             address,
             &context,
             &Filters::new(options.layer.as_deref(), &options.countries, None),
@@ -786,7 +802,7 @@ impl TextSearcher {
             let filters = Filters::new(None, &options.countries, None);
             hits = self.fallback(address, &context, &filters, None, 2)?;
         }
-        self.rate(&mut hits);
+        self.rate(&mut hits, numbered);
         stated_country(&options.countries, &mut hits);
         Ok(hits
             .into_iter()
@@ -1012,7 +1028,11 @@ impl TextSearcher {
                 }))
             });
         }
-        self.rate(&mut hits);
+        let numbered = match number {
+            Some(_) => Numbered::Yes,
+            None => Numbered::No,
+        };
+        self.rate(&mut hits, numbered);
         hits.truncate(limit);
         let highlighter = highlight::Highlighter::new(completion, number, words, typing);
         for hit in &mut hits {
@@ -2133,7 +2153,7 @@ impl TextSearcher {
         pooled: Option<&mut Vec<TextSearchHit>>,
         structured_limit: Option<usize>,
         mut accept: impl FnMut(&Session, &QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
-    ) -> Result<(String, Vec<TextSearchHit>)> {
+    ) -> Result<Variants> {
         let session = Session::new(self.budget);
         let (plans, scores, pieces, explanation, text_count) =
             self.readings(query_text, context, parses)?;
@@ -2144,8 +2164,14 @@ impl TextSearcher {
         };
         crate::stop::check()?;
         let first_query = first_plan.text();
-        let first_plan_numbered = first_plan.house_number.is_some();
-        let seeks_place = choose::Named::of(first_plan).seeks_place();
+        let numbered = Numbered::of(first_plan);
+        let named = choose::Named::of(first_plan);
+        let order = match (numbered, pieces.first()) {
+            (Numbered::No, Some(best)) if !self.places => {
+                self.name_order(query_text, best, filters, focus)?
+            }
+            _ => None,
+        };
         let stated = first_plan
             .context
             .iter()
@@ -2154,13 +2180,19 @@ impl TextSearcher {
         // A reading with its street trimmed, or one that reads fewer parts,
         // judges only the parts it holds. A part the best reading states that
         // the answer's reading did not judge is not one it matched.
-        let finish = |(query, mut hits): (String, Vec<TextSearchHit>)| {
+        let finish = |(query, mut hits): (String, Vec<TextSearchHit>),
+                      order: Option<names::NameOrder>| {
             for hit in &mut hits {
                 unjudged_unmatched(&stated, &mut hit.matched);
             }
-            (query, hits)
+            Variants {
+                query,
+                hits,
+                numbered,
+                order,
+                named,
+            }
         };
-        NAMED.with(|named| named.replace(Some(choose::Named::of(first_plan))));
         // Where the best reading says the record is holds in every reading:
         // a later one that reads "Christchurch" of "Ponsonby Road
         // Christchurch" as a region, which only ranks, must not answer with
@@ -2235,12 +2267,15 @@ impl TextSearcher {
             };
             let answer = self.structured_stage(&cx, &mut accept, &mut declined)?;
             let spent = start.elapsed();
+            // The structured stage's answer settles the query only when
+            // nothing a part of it names comes before it (see [`names`]).
+            let settles = match (&answer, &order) {
+                (Some(answer), Some(order)) => self.answers_first(order, &answer.1)?,
+                _ => true,
+            };
             match answer {
-                // A query for places only is not settled by the streets of a
-                // reading that takes its town for a road ("Exeter, RI"), so
-                // the text search still looks for the place itself.
-                Some(answer) if answer.1.len() >= wanted && !seeks_place => {
-                    return Ok(finish(answer));
+                Some(answer) if answer.1.len() >= wanted && settles => {
+                    return Ok(finish(answer, order));
                 }
                 // Fewer answers than asked for: they come first, and the text
                 // search gives the rest.
@@ -2299,7 +2334,7 @@ impl TextSearcher {
         // The ranker is fitted to queries for numbered addresses, so it
         // orders only those. A query for a town or a street keeps the order
         // the query's own words give.
-        let (query, hits) = match self.ranker.as_ref().filter(|_| first_plan_numbered) {
+        let (query, hits) = match self.ranker.as_ref().filter(|_| numbered == Numbered::Yes) {
             Some(ranker) => pool.ranked(ranker, &readings, limit),
             None => pool.chosen(&readings, limit),
         }
@@ -2312,20 +2347,23 @@ impl TextSearcher {
         {
             let (hits, _) =
                 self.structured_judged(&declined.plan, declined.hits, &search, &session)?;
-            return Ok(finish((declined.text, hits)));
+            return Ok(finish((declined.text, hits), order));
         }
-        Ok(finish(match first {
-            Some((query, mut first)) => {
-                for hit in hits {
-                    if !first.iter().any(|held| held.record_id == hit.record_id) {
-                        first.push(hit);
+        Ok(finish(
+            match first {
+                Some((query, mut first)) => {
+                    for hit in hits {
+                        if !first.iter().any(|held| held.record_id == hit.record_id) {
+                            first.push(hit);
+                        }
                     }
+                    first.truncate(limit);
+                    (query, first)
                 }
-                first.truncate(limit);
-                (query, first)
-            }
-            None => (query, hits),
-        }))
+                None => (query, hits),
+            },
+            order,
+        ))
     }
 
     /// Answer an address or a street from the structured index `structured`, before any
@@ -6150,6 +6188,57 @@ impl TextSearcher {
         let Some(key) = search_key(query_text) else {
             return Ok(Vec::new());
         };
+        let found = self.by_name(
+            &key,
+            query_text,
+            filters,
+            focus,
+            limit.max(NAMED_PLACES_WINDOW),
+        )?;
+        let mut hits = Vec::with_capacity(found.len());
+        for (mut hit, by_name) in found {
+            // Address product: only a place named the query takes the lead,
+            // as only places carry fame; a street or an address of the name
+            // keeps the place the address reading gives it.
+            if !self.places {
+                let street = streets && hit.record.layer == Layer::Street.as_str();
+                if !(by_name.exact && (by_name.known || street)) {
+                    continue;
+                }
+                // The query is wholly one of its names, so it states the part
+                // the place is and that part matches, unless the query splits
+                // the name with a comma.
+                let split = Tokens::new(query_text).breaks.contains(&true);
+                if let Some(slot) =
+                    named_part(&hit.record.layer).and_then(|part| part_of(&mut hit.matched, part))
+                {
+                    *slot = Some(match split {
+                        true => PartMatch::Partial,
+                        false => PartMatch::Matched,
+                    });
+                }
+            }
+            hits.push(hit);
+        }
+        self.one_per_item(&mut hits, limit)?;
+        Ok(hits)
+    }
+
+    /// The records that hold every word of `key` (a search key) in a name,
+    /// at most `window`, in the order a name gives them alone: one of
+    /// whose names is `key` before one that only holds its words, then
+    /// nearer `focus`, then better known, then the one `key` names by its
+    /// own name rather than another. Each comes with whether one of its
+    /// names is `key` and whether it is known (see [`Prominence`]). Ties go
+    /// to the spelling `written`, the words as asked ("Cà" before "Ca'").
+    fn by_name(
+        &self,
+        key: &str,
+        written: &str,
+        filters: &Filters<'_>,
+        focus: Option<[f64; 2]>,
+        window: usize,
+    ) -> Result<Vec<(TextSearchHit, ByName)>> {
         let words = key.split_whitespace().collect::<Vec<_>>();
         if words.is_empty() {
             return Ok(Vec::new());
@@ -6174,7 +6263,7 @@ impl TextSearcher {
         }
         clauses.push(self.product_clause());
         let ranking = Ranking {
-            query_words: QueryWords::new(query_text),
+            query_words: QueryWords::new(written),
             focus,
             ..Ranking::default()
         };
@@ -6182,7 +6271,6 @@ impl TextSearcher {
         // for its length, and the best known places carry the most names
         // (Roma's own and its "Rome", "Rom", "Rzym" ...), so by text score
         // every small Rome would fill the window first.
-        let window = limit.max(NAMED_PLACES_WINDOW);
         let searcher = self.reader.searcher();
         let docs = searcher.search(
             &BooleanQuery::new(clauses),
@@ -6195,12 +6283,12 @@ impl TextSearcher {
             .into_iter()
             .map(|((_, _, text_score), doc)| (RankKey::text(text_score), doc))
             .collect();
-        let mut hits = self.rank_documents(&searcher, top_docs, &ranking, window, &mut |hit| {
+        let hits = self.rank_documents(&searcher, top_docs, &ranking, window, &mut |hit| {
             Ok(filters.admit(hit))
         })?;
         let records = self.pack.records();
-        let mut order = HashMap::new();
-        for hit in &hits {
+        let mut found = Vec::with_capacity(hits.len());
+        for hit in hits {
             // Exact name, own or alternate ("AMS", "Rome" of Roma), before a
             // name holding the words; then nearer the caller, so fame never
             // outranks the caller's own surroundings; then better known. Of
@@ -6208,7 +6296,7 @@ impl TextSearcher {
             // name: "Lagos" is the city, not Laos, which one language spells
             // so and which is read a little more.
             let names = records.names(hit.record_id)?;
-            let named = |name: &String| search_key(name).as_deref() == Some(key.as_str());
+            let named = |name: &String| search_key(name).as_deref() == Some(key);
             let exact = names.iter().any(named);
             let own = names.first().is_some_and(named);
             let band = focus
@@ -6218,47 +6306,28 @@ impl TextSearcher {
                 });
             let known = records.prominence(hit.record_id)?;
             let fame = known.unwrap_or_default();
-            order.insert(
-                hit.record_id,
-                (
-                    std::cmp::Reverse(exact),
-                    band,
-                    std::cmp::Reverse(fame.importance / FAME_TIER),
-                    std::cmp::Reverse(own),
-                    std::cmp::Reverse(fame),
-                    known.is_some(),
-                ),
+            let order = (
+                std::cmp::Reverse(exact),
+                band,
+                std::cmp::Reverse(fame.importance / FAME_TIER),
+                std::cmp::Reverse(own),
+                std::cmp::Reverse(fame),
             );
+            found.push((
+                order,
+                hit,
+                ByName {
+                    exact,
+                    known: known.is_some(),
+                },
+            ));
         }
-        hits.sort_by_key(|hit| {
-            let (exact, band, tier, own, fame, _) = order[&hit.record_id];
-            (exact, band, tier, own, fame)
-        });
-        // Address product: only a place named the query takes the lead, as
-        // only places carry fame; a street or an address of the name keeps
-        // the place the address reading gives it.
-        if !self.places {
-            hits.retain(|hit| {
-                let (exact, _, _, _, _, known) = order[&hit.record_id];
-                exact.0 && (known || (streets && hit.record.layer == Layer::Street.as_str()))
-            });
-            // The query is wholly one of each one's names, so it states the
-            // part the place is and that part matches, unless the query
-            // splits the name with a comma.
-            let split = Tokens::new(query_text).breaks.contains(&true);
-            for hit in &mut hits {
-                if let Some(slot) =
-                    named_part(&hit.record.layer).and_then(|part| part_of(&mut hit.matched, part))
-                {
-                    *slot = Some(match split {
-                        true => PartMatch::Partial,
-                        false => PartMatch::Matched,
-                    });
-                }
-            }
-        }
-        self.one_per_item(&mut hits, limit)?;
-        Ok(hits)
+        // Stable, so equal keys keep the text index's order.
+        found.sort_by_key(|(order, _, _)| *order);
+        Ok(found
+            .into_iter()
+            .map(|(_, hit, by_name)| (hit, by_name))
+            .collect())
     }
 
     /// The best `limit` hits that `accept` keeps, ranked by [`RankKey`] over
@@ -7995,6 +8064,54 @@ fn stated_country(countries: &[String], hits: &mut [TextSearchHit]) {
     }
 }
 
+/// Whether a query states a house number, worked out once from its best
+/// reading. Calibration fits its ranker and its model to queries that do,
+/// so the ranker orders, and the model rates, the answers to those alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Numbered {
+    Yes,
+    No,
+}
+
+impl Numbered {
+    fn of(plan: &QueryPlan) -> Self {
+        match plan.house_number.is_some() {
+            true => Self::Yes,
+            false => Self::No,
+        }
+    }
+}
+
+/// Whether a search is the caller's, or one [`TextSearcher::order_by_names`]
+/// asks for the order a part's words give alone, which asks for none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Depth {
+    Query,
+    Bare,
+}
+
+/// What [`TextSearcher::search_variants`] answers: the reading the answer
+/// came from, the answer, and what the best reading says of the query.
+struct Variants {
+    query: String,
+    hits: Vec<TextSearchHit>,
+    numbered: Numbered,
+    /// The order of the answers to a query of no house number (see
+    /// [`names`]).
+    order: Option<names::NameOrder>,
+    /// What the best reading names, for choosing among the answers.
+    named: choose::Named,
+}
+
+/// What [`TextSearcher::by_name`] says of a record it found.
+#[derive(Debug, Clone, Copy)]
+struct ByName {
+    /// One of its names is the key.
+    exact: bool,
+    /// It carries a [`Prominence`].
+    known: bool,
+}
+
 /// The address part a record of `layer` is when a query names it, the
 /// first whose layers hold it (see [`area_layers`]). `None` for a POI or an
 /// address, which no one part names.
@@ -8321,12 +8438,6 @@ fn filter_by<T>(items: Vec<T>, keep: impl Fn(usize) -> bool) -> Vec<T> {
 /// in and out of its localities and with the base of its house number, and
 /// then the same with their streets trimmed.
 const MAX_SEARCHES: usize = 16;
-
-thread_local! {
-    /// What the best reading of the query being searched names, for
-    /// [`choose::Named::choose`].
-    static NAMED: RefCell<Option<choose::Named>> = const { RefCell::new(None) };
-}
 
 #[cfg(test)]
 thread_local! {
@@ -10832,6 +10943,8 @@ mod highlight;
 mod named;
 
 mod choose;
+
+mod names;
 
 mod phrase_prefix;
 

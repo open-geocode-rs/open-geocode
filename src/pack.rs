@@ -1401,6 +1401,15 @@ impl Reader {
         self.country_codes.get(&record_id).copied()
     }
 
+    /// The country records of the ISO 3166-1 code `code`.
+    pub fn countries_of(&self, code: CountryCode) -> Vec<RecordId> {
+        self.country_codes
+            .iter()
+            .filter(|(_, held)| **held == code)
+            .map(|(record, _)| *record)
+            .collect()
+    }
+
     /// The ISO 3166-2 code of an area record below a country (`CA-ON`).
     /// `None` for an area OpenStreetMap gives no code, for any other record,
     /// and for every record of a Pack sealed without subdivision codes.

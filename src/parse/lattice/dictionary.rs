@@ -1381,6 +1381,11 @@ fn admin_types() -> &'static [(String, Attach)] {
             } else if let Some(phrase) = phrase.strip_suffix('-') {
                 (phrase, Attach::Before)
             } else if let Some(phrase) = phrase.strip_suffix(" ~") {
+                // A type written "town of ~" is also written after the
+                // name it types ("Bristol town", "Jefferson Parish").
+                if let Some(kind) = phrase.strip_suffix(" of") {
+                    types.extend(dictionary_key(kind).map(|key| (key, Attach::WordAfter)));
+                }
                 (phrase, Attach::WordBefore)
             } else if let Some(phrase) = phrase.strip_prefix("~ ") {
                 (phrase, Attach::WordAfter)
@@ -1426,7 +1431,7 @@ pub(super) fn is_admin_type(key: &str) -> bool {
 /// "freistaat bayern", "madrid" of "comunidad de madrid", "경기" of "경기도".
 /// What is left must be two or more characters with no numeral, so "北区"
 /// and "3丁目" have none.
-pub(super) fn admin_aliases(key: &str) -> Vec<String> {
+pub(crate) fn admin_aliases(key: &str) -> Vec<String> {
     let mut aliases = Vec::new();
     for (phrase, attach) in admin_types() {
         let rests = match attach {

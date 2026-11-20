@@ -68,7 +68,7 @@ mod street;
 mod tags;
 
 #[cfg(test)]
-mod test_pbf;
+pub(crate) mod test_pbf;
 mod timezone;
 
 use std::{

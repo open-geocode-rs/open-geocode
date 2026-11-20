@@ -15,9 +15,6 @@ pub(super) struct Named {
     postcodes: Vec<String>,
     /// Each town, as [`search_key`] folds it.
     towns: Vec<String>,
-    /// The part the query seeks when it names places only and no number,
-    /// such as the town of "Exeter, RI".
-    place: Option<Label>,
 }
 
 impl Named {
@@ -43,48 +40,7 @@ impl Named {
             towns: parts(Label::Locality)
                 .filter_map(|town| search_key(&town))
                 .collect(),
-            place: plan
-                .subject_part
-                .0
-                .filter(|part| *part != Label::Street && plan.house_number.is_none()),
         }
-    }
-
-    /// Whether the query names places only and seeks the first of them.
-    pub(super) fn seeks_place(&self) -> bool {
-        self.place.is_some()
-    }
-
-    /// Whether `hit` is the place the query seeks, matched by name, with
-    /// every other part it states agreeing. Exeter is so for "Exeter, RI",
-    /// and Exeter Road, which another reading finds, is not.
-    fn is_place(&self, hit: &TextSearchHit) -> bool {
-        let Some(part) = self.place else {
-            return false;
-        };
-        let found = hit.matched;
-        let own = match part {
-            Label::Locality => found.locality,
-            Label::Region => found.region,
-            Label::Postcode => found.postcode,
-            Label::Country => found.country,
-            _ => None,
-        };
-        area_layers(part)
-            .iter()
-            .any(|layer| layer.as_str() == hit.record.layer)
-            && own == Some(PartMatch::Matched)
-            && [
-                found.housenumber,
-                found.street,
-                found.unit,
-                found.locality,
-                found.region,
-                found.postcode,
-                found.country,
-            ]
-            .iter()
-            .all(|part| *part != Some(PartMatch::Unmatched))
     }
 
     /// Whether `postcode` is one the query names, or begins one ("92025"
@@ -146,13 +102,12 @@ impl Named {
     }
 
     /// `hits` with those carrying the house number on the road first (see
-    /// [`Self::agreement`]), then, of a query for places only, the place it
-    /// seeks (see [`Self::is_place`]), each the same in the order they came.
-    /// The road, postcode and town alone reorder nothing: an address whose
-    /// locality is its postal town, not the town the query names, would go
-    /// below the street.
+    /// [`Self::agreement`]), each the same in the order they came. The road,
+    /// postcode and town alone reorder nothing: an address whose locality
+    /// is its postal town, not the town the query names, would go below
+    /// the street.
     pub(super) fn choose(&self, hits: &mut [TextSearchHit]) {
-        hits.sort_by_key(|hit| std::cmp::Reverse((self.agreement(hit).0, self.is_place(hit))));
+        hits.sort_by_key(|hit| std::cmp::Reverse(self.agreement(hit).0));
     }
 }
 

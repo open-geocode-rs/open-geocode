@@ -366,7 +366,8 @@ enum GeocodeCommand {
     /// Fit the Pack's answer confidence to held-out address points: each is
     /// written as messy queries, searched, and its answers judged right or
     /// wrong. The model is written beside the Pack file, replacing any
-    /// before it, and every answer from then on carries a `confidence`.
+    /// before it. From then on every answer to a query that states a house
+    /// number carries a `confidence`; answers to other queries carry none.
     Calibrate {
         /// Pack directory or Pack file.
         #[arg(long)]
