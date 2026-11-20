@@ -16,9 +16,9 @@ use crate::{
     limits::Limits,
     pack::Writer,
     record::{
-        AddressComponents, AddressRecord, Brand, InterpolationAddressComponents,
+        AddressComponents, AddressRecord, Brand, Contact, Entrance, InterpolationAddressComponents,
         InterpolationRange, InterpolationRecord, Layer, LocationPrecision, ObjectType, PlaceLayer,
-        PlaceRecord, PoiRecord, Record, SourceProvenance, point_geometry,
+        PlaceRecord, PoiDetails, PoiRecord, Record, SourceProvenance, point_geometry,
     },
     runtime::{AppState, build_router},
 };
@@ -74,6 +74,11 @@ fn write_pack() -> Pack {
     let country = place(&mut writer, PlaceLayer::Country, "Canada", 1, -80.0);
     let region = place(&mut writer, PlaceLayer::Region, "Ontario", 2, -79.5);
     let locality = place(&mut writer, PlaceLayer::Locality, "Toronto", 3, -79.2);
+    // Drawn as an outline, so og knows its box.
+    writer.set_extents(vec![(
+        locality,
+        [-793_000_000, 429_000_000, -789_000_000, 431_000_000],
+    )]);
     let neighbourhood = place(&mut writer, PlaceLayer::Neighbourhood, "Downtown", 4, -79.1);
     writer.set_country_codes(
         [(
@@ -122,7 +127,10 @@ fn write_pack() -> Pack {
     writer
         .write(
             &AddressRecord {
-                access: Vec::new(),
+                access: vec![Entrance {
+                    at: [-790_001_000, 430_001_000],
+                    kind: "main".to_string(),
+                }],
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: king.clone(),
@@ -154,7 +162,20 @@ fn write_pack() -> Pack {
                     name: "Queen Coffee".to_string(),
                     wikidata: None,
                 }),
-                details: None,
+                details: PoiDetails {
+                    contact: Some(Contact {
+                        phone: Some("+1 416-555-0111".to_string()),
+                        website: Some("https://queencafe.example/".to_string()),
+                        email: Some("hello@queencafe.example".to_string()),
+                    }),
+                    opening_hours: Some("Mo-Fr 08:00-18:00; Sa 09:00-13:00".to_string()),
+                    extent: Some([-790_052_000, 429_999_000, -790_048_000, 430_001_000]),
+                    access: vec![Entrance {
+                        at: [-790_050_000, 430_001_000],
+                        kind: "yes".to_string(),
+                    }],
+                }
+                .kept(),
                 aliases: Vec::new(),
             }
             .into(),
@@ -292,8 +313,28 @@ async fn geocoding_forward_answers_an_address_in_mapbox_shape() {
                     "feature_type": "address",
                     "full_address": "10 King Street, Unit 2, Toronto, M5V 1A1",
                     "name": "10 King Street",
-                    "coordinates": {"longitude": -79.0, "latitude": 43.0, "accuracy": "rooftop"},
+                    // og's own point of the address, a known address point.
+                    "coordinates": {
+                        "longitude": -79.0,
+                        "latitude": 43.0,
+                        "accuracy": "point",
+                        "routable_points": [
+                            {"name": "entrance", "longitude": -79.0001, "latitude": 43.0001},
+                        ],
+                    },
                     "place_formatted": "Toronto, M5V 1A1",
+                    // The query states the number and street, both matched.
+                    // Unstated parts are not in the input, and the country
+                    // og fills in is inferred.
+                    "match_code": {
+                        "address_number": "matched",
+                        "street": "matched",
+                        "postcode": "unmatched",
+                        "place": "unmatched",
+                        "region": "unmatched",
+                        "country": "inferred",
+                        "confidence": "exact",
+                    },
                     "context": merged(areas(), json!({
                         "address": {
                             "mapbox_id": address,
@@ -312,66 +353,228 @@ async fn geocoding_forward_answers_an_address_in_mapbox_shape() {
     );
 }
 
-/// Every og value of every result lands in its Mapbox slot unchanged.
+/// Every og value of every result lands in its Mapbox slot unchanged, on
+/// both products, forward and reverse, address ids included. Each og
+/// value with a Mapbox slot must be met at least once, so a fixture or
+/// translator that stops sending one fails here.
 #[tokio::test]
 async fn every_og_value_lands_in_its_mapbox_slot() {
     let pack = write_pack();
     let router = router(&pack);
+    let mut met = std::collections::BTreeSet::new();
+    let geocoding = "/compat/mapbox/search/geocode/v6";
+    let search_box = "/compat/mapbox/search/searchbox/v1";
     for (native, compat) in [
         (
-            "/geocode?q=10%20King%20Street",
-            "/compat/mapbox/search/geocode/v6/forward?q=10%20King%20Street",
+            "/geocode?q=10%20King%20Street".to_string(),
+            format!("{geocoding}/forward?q=10%20King%20Street&autocomplete=false"),
         ),
         (
-            "/geocode?q=Queen%20Street",
-            "/compat/mapbox/search/geocode/v6/forward?q=Queen%20Street",
+            "/geocode?q=Queen%20Street".to_string(),
+            format!("{geocoding}/forward?q=Queen%20Street&autocomplete=false"),
         ),
         (
-            "/reverse?lon=-79.0&lat=43.0",
-            "/compat/mapbox/search/geocode/v6/reverse?longitude=-79.0&latitude=43.0",
+            "/geocode?q=Toronto".to_string(),
+            format!("{geocoding}/forward?q=Toronto&autocomplete=false"),
+        ),
+        (
+            "/reverse?lon=-79.0&lat=43.0".to_string(),
+            format!("{geocoding}/reverse?longitude=-79.0&latitude=43.0"),
+        ),
+        (
+            "/places?q=Queen%20Cafe&focus=-79.0,43.0".to_string(),
+            format!("{search_box}/forward?q=Queen%20Cafe&types=poi&proximity=-79.0,43.0"),
+        ),
+        (
+            "/geocode?q=10%20King%20Street&focus=-79.0,43.0".to_string(),
+            format!("{search_box}/forward?q=10%20King%20Street&types=address&proximity=-79.0,43.0"),
+        ),
+        (
+            "/reverse?lon=-79.0&lat=43.0".to_string(),
+            format!("{search_box}/reverse?longitude=-79.0&latitude=43.0"),
         ),
     ] {
-        let (_, og) = get(&router, native).await;
-        let (status, mapbox) = get(&router, compat).await;
+        let searchbox = compat.starts_with(search_box);
+        let reverse = native.starts_with("/reverse");
+        let (_, og) = get(&router, &native).await;
+        let (status, mapbox) = get(&router, &compat).await;
         assert_eq!(status, StatusCode::OK, "{compat}");
         let og_features = og["features"].as_array().expect("features");
         let features = mapbox["features"].as_array().expect("features");
         assert!(!og_features.is_empty(), "{native}");
         assert_eq!(features.len(), og_features.len(), "{compat}");
-        for (og, feature) in og_features.iter().zip(features) {
-            let og = &og["properties"];
+        for (og_feature, feature) in og_features.iter().zip(features) {
+            let og = &og_feature["properties"];
             let properties = &feature["properties"];
+            let layer = og["layer"].as_str().expect("layer");
+            let at = format!("{compat}: {}", og["id"]);
             let own = encode_parts(
                 og["id"].as_str().expect("id"),
-                Layer::parse(og["layer"].as_str().expect("layer")),
+                Layer::parse(layer),
                 og["label"].as_str().expect("label"),
             );
-            assert_eq!(feature["id"], own);
-            assert_eq!(properties["mapbox_id"], own);
-            assert_eq!(properties["name"], og["name"]);
-            assert_eq!(properties["full_address"], og["label"]);
+            if !searchbox {
+                assert_eq!(feature["id"], own, "{at}");
+            }
+            assert_eq!(properties["mapbox_id"], own, "{at}");
+            if layer == "address" {
+                met.insert("address id");
+            }
+            assert_eq!(properties["name"], og["name"], "{at}");
+            if layer != "poi" {
+                assert_eq!(properties["full_address"], og["label"], "{at}");
+            }
             assert_eq!(
-                feature["geometry"]["coordinates"],
-                og_feature_coordinates(og_features, og)
+                feature["geometry"]["coordinates"], og_feature["geometry"]["coordinates"],
+                "{at}"
             );
-            let accuracy = &properties["coordinates"]["accuracy"];
-            match og["layer"].as_str() {
-                Some("address" | "interpolation" | "street") => {
-                    assert_eq!(accuracy, &og["accuracy"]);
+            let coordinates = &properties["coordinates"];
+            let is_address = layer == "address"
+                || (layer == "interpolation" && !og["address"]["housenumber"].is_null());
+            let accuracy = match (is_address, og["accuracy"].as_str()) {
+                (false, _) => None,
+                (true, Some("rooftop")) => Some("point"),
+                (true, Some("centroid")) => Some("rooftop"),
+                (true, Some("interpolated")) => Some("interpolated"),
+                (true, Some("street")) if searchbox => Some("street"),
+                (true, _) => None,
+            };
+            assert_eq!(coordinates["accuracy"].as_str(), accuracy, "{at}");
+            let entrances = og["access"]
+                .as_array()
+                .map(|access| {
+                    access
+                        .iter()
+                        .map(|point| {
+                            json!({"name": "entrance", "longitude": point["lon"], "latitude": point["lat"]})
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                coordinates["routable_points"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+                entrances,
+                "{at}"
+            );
+            if !entrances.is_empty() {
+                met.insert(if searchbox {
+                    "access searchbox"
+                } else {
+                    "access geocoding"
+                });
+            }
+            let boxed = searchbox
+                || matches!(
+                    layer,
+                    "country" | "region" | "postcode" | "district" | "locality" | "neighbourhood"
+                );
+            match boxed {
+                true => assert_eq!(properties["bbox"], og["bbox"], "{at}"),
+                false => assert_eq!(properties["bbox"], Value::Null, "{at}"),
+            }
+            if boxed && !og["bbox"].is_null() {
+                met.insert(if searchbox {
+                    "bbox searchbox"
+                } else {
+                    "bbox geocoding"
+                });
+            }
+            if searchbox {
+                // Mapbox measures distance from `proximity` only.
+                let distance = if reverse {
+                    &Value::Null
+                } else {
+                    &og["distance_m"]
+                };
+                assert_eq!(&properties["distance"], distance, "{at}");
+                if !distance.is_null() {
+                    met.insert("distance");
                 }
-                _ => assert_eq!(accuracy, &Value::Null),
+                let metadata = &properties["metadata"];
+                for key in ["phone", "website", "email"] {
+                    assert_eq!(metadata[key], og["contact"][key], "{at}");
+                    if !og["contact"][key].is_null() {
+                        met.insert(key);
+                    }
+                }
+                if og["opening_hours"] == "Mo-Fr 08:00-18:00; Sa 09:00-13:00" {
+                    let period = |day: u8, open: &str, close: &str| json!({"open": {"day": day, "time": open}, "close": {"day": day, "time": close}});
+                    let mut periods = (1..=5)
+                        .map(|day| period(day, "0800", "1800"))
+                        .collect::<Vec<_>>();
+                    periods.push(period(6, "0900", "1300"));
+                    assert_eq!(metadata["open_hours"], json!({"periods": periods}), "{at}");
+                    met.insert("opening_hours");
+                } else {
+                    assert_eq!(og["opening_hours"], Value::Null, "{at}");
+                    assert_eq!(metadata["open_hours"], Value::Null, "{at}");
+                }
+            } else {
+                assert_eq!(properties["distance"], Value::Null, "{at}");
+                assert_eq!(properties["metadata"], Value::Null, "{at}");
+            }
+            let matched = &og["match"];
+            if !searchbox && !reverse && is_address {
+                assert!(matched.is_object(), "{at}");
+                let word = |part: &Value| match part.as_str() {
+                    Some("matched") => "matched",
+                    _ => "unmatched",
+                };
+                let number = match (matched["housenumber"].as_str(), og["accuracy"].as_str()) {
+                    (Some("partial"), Some("interpolated")) => "plausible",
+                    (part, _) => word(&json!(part)),
+                };
+                let country =
+                    match matched["country"].is_null() && !og["context"]["country"].is_null() {
+                        true => "inferred",
+                        false => word(&matched["country"]),
+                    };
+                let changed =
+                    |part: &str| matched[part].as_str().is_some_and(|part| part != "matched");
+                let others = ["street", "unit", "locality", "postcode", "country"]
+                    .into_iter()
+                    .filter(|part| changed(part))
+                    .count();
+                let confidence =
+                    match (changed("housenumber") && number != "plausible") || changed("region") {
+                        true => "low",
+                        false => ["exact", "high", "medium", "low"][others.min(3)],
+                    };
+                let mut expected = json!({
+                    "address_number": number,
+                    "street": word(&matched["street"]),
+                    "postcode": word(&matched["postcode"]),
+                    "place": word(&matched["locality"]),
+                    "region": word(&matched["region"]),
+                    "country": country,
+                    "confidence": confidence,
+                });
+                if !matched["unit"].is_null() {
+                    expected["secondary_address"] = json!(word(&matched["unit"]));
+                }
+                assert_eq!(properties["match_code"], expected, "{at}");
+                met.insert("match");
+            } else {
+                assert_eq!(properties["match_code"], Value::Null, "{at}");
             }
             let context = &properties["context"];
             let parts = &og["address"];
-            if og["layer"] == "address" {
-                assert_eq!(context["address"]["address_number"], parts["housenumber"]);
-                assert_eq!(context["address"]["street_name"], parts["street"]);
-                assert_eq!(context["street"]["name"], parts["street"]);
+            if is_address {
+                assert_eq!(
+                    context["address"]["address_number"], parts["housenumber"],
+                    "{at}"
+                );
+                assert_eq!(context["address"]["street_name"], parts["street"], "{at}");
+                assert_eq!(context["street"]["name"], parts["street"], "{at}");
             }
-            if og["layer"] != "poi" {
-                assert_eq!(context["secondary_address"]["name"], parts["unit"]);
+            if !searchbox && layer != "poi" {
+                assert_eq!(context["secondary_address"]["name"], parts["unit"], "{at}");
             }
-            assert_eq!(context["postcode"]["name"], parts["postcode"]);
+            assert_eq!(context["postcode"]["name"], parts["postcode"], "{at}");
+            let key = if searchbox { "id" } else { "mapbox_id" };
             for (tier, slot) in [
                 ("neighbourhood", "neighborhood"),
                 ("locality", "place"),
@@ -383,27 +586,91 @@ async fn every_og_value_lands_in_its_mapbox_slot() {
                     continue;
                 }
                 assert_eq!(
-                    context[slot]["mapbox_id"],
-                    id(area["id"].as_str().expect("id"))
+                    context[slot][key],
+                    id(area["id"].as_str().expect("id")),
+                    "{at}"
                 );
-                assert_eq!(context[slot]["name"], area["name"]);
+                assert_eq!(context[slot]["name"], area["name"], "{at}");
             }
             if !og["context"]["country"].is_null() {
                 assert_eq!(
-                    context["country"]["country_code"],
-                    og["context"]["country"]["code"]
+                    context["country"]["country_code"], og["context"]["country"]["code"],
+                    "{at}"
                 );
+            }
+            if let Some(code) = og["context"]["region"]["code"].as_str() {
+                assert_eq!(context["region"]["region_code_full"], code, "{at}");
+            }
+            // An area result carries its own code in its own layer.
+            match (layer, og["code"].as_str()) {
+                ("country", Some(code)) => {
+                    assert_eq!(context["country"]["country_code"], code, "{at}");
+                    met.insert("country code");
+                }
+                ("region", Some(code)) => {
+                    assert_eq!(context["region"]["region_code_full"], code, "{at}");
+                    let short = code.split_once('-').map(|(_, short)| short);
+                    assert_eq!(context["region"]["region_code"].as_str(), short, "{at}");
+                    met.insert("region code");
+                }
+                (_, code) => assert_eq!(code, None, "{at}"),
             }
         }
     }
-}
 
-fn og_feature_coordinates(features: &[Value], properties: &Value) -> Value {
-    features
-        .iter()
-        .find(|feature| feature["properties"]["id"] == properties["id"])
-        .map(|feature| feature["geometry"]["coordinates"].clone())
-        .expect("feature")
+    // A suggestion carries the distance and metadata a retrieve does.
+    let (_, og) = get(&router, "/autocomplete?q=Queen%20Ca&focus=-79.0,43.0").await;
+    let (status, suggested) = get(
+        &router,
+        &format!("{search_box}/suggest?q=Queen%20Ca&session_token=t&proximity=-79.0,43.0"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cafe = og["features"]
+        .as_array()
+        .and_then(|features| {
+            features
+                .iter()
+                .find(|feature| feature["properties"]["name"] == "Queen Cafe")
+        })
+        .expect("og suggests the cafe");
+    let suggestion = suggested["suggestions"]
+        .as_array()
+        .and_then(|all| {
+            all.iter()
+                .find(|suggestion| suggestion["name"] == "Queen Cafe")
+        })
+        .expect("Mapbox suggests the cafe");
+    assert_eq!(suggestion["distance"], cafe["properties"]["distance_m"]);
+    assert!(!suggestion["distance"].is_null());
+    assert_eq!(
+        suggestion["metadata"]["phone"],
+        cafe["properties"]["contact"]["phone"]
+    );
+    assert_eq!(suggestion["metadata"]["periods"], Value::Null);
+    assert_eq!(
+        suggestion["metadata"]["open_hours"]["periods"]
+            .as_array()
+            .map(Vec::len),
+        Some(6)
+    );
+
+    let every = [
+        "access geocoding",
+        "access searchbox",
+        "address id",
+        "bbox geocoding",
+        "bbox searchbox",
+        "country code",
+        "distance",
+        "email",
+        "match",
+        "opening_hours",
+        "phone",
+        "region code",
+        "website",
+    ];
+    assert_eq!(met.into_iter().collect::<Vec<_>>(), every);
 }
 
 #[tokio::test]
@@ -426,11 +693,17 @@ async fn geocoding_reverse_lists_the_areas_holding_the_point() {
         types,
         ["address", "neighborhood", "place", "region", "country"]
     );
-    // og's reverse areas carry no context of their own. The area is its
-    // own layer.
+    // og gives a reverse area no context of its own. Every result lies at
+    // the point, so the town is its own layer, held by the region and
+    // country holding the point, and holds none of the smaller areas.
+    let held = areas();
     assert_eq!(
         body["features"][2]["properties"]["context"],
-        json!({"place": {"mapbox_id": id("osm:relation:3"), "name": "Toronto"}})
+        json!({
+            "place": {"mapbox_id": id("osm:relation:3"), "name": "Toronto"},
+            "region": held["region"],
+            "country": held["country"],
+        })
     );
     assert_eq!(
         body["features"][2]["properties"].get("place_formatted"),
@@ -633,9 +906,24 @@ async fn geocoding_errors_are_mapbox_errors() {
             "bbox must be 4 comma-separated numbers, min_lon,min_lat,max_lon,max_lat",
         ),
         (
-            format!("{base}/forward?q=a&limit=51"),
+            format!("{base}/forward?q=a&limit=11"),
             StatusCode::UNPROCESSABLE_ENTITY,
-            "requested result count exceeds the maximum",
+            "limit must be a number between 1 and 10",
+        ),
+        (
+            format!("{base}/reverse?longitude=-79&latitude=43&types=address&limit=6"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "limit must be a number between 1 and 5",
+        ),
+        (
+            format!("{base}/reverse?longitude=-79&latitude=43&country=canada"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Stack \"canada\" is not a known stack.",
+        ),
+        (
+            format!("{base}/forward?q=a&autocomplete=maybe"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "autocomplete must be true or false, not \"maybe\"",
         ),
         (
             format!("{base}/reverse?longitude=-79&latitude=43&limit=2"),
@@ -701,6 +989,21 @@ async fn search_box_suggest_then_retrieve() {
             "country_code_alpha_3": "CAN",
         },
     });
+    // og's contact and the hours it reads, Monday 0800 to 1800 and so on.
+    let open = |day: u8, from: &str, to: &str| json!({"open": {"day": day, "time": from}, "close": {"day": day, "time": to}});
+    let metadata = json!({
+        "phone": "+1 416-555-0111",
+        "website": "https://queencafe.example/",
+        "email": "hello@queencafe.example",
+        "open_hours": {"periods": [
+            open(1, "0800", "1800"),
+            open(2, "0800", "1800"),
+            open(3, "0800", "1800"),
+            open(4, "0800", "1800"),
+            open(5, "0800", "1800"),
+            open(6, "0900", "1300"),
+        ]},
+    });
     assert_eq!(
         body,
         json!({
@@ -716,6 +1019,7 @@ async fn search_box_suggest_then_retrieve() {
                 "brand": ["Queen Coffee"],
                 "poi_category": ["Coffee", "Cafe", "Food and Drink"],
                 "poi_category_ids": ["coffee", "cafe", "food_and_drink"],
+                "metadata": metadata,
             }],
             "attribution": OSM,
         })
@@ -742,11 +1046,19 @@ async fn search_box_suggest_then_retrieve() {
                     "full_address": "12 King Street, Unit A, Toronto, M5V 1A1",
                     "place_formatted": "Toronto, M5V 1A1",
                     "context": context,
-                    "coordinates": {"longitude": -79.005, "latitude": 43.0},
+                    "coordinates": {
+                        "longitude": -79.005,
+                        "latitude": 43.0,
+                        "routable_points": [
+                            {"name": "entrance", "longitude": -79.005, "latitude": 43.0001},
+                        ],
+                    },
+                    "bbox": [-79.0052, 42.9999, -79.0048, 43.0001],
                     "maki": "cafe",
                     "brand": ["Queen Coffee"],
                     "poi_category": ["Coffee", "Cafe", "Food and Drink"],
                     "poi_category_ids": ["coffee", "cafe", "food_and_drink"],
+                    "metadata": metadata,
                 },
             }],
             "attribution": OSM,
@@ -1230,4 +1542,83 @@ async fn search_box_names_results_in_its_first_language() {
     let country = &body["features"][0]["properties"]["context"]["country"];
     assert_eq!(country["name"], "Kanada");
     assert!(country.get("translations").is_none());
+}
+
+/// What a filter asks is honoured or refused, never dropped with a 200.
+#[tokio::test]
+async fn filters_are_honoured_or_refused() {
+    let pack = write_pack();
+    let router = router(&pack);
+    let geocoding = "/compat/mapbox/search/geocode/v6";
+    let search_box = "/compat/mapbox/search/searchbox/v1";
+    let names = |body: &Value, key: &str| {
+        body[key]
+            .as_array()
+            .expect("list")
+            .iter()
+            .map(|item| item.get("properties").unwrap_or(item)["name"].clone())
+            .collect::<Vec<_>>()
+    };
+
+    // One area type alone is that area at the point.
+    let (status, body) = get(
+        &router,
+        &format!("{geocoding}/reverse?longitude=-79.0&latitude=43.0&types=region"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(names(&body, "features"), ["Ontario"]);
+
+    // A point in another country answers nothing.
+    for uri in [
+        format!("{geocoding}/reverse?longitude=-79.0&latitude=43.0&country=fr"),
+        format!("{search_box}/reverse?longitude=-79.0&latitude=43.0&country=fr"),
+    ] {
+        let (status, body) = get(&router, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(body["features"], json!([]), "{uri}");
+    }
+
+    // Typed text completes, as Mapbox's default `autocomplete` does.
+    let (status, body) = get(&router, &format!("{geocoding}/forward?q=Toro")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(names(&body, "features").first(), Some(&json!("Toronto")));
+    // A whole address stays the geocode, whose match_code says the town
+    // it names is not the one it lies in.
+    let (status, body) = get(
+        &router,
+        &format!("{geocoding}/forward?q=10%20King%20Street,%20Ottawa"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let code = &body["features"][0]["properties"]["match_code"];
+    assert_eq!(code["address_number"], "matched", "{body}");
+    assert_eq!(code["place"], "unmatched", "{body}");
+
+    // A category keeps only places of it.
+    let (status, body) = get(
+        &router,
+        &format!("{search_box}/suggest?q=Queen&session_token=t&poi_category=bank"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["suggestions"], json!([]));
+
+    // What og cannot honour is refused.
+    for (uri, expected, message) in [
+        (
+            format!("{search_box}/suggest?q=Queen&session_token=t&route=abc"),
+            StatusCode::BAD_REQUEST,
+            "route is not supported by this server",
+        ),
+        (
+            format!("{geocoding}/forward?q=Queen&limit=11"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "limit must be a number between 1 and 10",
+        ),
+    ] {
+        let (status, body) = get(&router, &uri).await;
+        assert_eq!(status, expected, "{uri}");
+        assert_eq!(body["message"], message, "{uri}");
+    }
 }

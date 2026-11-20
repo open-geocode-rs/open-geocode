@@ -9,6 +9,7 @@
 
 mod category;
 mod geocoding;
+mod hours;
 mod searchbox;
 #[cfg(test)]
 mod tests;
@@ -23,7 +24,10 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::{
-    api::{Accuracy, Attribution, Common},
+    api::{
+        Accuracy, Attribution, Common, ForwardFeature, QueryMatch, ReverseCollection,
+        ReverseFeature,
+    },
     compat::{VendorError, encode_area_id, encode_id, iso, retry_after},
     http::problem::Problem,
     record::Layer,
@@ -198,6 +202,15 @@ impl Types {
         }
     }
 
+    /// og's `layer` for a reverse lookup of these types. og's reverse
+    /// answers the address or street at the point with the areas holding
+    /// it, and filters only those two, so an area type is kept from its
+    /// whole answer by [`Types::admits`].
+    fn reverse_layer(&self) -> Option<&'static str> {
+        self.og_layer()
+            .filter(|layer| matches!(*layer, "address" | "street" | "poi"))
+    }
+
     fn admits(&self, feature_type: &str) -> bool {
         self.0.contains(&feature_type)
     }
@@ -235,21 +248,95 @@ fn is_address(common: &Common) -> bool {
         || common.layer == Layer::Interpolation && common.address.housenumber.is_some()
 }
 
-/// `coordinates.accuracy`, which Mapbox sends on addresses and streets only.
-fn accuracy(common: &Common) -> Option<&'static str> {
-    if !matches!(
-        common.layer,
-        Layer::Address | Layer::Interpolation | Layer::Street
-    ) {
+/// `coordinates.accuracy`, which Mapbox sends on addresses only, in its own
+/// words for how the point was found. og's own point of an address is a
+/// known address point, Mapbox's `point`. The centre of the outline an
+/// address is drawn with lies in its building, Mapbox's `rooftop`. A house
+/// placed between its neighbours is `interpolated`. Search Box also has
+/// `street` for a point on the street. og's `approximate`, a node standing
+/// for something larger, is no ZIP centroid, Mapbox's `approximate`, so it
+/// is sent as nothing.
+fn accuracy(api: Api, common: &Common) -> Option<&'static str> {
+    if !is_address(common) {
         return None;
     }
-    Some(match common.accuracy {
-        Accuracy::Rooftop => "rooftop",
-        Accuracy::Interpolated => "interpolated",
-        Accuracy::Street => "street",
-        // The centre of a mapped area, as Mapbox's `approximate` is the
-        // centre of a postal area.
-        Accuracy::Centroid | Accuracy::Approximate => "approximate",
+    match common.accuracy {
+        Accuracy::Rooftop => Some("point"),
+        Accuracy::Centroid => Some("rooftop"),
+        Accuracy::Interpolated => Some("interpolated"),
+        Accuracy::Street => match api {
+            Api::SearchBox => Some("street"),
+            Api::Geocoding => None,
+        },
+        Accuracy::Approximate => None,
+    }
+}
+
+/// og's reverse answer, its areas given the context of the point. og
+/// gives an area at a point no context of its own, though every result of
+/// one answer lies at that point, so the areas holding the address or
+/// street hold the smaller areas too. [`context`] keeps of it only the
+/// tiers above each area.
+fn at_point(collection: &ReverseCollection) -> ReverseCollection {
+    let mut collection = collection.clone();
+    let shared = collection
+        .features
+        .iter()
+        .map(|feature| &feature.properties.common.context)
+        .find(|context| !context.is_empty())
+        .cloned();
+    if let Some(shared) = shared {
+        for feature in &mut collection.features {
+            let context = &mut feature.properties.common.context;
+            if context.is_empty() {
+                context.clone_from(&shared);
+            }
+        }
+    }
+    collection
+}
+
+/// The code of the country a reverse point lies in: of the country its
+/// results lie in, or of the country og answers as one of them.
+fn point_country(collection: &ReverseCollection) -> Option<&str> {
+    collection.features.iter().find_map(|feature| {
+        let common = &feature.properties.common;
+        common
+            .context
+            .country
+            .as_ref()
+            .and_then(|country| country.code.as_deref())
+            .or_else(|| common.id.strip_prefix("derived:country:"))
+    })
+}
+
+/// Keeps a reverse answer only when its point lies in one of `countries`,
+/// any when there are none. A point og places in no country is in none.
+fn keep_countries(collection: &mut ReverseCollection, countries: &[String]) {
+    let kept = countries.is_empty()
+        || point_country(collection)
+            .is_some_and(|code| countries.iter().any(|asked| asked == code));
+    if !kept {
+        collection.features.clear();
+    }
+}
+
+/// `country`, comma-separated ISO 3166 alpha-2 codes, as upper case. A
+/// value that is no code is Mapbox's unknown stack.
+fn countries(api: Api, params: &Params) -> Result<Vec<String>, crate::compat::VendorError> {
+    params.get("country").map_or(Ok(Vec::new()), |value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .map(|code| {
+                let letters =
+                    code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_alphabetic());
+                match letters {
+                    true => Ok(code.to_ascii_uppercase()),
+                    false => Err(api.invalid(format!("Stack \"{code}\" is not a known stack."))),
+                }
+            })
+            .collect()
     })
 }
 
@@ -284,6 +371,64 @@ struct Coordinates {
     latitude: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     accuracy: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    routable_points: Vec<RoutablePoint>,
+}
+
+/// A point to route to: an entrance OpenStreetMap maps on the outline the
+/// address or POI is drawn with.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct RoutablePoint {
+    name: &'static str,
+    longitude: f64,
+    latitude: f64,
+}
+
+/// One og result as the translators read it: its properties and point, and
+/// what the lookup that found it measured.
+#[derive(Debug, Clone, Copy)]
+struct Found<'a> {
+    common: &'a Common,
+    coordinates: [f64; 2],
+    /// How the query's parts matched, on a forward geocode's address
+    /// reading.
+    matched: Option<&'a QueryMatch>,
+    /// Metres from the forward focus, Mapbox's `proximity`.
+    distance_m: Option<f64>,
+}
+
+impl<'a> Found<'a> {
+    fn forward(feature: &'a ForwardFeature) -> Self {
+        Self {
+            common: &feature.properties.common,
+            coordinates: feature.geometry.coordinates,
+            matched: feature.properties.matched.as_ref(),
+            distance_m: feature.properties.distance_m,
+        }
+    }
+
+    fn reverse(feature: &'a ReverseFeature) -> Self {
+        Self {
+            common: &feature.properties.common,
+            coordinates: feature.geometry.coordinates,
+            matched: None,
+            // Mapbox measures `distance` from `proximity` or `origin`, which
+            // a reverse lookup has neither of, so og's distance from the
+            // point has no slot.
+            distance_m: None,
+        }
+    }
+}
+
+/// og's box as Mapbox's `[minLon, minLat, maxLon, maxLat]`. Mapbox's box
+/// cannot cross the antimeridian, so og's box that does is sent as every
+/// longitude, which still holds the result.
+fn bbox(common: &Common) -> Option<[f64; 4]> {
+    let [west, south, east, north] = common.bbox?;
+    Some(match west > east {
+        true => [-180.0, south, 180.0, north],
+        false => [west, south, east, north],
+    })
 }
 
 /// GeoJSON point geometry.
@@ -332,23 +477,31 @@ impl Area {
     /// letters; any other area's is its subdivision code, written on the
     /// region only.
     fn of(area: &crate::api::ContextArea) -> Self {
-        let mut layer = Self::named(Some(encode_area_id(area)), &area.name);
-        if let Some(code) = area.code.as_deref().filter(|code| !code.contains('-')) {
-            layer.country_code_alpha_3 = iso::alpha3(code);
-            layer.country_code = Some(code.to_string());
-        }
-        layer
+        Self::named(Some(encode_area_id(area)), &area.name).with_country_code(area.code.as_deref())
     }
 
     /// The region og found the result in, with its code (`ON` of `CA-ON`)
     /// and its full code.
     fn region(area: &crate::api::ContextArea) -> Self {
-        let mut layer = Self::of(area);
-        if let Some((_, own)) = area.code.as_deref().and_then(|code| code.split_once('-')) {
-            layer.region_code = Some(own.to_string());
-            layer.region_code_full.clone_from(&area.code);
+        Self::of(area).with_region_code(area.code.as_deref())
+    }
+
+    /// The area with `code`'s country codes, when it is a country's.
+    fn with_country_code(mut self, code: Option<&str>) -> Self {
+        if let Some(code) = code.filter(|code| !code.contains('-')) {
+            self.country_code_alpha_3 = iso::alpha3(code);
+            self.country_code = Some(code.to_string());
         }
-        layer
+        self
+    }
+
+    /// The area with `code`'s region codes, when it is a subdivision's.
+    fn with_region_code(mut self, code: Option<&str>) -> Self {
+        if let Some((_, own)) = code.and_then(|code| code.split_once('-')) {
+            self.region_code = Some(own.to_string());
+            self.region_code_full = code.map(str::to_string);
+        }
+        self
     }
 }
 
@@ -481,10 +634,13 @@ struct Translated {
     context: Context<Area>,
     maki: Option<&'static str>,
     brand: Option<String>,
+    bbox: Option<[f64; 4]>,
 }
 
 impl Translated {
-    fn of(common: &Common, [longitude, latitude]: [f64; 2]) -> Self {
+    fn of(api: Api, found: Found) -> Self {
+        let common = found.common;
+        let [longitude, latitude] = found.coordinates;
         let mapbox_id = encode_id(common);
         let feature_type = feature_type(common);
         let parts = &common.address;
@@ -512,10 +668,20 @@ impl Translated {
             coordinates: Coordinates {
                 longitude,
                 latitude,
-                accuracy: accuracy(common),
+                accuracy: accuracy(api, common),
+                routable_points: common
+                    .access
+                    .iter()
+                    .map(|entrance| RoutablePoint {
+                        name: "entrance",
+                        longitude: entrance.lon,
+                        latitude: entrance.lat,
+                    })
+                    .collect(),
             },
             maki: common.category.as_deref().and_then(maki),
             brand: common.brand.as_ref().map(|brand| brand.name.clone()),
+            bbox: bbox(common),
         }
     }
 }
@@ -668,18 +834,16 @@ fn context(common: &Common, mapbox_id: &str, is_address: bool) -> Context<Area> 
         Layer::Country => &mut context.country,
         Layer::Address | Layer::Poi => return context,
     };
-    // An area is its own layer; a country or region keeps the codes og
-    // gave its tier.
-    let coded = slot
-        .take()
-        .filter(|area| area.id.as_deref() == Some(mapbox_id))
-        .unwrap_or_default();
-    *slot = Some(Area {
-        country_code: coded.country_code,
-        country_code_alpha_3: coded.country_code_alpha_3,
-        region_code: coded.region_code,
-        region_code_full: coded.region_code_full,
-        ..own()
+    // An area is its own layer, with the code og gives it. A country og
+    // derives from its code names it in its id instead.
+    let code = common
+        .code
+        .as_deref()
+        .or_else(|| common.id.strip_prefix("derived:country:"));
+    *slot = Some(match common.layer {
+        Layer::Country => own().with_country_code(code),
+        Layer::Region => own().with_region_code(code),
+        _ => own(),
     });
     context
 }
