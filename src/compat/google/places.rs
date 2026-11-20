@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     Area, Code, LatLng, QueryParams, body, both_shapes, error, field_mask, from_problem, invalid,
     language::{Language, accept_language},
-    model::{Kind, Place, after_name, categories_of},
+    model::{Kind, Place, after_name, categories_of, place_type_known, type_known},
     proto_int, respond, run,
 };
 use crate::{
@@ -45,6 +45,83 @@ struct SearchTextRequest {
     location_restriction: Option<Area>,
     #[serde(alias = "language_code")]
     language_code: Option<String>,
+    #[serde(alias = "included_type")]
+    included_type: Option<String>,
+    #[serde(alias = "strict_type_filtering")]
+    strict_type_filtering: bool,
+    #[serde(alias = "rank_preference")]
+    rank_preference: Option<String>,
+    #[serde(alias = "open_now")]
+    open_now: bool,
+    #[serde(alias = "min_rating")]
+    min_rating: Option<f64>,
+    #[serde(alias = "price_levels")]
+    price_levels: Vec<String>,
+    #[serde(alias = "page_token")]
+    page_token: Option<String>,
+    #[serde(alias = "ev_options")]
+    ev_options: Option<serde_json::Value>,
+    #[serde(alias = "search_along_route_parameters")]
+    search_along_route_parameters: Option<serde_json::Value>,
+}
+
+impl SearchTextRequest {
+    /// Refuses what would narrow or order the answer by data og does not
+    /// hold, since an answer that ignored it would not be the one asked for.
+    fn refuse_unheld(&self) -> Result<(), VendorError> {
+        let unheld = |what: &str| invalid(format!("{what} is not supported by this server."));
+        if self.open_now {
+            return Err(unheld("openNow"));
+        }
+        if self.min_rating.is_some_and(|rating| rating > 0.0) {
+            return Err(unheld("minRating"));
+        }
+        if !self.price_levels.is_empty() {
+            return Err(unheld("priceLevels"));
+        }
+        if self.ev_options.is_some() {
+            return Err(unheld("evOptions"));
+        }
+        if self.search_along_route_parameters.is_some() {
+            return Err(unheld("searchAlongRouteParameters"));
+        }
+        // og answers in one page and so never issues a token.
+        if let Some(token) = self.page_token.as_deref().filter(|token| !token.is_empty()) {
+            return Err(invalid(format!("Invalid pageToken \"{token}\".")));
+        }
+        if let Some(named) = self
+            .included_type
+            .as_deref()
+            .filter(|named| !named.is_empty())
+            && !type_known(named)
+        {
+            return Err(unheld(&format!("includedType \"{named}\"")));
+        }
+        Ok(())
+    }
+}
+
+/// A Text Search `rankPreference`. og ranks by relevance, and by distance
+/// only from a point the request gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextRank {
+    Relevance,
+    Distance,
+}
+
+impl TextRank {
+    fn of(named: Option<&str>, focus: Option<&str>) -> Result<Self, VendorError> {
+        match named {
+            None | Some("" | "RANK_PREFERENCE_UNSPECIFIED" | "RELEVANCE") => Ok(Self::Relevance),
+            Some("DISTANCE") if focus.is_some() => Ok(Self::Distance),
+            Some("DISTANCE") => Err(invalid(
+                "rankPreference DISTANCE needs a locationBias on this server.",
+            )),
+            Some(other) => Err(invalid(format!(
+                "Invalid value at 'rank_preference' (type.googleapis.com/google.maps.places.v1.SearchTextRequest.RankPreference), \"{other}\""
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -65,25 +142,59 @@ pub(super) async fn search_text(
         let request: SearchTextRequest = body(&bytes)?;
         let text = request
             .text_query
+            .clone()
             .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| invalid("textQuery is required"))?;
+        request.refuse_unheld()?;
         let limit = page_size(request.page_size.or(request.max_result_count))?;
         let (focus, bbox) = bias_and_restriction(
             request.location_bias.as_ref(),
             request.location_restriction.as_ref(),
         )?;
-        let language = places_language(&state, request.language_code)?;
+        let rank = TextRank::of(request.rank_preference.as_deref(), focus.as_deref())?;
+        let language = places_language(&state, request.language_code.clone())?;
+        let included = request
+            .included_type
+            .as_deref()
+            .filter(|named| !named.is_empty());
+        // A type filter or a reordering reads more than the page holds.
+        let window = match (included, rank) {
+            (None, TextRank::Relevance) => limit,
+            _ => i64::try_from(NEARBY_WINDOW).unwrap_or(limit),
+        };
         let args = Args::new()
             .set("q", text)
-            .set("limit", limit.to_string())
+            .set("limit", window.to_string())
             .maybe("focus", focus)
             .maybe("bbox", bbox)
             .maybe("lang", language.code());
         let found = native::search(&state, args).await.map_err(from_problem)?;
+        let mut features = found.features.iter().collect::<Vec<_>>();
+        if let Some(named) = included {
+            let is = |feature: &&ForwardFeature| {
+                Kind::of(&feature.properties.common)
+                    .types()
+                    .contains(&named)
+            };
+            match request.strict_type_filtering {
+                true => features.retain(is),
+                // Without strict filtering the type biases: places of it
+                // first, the rest after in their order.
+                false => features.sort_by_key(|feature| !is(feature)),
+            }
+        }
+        if rank == TextRank::Distance {
+            features.sort_by(|a, b| {
+                let distance = |feature: &&ForwardFeature| feature.properties.distance_m;
+                distance(a)
+                    .partial_cmp(&distance(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
         let answer = SearchTextResponse {
-            places: found
-                .features
-                .iter()
+            places: features
+                .into_iter()
+                .take(usize::try_from(limit).unwrap_or_default())
                 .map(|feature| place(feature, &language))
                 .collect(),
         };
@@ -235,6 +346,15 @@ impl<'a> TypeRules<'a> {
                 return Err(invalid(format!(
                     "{name} takes at most {MAX_TYPES} types, got {}",
                     list.len()
+                )));
+            }
+        }
+        // A type og has no category for would match no place og knows, or
+        // exclude none, though Google's places of it exist.
+        for (name, list) in lists {
+            if let Some(named) = list.iter().find(|named| !place_type_known(named)) {
+                return Err(invalid(format!(
+                    "{name} \"{named}\" is not supported by this server."
                 )));
             }
         }
@@ -448,6 +568,27 @@ struct AutocompleteRequest {
     origin: Option<LatLng>,
     #[serde(alias = "language_code")]
     language_code: Option<String>,
+    #[serde(alias = "included_primary_types")]
+    included_primary_types: Vec<String>,
+}
+
+/// The most types `includedPrimaryTypes` takes.
+const MAX_PRIMARY_TYPES: usize = 5;
+
+/// Google's collection types for Autocomplete, by the types each admits.
+fn collection(named: &str) -> Option<&'static [&'static str]> {
+    match named {
+        "(cities)" => Some(&["locality"]),
+        "(regions)" => Some(&[
+            "locality",
+            "sublocality",
+            "postal_code",
+            "country",
+            "administrative_area_level_1",
+            "administrative_area_level_2",
+        ]),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -527,6 +668,33 @@ pub(super) async fn autocomplete(
             .filter(|input| !input.trim().is_empty())
             .ok_or_else(|| invalid("input is required"))?;
         let input = typed_before_cursor(&input, request.input_offset)?;
+        let primary = request
+            .included_primary_types
+            .iter()
+            .map(|named| named.trim())
+            .filter(|named| !named.is_empty())
+            .collect::<Vec<_>>();
+        if primary.len() > MAX_PRIMARY_TYPES {
+            return Err(invalid(format!(
+                "includedPrimaryTypes takes at most {MAX_PRIMARY_TYPES} types, got {}",
+                primary.len()
+            )));
+        }
+        if let Some(named) = primary
+            .iter()
+            .find(|named| collection(named).is_none() && !type_known(named))
+        {
+            return Err(invalid(format!(
+                "includedPrimaryTypes \"{named}\" is not supported by this server."
+            )));
+        }
+        let admits = |kind: Kind| {
+            primary.is_empty()
+                || primary.iter().any(|named| match collection(named) {
+                    Some(types) => kind.types().iter().any(|held| types.contains(held)),
+                    None => kind.primary() == Some(*named) || kind.types().contains(named),
+                })
+        };
         if request.location_bias.is_some() && request.location_restriction.is_some() {
             return Err(invalid(
                 "locationBias and locationRestriction cannot both be set",
@@ -559,9 +727,14 @@ pub(super) async fn autocomplete(
                 .filter(|code| !code.trim().is_empty())
                 .or_else(|| accept_language(&headers)),
         )?;
+        // A type filter reads more than the answer holds.
+        let window = match primary.is_empty() {
+            true => MAX_SUGGESTIONS,
+            false => crate::search::MAX_AUTOCOMPLETE_LIMIT,
+        };
         let args = Args::new()
             .set("q", input.clone())
-            .set("limit", MAX_SUGGESTIONS.to_string())
+            .set("limit", window.to_string())
             .maybe("lang", language.code())
             .maybe("focus", focus)
             .maybe("bbox", bbox)
@@ -581,8 +754,10 @@ pub(super) async fn autocomplete(
                     haversine_m(circle.center[0], circle.center[1], lon, lat) <= circle.radius
                 })
             })
+            .filter(|feature| admits(Kind::of(&feature.properties.common)))
+            .take(MAX_SUGGESTIONS)
             .map(|feature| Suggestion {
-                place_prediction: prediction(feature, &input, origin, &language),
+                place_prediction: prediction(feature, origin, &language),
             })
             .collect();
         Ok(respond(
@@ -648,18 +823,31 @@ fn restriction(area: &Area) -> Result<(Option<String>, Option<Circle>), VendorEr
 
 fn prediction(
     feature: &ForwardFeature,
-    input: &str,
     origin: Option<[f64; 2]>,
     language: &Language,
 ) -> PlacePrediction {
-    let common = &feature.properties.common;
+    let properties = &feature.properties;
+    let common = &properties.common;
     let place = Place::of(common, feature.geometry.coordinates, language);
     let [lon, lat] = feature.geometry.coordinates;
+    let highlights = properties
+        .highlights
+        .iter()
+        .map(|highlight| (highlight.start, highlight.end))
+        .collect::<Vec<_>>();
+    // og marks what was typed in the label. The name leads the label, and
+    // the text after it follows its ", ", so each is a window of it.
+    let name_chars = common.name.chars().count();
+    let main_text = match common.label.starts_with(common.name.as_str()) {
+        true => within(&common.name, &highlights, 0),
+        false => plain(&common.name),
+    };
     PlacePrediction {
-        text: formattable(&common.label, input),
+        text: within(&common.label, &highlights, 0),
         structured_format: StructuredFormat {
-            main_text: formattable(&common.name, input),
-            secondary_text: after_name(common).map(|text| formattable(&text, input)),
+            main_text,
+            secondary_text: after_name(common)
+                .map(|text| within(&text, &highlights, name_chars + ", ".chars().count())),
         },
         types: Kind::of(common).types(),
         // Google leaves the distance out when it is 0.
@@ -671,65 +859,43 @@ fn prediction(
     }
 }
 
-fn formattable(text: &str, input: &str) -> FormattableText {
+fn plain(text: &str) -> FormattableText {
     FormattableText {
         text: text.to_string(),
-        matches: matches(text, input),
+        matches: Vec::new(),
     }
 }
 
-/// Where the words typed appear in `text`. Each typed word is matched, case
-/// folded, at the start of a word of `text`. og ranks without recording
-/// which characters matched, so this finds them again in the text shown.
-fn matches(text: &str, input: &str) -> Vec<StringRange> {
-    let folded = text
-        .chars()
-        .map(|character| character.to_lowercase().next().unwrap_or(character))
-        .collect::<Vec<_>>();
-    let starts = (0..folded.len())
-        .filter(|&index| {
-            folded[index].is_alphanumeric() && (index == 0 || !folded[index - 1].is_alphanumeric())
-        })
-        .collect::<Vec<_>>();
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for word in input
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-    {
-        let word = word
-            .chars()
-            .map(|character| character.to_lowercase().next().unwrap_or(character))
-            .collect::<Vec<_>>();
-        let found = starts.iter().copied().find(|&start| {
-            folded[start..].starts_with(&word)
-                && !ranges
-                    .iter()
-                    .any(|&(from, to)| start < to && start + word.len() > from)
-        });
-        if let Some(start) = found {
-            ranges.push((start, start + word.len()));
+/// `text`, which starts at character `from` of the label, with og's
+/// highlights of the label that fall in it, cut to it. Both count Unicode
+/// scalar values, as Google's offsets do.
+fn within(text: &str, highlights: &[(usize, usize)], from: usize) -> FormattableText {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut matches: Vec<StringRange> = Vec::new();
+    for &(start, end) in highlights {
+        let start = start.max(from) - from;
+        let end = end.saturating_sub(from).min(characters.len());
+        if start >= end {
+            continue;
         }
-    }
-    ranges.sort_unstable();
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    // Words typed together read as one match, the gap between them too.
-    for (start, end) in ranges {
-        match merged.last_mut() {
+        // Words typed together read as one match, the gap between them too.
+        match matches.last_mut() {
             Some(last)
-                if folded[last.1..start]
-                    .iter()
-                    .all(|character| !character.is_alphanumeric()) =>
+                if last.end_offset <= start
+                    && characters[last.end_offset..start]
+                        .iter()
+                        .all(|character| !character.is_alphanumeric()) =>
             {
-                last.1 = end;
+                last.end_offset = end;
             }
-            _ => merged.push((start, end)),
+            _ => matches.push(StringRange {
+                start_offset: start,
+                end_offset: end,
+            }),
         }
     }
-    merged
-        .into_iter()
-        .map(|(start_offset, end_offset)| StringRange {
-            start_offset,
-            end_offset,
-        })
-        .collect()
+    FormattableText {
+        text: text.to_string(),
+        matches,
+    }
 }
