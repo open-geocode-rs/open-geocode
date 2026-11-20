@@ -224,6 +224,16 @@ pub(super) struct GeocodeResult {
 impl GeocodeResult {
     pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
         let place_id = encode_id(common);
+        let mut postal_address = postal_address(common);
+        let formatted_address = if common.layer == Layer::Address
+            && compat::country_code(&common.context) == Some("US")
+        {
+            postal_address
+                .as_mut()
+                .and_then(|postal| formatted_us_address(common, postal))
+        } else {
+            formatted_address(common)
+        };
         Self {
             // Every v4 response Google documents writes the full resource
             // name, host included, though its reference says `places/{id}`.
@@ -231,8 +241,8 @@ impl GeocodeResult {
             place_id,
             location: LatLng::of(coordinates),
             granularity: granularity(common.accuracy),
-            formatted_address: formatted_address(common),
-            postal_address: postal_address(common),
+            formatted_address,
+            postal_address,
             address_components: address_components(common, language),
             types: Kind::of(common).types(),
             viewport: Viewport::of(common.bbox),
@@ -337,6 +347,33 @@ fn formatted_address(common: &Common) -> Option<String> {
         return after_name(common);
     }
     (!common.label.is_empty()).then(|| common.label.clone())
+}
+
+fn formatted_us_address(common: &Common, postal: &mut PostalAddress) -> Option<String> {
+    let state_code = common
+        .context
+        .region
+        .as_ref()
+        .and_then(|area| area.code.as_deref())
+        .and_then(|code| code.strip_prefix("US-"))
+        .or_else(|| {
+            postal.administrative_area.as_deref().filter(|code| {
+                code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_uppercase())
+            })
+        })
+        .map(str::to_owned);
+    postal.administrative_area = state_code;
+    let street = postal.address_lines.first()?;
+    let locality = postal.locality.as_deref()?;
+    let state = postal.administrative_area.as_deref()?;
+    let zip = postal.postal_code.as_deref()?;
+    if let Some(unit) = common.address.unit.as_deref() {
+        return Some(format!(
+            "{street}, {}, {locality}, {state} {zip}, USA",
+            crate::labels::unit_label(unit)
+        ));
+    }
+    Some(format!("{street}, {locality}, {state} {zip}, USA"))
 }
 
 /// The house number and street (or `addr:place`) as one line, joined as og
