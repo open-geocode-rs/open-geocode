@@ -46,15 +46,15 @@ pub(crate) fn router() -> Router<AppState> {
             "/v1/autocomplete",
             post(realtime::autocomplete).fallback(not_found),
         )
-        // Same request and response as `/v1/autocomplete`; v2 adds a
-        // filter or bias og cannot honour.
+        // Same request and response as `/v1/autocomplete`, the one schema
+        // Precisely documents for both.
         .route(
             "/v1/express-autocomplete",
             post(realtime::autocomplete).fallback(not_found),
         )
         .route(
             "/v2/express-autocomplete",
-            post(realtime::autocomplete).fallback(not_found),
+            post(realtime::express_autocomplete_v2).fallback(not_found),
         )
         .route(
             "/v1/autocomplete/postal-city",
@@ -260,12 +260,82 @@ fn given(value: Option<&str>) -> Option<&str> {
 #[serde(rename_all = "camelCase")]
 struct Preferences {
     max_results: Option<i64>,
+    distance: Option<Distance>,
+    /// The point to measure from, `[x, y]` in the client's coordinate
+    /// system, which og takes as longitude and latitude. Requests send `[]`
+    /// for none.
+    #[serde(rename = "originXY", default)]
+    origin_xy: Vec<f64>,
+    /// Read only to tell it was sent (see
+    /// [`realtime::express_autocomplete_v2`]).
+    filter_bias: Option<serde::de::IgnoredAny>,
+}
+
+/// Precisely's `Distance`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Distance {
+    value: f64,
+    distance_unit: Option<DistanceUnit>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+enum DistanceUnit {
+    Foot,
+    Meter,
+    Mile,
+    Kilometer,
+}
+
+impl DistanceUnit {
+    const fn metres(self) -> f64 {
+        match self {
+            Self::Foot => 0.3048,
+            Self::Meter => 1.0,
+            Self::Mile => 1609.344,
+            Self::Kilometer => 1000.0,
+        }
+    }
 }
 
 /// Precisely answers one candidate unless asked for more.
 const DEFAULT_MAX_RESULTS: i64 = 1;
 
 impl Preferences {
+    /// The search radius in metres, when the request states one. Precisely
+    /// measures in metres unless told otherwise.
+    fn distance_m(&self) -> Result<Option<f64>, VendorError> {
+        let Some(distance) = &self.distance else {
+            return Ok(None);
+        };
+        if !(distance.value.is_finite() && distance.value > 0.0) {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                "Invalid value for distance (DIS-LI-1018)",
+            ));
+        }
+        let unit = distance.distance_unit.unwrap_or(DistanceUnit::Meter);
+        Ok(Some(distance.value * unit.metres()))
+    }
+
+    /// The `originXY` point as longitude and latitude, when the request
+    /// gives one. A point og cannot place is refused, not dropped.
+    fn origin(&self) -> Result<Option<[f64; 2]>, VendorError> {
+        match self.origin_xy[..] {
+            [] => Ok(None),
+            [lon, lat] if (-180.0..=180.0).contains(&lon) && (-90.0..=90.0).contains(&lat) => {
+                Ok(Some([lon, lat]))
+            }
+            _ => Err(error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                "Invalid value for originXY (DIS-LI-1018)",
+            )),
+        }
+    }
+
     fn max_results(&self) -> Result<usize, VendorError> {
         let max = self.max_results.unwrap_or(DEFAULT_MAX_RESULTS);
         usize::try_from(max)

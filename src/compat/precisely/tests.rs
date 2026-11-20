@@ -1,6 +1,7 @@
 //! `/compat/precisely` driven through og's router on a small Pack.
 
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -285,16 +286,40 @@ async fn native(router: &Router, path: &str) -> Value {
     reply.json()
 }
 
-/// Every og value of `feature` in its Precisely slot, unchanged.
-fn assert_carries(feature: &Value, result: &Value) {
+/// The Precisely route a result came back through, which decides where its
+/// distance goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Geocode,
+    Reverse,
+    Autocomplete,
+}
+
+/// The og values a Precisely result carries. Each one og gave is named in
+/// `seen`, so a test can tell that every slot was reached.
+fn assert_carries(
+    route: Route,
+    feature: &Value,
+    result: &Value,
+    seen: &mut BTreeSet<&'static str>,
+) {
     let properties = &feature["properties"];
     let address = &properties["address"];
     let context = &properties["context"];
     let carried = &result["address"];
+    let mut slot = |name: &'static str, og: &Value| {
+        if !og.is_null() {
+            seen.insert(name);
+        }
+    };
     assert_eq!(
-        decode_id(result["customFields"]["PB_KEY"].as_str().expect("PB_KEY"))
-            .map(|named| named.id().to_string())
-            .as_deref(),
+        decode_id(
+            result["customFields"]["PB_KEY"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no PB_KEY on {result} for {feature}"))
+        )
+        .map(|named| named.id().to_string())
+        .as_deref(),
         properties["id"].as_str()
     );
     assert_eq!(carried["formattedAddress"], properties["label"]);
@@ -310,12 +335,102 @@ fn assert_carries(feature: &Value, result: &Value) {
         Some(confidence) => assert_eq!(result["score"], json!((confidence * 100.0).round() as u8)),
         None => assert_eq!(result.get("score"), None),
     }
+
+    slot("address_lines", &properties["address_lines"]);
+    assert_eq!(
+        result.get("addressLines"),
+        properties.get("address_lines"),
+        "{feature} as {result}"
+    );
+
+    // Each part og judged is described, `EXACT` only for its `matched`.
+    let judged = &properties["match"];
+    slot("match", judged);
+    let description = &result["explanation"]["addressMatch"]["description"];
+    if judged.is_null() {
+        assert_eq!(description, &Value::Null, "{feature} as {result}");
+    }
+    for (part, label) in [
+        ("housenumber", "addressNumber"),
+        ("street", "street"),
+        ("unit", "unitMatch"),
+        ("locality", "city"),
+        ("region", "admin1"),
+        ("postcode", "postalCode"),
+        ("country", "country"),
+    ] {
+        let Some(judged) = judged[part].as_str() else {
+            continue;
+        };
+        let described = description
+            .as_array()
+            .and_then(|parts| parts.iter().find(|entry| entry["label"] == label))
+            .unwrap_or_else(|| panic!("{label} is not described in {result}"));
+        let kind = match judged {
+            "matched" => "EXACT",
+            "partial" => "PARTIAL",
+            "unmatched" => "NONE",
+            other => panic!("og judged {part} {other}"),
+        };
+        assert_eq!(described["matchType"], kind, "{part} of {result}");
+    }
+
+    let distance = &properties["distance_m"];
+    let (value, unit) = match route {
+        Route::Geocode => (Value::Null, Value::Null),
+        Route::Reverse => {
+            slot("reverse distance", distance);
+            let fields = &result["customFields"];
+            let value = fields["REVERSE_GEOCODE_DISTANCE"]
+                .as_str()
+                .map(|value| json!(value.parse::<f64>().expect("a number")))
+                .unwrap_or(Value::Null);
+            (value, fields["REVERSE_GEOCODE_DISTANCE_UNIT"].clone())
+        }
+        Route::Autocomplete => {
+            slot("prediction distance", distance);
+            (
+                result["distance"]["value"].clone(),
+                result["distance"]["distanceUnit"].clone(),
+            )
+        }
+    };
+    assert_eq!(&value, distance, "{feature} as {result}");
+    let metres = match route {
+        Route::Reverse => json!("METERS"),
+        _ => json!("METER"),
+    };
+    assert_eq!(
+        unit,
+        if distance.is_null() {
+            Value::Null
+        } else {
+            metres
+        },
+        "{feature} as {result}"
+    );
+
+    // An area result is its own region or country, which its context does
+    // not name.
+    let own = |layer: &str| {
+        if properties["layer"] == layer {
+            json!({"name": properties["name"], "code": properties["code"]})
+        } else {
+            Value::Null
+        }
+    };
+    let or = |area: &Value, own: Value| if area.is_null() { own } else { area.clone() };
+    let region = or(&context["region"], own("region"));
+    let country = or(&context["country"], own("country"));
+    if properties["layer"] == "region" || properties["layer"] == "country" {
+        slot("area code", &properties["code"]);
+    }
     let pairs = [
         (&address["housenumber"], &carried["addressNumber"]),
         (&address["street"], &carried["street"]),
         (&address["unit"], &carried["unit"]),
         (&address["postcode"], &carried["postalCode"]),
-        (&context["region"]["name"], &carried["admin1"]["longName"]),
+        (&region["name"], &carried["admin1"]["longName"]),
         (&context["locality"]["name"], &carried["city"]["longName"]),
         (&context["district"]["name"], &carried["admin2"]["longName"]),
         (
@@ -326,18 +441,14 @@ fn assert_carries(feature: &Value, result: &Value) {
             &context["neighbourhood"]["name"],
             &carried["neighborhood"]["longName"],
         ),
-        (&context["country"]["name"], &carried["country"]["name"]),
-        (
-            &context["country"]["code"],
-            &carried["country"]["isoAlpha2Code"],
-        ),
+        (&country["name"], &carried["country"]["name"]),
     ];
     for (og, precisely) in pairs {
         assert_eq!(og, precisely, "{feature} as {result}");
     }
     // The region's own code is its short name; the region the record states
     // stands in when og knows no code.
-    let short = context["region"]["code"]
+    let short = region["code"]
         .as_str()
         .and_then(|code| code.split_once('-'))
         .map(|(_, own)| json!(own))
@@ -346,7 +457,18 @@ fn assert_carries(feature: &Value, result: &Value) {
         carried["admin1"]["shortName"], short,
         "{feature} as {result}"
     );
-    let code = context["country"]["code"].as_str().expect("country code");
+    // The country's code, which a region's ISO 3166-2 code starts with when
+    // og names no country.
+    let code = country["code"]
+        .as_str()
+        .or_else(|| {
+            region["code"]
+                .as_str()?
+                .split_once('-')
+                .map(|(code, _)| code)
+        })
+        .expect("country code");
+    assert_eq!(carried["country"]["isoAlpha2Code"], code, "{result}");
     assert_eq!(
         carried["country"]["isoAlpha3Code"].as_str(),
         iso::alpha3(code)
@@ -357,7 +479,23 @@ fn assert_carries(feature: &Value, result: &Value) {
     );
 }
 
-fn address_result(score: &Value) -> Value {
+/// The address result, `described` its matchType per part as og judged it,
+/// in Precisely's order.
+fn address_result(score: &Value, described: &[&str; 7]) -> Value {
+    let labels = [
+        "addressNumber",
+        "street",
+        "unitMatch",
+        "city",
+        "admin1",
+        "postalCode",
+        "country",
+    ];
+    let description = labels
+        .iter()
+        .zip(described.iter())
+        .map(|(label, kind)| json!({"label": label, "matchType": kind}))
+        .collect::<Vec<_>>();
     json!({
         "score": score,
         "address": {
@@ -391,7 +529,8 @@ fn address_result(score: &Value) -> Value {
                 "geometry": {"type": "Point", "coordinates": [-79.3817, 43.6493]},
             },
         },
-        "explanation": {"addressMatch": {"type": "ADDRESS"}},
+        "addressLines": ["Unit 5", "100 King Street West", "Toronto, ON M5X 1A9", "Canada"],
+        "explanation": {"addressMatch": {"type": "ADDRESS", "description": description}},
         "customFields": {"PB_KEY": address_vendor_id("osm:node:10")},
     })
 }
@@ -443,9 +582,15 @@ async fn geocode_answers_each_address_in_order() {
     assert_eq!(
         reply.json(),
         json!({"responses": [
-            {"addressId": "1", "status": "OK", "results": [address_result(&score)]},
+            {"addressId": "1", "status": "OK", "results": [address_result(
+                &score,
+                &["EXACT", "EXACT", "ADDED", "ADDED", "ADDED", "ADDED", "ADDED"],
+            )]},
             {"addressId": "2", "status": "ZERO_RESULTS", "results": []},
-            {"addressId": "3", "status": "OK", "results": [address_result(&structured_score)]},
+            {"addressId": "3", "status": "OK", "results": [address_result(
+                &structured_score,
+                &["EXACT", "EXACT", "ADDED", "EXACT", "ADDED", "EXACT", "ADDED"],
+            )]},
         ]})
     );
 }
@@ -454,6 +599,27 @@ async fn geocode_answers_each_address_in_order() {
 async fn every_og_value_lands_in_its_precisely_slot() {
     let fixture = Fixture::new("fidelity");
     let router = fixture.router();
+    let mut seen = BTreeSet::new();
+
+    let og = native(
+        &router,
+        "/geocode?q=100%20King%20Street%20West%2C%20Toronto&limit=5",
+    )
+    .await;
+    let features = og["features"].as_array().expect("features");
+    let reply = post(
+        &router,
+        "/v1/geocode",
+        &json!({"preferences": {"maxResults": 5},
+                "addresses": [{"addressLines": ["100 King Street West, Toronto"], "country": "CA"}]}),
+    )
+    .await;
+    let results = reply.json()["responses"][0]["results"].clone();
+    let results = results.as_array().expect("results");
+    assert_eq!(results.len(), features.len(), "{og}");
+    for (feature, result) in features.iter().zip(results) {
+        assert_carries(Route::Geocode, feature, result, &mut seen);
+    }
 
     let og = native(&router, "/geocode?q=King%20Street%20West&limit=5").await;
     let features = og["features"].as_array().expect("features");
@@ -469,7 +635,7 @@ async fn every_og_value_lands_in_its_precisely_slot() {
     let results = reply.json()["responses"][0]["results"].clone();
     assert_eq!(results.as_array().map(Vec::len), Some(2));
     for (feature, result) in features.iter().zip(results.as_array().expect("results")) {
-        assert_carries(feature, result);
+        assert_carries(Route::Geocode, feature, result, &mut seen);
     }
     // A range with no number asked is placed on its street, not at a house.
     assert_eq!(
@@ -481,31 +647,75 @@ async fn every_og_value_lands_in_its_precisely_slot() {
         ["STREET_CENTER", "STREET", "ADDRESS_POINT"]
     );
 
-    let og = native(&router, "/reverse?lon=-79.3817&lat=43.6493").await;
+    // The point's areas come back too, each its own region or country.
+    let og = native(&router, "/reverse?lon=-79.3815&lat=43.6495").await;
+    let features = og["features"].as_array().expect("features");
     let reply = post(
         &router,
         "/v1/reverse-geocode",
-        &json!({"preferences": {"maxResults": 1},
-                "locations": [{"longitude": -79.3817, "latitude": 43.6493, "country": "CAN"}]}),
+        &json!({"preferences": {"maxResults": 10},
+                "locations": [{"longitude": -79.3815, "latitude": 43.6495, "country": "CAN"}]}),
     )
     .await;
-    assert_carries(
-        &og["features"][0],
-        &reply.json()["responses"][0]["results"][0],
+    let results = reply.json()["responses"][0]["results"].clone();
+    let results = results.as_array().expect("results");
+    // The house is a few metres off the asked point, so a distance lost or
+    // zeroed shows.
+    assert!(
+        features[0]["properties"]["distance_m"].as_f64() > Some(1.0),
+        "{og}"
     );
+    // The fixture's areas below the region name no country, so the asked
+    // country keeps the house, the region and the country.
+    assert_eq!(results.len(), 3, "{og}");
+    for result in results {
+        let key = result["customFields"]["PB_KEY"].as_str().expect("PB_KEY");
+        let id = decode_id(key).expect("og's key").id().to_string();
+        let feature = features
+            .iter()
+            .find(|feature| feature["properties"]["id"] == id.as_str())
+            .unwrap_or_else(|| panic!("{id} is not in {og}"));
+        assert_carries(Route::Reverse, feature, result, &mut seen);
+    }
 
-    let og = native(&router, "/autocomplete?q=Queen%20Bak&limit=1").await;
-    let reply = post(
-        &router,
-        "/v1/autocomplete",
-        &json!({"address": {"addressLines": ["Queen Bak"], "country": "CAN"}}),
-    )
-    .await;
-    let prediction = &reply.json()["response"]["predictions"][0];
-    assert_carries(&og["features"][0], prediction);
+    for (native_uri, preferences) in [
+        ("/autocomplete?q=Queen%20Bak&limit=1", json!({})),
+        (
+            "/autocomplete?q=Queen%20Bak&limit=1&focus=-79.3815,43.6495",
+            json!({"originXY": [-79.3815, 43.6495]}),
+        ),
+    ] {
+        let og = native(&router, native_uri).await;
+        let reply = post(
+            &router,
+            "/v1/autocomplete",
+            &json!({"preferences": preferences,
+                    "address": {"addressLines": ["Queen Bak"], "country": "CAN"}}),
+        )
+        .await;
+        let prediction = &reply.json()["response"]["predictions"][0];
+        assert_carries(
+            Route::Autocomplete,
+            &og["features"][0],
+            prediction,
+            &mut seen,
+        );
+        assert_eq!(
+            prediction["prediction"],
+            og["features"][0]["properties"]["label"]
+        );
+    }
+
+    // Every slot was reached, so none can go empty unseen.
     assert_eq!(
-        prediction["prediction"],
-        og["features"][0]["properties"]["label"]
+        seen.into_iter().collect::<Vec<_>>(),
+        [
+            "address_lines",
+            "area code",
+            "match",
+            "prediction distance",
+            "reverse distance"
+        ]
     );
 }
 
@@ -546,6 +756,7 @@ async fn a_poi_says_what_it_is_and_where() {
                 "feature": {"type": "Feature", "properties": {"crsName": "epsg:4326"},
                             "geometry": {"type": "Point", "coordinates": [-79.383, 43.649]}},
             },
+            "addressLines": ["120 King Street West", "Toronto, ON M5X 1A9", "Canada"],
             "explanation": {"addressMatch": {"type": "POI"}},
             "customFields": {"PB_KEY": encode_parts("osm:way:11", Some(Layer::Poi), "")},
         }]}})
@@ -700,15 +911,25 @@ async fn reverse_geocode_answers_each_point() {
         &router,
         "/v1/reverse-geocode",
         &json!({"locations": [
-            {"addressId": "a", "longitude": -79.3817, "latitude": 43.6493, "country": "USA"},
+            {"addressId": "a", "longitude": -79.3817, "latitude": 43.6493, "country": "CAN"},
             {"addressId": "b", "latitude": 43.6493, "country": "CAN"},
             {"addressId": "c", "longitude": -79.3817, "latitude": 91.0, "country": "CAN"},
+            {"addressId": "d", "longitude": -79.3817, "latitude": 43.6493, "country": "USA"},
         ]}),
     )
     .await;
     assert_eq!(reply.status, StatusCode::PARTIAL_CONTENT);
-    let mut expected = address_result(&json!(null));
+    // A point judges no stated part, so the result has no score and no
+    // match description.
+    let mut expected = address_result(&json!(null), &["NONE"; 7]);
     expected.as_object_mut().expect("result").remove("score");
+    expected["explanation"]["addressMatch"]
+        .as_object_mut()
+        .expect("addressMatch")
+        .remove("description");
+    // The house stands on the asked point.
+    expected["customFields"]["REVERSE_GEOCODE_DISTANCE"] = json!("0");
+    expected["customFields"]["REVERSE_GEOCODE_DISTANCE_UNIT"] = json!("METERS");
     assert_eq!(
         reply.json(),
         json!({"responses": [
@@ -717,8 +938,27 @@ async fn reverse_geocode_answers_each_point() {
              "errorMessage": "could not parse query parameters (DIS-LI-1018)"},
             {"addressId": "c", "status": "INVALID_REQUEST",
              "errorMessage": "coordinate out of range (DIS-LI-1018)"},
+            // A point in Canada has no answer in the United States.
+            {"addressId": "d", "status": "ZERO_RESULTS", "results": []},
         ]})
     );
+    // Past the search radius is no house or street. An area holds the
+    // point, so it is within any radius.
+    let near = post(
+        &router,
+        "/v1/reverse-geocode",
+        &json!({"preferences": {"distance": {"value": 0.001, "distanceUnit": "METER"}},
+                "locations": [{"longitude": -79.3816, "latitude": 43.6494, "country": "CAN"}]}),
+    )
+    .await;
+    let near = near.json();
+    let kinds = near["responses"][0]["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|result| result["explanation"]["addressMatch"]["type"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, [json!("ADMIN")], "{near}");
 }
 
 #[tokio::test]
@@ -736,7 +976,12 @@ async fn lookup_finds_a_record_by_the_pb_key_og_issued() {
     let body = reply.json();
     assert_eq!(body["responses"][0]["status"], "OK");
     assert_eq!(body["responses"][0].get("addressId"), None);
-    assert_carries(&og["features"][0], &body["responses"][0]["results"][0]);
+    assert_carries(
+        Route::Geocode,
+        &og["features"][0],
+        &body["responses"][0]["results"][0],
+        &mut BTreeSet::new(),
+    );
 
     // The key of an address, which the catalogue does not hold, finds it.
     let reply = post(
@@ -1534,8 +1779,7 @@ async fn proximity_search_finds_the_nearest_address() {
     let search = |distance: Value, country: &str| {
         let router = router.clone();
         let body = json!({
-            "preferences": {"dataset": "premium-address-points", "maxResults": 3,
-                            "distance": distance},
+            "preferences": {"dataset": "osm", "maxResults": 1, "distance": distance},
             "location": {"addressId": "7", "latitude": 43.6494, "longitude": -79.3816,
                          "country": country},
         });
@@ -1585,20 +1829,32 @@ async fn proximity_search_finds_the_nearest_address() {
             "Dataset is not provided in the request (DIS-LI-1031)",
         ),
         (
-            json!({"preferences": {"dataset": "d"}, "location": {"latitude": 1, "longitude": 1}}),
+            json!({"preferences": {"dataset": "premium-address-points"},
+                   "location": {"latitude": 1, "longitude": 1, "country": "CA"}}),
+            "Dataset premium-address-points is not held by this server, which searches the \
+             osm and openaddresses addresses of its Pack (DIS-LI-1031)",
+        ),
+        (
+            json!({"preferences": {"dataset": "osm", "maxResults": 3},
+                   "location": {"latitude": 1, "longitude": 1, "country": "CA"}}),
+            "Invalid value for maxResults, this server answers the one nearest address \
+             (DIS-LI-1036)",
+        ),
+        (
+            json!({"preferences": {"dataset": "osm"}, "location": {"latitude": 1, "longitude": 1}}),
             "Country is not provided in the request (DIS-LI-1015)",
         ),
         (
-            json!({"preferences": {"dataset": "d"}, "location": {"latitude": 1, "country": "CA"}}),
+            json!({"preferences": {"dataset": "osm"}, "location": {"latitude": 1, "country": "CA"}}),
             "Request Body is not valid (DIS-LI-1018)",
         ),
         (
-            json!({"preferences": {"dataset": "d", "distance": {"value": 1, "distanceUnit": "CUBIT"}},
+            json!({"preferences": {"dataset": "osm", "distance": {"value": 1, "distanceUnit": "CUBIT"}},
                    "location": {"latitude": 1, "longitude": 1, "country": "CA"}}),
             "Request Body is not valid (DIS-LI-1018)",
         ),
         (
-            json!({"preferences": {"dataset": "d", "maxResults": 0},
+            json!({"preferences": {"dataset": "osm", "maxResults": 0},
                    "location": {"latitude": 1, "longitude": 1, "country": "CA"}}),
             "Invalid value for maxResults (DIS-LI-1036)",
         ),
@@ -1733,5 +1989,36 @@ async fn a_bulk_verify_job_writes_verify_output() {
     assert_eq!(
         lines.next(),
         Some(format!("V2,ZERO_RESULTS,,{blank}").as_str())
+    );
+}
+
+#[tokio::test]
+async fn express_autocomplete_v2_refuses_a_filter_it_cannot_honour() {
+    let fixture = Fixture::new("filter-bias");
+    let router = fixture.router();
+    let address = json!({"addressLines": ["Queen Bak"], "country": "CAN"});
+    let plain = post(
+        &router,
+        "/v2/express-autocomplete",
+        &json!({"address": address}),
+    )
+    .await;
+    assert_eq!(plain.status, StatusCode::OK);
+    assert_eq!(plain.json()["response"]["status"], "OK");
+    let filtered = post(
+        &router,
+        "/v2/express-autocomplete",
+        &json!({"preferences": {"filterBias": {"type": "filter",
+                    "fields": {"include": {"city": {"value": "Toronto"}}}}},
+                "address": address}),
+    )
+    .await;
+    assert_eq!(filtered.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        filtered.json(),
+        errors(
+            "INVALID_REQUEST",
+            "filterBias is not supported by this server (DIS-LI-1018)"
+        )
     );
 }
