@@ -132,7 +132,21 @@ impl TextSearcher {
     ) -> Result<Option<NameOrder>> {
         let mut parts = Vec::new();
         let mut found = Vec::<TextSearchHit>::new();
-        for field in query_fields(query_text, pieces) {
+        let mut fields = query_fields(query_text, pieces).into_iter().peekable();
+        while let Some(field) = fields.next() {
+            if let Some(next) = fields.peek()
+                && let Some((part, hits)) =
+                    self.literal_comma_locality(&field, next, filters, focus)?
+            {
+                fields.next();
+                for hit in hits {
+                    if !found.iter().any(|held| held.record_id == hit.record_id) {
+                        found.push(hit);
+                    }
+                }
+                parts.push(part);
+                continue;
+            }
             // A field the parser labels in pieces is one name ("Providence
             // County" read as a town and a region, "Fredrick C Greene
             // Memorial Boulevard" misspelt and read as a unit and a street),
@@ -182,6 +196,61 @@ impl TextSearcher {
             found,
             written: format!(" {} ", exact_key(query_text).unwrap_or_default()),
         }))
+    }
+
+    // A comma still ends a field unless a stored locality name uses it
+    // at that position. Folding punctuation alone would join unrelated fields.
+    fn literal_comma_locality(
+        &self,
+        left: &[(Vec<String>, Label)],
+        right: &[(Vec<String>, Label)],
+        filters: &Filters<'_>,
+        focus: Option<[f64; 2]>,
+    ) -> Result<Option<(Part, Vec<TextSearchHit>)>> {
+        let words = |field: &[(Vec<String>, Label)]| {
+            field
+                .iter()
+                .flat_map(|(words, _)| words.iter().cloned())
+                .collect::<Vec<_>>()
+        };
+        let left = words(left);
+        let right = words(right);
+        let joined = [&left[..], &right[..]].concat();
+        let Some(key) = lattice::dictionary_key(&joined.join(" ")) else {
+            return Ok(None);
+        };
+        if !self
+            .tagger
+            .dictionaries()
+            .contains(NameField::Locality, &key)
+        {
+            return Ok(None);
+        }
+        let (Some(first), Some(last)) = (search_key(&left.join(" ")), search_key(&right.join(" ")))
+        else {
+            return Ok(None);
+        };
+        let Some((part, hits)) = self.part(&joined, Label::Locality, filters, focus)? else {
+            return Ok(None);
+        };
+        for hit in &hits {
+            if hit.record.layer == Layer::Locality.as_str()
+                && self
+                    .pack
+                    .records()
+                    .names(hit.record_id)?
+                    .iter()
+                    .any(|name| {
+                        name.split_once(',').is_some_and(|(a, b)| {
+                            search_key(a).as_deref() == Some(&first)
+                                && search_key(b).as_deref() == Some(&last)
+                        })
+                    })
+            {
+                return Ok(Some((part, hits)));
+            }
+        }
+        Ok(None)
     }
 
     /// Whether `part` names a record whole, among those its lookup found.
@@ -619,7 +688,9 @@ impl TextSearcher {
         let tied = keyed[..shown]
             .windows(2)
             .any(|pair| !pair[0].0.unnamed && order_key(pair[0].0) == order_key(pair[1].0));
-        if tied && order.parts.len() > 1 && depth == Depth::Query {
+        let country_only =
+            order.parts.len() == 2 && order.parts[1 - sought].label == Label::Country;
+        if tied && order.parts.len() > 1 && !country_only && depth == Depth::Query {
             let bare = self.search_at(
                 &TextSearchOptions {
                     query: order.parts[sought].key.clone(),
@@ -1053,6 +1124,18 @@ mod tests {
                 ("name", "La Vingtaine de St. Nicolas"),
             ],
         ));
+        nodes.push(node(
+            905,
+            41.86,
+            1.5,
+            &[("place", "village"), ("name", "Old Mill, Plainfield")],
+        ));
+        nodes.push(node(
+            906,
+            41.87,
+            1.5,
+            &[("place", "village"), ("name", "Plainfield")],
+        ));
         vec![nodes, ways, relations]
     }
 
@@ -1206,6 +1289,12 @@ mod tests {
     /// ("Lincoln RI", where "ri" types a street as "rise"); this fixture's
     /// parser reads such a field as one street, so the Rhode Island Pack's
     /// "<town> RI" sweep guards that half.
+    #[test]
+    fn a_localitys_written_comma_does_not_end_its_name() {
+        answers("Old Mill, Plainfield, US", "osm:node:905");
+        answers("Plainfield, US", "osm:node:906");
+    }
+
     #[test]
     fn a_field_naming_something_whole_is_one_name() {
         answers("Providence County, RI", "osm:relation:5");
