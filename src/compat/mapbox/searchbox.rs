@@ -13,10 +13,10 @@ use super::{
     attribution, category, error,
 };
 use crate::{
-    api::{Common, ForwardCollection, ForwardFeature, ReverseCollection},
+    api::{Common, ForwardCollection, ReverseCollection},
     categories,
     compat::{Args, VendorError, decode_id, native},
-    record::{Contact, Layer as OgLayer},
+    record::Contact,
     runtime::AppState,
 };
 
@@ -348,26 +348,6 @@ impl Asked {
     }
 }
 
-/// Whether every word of `q` is a word of an area's label: the area the
-/// text names, and not a place named after it ("Providence Place").
-fn names_area(q: &str, feature: &ForwardFeature) -> bool {
-    let words = |text: &str| {
-        crate::util::fold::search_key(text)
-            .map(|key| {
-                key.split_whitespace()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    };
-    let label = words(&feature.properties.common.label);
-    let common = &feature.properties.common;
-    common.layer.is_context()
-        && common.layer != OgLayer::Postcode
-        && !feature.properties.fallback
-        && words(q).iter().all(|word| label.contains(word))
-}
-
 fn required_q(params: &Params) -> Result<&str, VendorError> {
     params
         .get("q")
@@ -452,16 +432,13 @@ pub(super) async fn forward(
     let types = params.types(Api::SearchBox)?;
     let asked = Asked::of(&params)?;
     let layer = types.as_ref().and_then(Types::og_layer);
-    let text = || {
-        Args::new()
-            .set("q", q)
-            .maybe("limit", asked.fetch())
-            .maybe("country", params.get("country"))
-            .maybe("focus", params.focus())
-            .maybe("bbox", params.get("bbox"))
-            .set("lang", language(&params))
-    };
-    let args = text();
+    let args = Args::new()
+        .set("q", q)
+        .maybe("limit", asked.fetch())
+        .maybe("country", params.get("country"))
+        .maybe("focus", params.focus())
+        .maybe("bbox", params.get("bbox"))
+        .set("lang", language(&params));
     let autocomplete = params
         .get("auto_complete")
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
@@ -471,28 +448,8 @@ pub(super) async fn forward(
         match layer {
             Some("poi") => native::places(&state, args).await,
             Some(layer) => native::geocode(&state, args.set("layer", layer)).await,
-            None => {
-                let (areas, found) = tokio::join!(
-                    native::geocode(&state, text()),
-                    native::search(&state, args)
-                );
-                found.map(|mut found| {
-                    let named = areas
-                        .map(|areas| areas.features)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|feature| names_area(q, feature))
-                        .filter(|area| {
-                            !found
-                                .features
-                                .iter()
-                                .any(|held| held.properties.common.id == area.properties.common.id)
-                        })
-                        .collect::<Vec<_>>();
-                    found.features.splice(0..0, named);
-                    found
-                })
-            }
+            // A town the text names comes first, as og's search answers it.
+            None => native::search(&state, args).await,
         }
     }
     .map_err(failed)?;
