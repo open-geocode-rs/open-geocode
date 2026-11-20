@@ -325,11 +325,11 @@ pub struct ForwardProperties {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distance_m: Option<f64>,
     /// How each address part the query states matched the result. Present
-    /// on a `/geocode` result found by reading the query as an address,
-    /// when it states a part. Absent on a result found by its whole name,
-    /// and on `/places` and `/autocomplete`. A place is sought by its name
-    /// and a suggestion by what is typed so far, which no address reading
-    /// judges.
+    /// on a `/geocode` result when the query states a part. A place found
+    /// because the whole query is one of its names states the part it is.
+    /// Absent on `/places` and `/autocomplete`. A place is sought by its
+    /// name and a suggestion by what is typed so far, which no address
+    /// reading judges.
     #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
     pub matched: Option<QueryMatch>,
     /// The parts of `label` the typed text matched, in order, none
@@ -363,7 +363,10 @@ pub struct Highlight {
 /// query does not state is absent, whatever the result holds for it. Every
 /// result fills in parts the query left out, so naming them says nothing.
 /// The query's parts are the ones its reading labels, so no query states a
-/// district.
+/// district. A `country` filter states the country too. A query that is
+/// wholly one of a place's names states the part that place is, its
+/// `locality` for a town or a county, its `region`, `postcode`, `country`
+/// or `street`, and that part is `matched`.
 ///
 /// What judges each part is listed below.
 ///
@@ -375,18 +378,22 @@ pub struct Highlight {
 /// - `street`: the query's street words against the words of the result's
 ///   street, as search counts typos. `matched` when the street has each
 ///   word, the word an abbreviation stands for, or its abbreviation
-///   (`Street` for a street written `St`). `partial` when a word is
-///   a typo away or missing. `unmatched` when it has none of them or the
+///   (`Street` for a street written `St`), and the query writes every word
+///   of the street but its type. `partial` when a word is a typo away or
+///   missing, or the street has a word the query leaves out (`South Main
+///   Street` for `Main St`). `unmatched` when it has none of them or the
 ///   result has no street.
 /// - `unit`: `matched` when the result states the unit, else `unmatched`.
 /// - `locality`: `matched` when an area the result lies in has the name.
 ///   `partial` when the name is read through a typo, is the postal town of
 ///   the stated postcode, or is a settlement mapped as a point beside the
-///   result. `unmatched` when the result lies elsewhere or the Pack does
+///   result, and on a town or county result whose name has a word the
+///   query leaves out (`East Providence` for `Providence`). `unmatched` when the result lies elsewhere or the Pack does
 ///   not know the name.
 /// - `region` and `country`: `matched` when the result lies in the one
-///   named, `partial` when the name is read through a typo, `unmatched`
-///   when the Pack does not know the name.
+///   named, or in a country the `country` filter names. `partial` when the
+///   name is read through a typo. `unmatched` when the Pack does not know
+///   the name.
 /// - `postcode`: `matched` when the result or its street states the
 ///   postcode. `partial` when one starts the other, or the result only
 ///   lies where the postcode does. `unmatched` when the result states

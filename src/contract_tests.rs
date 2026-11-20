@@ -506,8 +506,15 @@ async fn responses_match_the_committed_examples() {
 
     // The country the contract Pack is built from finds the same places the
     // unfiltered query does, so the filter narrows without changing ranking.
+    // It states the country, which each answer then matches.
     let unfiltered = get(&router, "/geocode?q=king").await;
-    let filtered = get(&router, "/geocode?q=king&country=CA").await;
+    let mut filtered = get(&router, "/geocode?q=king&country=CA").await;
+    for feature in filtered["features"].as_array_mut().expect("features") {
+        let matched = feature["properties"]["match"]
+            .as_object_mut()
+            .expect("a match");
+        assert_eq!(matched.remove("country"), Some(json!("matched")));
+    }
     assert_eq!(unfiltered["features"], filtered["features"]);
 
     let _ = std::fs::remove_dir_all(&pack);

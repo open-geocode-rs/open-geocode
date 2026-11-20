@@ -584,12 +584,12 @@ async fn geocode_answers_each_address_in_order() {
         json!({"responses": [
             {"addressId": "1", "status": "OK", "results": [address_result(
                 &score,
-                &["EXACT", "EXACT", "ADDED", "ADDED", "ADDED", "ADDED", "ADDED"],
+                &["EXACT", "EXACT", "ADDED", "ADDED", "ADDED", "ADDED", "EXACT"],
             )]},
             {"addressId": "2", "status": "ZERO_RESULTS", "results": []},
             {"addressId": "3", "status": "OK", "results": [address_result(
                 &structured_score,
-                &["EXACT", "EXACT", "ADDED", "EXACT", "ADDED", "EXACT", "ADDED"],
+                &["EXACT", "EXACT", "ADDED", "EXACT", "ADDED", "EXACT", "EXACT"],
             )]},
         ]})
     );
@@ -1551,7 +1551,7 @@ fn verified_result(score: &Value, stated: &[&str], codes: [&str; 2]) -> Value {
             {"label": "city", "matchType": match_type("city")},
             {"label": "admin1", "matchType": "ADDED"},
             {"label": "postalCode", "matchType": match_type("postalCode")},
-            {"label": "country", "matchType": "ADDED"},
+            {"label": "country", "matchType": match_type("country")},
         ]}},
         "customFields": {
             "PB_KEY": address_vendor_id("osm:node:10"),
@@ -1576,7 +1576,7 @@ async fn verify_answers_the_matched_address_standardized_without_a_point() {
     assert_eq!(
         properties["match"],
         json!({"housenumber": "matched", "street": "matched", "locality": "matched",
-               "postcode": "matched"})
+               "postcode": "matched", "country": "matched"})
     );
     let score = json!((confidence * 100.0).round() as u8);
     let stars = (confidence * 5.0).round() as u8;
@@ -1597,10 +1597,10 @@ async fn verify_answers_the_matched_address_standardized_without_a_point() {
         json!({"responses": [
             {"addressId": "1", "status": "OK", "results": [verified_result(
                 &score,
-                &["addressNumber", "street", "city", "postalCode"],
+                &["addressNumber", "street", "city", "postalCode", "country"],
                 [
-                    &format!("V4-P4S4A6T4R6Z4C6-{stars}"),
-                    &format!("V4-D0M0B0U6F0G0P4S4Q0X0A6T4E0R6W0Z4Y0C6-{stars}"),
+                    &format!("V4-P4S4A6T4R6Z4C4-{stars}"),
+                    &format!("V4-D0M0B0U6F0G0P4S4Q0X0A6T4E0R6W0Z4Y0C4-{stars}"),
                 ],
             )]},
             {"addressId": "2", "status": "ZERO_RESULTS", "results": []},
@@ -1612,7 +1612,7 @@ async fn verify_answers_the_matched_address_standardized_without_a_point() {
         &router,
         "/v1/explain-addresscode",
         &json!({"codeType": "GlobalMatchCode",
-                "codes": [{"code": format!("V4-P4S4A6T4R6Z4C6-{stars}")}]}),
+                "codes": [{"code": format!("V4-P4S4A6T4R6Z4C4-{stars}")}]}),
     )
     .await;
     assert_eq!(explained.status, StatusCode::OK);
@@ -1980,8 +1980,8 @@ async fn a_bulk_verify_job_writes_verify_output() {
             "V1,OK,,{score},\"100 King Street West, Unit 5, ON, M5X 1A9\",\"100 King Street West, Unit 5\",\
              \"ON, M5X 1A9\",100,King Street West,5,,Financial District,Old Toronto,\
              Toronto,Toronto Division,Ontario,ON,M5X 1A9,,CAN,Canada,CA,124,,,,ADDRESS,\
-             \"{{\"\"extendedMatchCode\"\":\"\"V4-D0M0B0U6F0G0P4S4Q0X0A6T4E0R6W0Z4Y0C6-{stars}\"\",\
-             \"\"pbKey\"\":\"\"{}\"\",\"\"simpleMatchCode\"\":\"\"V4-P4S4A6T4R6Z4C6-{stars}\"\"}}\"",
+             \"{{\"\"extendedMatchCode\"\":\"\"V4-D0M0B0U6F0G0P4S4Q0X0A6T4E0R6W0Z4Y0C4-{stars}\"\",\
+             \"\"pbKey\"\":\"\"{}\"\",\"\"simpleMatchCode\"\":\"\"V4-P4S4A6T4R6Z4C4-{stars}\"\"}}\"",
             address_vendor_id("osm:node:10")
         )
     );

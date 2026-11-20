@@ -98,7 +98,9 @@ impl MatchCode {
     /// accepted under another spelling is corrected. A part the request
     /// left out and the result fills in is appended from og's data, which
     /// stands in for the reference data the code speaks of. The confidence
-    /// is the result's `score` in fifths, none without one.
+    /// is the result's `score` in fifths. A result with no `score`, from a
+    /// Pack never calibrated, has no code, since its last segment is that
+    /// confidence.
     pub(super) fn derive(judged: QueryMatch, holds: Holds, score: Option<u8>) -> Option<Self> {
         if judged_parts(judged).any(|part| part == PartMatch::Unmatched) {
             return None;
@@ -135,7 +137,9 @@ impl MatchCode {
         } else {
             return None;
         };
-        let confidence = score.map_or(0, |score| (score + 10) / 20);
+        // The last segment rates the match, which only a calibrated score
+        // says; without one there is no whole code to give.
+        let confidence = (score? + 10) / 20;
         Some(Self {
             level,
             values,
@@ -412,7 +416,7 @@ mod tests {
     fn the_level_is_the_finest_part_verified() {
         let holds = Holds::default();
         let level = |judged: QueryMatch| {
-            MatchCode::derive(judged, holds, None).map(|code| code.simple()[..2].to_string())
+            MatchCode::derive(judged, holds, Some(50)).map(|code| code.simple()[..2].to_string())
         };
         let street = QueryMatch {
             street: Some(PartMatch::Matched),
@@ -453,16 +457,19 @@ mod tests {
             ..QueryMatch::default()
         };
         let confidence = |score: Option<u8>| {
-            let code = MatchCode::derive(judged, Holds::default(), score).expect("verified");
-            code.simple()
-                .rsplit('-')
-                .next()
-                .expect("a confidence")
-                .to_string()
+            MatchCode::derive(judged, Holds::default(), score).map(|code| {
+                code.simple()
+                    .rsplit('-')
+                    .next()
+                    .expect("a confidence")
+                    .to_string()
+            })
         };
-        assert_eq!(confidence(Some(75)), "4");
-        assert_eq!(confidence(Some(100)), "5");
-        assert_eq!(confidence(Some(9)), "0");
+        assert_eq!(confidence(Some(75)).as_deref(), Some("4"));
+        assert_eq!(confidence(Some(100)).as_deref(), Some("5"));
+        assert_eq!(confidence(Some(9)).as_deref(), Some("0"));
+        // A Pack never calibrated rates no match, so no code is whole.
+        assert_eq!(confidence(None), None);
     }
 
     #[test]

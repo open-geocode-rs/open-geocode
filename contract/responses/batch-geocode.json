@@ -49,6 +49,7 @@
               "label": "10 King Street, M5V 1A1",
               "layer": "address",
               "match": {
+                "country": "matched",
                 "housenumber": "matched",
                 "postcode": "matched",
                 "street": "matched"

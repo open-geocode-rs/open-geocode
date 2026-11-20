@@ -3576,11 +3576,18 @@ mod router_tests {
                 "region": "matched",
             }),
         );
-        let town = without("osm:relation:13");
+        let town = with(
+            "osm:relation:13",
+            serde_json::json!({"locality": "matched"}),
+        );
         let cafe = without("osm:node:5");
         let queen = with(
             "osm:node:2",
             serde_json::json!({"housenumber": "matched", "street": "matched"}),
+        );
+        let queen_in_part = with(
+            "osm:node:2",
+            serde_json::json!({"housenumber": "matched", "street": "partial"}),
         );
 
         for (uri, expected) in [
@@ -3605,8 +3612,15 @@ mod router_tests {
                 "/geocode?address=99%20Nowhere%20Road&locality=Toronto&region=Ontario",
                 &town_by_fields,
             ),
-            // Found by its whole name, which no reading labels.
+            // The whole query is the town's name, so it states the town.
             ("/geocode?q=Toronto", &town),
+            // A street with a word the query leaves out is another street.
+            ("/geocode?q=12%20Queen%20Street", &queen_in_part),
+            // A country filter states the country, and the answer lies in it.
+            (
+                "/geocode?q=10%20King%20Street%20West&country=CA",
+                &house(&[("country", "matched")]),
+            ),
             // A place is sought by name, a suggestion by what is typed.
             ("/places?q=Lantern%20Cafe,%20Toronto", &cafe),
             ("/places?ids=osm:node:5", &cafe),
