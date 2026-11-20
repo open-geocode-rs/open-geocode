@@ -3,9 +3,10 @@
 //! that thing is. "Exeter, RI" asks for Exeter, which Rhode Island holds;
 //! "Cranston Street, Cranston" asks for the street, which Cranston holds.
 //!
-//! The query is cut into parts: the runs of one label of its best reading,
-//! never across a comma. Each part is read against each record the same
-//! way, whatever label the parser gave it:
+//! The query is cut into parts at commas, except where the comma is part of
+//! a recorded locality name. Within each field the best reading can split
+//! it into runs of one label. Each part is read against each record the
+//! same way, whatever label the parser gave it:
 //!
 //! - a part **names** a record when the part is one of the record's names,
 //!   whole, or whole bar a word of a type og's vocabulary holds ("Town of
@@ -688,9 +689,21 @@ impl TextSearcher {
         let tied = keyed[..shown]
             .windows(2)
             .any(|pair| !pair[0].0.unnamed && order_key(pair[0].0) == order_key(pair[1].0));
-        let country_only =
-            order.parts.len() == 2 && order.parts[1 - sought].label == Label::Country;
-        if tied && order.parts.len() > 1 && !country_only && depth == Depth::Query {
+        // A country can distinguish a locality from a namesake region.
+        // With a namesake street, keep the usual bare-name tie-break.
+        let locality_in_country = order.parts.len() == 2
+            && order.parts[1 - sought].label == Label::Country
+            && matches!(
+                keyed.as_slice(),
+                [(first, _, locality), (second, _, area), ..]
+                    if order_key(*first) == order_key(*second)
+                        && locality.record.layer == Layer::Locality.as_str()
+                        && matches!(
+                            Layer::parse(&area.record.layer),
+                            Some(Layer::District | Layer::Region)
+                        )
+            );
+        if tied && order.parts.len() > 1 && !locality_in_country && depth == Depth::Query {
             let bare = self.search_at(
                 &TextSearchOptions {
                     query: order.parts[sought].key.clone(),
@@ -1284,17 +1297,17 @@ mod tests {
         answers("Hopkinton, Wharf", "osm:relation:12");
     }
 
+    #[test]
+    fn a_comma_in_a_locality_name_stays_inside_it() {
+        answers("Old Mill, Plainfield, US", "osm:node:905");
+        answers("Plainfield, US", "osm:node:906");
+    }
+
     /// A field the parser labels in pieces is one name when it names
     /// something whole. One that names nothing whole is read as its pieces
     /// ("Lincoln RI", where "ri" types a street as "rise"); this fixture's
     /// parser reads such a field as one street, so the Rhode Island Pack's
     /// "<town> RI" sweep guards that half.
-    #[test]
-    fn a_localitys_written_comma_does_not_end_its_name() {
-        answers("Old Mill, Plainfield, US", "osm:node:905");
-        answers("Plainfield, US", "osm:node:906");
-    }
-
     #[test]
     fn a_field_naming_something_whole_is_one_name() {
         answers("Providence County, RI", "osm:relation:5");
