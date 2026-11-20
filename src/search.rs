@@ -254,6 +254,10 @@ pub const SEARCH_BUDGET: Duration = Duration::from_millis(300);
 #[cfg(test)]
 pub const SEARCH_BUDGET: Duration = Duration::from_secs(3_600);
 pub const MAX_AUTOCOMPLETE_LIMIT: usize = 20;
+/// Postcode records read to find one of a country: a code is held by a
+/// record of each country that states it, and once with no country.
+const POSTCODE_RECORDS_READ: usize = 16;
+
 const MIN_AUTOCOMPLETE_QUERY_CHARS: usize = 3;
 const AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS: u32 = 1_024;
 /// Planet Pack holds 33,000 words of "mar" (7 ms to read) and 606,000 of "s"
@@ -5646,6 +5650,28 @@ impl TextSearcher {
             .into_iter()
             .map(|(_, doc)| Ok(self.document_records(&searcher, doc)?.0))
             .collect()
+    }
+
+    /// The id of the record the Pack derived for `postcode` in `country`
+    /// (alpha-2), `None` when it derived none: a postcode no address of the
+    /// Pack states has no record.
+    pub fn postcode_record_id(
+        &self,
+        postcode: &str,
+        country: Option<&str>,
+    ) -> Result<Option<String>> {
+        // The index keeps a postcode as its search key, spaces and all.
+        let Some(term) = search_key(postcode) else {
+            return Ok(None);
+        };
+        let wanted = labels::derived_postcode_id(country.and_then(CountryCode::parse), postcode);
+        for id in self.postcode_records(&[term], POSTCODE_RECORDS_READ)? {
+            let summary = self.pack.record_summary(id)?;
+            if summary.id == wanted {
+                return Ok(Some(summary.id));
+            }
+        }
+        Ok(None)
     }
 
     /// One word must match the record itself, else "ballard" suggests every

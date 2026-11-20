@@ -580,6 +580,24 @@ impl Context<Area> {
         }
     }
 
+    /// The layers that name a record. A layer filled from an address part
+    /// the source states names none, so it has no id to give.
+    fn recorded(self) -> Self {
+        let kept = |layer: Option<Area>| layer.filter(|area| area.id.is_some());
+        Self {
+            address: kept(self.address),
+            secondary_address: kept(self.secondary_address),
+            street: kept(self.street),
+            neighborhood: kept(self.neighborhood),
+            postcode: kept(self.postcode),
+            locality: kept(self.locality),
+            place: kept(self.place),
+            district: kept(self.district),
+            region: kept(self.region),
+            country: kept(self.country),
+        }
+    }
+
     fn map<L>(self, layer: impl Fn(Area) -> L) -> Context<L> {
         Context {
             address: self.address.map(&layer),
@@ -765,6 +783,12 @@ fn context(common: &Common, mapbox_id: &str, is_address: bool) -> Context<Area> 
             street_name: parts.street.clone(),
             ..own()
         });
+        // An address that states a unit is the flat, so it is the unit's
+        // record too.
+        context.secondary_address = parts
+            .unit
+            .as_deref()
+            .map(|unit| Area::named(Some(mapbox_id.to_string()), unit));
         context.street = parts
             .street
             .as_deref()

@@ -157,6 +157,9 @@ pub(super) struct Suggestions {
 struct Suggestion {
     #[serde(flatten)]
     described: Described,
+    /// The language the suggestion is named in, which every suggestion
+    /// states.
+    language: String,
     /// Metres from `proximity`.
     #[serde(skip_serializing_if = "Option::is_none")]
     distance: Option<f64>,
@@ -382,9 +385,13 @@ pub(super) async fn suggest(
         .iter()
         .filter(|feature| admitted(types.as_ref(), &feature.properties.common))
         .map(|feature| {
-            let (described, placed, poi) = described(Found::forward(feature));
+            let (mut described, placed, poi) = described(Found::forward(feature));
+            // Every suggestion states where it lies, empty for a place og
+            // finds in no area.
+            described.place_formatted.get_or_insert_default();
             Suggestion {
                 described,
+                language: language(&params).to_string(),
                 distance: placed.distance,
                 poi,
             }
