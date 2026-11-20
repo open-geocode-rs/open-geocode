@@ -206,6 +206,13 @@ pub struct Common {
     /// House number and street for an address (`12 King Street West`), or
     /// the name of a street, area or POI.
     pub name: String,
+    /// ISO code of a result that is an area: on a country its ISO 3166-1
+    /// alpha-2 code, on an area below it its ISO 3166-2 code, as
+    /// `context` gives them. Absent on any other result, and on an area
+    /// the source data gives no code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "MC")]
+    pub code: Option<String>,
     /// One-line display label: `name` followed by its location. With
     /// `lang`, each part that names the result or one of its areas is that
     /// name in the language asked, as `name` and `context` are.
@@ -789,6 +796,14 @@ impl<'a> Contexts<'a> {
         })
     }
 
+    /// An area's ISO code: a country's own, else its subdivision code.
+    fn code(&self, record_id: RecordId) -> Option<String> {
+        self.pack
+            .country_code(record_id)
+            .map(|code| code.as_str().to_string())
+            .or_else(|| self.pack.subdivision_code(record_id).map(str::to_string))
+    }
+
     fn area(&mut self, record_id: Option<RecordId>) -> Result<Option<ContextArea>> {
         let Some(record_id) = record_id else {
             return Ok(None);
@@ -802,11 +817,7 @@ impl<'a> Contexts<'a> {
             .map(|record| ContextArea {
                 id: record.id,
                 name: record.name,
-                code: self
-                    .pack
-                    .country_code(record_id)
-                    .map(|code| code.as_str().to_string())
-                    .or_else(|| self.pack.subdivision_code(record_id).map(str::to_string)),
+                code: self.code(record_id),
                 translations: None,
                 record_id,
                 local_name: None,
@@ -1276,6 +1287,10 @@ fn common(
     let context = contexts.of(record_id)?;
     Ok(Common {
         id: summary.id,
+        code: layer
+            .is_context()
+            .then(|| contexts.code(record_id))
+            .flatten(),
         layer,
         accuracy,
         name: summary.name,

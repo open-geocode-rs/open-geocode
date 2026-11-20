@@ -16,6 +16,7 @@
           -52.3231,
           83.3362
         ],
+        "code": "CA",
         "id": "osm:relation:1",
         "label": "Toronto, Ontario, Canada",
         "layer": "country",
@@ -69,6 +70,7 @@
           -74.3199,
           56.8593
         ],
+        "code": "CA-ON",
         "id": "osm:relation:2",
         "label": "Ontario",
         "layer": "region",
