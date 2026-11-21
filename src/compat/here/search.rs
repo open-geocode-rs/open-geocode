@@ -11,9 +11,10 @@ use axum::{
 use serde::Serialize;
 
 use crate::{
-    api::{ForwardCollection, ReverseCollection},
+    api::{ForwardCollection, PartMatch, ReverseCollection},
     compat::{Args, decode_id, native},
     http::bounds::MAX_SEARCH_LIMIT,
+    record::Layer,
     runtime::AppState,
     util::fold::search_key,
 };
@@ -280,6 +281,11 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
         // all it may give.
         limit: if types.is_some() {
             MAX_SEARCH_LIMIT
+        } else if params
+            .get("q")
+            .is_some_and(|text| text.bytes().any(|c| c.is_ascii_digit()))
+        {
+            limit.max(20)
         } else {
             limit
         },
@@ -287,16 +293,68 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
     let Some(fields) = request.og_fields() else {
         return Ok(Items { items: Vec::new() });
     };
-    let collection = native::geocode(state, args(fields).maybe("lang", og_lang(&params)))
+    let mut collection = native::geocode(state, args(fields).maybe("lang", og_lang(&params)))
         .await
         .map_err(Gs7Error::of)?;
+    prefer_postcode_correction(&mut collection);
     let items = features(&collection)
         .iter()
-        .map(|feature| item(feature).distance_from(at))
+        .zip(&collection.features)
+        .map(|(feature, native)| {
+            item(feature)
+                .with_geocoded_label(&native.properties.common)
+                .distance_from(at)
+        })
         .filter(|item| item.is_any_of(types.as_deref()))
         .take(limit)
         .collect();
     Ok(Items { items })
+}
+
+// A uniquely identified house can correct the stated postcode when the
+// alternative is falling back to its street.
+fn prefer_postcode_correction(collection: &mut ForwardCollection) {
+    if !collection.features.first().is_some_and(|first| {
+        first.properties.common.layer == Layer::Street
+            && first.properties.matched.as_ref().is_some_and(|matched| {
+                matched.housenumber == Some(PartMatch::Unmatched)
+                    && matched.street == Some(PartMatch::Matched)
+                    && matched.locality == Some(PartMatch::Matched)
+                    && matched.country == Some(PartMatch::Matched)
+                    && matched.postcode == Some(PartMatch::Unmatched)
+            })
+    }) {
+        return;
+    }
+    let mut houses = collection
+        .features
+        .iter()
+        .enumerate()
+        .filter(|(_, feature)| {
+            let properties = &feature.properties;
+            properties.common.layer == Layer::Address
+                && properties.common.address.postcode.is_some()
+                && properties.matched.as_ref().is_some_and(|matched| {
+                    matched.housenumber == Some(PartMatch::Matched)
+                        && matched.street == Some(PartMatch::Matched)
+                        && matched.locality == Some(PartMatch::Matched)
+                        && matched.country == Some(PartMatch::Matched)
+                        && [matched.region, matched.unit]
+                            .into_iter()
+                            .all(|part| part != Some(PartMatch::Unmatched))
+                })
+        });
+    if let Some((index, house)) = houses.next()
+        && houses.next().is_none()
+        && house
+            .properties
+            .matched
+            .as_ref()
+            .is_some_and(|matched| matched.postcode == Some(PartMatch::Unmatched))
+    {
+        let house = collection.features.remove(index);
+        collection.features[0] = house;
+    }
 }
 
 /// A reverse geocode as HERE asks it.

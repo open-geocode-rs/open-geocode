@@ -8,6 +8,7 @@ use crate::{
     iso,
     record::{Contact, Layer},
     spatial_index::haversine_m,
+    util::fold::search_key,
 };
 
 use super::{
@@ -610,6 +611,34 @@ fn address(properties: &Properties) -> ItemAddress {
 }
 
 impl Item {
+    /// Render the city in a geocoded house's label when the source used
+    /// the enclosing district for its locality. The original label stays
+    /// in the lookup reference.
+    pub(super) fn with_geocoded_label(mut self, common: &api::Common) -> Self {
+        let (Some(city), Some(district), Some(locality)) = (
+            &common.context.locality,
+            &common.context.sublocality,
+            &common.address.locality,
+        ) else {
+            return self;
+        };
+        if self.result_type == "houseNumber"
+            && city.id != district.id
+            && search_key(locality) == search_key(&district.name)
+            && search_key(locality) != search_key(&city.name)
+        {
+            let mut address = common.address.clone();
+            address.locality = Some(city.name.clone());
+            let lines =
+                crate::address_lines::address_lines(common.layer, &address, &common.context);
+            if let [_, _, ..] = lines.as_slice() {
+                self.title = lines.join(", ");
+                self.address.label = Some(self.title.clone());
+            }
+        }
+        self
+    }
+
     /// The crow-flies distance from the search center to the result, in
     /// whole meters, as HERE counts it.
     pub(super) fn distance_from(mut self, center: Option<LatLng>) -> Self {
