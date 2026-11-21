@@ -68,16 +68,6 @@ impl Viewport {
             ]))
         })
     }
-
-    pub(super) fn contains(&self, point: LatLng) -> bool {
-        let in_lat = (self.low.latitude..=self.high.latitude).contains(&point.latitude);
-        let in_lon = if self.low.longitude <= self.high.longitude {
-            (self.low.longitude..=self.high.longitude).contains(&point.longitude)
-        } else {
-            point.longitude >= self.low.longitude || point.longitude <= self.high.longitude
-        };
-        in_lat && in_lon
-    }
 }
 
 /// Google's `timeZone`. og knows the IANA name, not which release of the

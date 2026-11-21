@@ -19,6 +19,7 @@ pub(crate) mod fieldmask;
 pub(crate) mod google;
 pub(crate) mod here;
 pub(crate) mod hours;
+pub(crate) mod house;
 pub(crate) mod mapbox;
 pub(crate) mod precisely;
 pub(crate) mod usps;
@@ -242,13 +243,19 @@ impl Args {
 pub(crate) mod native {
     use super::*;
 
+    // A vendor answers a house once, og each record of it it holds, so the
+    // answers that can hold a house keep one copy of it
+    // (see [`house::one_per_house`]).
+
     pub(crate) async fn geocode(
         state: &AppState,
         args: Args,
     ) -> Result<ForwardCollection, Problem> {
-        runtime::geocode(State(state.clone()), args.query())
-            .await
-            .map(|json| json.0)
+        let mut found = runtime::geocode(State(state.clone()), args.query())
+            .await?
+            .0;
+        house::one_per_house(&mut found.features);
+        Ok(found)
     }
 
     pub(crate) async fn places(state: &AppState, args: Args) -> Result<ForwardCollection, Problem> {
@@ -261,9 +268,11 @@ pub(crate) mod native {
         state: &AppState,
         args: Args,
     ) -> Result<ForwardCollection, Problem> {
-        runtime::autocomplete(State(state.clone()), args.query())
-            .await
-            .map(|json| json.0)
+        let mut found = runtime::autocomplete(State(state.clone()), args.query())
+            .await?
+            .0;
+        house::one_per_house(&mut found.features);
+        Ok(found)
     }
 
     /// Free text answered with addresses, areas and places together, as a
@@ -335,9 +344,11 @@ pub(crate) mod native {
         state: &AppState,
         args: Args,
     ) -> Result<ReverseCollection, Problem> {
-        runtime::reverse(State(state.clone()), args.query())
-            .await
-            .map(|json| json.0)
+        let mut found = runtime::reverse(State(state.clone()), args.query())
+            .await?
+            .0;
+        house::one_per_house(&mut found.features);
+        Ok(found)
     }
 
     /// The places of `categories`, as the catalog writes each one.

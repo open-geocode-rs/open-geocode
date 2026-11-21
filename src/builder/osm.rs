@@ -2701,7 +2701,7 @@ const REPEATED_HOUSE_RADIUS_M: f64 = 100.0;
 /// numbers start over). A large rural parcel's centroid lies a few hundred
 /// metres from its house; a row geocoded to the wrong end of a street or to
 /// another town does not, and is kept as the house it says it is.
-const DISPUTED_HOUSE_RADIUS_M: f64 = 1_000.0;
+pub(crate) const DISPUTED_HOUSE_RADIUS_M: f64 = 1_000.0;
 
 /// What finding repeated houses decided about an address: dropped, or kept
 /// and disputed. Sorted after its position in the address book.

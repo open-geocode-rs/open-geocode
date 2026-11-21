@@ -1999,6 +1999,23 @@ fn us_fixture() -> Fixture {
             context.clone(),
         )
         .expect("address");
+    // The same house mapped again as its building's outline, whose middle
+    // lies 115 m off.
+    writer
+        .write(
+            &AddressRecord {
+                access: Vec::new(),
+                disputed: false,
+                street_postcodes: Vec::new(),
+                address: address.clone(),
+                geometry: point_geometry(lon - 0.0013, lat),
+                location_precision: LocationPrecision::Centroid,
+                source: SourceProvenance::osm(ObjectType::Way, 13),
+            }
+            .into(),
+            context.clone(),
+        )
+        .expect("outline of the same house");
     // A house mapped as its building's outline.
     writer
         .write(
@@ -2096,6 +2113,72 @@ async fn a_us_address_is_written_as_google_writes_it_in_its_town() {
         "{}",
         details.body
     );
+}
+
+/// A house og holds twice, as its point and its building's outline, is one
+/// result for every vendor, at its point.
+#[tokio::test]
+async fn a_house_held_twice_is_answered_once() {
+    let fixture = us_fixture();
+    let router = &fixture.router;
+    let query = "1600%20Amphitheatre%20Parkway,%20Mountain%20View,%20CA";
+    let google = get(
+        router,
+        &format!("/compat/google/v4/geocode/address/{query}"),
+    )
+    .await;
+    let results = google.body["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1, "{}", google.body);
+    assert_eq!(results[0]["granularity"], "ROOFTOP");
+    assert_eq!(
+        results[0]["location"],
+        json!({"latitude": 37.4218, "longitude": -122.0846})
+    );
+
+    let here = get(router, &format!("/compat/here/v1/geocode?q={query}")).await;
+    assert_eq!(
+        here.body["items"].as_array().expect("items").len(),
+        1,
+        "{}",
+        here.body
+    );
+    let mapbox = get(
+        router,
+        &format!("/compat/mapbox/search/geocode/v6/forward?q={query}"),
+    )
+    .await;
+    let features = mapbox.body["features"].as_array().expect("features");
+    assert_eq!(features.len(), 1, "{}", mapbox.body);
+    let precisely = post(
+        router,
+        "/compat/precisely/v1/geocode",
+        json!({"preferences": {"maxResults": 5},
+               "addresses": [{"addressLines": ["1600 Amphitheatre Parkway, Mountain View, CA"],
+                              "country": "US"}]}),
+    )
+    .await;
+    let candidates = precisely.body["responses"][0]["results"]
+        .as_array()
+        .expect("results");
+    assert_eq!(candidates.len(), 1, "{}", precisely.body);
+
+    let reverse = get(
+        router,
+        "/compat/google/v4/geocode/location/37.4219,-122.0849",
+    )
+    .await;
+    let houses = reverse.body["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .filter(|result| result["types"] == json!(["street_address"]))
+        .filter(|result| {
+            result["formattedAddress"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("1600 "))
+        })
+        .count();
+    assert_eq!(houses, 1, "{}", reverse.body);
 }
 
 /// Google answers the house nearest a point on its lot or the street before
