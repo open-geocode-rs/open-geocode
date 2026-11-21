@@ -194,11 +194,13 @@ fn close_in(
     (!area.0.is_empty()).then_some(area)
 }
 
-/// The open chains closed into rings along the outline they meet: from
-/// each chain's last end forward along its ring to the next end of any
-/// chain there, then along that chain, until the ring of chains closes.
-/// Each stretch of outline between two ends serves at most one ring, so the
-/// rings never overlap, however the chains lie.
+/// The open chains closed into rings along the outline they meet. On each
+/// ring of the outline their ends lie in some order; the stretches between
+/// them alternate, and every other one, from the first end to the second,
+/// the third to the fourth and so on, joins the chains into rings that
+/// never cross, whichever way each chain runs. The other stretches would
+/// make the rest of the cut, which [`close_in`] reaches by adding the
+/// outline when the anchor says so.
 fn closures(
     outlines: &[Vec<Coord<f64>>],
     open: &[Vec<Vertex>],
@@ -216,13 +218,22 @@ fn closures(
             .cmp(&(b.ring, b.segment))
             .then(a.along.total_cmp(&b.along))
     });
-    let next = |at: OnOutline| {
+    // Each end's place among the ends of its own ring.
+    let mut place = vec![[0usize; 2]; open.len()];
+    for (at, (_, chain, first)) in order.iter().enumerate() {
+        place[*chain][usize::from(!first)] = at;
+    }
+    let ring_start = |at: usize| {
+        let ring = order[at].0.ring;
         order
             .iter()
-            .filter(|(on, ..)| on.ring == at.ring)
-            .find(|(on, ..)| (on.segment, on.along) > (at.segment, at.along))
-            .or_else(|| order.iter().find(|(on, ..)| on.ring == at.ring))
-            .copied()
+            .position(|(on, ..)| on.ring == ring)
+            .unwrap_or(0)
+    };
+    // The end the stretch from end `at` leads to.
+    let partner = |at: usize| match (at - ring_start(at)) % 2 {
+        0 => at + 1,
+        _ => at - 1,
     };
     let mut used = vec![false; open.len()];
     let mut contours = Vec::new();
@@ -235,21 +246,23 @@ fn closures(
         loop {
             used[chain] = true;
             let points = open[chain].iter().map(coord);
-            let leave = match forward {
-                true => {
-                    contour.extend(points);
-                    ends[chain].1
-                }
+            match forward {
+                true => contour.extend(points),
+                false => contour.extend(points.rev()),
+            }
+            let leave = place[chain][usize::from(forward)];
+            let arrive = partner(leave);
+            let (from, to) = (order[leave].0, order[arrive].0);
+            match arrive > leave {
+                true => contour.extend(walk(&outlines[from.ring], from, to)),
                 false => {
-                    contour.extend(points.rev());
-                    ends[chain].0
+                    let mut back = walk(&outlines[from.ring], to, from);
+                    back.reverse();
+                    contour.extend(back);
                 }
-            };
-            let Some((arrive, then, first)) = next(leave) else {
-                break;
-            };
-            contour.extend(walk(&outlines[leave.ring], leave, arrive));
-            if used[then] {
+            }
+            let (_, then, first) = order[arrive];
+            if then == start || used[then] {
                 break;
             }
             (chain, forward) = (then, first);
@@ -615,5 +628,29 @@ mod tests {
         assert!(!west.contains(&Point::new(25.0, 25.0)));
         let one = Cut::of_bounds([[0.0, 0.0, 30.0, 30.0]]);
         assert!(one.close(&[], &[chain], [1.0, 5.0]).is_none());
+    }
+
+    /// Two outlines the cut broke that run the same way, one inside the
+    /// other: the area is the label's corner and the far corner, not the
+    /// strip between them, whichever way and in whichever order the chains
+    /// come.
+    #[test]
+    fn outlines_that_run_alike_close_into_alternate_strips() {
+        let cut = Cut::of_bounds([[0.0, 0.0, 10.0, 10.0]]);
+        let a = line(&[(12.0, 2.0), (2.0, 2.0), (2.0, 12.0)], 1);
+        let b = line(&[(12.0, 4.0), (4.0, 4.0), (4.0, 12.0)], 4);
+        let reversed = |chain: &Vec<Vertex>| chain.iter().rev().copied().collect::<Vec<_>>();
+        for chains in [
+            vec![a.clone(), b.clone()],
+            vec![b.clone(), a.clone()],
+            vec![reversed(&a), b.clone()],
+            vec![a.clone(), reversed(&b)],
+            vec![reversed(&b), reversed(&a)],
+        ] {
+            let area = cut.close(&[], &chains, [1.0, 1.0]).expect("area");
+            assert!(area.contains(&Point::new(1.0, 1.0)));
+            assert!(area.contains(&Point::new(8.0, 8.0)), "{chains:?}");
+            assert!(!area.contains(&Point::new(3.0, 3.0)), "{chains:?}");
+        }
     }
 }
