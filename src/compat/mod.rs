@@ -406,10 +406,11 @@ pub(crate) fn without_kind(name: &str) -> String {
 /// vendor answers the address it found, not the near misses og also holds
 /// ("Back Bay, Boston" is the district, not Back Bay Road in Newark). A
 /// first result that leaves a stated part unmatched is no sure match, and
-/// every result stays. Of the areas kept, when one is named as `asked`, one
-/// named otherwise matched by another of its names only, and goes too: a
-/// county labelled Providence is not the town Providence asked for.
-pub(crate) fn best_matches(features: &mut Vec<crate::api::ForwardFeature>, asked: Option<&str>) {
+/// every result stays. Of the areas kept, one that holds another kept area
+/// goes too, so the narrowest of nested matches answers. Paris the city
+/// answers, not the department of the same name that holds it, while Köln
+/// and the Cologne in Italy both stay.
+pub(crate) fn best_matches(features: &mut Vec<crate::api::ForwardFeature>) {
     use crate::api::{PartMatch, QueryMatch};
     fn parts(found: QueryMatch) -> [Option<PartMatch>; 7] {
         [
@@ -448,20 +449,16 @@ pub(crate) fn best_matches(features: &mut Vec<crate::api::ForwardFeature>, asked
                 .all(|(part, best)| best.is_none() || rank(*part) <= rank(*best))
         })
     });
-    let key = |text: &str| crate::util::fold::search_key(text);
-    let Some(asked) = asked.and_then(key) else {
-        return;
-    };
-    let area = |feature: &crate::api::ForwardFeature| feature.properties.common.layer.is_context();
-    let named = |feature: &crate::api::ForwardFeature| {
-        key(&feature.properties.common.name).as_deref() == Some(asked.as_str())
-    };
-    if features
+    let held = features
         .iter()
-        .any(|feature| area(feature) && named(feature))
-    {
-        features.retain(|feature| !area(feature) || named(feature));
-    }
+        .filter(|feature| feature.properties.common.layer.is_context())
+        .flat_map(|feature| feature.properties.common.context.areas())
+        .map(|area| area.record_id)
+        .collect::<std::collections::HashSet<_>>();
+    features.retain(|feature| {
+        let common = &feature.properties.common;
+        !(common.layer.is_context() && common.record_id.is_some_and(|id| held.contains(&id)))
+    });
 }
 
 /// og's native lookups, called as their routes would be.
@@ -1463,6 +1460,103 @@ mod tests {
                 "{answer}"
             );
         }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A town inside a county of the same name answers alone, as the
+    /// narrowest of nested matches, while two towns far apart that a name
+    /// matches whole both answer, one by another of its names.
+    #[tokio::test]
+    async fn the_narrowest_of_nested_areas_answers_and_unrelated_ones_stay() {
+        use crate::{
+            pack::{RecordContext, Writer},
+            record::{
+                ObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance, point_geometry,
+            },
+            runtime::router_tests::{state_for, temp_path},
+        };
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let pack = temp_path("vendor-nested-areas");
+        let _ = std::fs::remove_dir_all(&pack);
+        let mut writer = Writer::create(&pack).expect("writer");
+        let mut area = |layer,
+                        name: &str,
+                        alt: &[&str],
+                        id: i64,
+                        at: [f64; 2],
+                        within: &[(PlaceLayer, u64)]| {
+            let record = Record::Place(
+                layer,
+                PlaceRecord {
+                    alt_names: alt.iter().map(|name| name.to_string()).collect(),
+                    name: name.to_string(),
+                    place_type: "admin_level:8".to_string(),
+                    geometry: point_geometry(at[0], at[1]),
+                    source: SourceProvenance::osm(ObjectType::Relation, id),
+                    prominence: Default::default(),
+                    wikidata: None,
+                },
+            );
+            let context = (!within.is_empty()).then(|| RecordContext {
+                admin_context: crate::context::AdminContextTuple::from_tiers(
+                    within.iter().copied(),
+                ),
+                flags: 0,
+                zone: None,
+            });
+            writer.write(&record, context).expect("area")
+        };
+        let county = area(
+            PlaceLayer::District,
+            "Providence County",
+            &["Providence"],
+            1,
+            [-71.5, 41.8],
+            &[],
+        );
+        area(
+            PlaceLayer::Locality,
+            "Providence",
+            &[],
+            2,
+            [-71.41, 41.82],
+            &[(PlaceLayer::District, county)],
+        );
+        area(
+            PlaceLayer::Locality,
+            "Köln",
+            &["Cologne"],
+            3,
+            [6.96, 50.94],
+            &[],
+        );
+        area(PlaceLayer::Locality, "Cologne", &[], 4, [10.4, 45.6], &[]);
+        writer.finish().expect("finish");
+        let router = runtime::build_router(state_for(&pack, true), None, None);
+        let titles = |q: &str| {
+            let router = router.clone();
+            let request = axum::http::Request::get(format!("/compat/here/v1/geocode?q={q}"))
+                .body(Body::empty())
+                .expect("request");
+            async move {
+                let reply = router.oneshot(request).await.expect("reply");
+                let bytes = axum::body::to_bytes(reply.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                let body = serde_json::from_slice::<Value>(&bytes).expect("json");
+                let mut titles = body["items"]
+                    .as_array()
+                    .expect("items")
+                    .iter()
+                    .map(|item| item["title"].as_str().expect("title").to_string())
+                    .collect::<Vec<_>>();
+                titles.sort();
+                titles
+            }
+        };
+        assert_eq!(titles("Providence").await, ["Providence"]);
+        assert_eq!(titles("Cologne").await, ["Cologne", "Köln"]);
         let _ = std::fs::remove_dir_all(&pack);
     }
 
