@@ -4,14 +4,14 @@
 
 use axum::{
     body::Bytes,
-    extract::{RawQuery, State},
+    extract::{OriginalUri, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::Response,
 };
 use serde::Serialize;
 
 use crate::{
-    api::{ForwardCollection, PartMatch, ReverseCollection},
+    api::{ForwardCollection, Highlight, PartMatch, ReverseCollection},
     compat::{Args, decode_id, native},
     http::bounds::MAX_SEARCH_LIMIT,
     record::Layer,
@@ -943,6 +943,8 @@ fn along(items: Vec<Item>, corridor: Option<&Corridor>) -> Vec<Item> {
 pub(super) async fn autosuggest(
     State(state): State<AppState>,
     Rid(request_id): Rid,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
     RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Response {
@@ -972,20 +974,93 @@ pub(super) async fn autosuggest(
         let collection = native::autocomplete(&state, args(fields).maybe("lang", og_lang(&params)))
             .await
             .map_err(Gs7Error::of)?;
-        let items = features(&collection)
-            .iter()
-            .map(|feature| {
-                item(feature)
-                    .without_scoring()
-                    .with_details(feature)
-                    .with_highlights(feature)
-                    .distance_from(near.center)
-            })
-            .filter(|item| near.admits(item))
-            .collect();
-        Ok(page(along(items, corridor.as_ref()), offset, limit, true))
+        let mut items = query_items(&state, &headers, &uri, &params, q, &collection);
+        items.extend(along(
+            features(&collection)
+                .iter()
+                .map(|feature| {
+                    item(feature)
+                        .without_scoring()
+                        .with_details(feature)
+                        .with_highlights(feature)
+                        .distance_from(near.center)
+                })
+                .filter(|item| near.admits(item))
+                .collect(),
+            corridor.as_ref(),
+        ));
+        Ok(page(items, offset, limit, true))
     };
     respond(&request_id, answer.await)
+}
+
+/// The searches HERE offers ahead of the places: a `categoryQuery` for each
+/// category whose name the typed word begins, and a `chainQuery` for a chain
+/// the query names whole. Their titles are og's English names, so they are
+/// offered in English only. Each runs as og's own `/discover`.
+fn query_items(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    params: &Params,
+    q: &str,
+    collection: &ForwardCollection,
+) -> Vec<Item> {
+    let english = og_lang(params).is_none_or(|lang| lang == "en" || lang.starts_with("en-"));
+    if !english {
+        return Vec::new();
+    }
+    let path = uri.path();
+    let prefix = path.find("/v1/").map_or("", |at| &path[..at]);
+    let href = |title: &str| {
+        let mut query = vec![("q", title.to_string())];
+        for name in ["at", "in", "limit", "lang"] {
+            if let Some(value) = params.get(name) {
+                query.push((name, value.to_string()));
+            }
+        }
+        format!(
+            "{}{prefix}/v1/discover?{}",
+            state.origin(headers),
+            serde_urlencoded::to_string(&query).unwrap_or_default()
+        )
+    };
+    let mut items = super::category::begun_by(q)
+        .into_iter()
+        .map(|(id, name, start, end)| {
+            Item::query(
+                "categoryQuery",
+                name.to_string(),
+                crate::compat::encode_parts(&format!("here:category:{id}"), None, name),
+                href(name),
+                vec![Highlight { start, end }],
+            )
+        })
+        .collect::<Vec<_>>();
+    let typed = search_key(q);
+    let mut chains = Vec::new();
+    for feature in &collection.features {
+        if let Some(brand) = &feature.properties.common.brand
+            && search_key(&brand.name) == typed
+            && !chains.contains(&brand.name)
+        {
+            chains.push(brand.name.clone());
+        }
+    }
+    for name in chains {
+        let length = name.chars().count();
+        items.push(Item::query(
+            "chainQuery",
+            name.clone(),
+            crate::compat::encode_parts(&format!("here:chain:{name}"), None, &name),
+            href(&name),
+            vec![Highlight {
+                start: 0,
+                end: length,
+            }],
+        ));
+    }
+    items
 }
 
 pub(super) async fn autocomplete(

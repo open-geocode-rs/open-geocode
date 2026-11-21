@@ -221,6 +221,10 @@ pub(super) struct Item {
     pub(super) locality_type: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) administrative_area_type: Option<&'static str>,
+    /// A query item's search, a `/discover` URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) href: Option<String>,
+    #[serde(skip_serializing_if = "ItemAddress::is_empty")]
     pub(super) address: ItemAddress,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) position: Option<Position>,
@@ -323,6 +327,12 @@ pub(super) struct ItemAddress {
     pub(super) unit: Option<String>,
 }
 
+impl ItemAddress {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub(super) struct Position {
     pub(super) lat: f64,
@@ -343,7 +353,9 @@ pub(super) struct MapView {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(super) struct Highlights {
     title: Vec<Highlight>,
-    address: LabelHighlights,
+    /// A query item has a title and no address, so it marks none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<LabelHighlights>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -524,6 +536,7 @@ pub(super) fn item(feature: &Feature) -> Item {
         house_number_type,
         locality_type,
         administrative_area_type,
+        href: None,
         address: address(properties),
         position: Some(Position { lat, lng: lon }),
         access: properties
@@ -622,10 +635,10 @@ fn highlights(properties: &Properties) -> Highlights {
     };
     Highlights {
         title: in_title,
-        address: LabelHighlights {
+        address: Some(LabelHighlights {
             label: marks,
             fields: Default::default(),
-        },
+        }),
     }
 }
 
@@ -755,6 +768,41 @@ impl Item {
     }
 
     /// Where the typed text lies, which only suggestions carry.
+    /// A query item, a search HERE offers to run: `categoryQuery` or
+    /// `chainQuery`, with its title, the `/discover` URL that runs it and
+    /// where the typed text lies in its title.
+    pub(super) fn query(
+        result_type: &'static str,
+        title: String,
+        id: String,
+        href: String,
+        marks: Vec<Highlight>,
+    ) -> Self {
+        Self {
+            title,
+            id,
+            result_type,
+            house_number_type: None,
+            locality_type: None,
+            administrative_area_type: None,
+            href: Some(href),
+            address: ItemAddress::default(),
+            position: None,
+            access: Vec::new(),
+            distance: None,
+            map_view: None,
+            categories: Vec::new(),
+            contacts: Vec::new(),
+            opening_hours: Vec::new(),
+            highlights: Some(Highlights {
+                title: marks,
+                address: None,
+            }),
+            scoring: None,
+            parsing: None,
+        }
+    }
+
     pub(super) fn with_highlights(mut self, feature: &Feature) -> Self {
         let mut found = highlights(&feature.properties);
         let address = &self.address;
@@ -770,12 +818,13 @@ impl Item {
                 ("postalCode", address.postal_code.as_deref()),
                 ("houseNumber", address.house_number.as_deref()),
             ];
-            for (name, value) in fields {
-                let marks = value.map_or_else(Vec::new, |value| {
-                    field_marks(label, &found.address.label, value)
-                });
-                if !marks.is_empty() {
-                    found.address.fields.insert(name, marks);
+            if let Some(marked) = found.address.as_mut() {
+                for (name, value) in fields {
+                    let marks = value
+                        .map_or_else(Vec::new, |value| field_marks(label, &marked.label, value));
+                    if !marks.is_empty() {
+                        marked.fields.insert(name, marks);
+                    }
                 }
             }
         }
@@ -903,7 +952,10 @@ mod tests {
         assert_eq!(found.title, "Heinestraße 42, 1020 Wien, Austria");
         assert_eq!(found.address.label.as_deref(), Some(found.title.as_str()));
         let marks = highlights(&vienna.properties);
-        assert_eq!(marks.address.label, [Highlight { start: 0, end: 11 }]);
+        assert_eq!(
+            marks.address.as_ref().map(|address| address.label.clone()),
+            Some(vec![Highlight { start: 0, end: 11 }])
+        );
         assert_eq!(marks.title, [Highlight { start: 0, end: 11 }]);
 
         let boston = feature(&serde_json::json!({

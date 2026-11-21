@@ -236,6 +236,31 @@ pub(super) fn of_place(category: &str) -> Vec<ItemCategory> {
         .collect()
 }
 
+/// The categories a typed word begins a word of the name of, as HERE
+/// offers them as searches, each with its id, its name and where the typed
+/// word lies in the name, in characters. A word as short as `re` begins
+/// many names and means none of them, so a shorter one offers none.
+pub(super) fn begun_by(typed: &str) -> Vec<(&'static str, &'static str, usize, usize)> {
+    let typed = typed.trim().to_lowercase();
+    let length = typed.chars().count();
+    if length < crate::search::MIN_TYPO_CHARS || typed.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for listed in CATEGORIES {
+        let mut at = 0;
+        for word in listed.name.split(|c: char| c.is_whitespace() || c == '-') {
+            if word.to_lowercase().starts_with(&typed) {
+                found.push((listed.id, listed.name, at, at + length));
+                break;
+            }
+            at += word.chars().count() + 1;
+        }
+    }
+    found.dedup_by_key(|(_, name, _, _)| *name);
+    found
+}
+
 /// Whether `asked`, an id of any level, names the category `id`. A level 3
 /// id ending in `0000` is the general kind of its level 2, so it names every
 /// kind under that.
@@ -347,6 +372,23 @@ mod tests {
                 assert!(categories::is_known(category), "{} {category}", listed.id);
             }
         }
+    }
+
+    #[test]
+    fn a_typed_word_offers_the_categories_whose_names_it_begins() {
+        assert_eq!(begun_by("rest"), [("100-1000-0000", "Restaurant", 0, 4)]);
+        let stores = begun_by("Store");
+        assert!(
+            stores.contains(&("600-6600-0080", "Furniture Store", 10, 15)),
+            "{stores:?}"
+        );
+        assert!(
+            stores
+                .iter()
+                .all(|(_, name, from, to)| &name[*from..*to] == "Store")
+        );
+        assert!(begun_by("res").is_empty(), "too short to mean a kind");
+        assert!(begun_by("zzzz").is_empty());
     }
 
     #[test]

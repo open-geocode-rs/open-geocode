@@ -207,7 +207,11 @@ pub(super) fn pack(name: &str) -> TestPack {
                 source: SourceProvenance::osm(ObjectType::Way, 11),
                 prominence: Default::default(),
                 wikidata: None,
-                brand: None,
+                // A chain of one bakery, for HERE's chain searches.
+                brand: Some(crate::record::Brand {
+                    name: "Queen Bakery".to_string(),
+                    wikidata: None,
+                }),
                 details: PoiDetails {
                     contact: Contact::stated(
                         Some("+1 416-555-0111;+1 416-555-0112".to_string()),
@@ -2548,6 +2552,72 @@ async fn geocode_shows_how_it_read_the_query() {
     assert!(plain.json()["items"][0].get("parsing").is_none());
 }
 
+/// Autosuggest offers the searches a typed word begins, a category by the
+/// start of a word of its name and a chain the query names whole, ahead of
+/// the places, each run by og's own discover, in English only.
+#[tokio::test]
+async fn autosuggest_offers_category_and_chain_searches() {
+    let pack = pack("query-items");
+    let router = pack.router();
+    let reply = get(
+        &router,
+        "/compat/here/v1/autosuggest?q=bake&at=43,-79&limit=5",
+    )
+    .await;
+    let first = &reply.json()["items"][0];
+    assert_eq!(first["resultType"], "categoryQuery", "{}", reply.text());
+    assert_eq!(first["title"], "Bakery and Baked Goods Store");
+    assert_eq!(
+        first["highlights"],
+        json!({"title": [{"start": 0, "end": 4}]})
+    );
+    let href = first["href"].as_str().expect("an href");
+    assert!(
+        href.contains(
+            "/compat/here/v1/discover?q=Bakery+and+Baked+Goods+Store&at=43%2C-79&limit=5"
+        ),
+        "{href}"
+    );
+    assert!(first["id"].as_str().is_some_and(|id| id.starts_with("og_")));
+
+    let chain = get(
+        &router,
+        "/compat/here/v1/autosuggest?q=Queen%20Bakery&at=43,-79",
+    )
+    .await;
+    let kinds = chain.json()["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| (item["resultType"].clone(), item["title"].clone()))
+        .collect::<Vec<_>>();
+    assert!(
+        kinds.contains(&(json!("chainQuery"), json!("Queen Bakery"))),
+        "{kinds:?}"
+    );
+
+    let short = get(&router, "/compat/here/v1/autosuggest?q=bak&at=43,-79").await;
+    assert!(
+        short.json()["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|item| item["resultType"] != "categoryQuery")
+    );
+    let german = get(
+        &router,
+        "/compat/here/v1/autosuggest?q=bake&at=43,-79&lang=de",
+    )
+    .await;
+    assert!(
+        german.json()["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|item| item["resultType"] != "categoryQuery")
+    );
+}
+
 #[tokio::test]
 async fn a_search_along_a_route_keeps_what_lies_by_it() {
     let pack = pack("route");
@@ -2561,12 +2631,14 @@ async fn a_search_along_a_route_keeps_what_lies_by_it() {
         } else {
             "&q=queen%20bakery"
         };
+        // The places, which a route filters; a search offered is no place.
         let titles = |reply: &Reply| {
             reply.json()["items"]
                 .as_array()
                 .map(|items| {
                     items
                         .iter()
+                        .filter(|item| item.get("href").is_none())
                         .map(|item| item["title"].clone())
                         .collect::<Vec<_>>()
                 })
@@ -2588,7 +2660,7 @@ async fn a_search_along_a_route_keeps_what_lies_by_it() {
             .and_then(|items| {
                 items
                     .iter()
-                    .find(|item| item["title"] == "Queen Bakery")
+                    .find(|item| item["title"] == "Queen Bakery" && item.get("href").is_none())
                     .cloned()
             })
             .expect("the bakery");
