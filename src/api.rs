@@ -257,6 +257,13 @@ pub struct Common {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "Europe/Monaco")]
     pub timezone: Option<String>,
+    /// For an address that states no postcode, the one postcode the other
+    /// addresses of its street state, when they all state the same one. It
+    /// is where the address most likely lies, and `address.postcode` stays
+    /// what the source states. Absent on every other result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "94124")]
+    pub street_postcode: Option<String>,
     /// The points to route to when going to the result, which are the
     /// entrances OpenStreetMap maps for it. They are the nodes tagged
     /// `entrance` on the outline of the building or site an address or a
@@ -1364,6 +1371,7 @@ fn common(
         opening_hours: summary.opening_hours,
         bbox: summary.bbox,
         timezone: summary.timezone,
+        street_postcode: summary.street_postcode,
         access: summary.access,
         address_lines: crate::address_lines::address_lines(layer, &address, &context),
         address,

@@ -387,6 +387,14 @@ pub(crate) fn best_matches(features: &mut Vec<crate::api::ForwardFeature>) {
 }
 
 /// og's native lookups, called as their routes would be.
+/// Gives an address whose source states no postcode the one the other
+/// addresses of its street agree on (`street_postcode`).
+fn with_street_postcode(address: &mut crate::api::Address, street_postcode: Option<&String>) {
+    if address.postcode.is_none() {
+        address.postcode = street_postcode.cloned();
+    }
+}
+
 pub(crate) mod native {
     use super::*;
 
@@ -394,20 +402,28 @@ pub(crate) mod native {
     // answers that can hold a house keep one copy of it
     // (see [`house::one_per_house`]).
 
-    /// The answer with each area named in several languages at once named
-    /// in the place's own, when no language was asked
-    /// ([`name_joined_areas`]).
+    /// The answer as a vendor writes it ([`as_vendors_write`]).
     fn local_forward(
         state: &AppState,
         asked: bool,
         mut found: ForwardCollection,
     ) -> ForwardCollection {
-        if !asked {
-            for feature in &mut found.features {
-                name_joined_areas(state.pack(), &mut feature.properties.common.context);
-            }
+        for feature in &mut found.features {
+            as_vendors_write(state, asked, &mut feature.properties.common);
         }
         found
+    }
+
+    /// A result as a vendor writes it. Each area named in several languages
+    /// at once is named in the place's own when no language was asked
+    /// ([`name_joined_areas`]). An address whose source states no postcode
+    /// has the one the other addresses of its street agree on, since a
+    /// vendor writes every address with its postcode.
+    fn as_vendors_write(state: &AppState, asked: bool, common: &mut crate::api::Common) {
+        if !asked {
+            name_joined_areas(state.pack(), &mut common.context);
+        }
+        with_street_postcode(&mut common.address, common.street_postcode.as_ref());
     }
 
     /// Runs a lookup and keeps one copy of each house in its answer. Where
@@ -587,10 +603,8 @@ pub(crate) mod native {
         )
         .await
         .map(|mut found| {
-            if !args_lang {
-                for feature in &mut found.features {
-                    name_joined_areas(state.pack(), &mut feature.properties.common.context);
-                }
+            for feature in &mut found.features {
+                as_vendors_write(state, args_lang, &mut feature.properties.common);
             }
             found
         })
@@ -645,9 +659,10 @@ pub(crate) mod native {
         categories: Vec<&'static str>,
         args: Args,
     ) -> Result<ForwardCollection, Problem> {
+        let args_lang = args.get("lang").is_some();
         runtime::of_categories(State(state.clone()), categories, args.query())
             .await
-            .map(|json| json.0)
+            .map(|json| local_forward(state, args_lang, json.0))
     }
 
     /// The record a vendor id names, or `None` when no record has it,
@@ -939,6 +954,25 @@ mod tests {
 
     /// og is asked for more answers only while copies leave too few houses,
     /// og had more to give, and never past the route's own limit.
+    #[test]
+    fn an_address_stating_no_postcode_takes_the_one_its_street_agrees_on() {
+        let filled = |postcode: Option<&str>, street: Option<&str>| {
+            let mut address = crate::api::Address {
+                postcode: postcode.map(str::to_string),
+                ..house("1", "Redondo Street", "San Francisco", "")
+            };
+            with_street_postcode(&mut address, street.map(str::to_string).as_ref());
+            address.postcode
+        };
+        assert_eq!(filled(None, Some("94124")).as_deref(), Some("94124"));
+        assert_eq!(
+            filled(Some("94134"), Some("94124")).as_deref(),
+            Some("94134"),
+            "the source's own postcode stands"
+        );
+        assert_eq!(filled(None, None), None);
+    }
+
     #[test]
     fn og_is_asked_again_only_while_it_can_answer_more_houses() {
         // Asked 3, og answered 3 of which 2 houses: ask 6.

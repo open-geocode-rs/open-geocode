@@ -222,6 +222,10 @@ pub struct Summary {
     /// adds, as it holds the zones beside the records.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+    /// For an address that states no postcode, the one postcode the other
+    /// addresses of its street state, when they agree on one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub street_postcode: Option<String>,
     /// The entrances the record's source maps, as points to route to.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub access: Vec<AccessPoint>,
@@ -1368,11 +1372,12 @@ impl Reader {
         let mut extent = None;
         let mut access = Vec::new();
         let mut stated = Address::default();
+        let mut street_postcode = None;
         let (record_id, name, label) = match header.layer {
             Layer::Address => {
                 let (address, flagged) = self.entry_address(&entry, &mut fields)?;
+                street_postcode = agreed_postcode(&self.string_list(header.strings, &mut fields)?);
                 if flagged {
-                    self.string_list(header.strings, &mut fields)?;
                     access = self.entry_access(&entry, flagged, &mut fields)?;
                 }
                 stated = Address::from(&address);
@@ -1467,6 +1472,7 @@ impl Reader {
             opening_hours,
             bbox: extent.map(bbox),
             timezone: None,
+            street_postcode,
             access: access.iter().map(AccessPoint::from).collect(),
             point: Some(header.point()),
             source,
@@ -2750,6 +2756,18 @@ fn add_delta(base: i32, delta: i64) -> Result<i32> {
         .map_err(|_| Error::Decode("coordinate delta is out of range"))
 }
 
+/// The one postcode `postcodes` agree on, as the first writes it: none
+/// when they are none or name more than one, written in any case or
+/// spacing.
+fn agreed_postcode(postcodes: &[String]) -> Option<String> {
+    let first = postcodes.first()?;
+    let key = crate::text_index::compact_postcode(first)?;
+    postcodes
+        .iter()
+        .all(|postcode| crate::text_index::compact_postcode(postcode).as_ref() == Some(&key))
+        .then(|| first.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3019,6 +3037,49 @@ mod tests {
         );
         let bare = serde_json::to_value(reader.summary(3).expect("summary")).expect("value");
         assert_eq!(bare.get("bbox"), None);
+    }
+
+    #[test]
+    fn an_address_without_a_postcode_has_the_one_its_street_agrees_on() {
+        let house = |id: i64, postcodes: &[&str], access: Vec<Entrance>| {
+            Record::Address(AddressRecord {
+                access,
+                disputed: false,
+                street_postcodes: postcodes.iter().map(|code| code.to_string()).collect(),
+                address: AddressComponents {
+                    areas: Vec::new(),
+                    number: (id * 2).to_string(),
+                    street: Some(format!("Street {}", postcodes.len())),
+                    place: None,
+                    unit: None,
+                    locality: Some("Toronto".into()),
+                    region: None,
+                    postcode: None,
+                    country: None,
+                },
+                geometry: point_geometry(-79.0 + id as f64 * 1e-4, 43.0),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Way, id),
+            })
+        };
+        let door = vec![Entrance {
+            at: [-790_000_500, 430_000_000],
+            kind: "main".to_string(),
+        }];
+        let records = [
+            house(1, &["M5V 1A1", "m5v1a1"], Vec::new()),
+            house(2, &["M5V 1A1", "m5v1a1"], door),
+            house(3, &["M5V 1A1", "M5V 2B2", "M5V 3C3"], Vec::new()),
+            house(4, &[], Vec::new()),
+        ];
+        let reader = write_store(&records, &[]);
+        let agreed = |id: u64| reader.summary(id).expect("summary").street_postcode;
+        // Written in any spacing, one postcode is agreed on, whether or not
+        // the address maps its entrances.
+        assert_eq!(agreed(0).as_deref(), Some("M5V 1A1"));
+        assert_eq!(agreed(1).as_deref(), Some("M5V 1A1"));
+        assert_eq!(agreed(2), None, "the street's addresses disagree");
+        assert_eq!(agreed(3), None, "the street's addresses state none");
     }
 
     #[test]

@@ -7476,6 +7476,7 @@ impl TextSearcher {
                 opening_hours: None,
                 bbox: None,
                 timezone: None,
+                street_postcode: None,
                 access: Vec::new(),
                 point: Some(Point {
                     lon,
@@ -12861,6 +12862,7 @@ mod tests {
             opening_hours: None,
             bbox: None,
             timezone: None,
+            street_postcode: None,
             access: Vec::new(),
             point: None,
             source: Source {

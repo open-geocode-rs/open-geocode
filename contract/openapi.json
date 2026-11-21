@@ -243,6 +243,11 @@
           "source": {
             "$ref": "#/components/schemas/Source"
           },
+          "street_postcode": {
+            "description": "For an address that states no postcode, the one postcode the other\naddresses of its street state, when they all state the same one. It\nis where the address most likely lies, and `address.postcode` stays\nwhat the source states. Absent on every other result.",
+            "example": "94124",
+            "type": "string"
+          },
           "timezone": {
             "description": "The IANA name of the timezone the result lies in, such as\n`Europe/Monaco`. Its offset from UTC is the reader's to compute,\nas it changes with the date. An area's is the zone it lies wholly in,\nand any other result's is the zone at its point. Absent on an area\nthat reaches into two zones, where the timezone boundaries name no\nzone or two, and on every result of a Pack built without them.",
             "example": "Europe/Monaco",
