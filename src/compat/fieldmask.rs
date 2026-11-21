@@ -41,6 +41,24 @@ impl FieldMask {
         any.then_some(Self::Paths(root))
     }
 
+    /// Whether the mask keeps the field at `path`, or a field inside it.
+    /// No mask, or `*`, keeps every field.
+    pub(crate) fn asks(mask: Option<&Self>, path: &[&str]) -> bool {
+        let Some(Self::Paths(mut node)) = mask.cloned() else {
+            return true;
+        };
+        for part in path {
+            if node.0.is_empty() {
+                return true;
+            }
+            match node.0.remove(*part) {
+                Some(child) => node = child,
+                None => return false,
+            }
+        }
+        true
+    }
+
     /// Drops every field the mask leaves out. Arrays are masked element by
     /// element, so `places.id` keeps the `id` of every place.
     pub(crate) fn apply(&self, value: &mut Value) {

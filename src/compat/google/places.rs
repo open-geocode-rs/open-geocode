@@ -12,13 +12,15 @@ use serde::{Deserialize, Serialize};
 use super::{
     Area, Code, LatLng, QueryParams, body, both_shapes, error, field_mask, from_problem, invalid,
     language::{Language, accept_language},
-    model::{Kind, Place, after_name, categories_of},
+    model::{AddressDescriptor, Kind, Place, after_name, categories_of},
     proto_int, respond, run,
 };
 use crate::{
     api::ForwardFeature,
     compat::{
-        Args, VendorError, decode_id, native,
+        Args, VendorError, decode_id,
+        fieldmask::FieldMask,
+        native,
         route::{self, Corridor},
     },
     runtime::AppState,
@@ -236,12 +238,12 @@ pub(super) async fn search_text(
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
+        let taken = features
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or_default())
+            .collect::<Vec<_>>();
         let answer = SearchTextResponse {
-            places: features
-                .into_iter()
-                .take(usize::try_from(limit).unwrap_or_default())
-                .map(|feature| place(feature, &language))
-                .collect(),
+            places: all_described(&state, taken, &language, mask.as_ref()).await?,
         };
         Ok(respond(&answer, mask.as_ref()))
     })
@@ -328,14 +330,14 @@ pub(super) async fn search_nearby(
         let found = native::of_categories(&state, categories, args)
             .await
             .map_err(from_problem)?;
+        let taken = found
+            .features
+            .iter()
+            .filter(|feature| rules.admit(Kind::of(&feature.properties.common)))
+            .take(usize::try_from(limit).unwrap_or_default())
+            .collect::<Vec<_>>();
         let answer = SearchTextResponse {
-            places: found
-                .features
-                .iter()
-                .filter(|feature| rules.admit(Kind::of(&feature.properties.common)))
-                .take(usize::try_from(limit).unwrap_or_default())
-                .map(|feature| place(feature, &language))
-                .collect(),
+            places: all_described(&state, taken, &language, mask.as_ref()).await?,
         };
         Ok(respond(&answer, mask.as_ref()))
     })
@@ -503,6 +505,67 @@ fn place(feature: &ForwardFeature, language: &Language) -> Place {
     )
 }
 
+/// How far around a place its landmarks lie, a short walk, and how many
+/// tell where it is without naming the whole district.
+const LANDMARK_RADIUS_M: f64 = 300.0;
+const MAX_LANDMARKS: usize = 5;
+
+/// The place, with its address descriptor when the mask asks for one at
+/// `path`. The landmarks are a lookup of their own, so a mask that leaves
+/// the descriptor out costs none.
+async fn described(
+    state: &AppState,
+    feature: &ForwardFeature,
+    language: &Language<'_>,
+    mask: Option<&FieldMask>,
+    path: &[&str],
+) -> Result<Place, VendorError> {
+    let mut found = place(feature, language);
+    if FieldMask::asks(mask, path) {
+        let point = feature.geometry.coordinates;
+        let landmarks = native::landmarks(
+            state,
+            point,
+            LANDMARK_RADIUS_M,
+            MAX_LANDMARKS,
+            language.code().map(str::to_string),
+            &feature.properties.common.id,
+        )
+        .await
+        .map_err(from_problem)?;
+        found.address_descriptor = Some(AddressDescriptor::of(
+            point,
+            &feature.properties.common,
+            &landmarks,
+            language,
+        ));
+    }
+    Ok(found)
+}
+
+/// Each place, described as [`described`] does.
+async fn all_described(
+    state: &AppState,
+    features: impl IntoIterator<Item = &ForwardFeature>,
+    language: &Language<'_>,
+    mask: Option<&FieldMask>,
+) -> Result<Vec<Place>, VendorError> {
+    let mut places = Vec::new();
+    for feature in features {
+        places.push(
+            described(
+                state,
+                feature,
+                language,
+                mask,
+                &["places", "addressDescriptor"],
+            )
+            .await?,
+        );
+    }
+    Ok(places)
+}
+
 /// Places names its results in `languageCode`, English when none is sent.
 fn places_language(state: &AppState, code: Option<String>) -> Result<Language<'_>, VendorError> {
     let code = code.filter(|code| !code.trim().is_empty());
@@ -520,7 +583,15 @@ pub(super) async fn details(
         let mask = field_mask(&headers, &query);
         let language = places_language(&state, query.get("languageCode").map(str::to_string))?;
         let feature = by_place_id(&state, &place_id, &language).await?;
-        Ok(respond(&place(&feature, &language), mask.as_ref()))
+        let found = described(
+            &state,
+            &feature,
+            &language,
+            mask.as_ref(),
+            &["addressDescriptor"],
+        )
+        .await?;
+        Ok(respond(&found, mask.as_ref()))
     })
     .await
 }

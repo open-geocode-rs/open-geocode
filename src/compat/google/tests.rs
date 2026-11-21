@@ -220,6 +220,14 @@ async fn get(router: &Router, uri: &str) -> Reply {
     .await
 }
 
+async fn get_with(router: &Router, uri: &str, headers: &[(&str, &str)]) -> Reply {
+    let mut request = Request::get(uri);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    send(router, request.body(Body::empty()).expect("request")).await
+}
+
 async fn post(router: &Router, uri: &str, body: Value) -> Reply {
     post_with(router, uri, &[], body).await
 }
@@ -291,6 +299,22 @@ fn bakery_place() -> Value {
         },
         "internationalPhoneNumber": "+1 416-555-0111",
         "websiteUri": "https://queenbakery.example/",
+        // The areas below its town that hold it, smallest first. It is the
+        // only place og holds, so no landmark stands near it.
+        "addressDescriptor": {"areas": [
+            {
+                "name": format!("places/{}", encode_parts("osm:relation:7", None, "St. Lawrence")),
+                "placeId": encode_parts("osm:relation:7", None, "St. Lawrence"),
+                "displayName": {"text": "St. Lawrence"},
+                "containment": "WITHIN",
+            },
+            {
+                "name": format!("places/{}", encode_parts("osm:relation:6", None, "Old Toronto")),
+                "placeId": encode_parts("osm:relation:6", None, "Old Toronto"),
+                "displayName": {"text": "Old Toronto"},
+                "containment": "WITHIN",
+            },
+        ]},
         "regularOpeningHours": {"periods": bakery_hours()},
         "entrances": [{
             "location": {"latitude": 42.9995, "longitude": -79.005},
@@ -900,6 +924,7 @@ async fn place_geocoding_answers_one_bare_result() {
         "websiteUri",
         "regularOpeningHours",
         "entrances",
+        "addressDescriptor",
     ] {
         fields.remove(field);
     }
@@ -1675,6 +1700,7 @@ fn bakery_destination() -> Value {
         "websiteUri",
         "regularOpeningHours",
         "entrances",
+        "addressDescriptor",
     ] {
         fields.remove(field);
     }
@@ -2257,4 +2283,125 @@ async fn a_house_mapped_as_an_outline_is_a_rooftop() {
         "{result}"
     );
     assert_eq!(result["granularity"], "ROOFTOP", "{result}");
+}
+
+/// Four places near 43 N 79 W: the one asked for, a well known mall whose
+/// outline holds it, a corner shop nearer, and a shop 490 m off.
+fn landmark_fixture() -> Fixture {
+    let pack = std::env::temp_dir().join(format!(
+        "open-geocode-compat-google-landmarks-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut writer = Writer::create(&pack).expect("writer");
+    let mut poi = |name: &str, category: &str, lon: f64, id, prominence| {
+        writer
+            .write(
+                &PoiRecord {
+                    alt_names: Vec::new(),
+                    name: name.to_string(),
+                    category: category.to_string(),
+                    address: None,
+                    geometry: point_geometry(lon, 43.0),
+                    location_precision: LocationPrecision::Centroid,
+                    source: SourceProvenance::osm(ObjectType::Way, id),
+                    prominence,
+                    wikidata: None,
+                    brand: None,
+                    details: None,
+                    aliases: Vec::new(),
+                }
+                .into(),
+                None,
+            )
+            .expect("poi")
+    };
+    poi(
+        "Lantern Cafe",
+        "amenity:cafe",
+        -79.0,
+        21,
+        Default::default(),
+    );
+    let known = crate::record::Prominence {
+        importance: 50,
+        linked: true,
+        languages: 3,
+    };
+    let mall = poi("Queen Mall", "shop:mall", -79.0015, 22, known);
+    poi(
+        "Corner Shop",
+        "shop:convenience",
+        -79.0005,
+        23,
+        Default::default(),
+    );
+    poi(
+        "Far Shop",
+        "shop:convenience",
+        -79.006,
+        24,
+        Default::default(),
+    );
+    // The mall's outline holds the cafe.
+    writer.set_extents(vec![(
+        mall,
+        [-790_030_000, 429_990_000, -789_990_000, 430_010_000],
+    )]);
+    writer.finish().expect("finish");
+    let state = AppState::open(&pack, &pack.with_extension("jobs"), Limits::DEFAULT).expect("pack");
+    let router = build_router(state, None, None);
+    Fixture { pack, router }
+}
+
+/// A place's landmarks are the best known places within a short walk, the
+/// nearer first among equals, each saying whether the place lies inside it.
+#[tokio::test]
+async fn a_place_is_described_by_its_best_known_neighbours() {
+    let fixture = landmark_fixture();
+    let router = &fixture.router;
+    let cafe = encode_parts("osm:way:21", Some(Layer::Poi), "");
+    let reply = get_with(
+        router,
+        &format!("/compat/google/v1/places/{cafe}"),
+        &[("x-goog-fieldmask", "addressDescriptor")],
+    )
+    .await;
+    let landmarks = reply.body["addressDescriptor"]["landmarks"]
+        .as_array()
+        .expect("landmarks")
+        .clone();
+    let names = landmarks
+        .iter()
+        .map(|landmark| landmark["displayName"]["text"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [json!("Queen Mall"), json!("Corner Shop")],
+        "{}",
+        reply.body
+    );
+    assert_eq!(landmarks[0]["spatialRelationship"], "WITHIN");
+    assert!(landmarks[1].get("spatialRelationship").is_none());
+    let distance = landmarks[1]["straightLineDistanceMeters"]
+        .as_f64()
+        .expect("a distance");
+    assert!((40.0..42.0).contains(&distance), "{distance}");
+    assert_eq!(
+        landmarks[0]["types"],
+        json!([
+            "shopping_mall",
+            "store",
+            "point_of_interest",
+            "establishment"
+        ])
+    );
+    // A mask that leaves the descriptor out costs no lookup and gets none.
+    let plain = get_with(
+        router,
+        &format!("/compat/google/v1/places/{cafe}"),
+        &[("x-goog-fieldmask", "displayName")],
+    )
+    .await;
+    assert!(plain.body.get("addressDescriptor").is_none());
 }

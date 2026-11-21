@@ -183,6 +183,97 @@ pub(super) struct Place {
     pub(super) time_zone: Option<TimeZone>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) entrances: Vec<PlaceEntrance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) address_descriptor: Option<AddressDescriptor>,
+}
+
+/// Where a place is, told by the places near it and the areas holding it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(super) struct AddressDescriptor {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) landmarks: Vec<Landmark>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) areas: Vec<DescriptorArea>,
+}
+
+/// A place near another, and how it stands to it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Landmark {
+    pub(super) name: String,
+    pub(super) place_id: String,
+    pub(super) display_name: LocalizedText,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) types: Vec<&'static str>,
+    /// `WITHIN` where the place lies inside the landmark's outline. Near,
+    /// Google's default, is left out, as Google leaves it out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) spatial_relationship: Option<&'static str>,
+    pub(super) straight_line_distance_meters: f64,
+}
+
+/// An area holding a place.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DescriptorArea {
+    pub(super) name: String,
+    pub(super) place_id: String,
+    pub(super) display_name: LocalizedText,
+    pub(super) containment: &'static str,
+}
+
+impl AddressDescriptor {
+    /// The descriptor of the place at `point`, from the landmarks og found
+    /// near it and the areas below its town that hold it, smallest first.
+    pub(super) fn of(
+        point: [f64; 2],
+        common: &Common,
+        landmarks: &[crate::api::ForwardFeature],
+        language: &Language,
+    ) -> Self {
+        let landmarks = landmarks
+            .iter()
+            .map(|feature| {
+                let found = &feature.properties.common;
+                let [lon, lat] = feature.geometry.coordinates;
+                let place_id = encode_id(found);
+                let within = found.bbox.is_some_and(|[west, south, east, north]| {
+                    (west..=east).contains(&point[0]) && (south..=north).contains(&point[1])
+                });
+                Landmark {
+                    name: format!("places/{place_id}"),
+                    place_id,
+                    display_name: LocalizedText {
+                        text: found.name.clone(),
+                        language_code: language.of(found.record_id),
+                    },
+                    types: Kind::of(found).types(),
+                    spatial_relationship: within.then_some("WITHIN"),
+                    straight_line_distance_meters: crate::spatial_index::haversine_m(
+                        point[0], point[1], lon, lat,
+                    ),
+                }
+            })
+            .collect();
+        let context = &common.context;
+        let areas = [&context.neighbourhood, &context.sublocality]
+            .into_iter()
+            .flatten()
+            .map(|area| {
+                let place_id = compat::encode_area_id(area);
+                DescriptorArea {
+                    name: format!("places/{place_id}"),
+                    place_id,
+                    display_name: LocalizedText {
+                        text: area.name.clone(),
+                        language_code: language.of(Some(area.record_id)),
+                    },
+                    containment: "WITHIN",
+                }
+            })
+            .collect();
+        Self { landmarks, areas }
+    }
 }
 
 impl Place {
@@ -212,6 +303,7 @@ impl Place {
                 .and_then(|contact| contact.website.clone()),
             regular_opening_hours: common.opening_hours.as_deref().and_then(hours::parse),
             time_zone: common.timezone.clone().map(|id| TimeZone { id }),
+            address_descriptor: None,
             entrances: common
                 .access
                 .iter()

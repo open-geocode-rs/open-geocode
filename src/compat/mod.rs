@@ -434,6 +434,49 @@ pub(crate) mod native {
         .await
     }
 
+    /// The places og holds within `radius_m` of `point`, the most prominent
+    /// first (QRank, a Wikidata link, names in many languages), then the
+    /// nearest, as many as `limit`, the place `except` left out.
+    pub(crate) async fn landmarks(
+        state: &AppState,
+        point: [f64; 2],
+        radius_m: f64,
+        limit: usize,
+        lang: Option<String>,
+        except: &str,
+    ) -> Result<Vec<ForwardFeature>, Problem> {
+        let args = Args::new()
+            .set("limit", crate::http::bounds::MAX_SEARCH_LIMIT.to_string())
+            .set("focus", format!("{},{}", point[0], point[1]))
+            .set("radius", radius_m.to_string())
+            .maybe("lang", lang);
+        let found = of_categories(state, crate::categories::keys(), args).await?;
+        let records = state.pack().records();
+        let mut ranked = found
+            .features
+            .into_iter()
+            .filter(|feature| feature.properties.common.id != except)
+            .map(|feature| {
+                let prominence = feature
+                    .properties
+                    .common
+                    .record_id
+                    .and_then(|id| records.prominence(id).ok().flatten())
+                    .unwrap_or_default();
+                (prominence, feature)
+            })
+            .collect::<Vec<_>>();
+        let distance = |feature: &ForwardFeature| feature.properties.distance_m.unwrap_or(f64::MAX);
+        ranked.sort_by(|(left, a), (right, b)| {
+            right.cmp(left).then(distance(a).total_cmp(&distance(b)))
+        });
+        Ok(ranked
+            .into_iter()
+            .take(limit)
+            .map(|(_, feature)| feature)
+            .collect())
+    }
+
     /// The places of `categories`, as the catalog writes each one.
     pub(crate) async fn of_categories(
         state: &AppState,
