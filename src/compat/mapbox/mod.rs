@@ -585,6 +585,8 @@ struct Area {
     country_code_alpha_3: Option<&'static str>,
     region_code: Option<String>,
     region_code_full: Option<String>,
+    /// The area's Wikidata item, `Q30`.
+    wikidata_id: Option<String>,
 }
 
 impl Area {
@@ -600,7 +602,11 @@ impl Area {
     /// letters; any other area's is its subdivision code, written on the
     /// region only.
     fn of(area: &crate::api::ContextArea) -> Self {
-        Self::named(Some(encode_area_id(area)), &area.name).with_country_code(area.code.as_deref())
+        Self {
+            wikidata_id: area.wikidata.map(|item| format!("Q{item}")),
+            ..Self::named(Some(encode_area_id(area)), &area.name)
+        }
+        .with_country_code(area.code.as_deref())
     }
 
     /// The region og found the result in, with its code (`ON` of `CA-ON`)

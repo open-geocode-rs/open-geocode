@@ -706,6 +706,7 @@ mod tests {
             translations: None,
             record_id: 0,
             local_name: None,
+            wikidata: None,
         })
     }
 

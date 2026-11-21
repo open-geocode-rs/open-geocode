@@ -185,6 +185,9 @@ struct Layer {
     mapbox_id: Option<String>,
     #[serde(flatten)]
     fields: LayerFields,
+    /// The area's Wikidata item, where og holds one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wikidata_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     translations: Option<BTreeMap<String, Translation>>,
 }
@@ -305,6 +308,7 @@ impl Feature {
         areas.insert(encode_id(common), Names::of_result(common));
         let translated = Translated::of(Api::Geocoding, found);
         let layer = |key: &str, area: super::Area| {
+            let wikidata_id = area.wikidata_id.clone();
             let (mapbox_id, fields) = area.split();
             let translations = TRANSLATED_LAYERS
                 .contains(&key)
@@ -319,6 +323,7 @@ impl Feature {
             Layer {
                 mapbox_id,
                 fields,
+                wikidata_id,
                 translations,
             }
         };

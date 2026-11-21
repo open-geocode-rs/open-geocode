@@ -66,7 +66,8 @@ fn write_pack() -> Pack {
                         geometry: point_geometry(lon, 43.0),
                         source: SourceProvenance::osm(ObjectType::Relation, id),
                         prominence: Default::default(),
-                        wikidata: None,
+                        // Canada's item, which Mapbox writes on its layer.
+                        wikidata: (id == 1).then_some(16),
                     },
                 ),
                 (!within.is_empty()).then(|| RecordContext {
@@ -317,6 +318,7 @@ fn areas() -> Value {
             "name": "Canada",
             "country_code": "CA",
             "country_code_alpha_3": "CAN",
+            "wikidata_id": "Q16",
         },
     })
 }
@@ -1479,6 +1481,7 @@ async fn geocoding_language_names_layers_and_translates_them() {
             "name": "Kanada",
             "country_code": "CA",
             "country_code_alpha_3": "CAN",
+            "wikidata_id": "Q16",
             "translations": both_languages("Kanada", "Canada"),
         })
     );

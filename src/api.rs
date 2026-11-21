@@ -699,6 +699,9 @@ pub struct ContextArea {
     /// The area's local name, when `lang` renamed it.
     #[serde(skip)]
     pub local_name: Option<String>,
+    /// The area's Wikidata item, for the vendors that write one.
+    #[serde(skip)]
+    pub wikidata: Option<u32>,
 }
 
 impl Point {
@@ -841,14 +844,18 @@ impl<'a> Contexts<'a> {
         let area = self
             .pack
             .context_record(record_id)?
-            .map(|record| ContextArea {
-                id: record.id,
-                name: record.name,
-                code: self.code(record_id),
-                translations: None,
-                record_id,
-                local_name: None,
-            });
+            .map(|record| {
+                Ok::<_, crate::Error>(ContextArea {
+                    id: record.id,
+                    name: record.name,
+                    code: self.code(record_id),
+                    translations: None,
+                    record_id,
+                    local_name: None,
+                    wikidata: self.pack.records().wikidata(record_id)?,
+                })
+            })
+            .transpose()?;
         self.areas.insert(record_id, area.clone());
         Ok(area)
     }
