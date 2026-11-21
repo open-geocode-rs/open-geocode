@@ -602,6 +602,13 @@ impl TextSearcher {
             |_, _, _, _| Ok(true),
         )?;
         let mut hits = variants.hits;
+        if depth == Depth::Query && !self.places && variants.numbered == Numbered::Yes {
+            if let Some(hit) = self.address_with_unconfirmed_neighbourhood(options, &hits)? {
+                hits.insert(0, hit);
+            } else if options.layer.is_none() {
+                self.prefer_exact_street(options, &mut hits)?;
+            }
+        }
         if hits.is_empty() && filters.layer.is_none() {
             hits = self.fallback(query_text, &[], &filters, options.focus, limit + 1)?;
         }
@@ -628,6 +635,194 @@ impl TextSearcher {
             stated_country(&options.countries, &mut hits);
         }
         Ok(hits)
+    }
+
+    // When a numbered result adds a direction the query never said, a
+    // separate street with the exact name in the stated town is better evidence.
+    fn prefer_exact_street(
+        &self,
+        options: &TextSearchOptions,
+        hits: &mut Vec<TextSearchHit>,
+    ) -> Result<()> {
+        let Some(first) = hits.first().filter(|hit| {
+            hit.matched.housenumber == Some(PartMatch::Matched)
+                && hit.matched.street == Some(PartMatch::Partial)
+                && hit.matched.locality == Some(PartMatch::Matched)
+        }) else {
+            return Ok(());
+        };
+        let Some(street) = first
+            .record
+            .address
+            .street
+            .as_deref()
+            .and_then(street_search_text)
+        else {
+            return Ok(());
+        };
+        let numbered = self.descriptors(street.split_whitespace());
+        if numbered.directions.is_empty() {
+            return Ok(());
+        }
+        let answers_named_street = |hit: &TextSearchHit| {
+            if hit.matched.street != Some(PartMatch::Matched)
+                || hit.matched.locality != Some(PartMatch::Matched)
+                || [
+                    hit.matched.region,
+                    hit.matched.country,
+                    hit.matched.postcode,
+                ]
+                .contains(&Some(PartMatch::Unmatched))
+            {
+                return false;
+            }
+            if hit.matched.housenumber == Some(PartMatch::Matched) {
+                return true;
+            }
+            if hit.record.layer != Layer::Street.as_str() {
+                return false;
+            }
+            street_search_text(&hit.record.name).is_some_and(|name| {
+                let exact = self.descriptors(name.split_whitespace());
+                exact.names == numbered.names
+                    && exact.types == numbered.types
+                    && exact.directions.is_empty()
+            })
+        };
+        if let Some(index) = hits.iter().position(answers_named_street) {
+            hits[..=index].rotate_right(1);
+            return Ok(());
+        }
+        let retry = TextSearchOptions {
+            limit: CHOOSER_HITS,
+            ..options.clone()
+        };
+        if let Some(chosen) = self
+            .search_at(&retry, Depth::Retry)?
+            .into_iter()
+            .find(answers_named_street)
+        {
+            hits.retain(|hit| hit.record_id != chosen.record_id);
+            hits.insert(0, chosen);
+        }
+        Ok(())
+    }
+
+    // A comma-delimited area can be an unmapped neighbourhood of a named
+    // municipality. Recover only a unique, fully matched numbered address,
+    // with the other fields unchanged and no contradictory neighbourhood.
+    fn address_with_unconfirmed_neighbourhood(
+        &self,
+        options: &TextSearchOptions,
+        hits: &[TextSearchHit],
+    ) -> Result<Option<TextSearchHit>> {
+        let exact = |hit: &TextSearchHit| {
+            hit.record.layer == Layer::Address.as_str()
+                && [
+                    hit.matched.housenumber,
+                    hit.matched.street,
+                    hit.matched.locality,
+                ]
+                .iter()
+                .all(|part| *part == Some(PartMatch::Matched))
+                && [
+                    hit.matched.unit,
+                    hit.matched.region,
+                    hit.matched.country,
+                    hit.matched.postcode,
+                ]
+                .iter()
+                .all(|part| part.is_none_or(|part| part == PartMatch::Matched))
+        };
+        if hits.iter().any(exact)
+            || options
+                .layer
+                .as_deref()
+                .is_some_and(|layer| layer != "address")
+        {
+            return Ok(None);
+        }
+        let fields = options.query.split(',').map(str::trim).collect::<Vec<_>>();
+        let dictionaries = self.tagger.dictionaries();
+        let locality = |field: &str| {
+            dictionary_key(field).is_some_and(|key| {
+                dictionaries.contains(NameField::Locality, &key)
+                    && !dictionaries.contains(NameField::Country, &key)
+            })
+        };
+        let mut area_pairs = fields
+            .windows(2)
+            .enumerate()
+            .skip(1)
+            .filter(|(index, pair)| {
+                locality(pair[0])
+                    && locality(pair[1])
+                    && fields[..*index]
+                        .iter()
+                        .any(|field| field.split_whitespace().any(is_numeric_token))
+            });
+        let Some((index, pair)) = area_pairs.next() else {
+            return Ok(None);
+        };
+        if area_pairs.next().is_some() {
+            return Ok(None);
+        }
+        let Some(neighbourhood) = search_key(pair[0]) else {
+            return Ok(None);
+        };
+        let Some(municipality) = search_key(pair[1]) else {
+            return Ok(None);
+        };
+        let retry = TextSearchOptions {
+            query: fields[..index]
+                .iter()
+                .chain(&fields[index + 1..])
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", "),
+            limit: CHOOSER_HITS,
+            layer: Some(Layer::Address.as_str().to_string()),
+            ..options.clone()
+        };
+        let hits = self.search_at(&retry, Depth::Retry)?;
+        let mut exact = hits.into_iter().filter(exact);
+        let Some(mut hit) = exact.next() else {
+            return Ok(None);
+        };
+        if exact.any(|other| other.record.point != hit.record.point)
+            || hit
+                .record
+                .address
+                .locality
+                .as_deref()
+                .and_then(search_key)
+                .as_deref()
+                != Some(municipality.as_str())
+        {
+            return Ok(None);
+        }
+        let named = |name: &str| search_key(name).as_deref() == Some(neighbourhood.as_str());
+        if !hit.record.address.areas.is_empty()
+            && !hit.record.address.areas.iter().any(|name| named(name))
+        {
+            return Ok(None);
+        }
+        if let Some(area) = self
+            .pack
+            .boundary_context(hit.record_id)?
+            .and_then(|context| context.admin_context.get(PlaceLayer::Neighbourhood))
+            && !self
+                .pack
+                .records()
+                .names(area)?
+                .iter()
+                .any(|name| named(name))
+        {
+            return Ok(None);
+        }
+        hit.matched.locality = Some(PartMatch::Partial);
+        hit.features.area = Agreement::Unknown;
+        Ok(Some(hit))
     }
 
     /// `hits` with each Wikidata item once, at its best place, cut to
@@ -8236,6 +8431,7 @@ impl Numbered {
 enum Depth {
     Query,
     Bare,
+    Retry,
 }
 
 /// What [`TextSearcher::search_variants`] answers: the reading the answer
@@ -14376,6 +14572,43 @@ mod tests {
             Some("osm:node:3")
         );
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn an_unconfirmed_neighbourhood_cannot_replace_the_stated_municipality() {
+        let directory = temp_pack_path("unconfirmed-neighbourhood");
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut writer = Writer::create(&directory).expect("writer");
+        for (id, number, city, neighbourhood) in [
+            ("osm:node:41", "182", "Maridale", None),
+            ("osm:node:42", "184", "Maridale", Some("Riverbend")),
+            ("osm:node:43", "182", "Old Market", None),
+        ] {
+            let mut address = address_record(id, "", number, "Pedro Street", Some(city), None);
+            if let Some(neighbourhood) = neighbourhood {
+                address.address.areas.push(neighbourhood.to_string());
+            }
+            writer.write(&address.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&directory).expect("searcher");
+        let ask = |query: &str| {
+            let options = TextSearchOptions {
+                query: query.to_string(),
+                limit: 1,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            };
+            searcher.search(&options).expect("search")
+        };
+        let found = ask("182 Pedro Street, Old Market, Maridale");
+        assert_eq!(found[0].record.id, "osm:node:41");
+        assert_eq!(found[0].matched.locality, Some(PartMatch::Partial));
+        let found = ask("184 Pedro Street, Old Market, Maridale");
+        assert!(found.iter().all(|hit| hit.record.id != "osm:node:42"));
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
