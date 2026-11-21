@@ -432,7 +432,12 @@ impl BoundarySet {
             labels: HashMap::new(),
             items: HashMap::new(),
             names: HashMap::new(),
-            points: vec![None; self.candidates.len()],
+            matched: HashMap::new(),
+            brought: HashMap::new(),
+            waiting: Vec::new(),
+            strongest: vec![None; self.candidates.len()],
+            lookup_bytes: 0,
+            brought_list_bytes: 0,
         };
         for (index, candidate) in self.candidates.iter_mut().enumerate() {
             let layer = candidate.boundary.layer;
@@ -440,10 +445,7 @@ impl BoundarySet {
                 links.labels.entry((label, layer)).or_insert(index);
             }
             if let Some(item) = candidate.boundary.wikidata {
-                links
-                    .items
-                    .entry((item, layer))
-                    .or_insert((index, candidate.boundary.bounds));
+                links.items.entry((item, layer)).or_default().push(index);
             }
             links
                 .names
@@ -451,28 +453,88 @@ impl BoundarySet {
                 .or_default()
                 .push(index);
         }
+        links.lookup_bytes = links.measure_lookups();
         links
     }
 
-    /// Merges a place point into its boundary, if it has one.
+    /// Finds the boundary the place point at position `at` names, if any.
+    /// Nothing merges until every point is matched, so no match depends on
+    /// the order the points arrive in.
+    pub(crate) fn match_place_point(
+        &self,
+        links: &mut PlaceLinks,
+        at: u64,
+        layer: PlaceLayer,
+        place: &PlaceRecord,
+    ) {
+        let found = links.find(
+            layer,
+            place,
+            |index, point| self.holds(index, point),
+            |index, point| covers_point(&self.shapes, &self.candidates[index].boundary, point),
+        );
+        match (found, place.wikidata) {
+            (Some((index, link)), item) => {
+                links.matched.insert(at, (index, link));
+                if let Some(item) = item {
+                    let list = links.brought.entry((item, layer)).or_default();
+                    let capacity = list.capacity();
+                    list.push(index);
+                    links.brought_list_bytes +=
+                        (list.capacity() - capacity) * std::mem::size_of::<usize>();
+                }
+            }
+            (None, Some(item)) => {
+                if let Some(point) = point_lon_lat(&place.geometry) {
+                    links.waiting.push((at, item, layer, point));
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// Matches the points that named no boundary to one a point of their
+    /// Wikidata item named, when its box holds them: one item is one place,
+    /// whichever of its points the boundary was matched by.
+    pub(crate) fn group_place_points(&self, links: &mut PlaceLinks) {
+        for (at, item, layer, point) in std::mem::take(&mut links.waiting) {
+            let held = links.brought.get(&(item, layer)).and_then(|boundaries| {
+                boundaries
+                    .iter()
+                    .filter(|&&index| self.holds(index, point))
+                    .min()
+                    .copied()
+            });
+            if let Some(index) = held {
+                links.matched.insert(at, (index, PlaceLink::Item));
+            }
+        }
+    }
+
+    /// Merges the place point at position `at` into the boundary it was
+    /// matched to, if any. The boundary takes its names, fame and settlement
+    /// now, and its point and item once every point is in
+    /// ([`Self::finish_place_merges`]).
     pub(crate) fn merge_place_point(
         &mut self,
         links: &mut PlaceLinks,
-        layer: PlaceLayer,
+        at: u64,
         place: &PlaceRecord,
     ) -> bool {
-        let Some((index, link)) = links.find(layer, place, |index, point| {
-            covers_point(&self.shapes, &self.candidates[index].boundary, point)
-        }) else {
+        let Some(&(index, link)) = links.matched.get(&at) else {
             return false;
         };
         let boundary = &mut self.candidates[index].boundary;
-        // The strongest link's point wins, so a `label` node beats a name or Wikidata match.
-        if links.points[index] < Some(link)
+        // The strongest link wins, so a `label` node beats a name or Wikidata
+        // match; of equal links, the first.
+        if links.strongest[index].is_none_or(|held| held.link < link)
             && let Some(point) = point_lon_lat(&place.geometry)
         {
-            boundary.representative_point = point;
-            links.points[index] = Some(link);
+            links.strongest[index] = Some(Strongest {
+                link,
+                point,
+                item: place.wikidata,
+            });
         }
         for name in std::iter::once(&place.name).chain(&place.alt_names) {
             let folded = name.to_lowercase();
@@ -485,9 +547,29 @@ impl BoundarySet {
             }
         }
         boundary.prominence = boundary.prominence.max(place.prominence);
-        boundary.wikidata = boundary.wikidata.or(place.wikidata);
         boundary.settled |= is_settlement(&place.place_type);
         true
+    }
+
+    /// Gives each boundary the point of the place point its strongest link
+    /// came from, and that point's Wikidata item when the boundary has none.
+    /// A boundary's own item names the boundary. A `label` node's item often
+    /// names something else: the settlement inside a commune, the district a
+    /// cadastral quarter shares its name with, or a historical region.
+    pub(crate) fn finish_place_merges(&mut self, links: PlaceLinks) {
+        for (candidate, strongest) in self.candidates.iter_mut().zip(links.strongest) {
+            if let Some(Strongest { point, item, .. }) = strongest {
+                candidate.boundary.representative_point = point;
+                candidate.boundary.wikidata = candidate.boundary.wikidata.or(item);
+            }
+        }
+    }
+
+    /// Whether boundary `index`'s box holds `point`.
+    fn holds(&self, index: usize, [lon, lat]: [f64; 2]) -> bool {
+        let bounds = self.candidates[index].boundary.bounds;
+        let (min, max) = (bounds.min(), bounds.max());
+        (min.x..=max.x).contains(&lon) && (min.y..=max.y).contains(&lat)
     }
 
     /// Whether a town, city or other settlement node was merged into boundary `index`.
@@ -1862,20 +1944,75 @@ enum PlaceLink {
 }
 
 /// Lookups from a place point to the boundary it names, all keyed by layer so
-/// that a city node labelling its county stays a separate city.
+/// that a city node labelling its county stays a separate city, and what
+/// matching found.
 pub(crate) struct PlaceLinks {
     labels: HashMap<(i64, PlaceLayer), usize>,
-    /// The boundary of each item and layer, and its bounds.
-    items: HashMap<(u32, PlaceLayer), (usize, Rect<f64>)>,
+    /// Every boundary of each item and layer: one item can be several
+    /// disjoint boundaries.
+    items: HashMap<(u32, PlaceLayer), Vec<usize>>,
     /// The boundaries of each normalized name and layer.
     names: HashMap<(String, PlaceLayer), Vec<usize>>,
-    /// The link that set each boundary's point, or `None` while it's still the centroid.
-    points: Vec<Option<PlaceLink>>,
+    /// The boundary each matched point names and how, by the point's position.
+    matched: HashMap<u64, (usize, PlaceLink)>,
+    /// The boundaries matched points of each item and layer named.
+    brought: HashMap<(u32, PlaceLayer), Vec<usize>>,
+    /// Points with an item that named no boundary: position, item, layer, point.
+    waiting: Vec<(u64, u32, PlaceLayer, [f64; 2])>,
+    /// Each boundary's strongest link merged so far.
+    strongest: Vec<Option<Strongest>>,
+    /// Heap of the lookups above, which stay as built.
+    lookup_bytes: usize,
+    /// Heap the lists inside `brought` hold.
+    brought_list_bytes: usize,
+}
+
+/// The strongest link merged into a boundary, with the point and the
+/// Wikidata item of the place point it came from.
+#[derive(Debug, Clone, Copy)]
+struct Strongest {
+    link: PlaceLink,
+    point: [f64; 2],
+    item: Option<u32>,
+}
+
+/// Heap a hash table of `map`'s capacity holds, its control bytes included.
+fn table_bytes<K, V>(map: &HashMap<K, V>) -> usize {
+    map.capacity() * 8 / 7 * (std::mem::size_of::<(K, V)>() + 1)
 }
 
 impl PlaceLinks {
     pub(crate) fn is_empty(&self) -> bool {
         self.labels.is_empty() && self.items.is_empty() && self.names.is_empty()
+    }
+
+    /// Heap the lookups hold, which matching does not change.
+    fn measure_lookups(&self) -> usize {
+        let word = std::mem::size_of::<usize>();
+        table_bytes(&self.labels)
+            + table_bytes(&self.items)
+            + self
+                .items
+                .values()
+                .map(|list| list.capacity() * word)
+                .sum::<usize>()
+            + table_bytes(&self.names)
+            + self
+                .names
+                .iter()
+                .map(|((name, _), list)| name.capacity() + list.capacity() * word)
+                .sum::<usize>()
+            + self.strongest.capacity() * std::mem::size_of::<Option<Strongest>>()
+    }
+
+    /// Heap the links hold now, outside the memory budget unless a caller
+    /// reserves it: the lookups, and what matching has found so far.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.lookup_bytes
+            + table_bytes(&self.matched)
+            + table_bytes(&self.brought)
+            + self.brought_list_bytes
+            + self.waiting.capacity() * std::mem::size_of::<(u64, u32, PlaceLayer, [f64; 2])>()
     }
 
     /// The boundary a place point names, and how. An `admin_centre` member doesn't
@@ -1884,6 +2021,7 @@ impl PlaceLinks {
         &self,
         layer: PlaceLayer,
         place: &PlaceRecord,
+        holds: impl Fn(usize, [f64; 2]) -> bool,
         covers: impl Fn(usize, [f64; 2]) -> bool,
     ) -> Option<(usize, PlaceLink)> {
         let label = (place.source.object_type == ObjectType::Node)
@@ -1893,16 +2031,14 @@ impl PlaceLinks {
             return Some((*index, PlaceLink::Label));
         }
         let point = point_lon_lat(&place.geometry)?;
-        // Within the bounds only, so a mistagged Wikidata item can't pull in a distant point.
+        // Within the box only, so a mistagged Wikidata item can't pull in a
+        // distant point, and of an item's boundaries the one whose box holds it.
         let item = place
             .wikidata
             .and_then(|item| self.items.get(&(item, layer)))
-            .filter(|(_, bounds)| {
-                let (min, max) = (bounds.min(), bounds.max());
-                (min.x..=max.x).contains(&point[0]) && (min.y..=max.y).contains(&point[1])
-            });
-        if let Some((index, _)) = item {
-            return Some((*index, PlaceLink::Item));
+            .and_then(|boundaries| boundaries.iter().find(|&&index| holds(index, point)));
+        if let Some(&index) = item {
+            return Some((index, PlaceLink::Item));
         }
         // Names repeat, so a name only matches a boundary that contains the point.
         self.names
@@ -2394,7 +2530,10 @@ mod tests {
             prominence: Prominence::default(),
             wikidata: None,
         };
-        assert!(set.merge_place_point(&mut links, PlaceLayer::Locality, &point));
+        set.match_place_point(&mut links, 0, PlaceLayer::Locality, &point);
+        set.group_place_points(&mut links);
+        assert!(set.merge_place_point(&mut links, 0, &point));
+        set.finish_place_merges(links);
 
         let places = set.place_records(&mut BuilderReport::default());
         let Record::Place(_, seattle) = &places[0].1 else {
@@ -2405,6 +2544,59 @@ mod tests {
             set.context_names(&[7], &HashMap::new()),
             HashMap::from([(7, vec!["Seattle".to_string()])])
         );
+    }
+
+    /// The links' heap grows with the points matched, so a build can reserve it.
+    #[test]
+    fn place_links_count_the_points_they_hold() {
+        let scratch = test_scratch();
+        let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
+        let vertex = |node_id, lon, lat| Vertex { node_id, lat, lon };
+        let ring = vec![
+            vertex(1, 0.0, 0.0),
+            vertex(2, 1.0, 0.0),
+            vertex(3, 1.0, 1.0),
+            vertex(4, 0.0, 1.0),
+            vertex(1, 0.0, 0.0),
+        ];
+        builder
+            .add_relations(
+                &[BoundaryRelationStub {
+                    object_id: 900,
+                    members: vec![BoundaryRelationMember {
+                        way_id: 500,
+                        role: BoundaryMemberRole::Outer,
+                    }],
+                    label: None,
+                    tags: boundary_tags(&BTreeMap::from([
+                        ("boundary".to_string(), "administrative".to_string()),
+                        ("admin_level".to_string(), "8".to_string()),
+                        ("name".to_string(), "Seattle".to_string()),
+                    ])),
+                }],
+                |_| Ok(Some(ring.clone())),
+            )
+            .expect("relations");
+        let mut set = builder.finish().expect("boundaries");
+        let mut links = set.place_links();
+        let empty = links.heap_bytes();
+        let point = |name: &str, item| PlaceRecord {
+            name: name.to_string(),
+            alt_names: Vec::new(),
+            place_type: "city".to_string(),
+            geometry: point_geometry(0.3, 0.2),
+            source: SourceProvenance::osm(ObjectType::Node, 10),
+            prominence: Prominence::default(),
+            wikidata: Some(item),
+        };
+        let points = 10_000u64;
+        for at in 0..points {
+            let name = if at % 2 == 0 { "Seattle" } else { "Elsewhere" };
+            set.match_place_point(&mut links, at, PlaceLayer::Locality, &point(name, 1));
+        }
+        // A matched point costs a table slot and a waiting one a list entry, 8 B or more each.
+        let grown = links.heap_bytes() - empty;
+        assert!(grown >= points as usize * 8, "{grown}");
     }
 
     fn test_boundary(layer: PlaceLayer) -> BuiltBoundary {
