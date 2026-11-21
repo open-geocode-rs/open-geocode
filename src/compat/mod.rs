@@ -262,10 +262,11 @@ pub(crate) mod native {
 
     /// Runs a lookup and keeps one copy of each house in its answer. Where
     /// the caller asked for a number of answers and copies leave fewer, og
-    /// is asked for more, up to its own most, so the answer holds as many
-    /// houses as og has.
+    /// is asked for more, up to `most`, the route's own limit, so the answer
+    /// holds as many houses as og has.
     async fn one_per_house<C, A, Fut>(
         args: Args,
+        most: usize,
         features: fn(&mut C) -> &mut Vec<A>,
         run: impl Fn(Args) -> Fut,
     ) -> Result<C, Problem>
@@ -285,13 +286,28 @@ pub(crate) mod native {
             let Some(asked) = asked else {
                 return Ok(found);
             };
-            let more = (ask * 2).min(crate::http::bounds::MAX_SEARCH_LIMIT);
-            if answers.len() >= asked || held < ask || more <= ask {
-                answers.truncate(asked);
-                return Ok(found);
+            match ask_again(asked, ask, held, answers.len(), most) {
+                Some(more) => ask = more,
+                None => {
+                    answers.truncate(asked);
+                    return Ok(found);
+                }
             }
-            ask = more;
         }
+    }
+
+    /// How many answers to ask og for next, having asked for `ask`, been
+    /// answered `held` and kept `kept` houses of the `asked`. `None` once
+    /// enough are kept, og has no more, or `most` was asked.
+    pub(super) fn ask_again(
+        asked: usize,
+        ask: usize,
+        held: usize,
+        kept: usize,
+        most: usize,
+    ) -> Option<usize> {
+        let more = (ask * 2).min(most);
+        (kept < asked && held >= ask && more > ask).then_some(more)
     }
 
     pub(crate) async fn geocode(
@@ -300,6 +316,7 @@ pub(crate) mod native {
     ) -> Result<ForwardCollection, Problem> {
         one_per_house(
             args,
+            crate::http::bounds::MAX_SEARCH_LIMIT,
             |found: &mut ForwardCollection| &mut found.features,
             |args| async move {
                 Ok(runtime::geocode(State(state.clone()), args.query())
@@ -322,6 +339,7 @@ pub(crate) mod native {
     ) -> Result<ForwardCollection, Problem> {
         one_per_house(
             args,
+            crate::search::MAX_AUTOCOMPLETE_LIMIT,
             |found: &mut ForwardCollection| &mut found.features,
             |args| async move {
                 Ok(runtime::autocomplete(State(state.clone()), args.query())
@@ -403,6 +421,7 @@ pub(crate) mod native {
     ) -> Result<ReverseCollection, Problem> {
         one_per_house(
             args,
+            crate::http::bounds::MAX_SEARCH_LIMIT,
             |found: &mut ReverseCollection| &mut found.features,
             |args| async move {
                 Ok(runtime::reverse(State(state.clone()), args.query())
@@ -697,6 +716,21 @@ mod tests {
             postcode: Some(postcode.to_string()),
             ..crate::api::Address::default()
         }
+    }
+
+    /// og is asked for more answers only while copies leave too few houses,
+    /// og had more to give, and never past the route's own limit.
+    #[test]
+    fn og_is_asked_again_only_while_it_can_answer_more_houses() {
+        // Asked 3, og answered 3 of which 2 houses: ask 6.
+        assert_eq!(native::ask_again(3, 3, 3, 2, 50), Some(6));
+        // Enough houses kept.
+        assert_eq!(native::ask_again(3, 3, 3, 3, 50), None);
+        // og had fewer than asked, so it has no more.
+        assert_eq!(native::ask_again(3, 6, 5, 2, 50), None);
+        // Never past the route's limit, and not again at it.
+        assert_eq!(native::ask_again(15, 15, 15, 9, 20), Some(20));
+        assert_eq!(native::ask_again(20, 20, 20, 9, 20), None);
     }
 
     /// A house's lines are rendered from its parts in its country's form,
