@@ -177,6 +177,10 @@ pub(super) struct State {
     pub contexts: Option<ContextState>,
     /// Postcode points, from address placement to the record write.
     pub postcodes: Option<RunState>,
+    /// The towns the addresses name, one spool for each checkpoint, until
+    /// the context stage measures how far each town reaches.
+    #[serde(default)]
+    pub town_votes: Vec<RunState>,
     /// The training sample, from the record write to the training.
     pub sample: Option<(String, u64)>,
     pub sealing: Option<SealingState>,
@@ -268,25 +272,32 @@ impl Spill for Id {
     }
 }
 
-/// A postcode's point, from address placement to the record write.
+/// A name and where it was seen: a postcode's point, or a town an address
+/// names and where the address lies.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct PostcodePoint(pub String, pub [f64; 2]);
+pub(super) struct NamedPoint {
+    pub name: String,
+    pub point: [f64; 2],
+}
 
-impl Spill for PostcodePoint {
+impl Spill for NamedPoint {
     fn encode(&self, out: &mut Vec<u8>) {
-        put_str(out, &self.0);
-        for value in self.1 {
+        put_str(out, &self.name);
+        for value in self.point {
             out.extend_from_slice(&value.to_bits().to_le_bytes());
         }
     }
 
     fn decode(input: &mut &[u8]) -> Result<Self> {
-        let postcode = get_string(input)?;
-        Ok(Self(postcode, [get_f64(input)?, get_f64(input)?]))
+        let name = get_string(input)?;
+        Ok(Self {
+            name,
+            point: [get_f64(input)?, get_f64(input)?],
+        })
     }
 
     fn resident_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.0.len()
+        std::mem::size_of::<Self>() + self.name.len()
     }
 }
 
@@ -576,7 +587,10 @@ mod tests {
             GeometryItem::Member(501, Some(vec![vertex(1, -1, 1)])),
         ]);
         round_trip(&[Id(5), Id(-3), Id(i64::MAX), Id(0)]);
-        round_trip(&[PostcodePoint("M5V 1A1".into(), [-79.4, 43.6])]);
+        round_trip(&[NamedPoint {
+            name: "M5V 1A1".into(),
+            point: [-79.4, 43.6],
+        }]);
     }
 
     #[test]

@@ -2,7 +2,6 @@
 //! that name it and at least half way to the nearest other town point.
 
 use std::{
-    cmp::Ordering,
     collections::HashMap,
     sync::atomic::{AtomicU64, Ordering as Atomic},
 };
@@ -11,63 +10,11 @@ use rayon::prelude::*;
 use rstar::{RTree, primitives::GeomWithData};
 
 use crate::{
-    error::Result,
-    extsort::Spill,
-    parse::lattice::dictionary_key,
-    spatial_index::haversine_m,
-    util::{
-        codec::{get_string, put_str},
-        geo::METRES_PER_DEGREE,
-    },
+    error::Result, parse::lattice::dictionary_key, spatial_index::haversine_m,
+    util::geo::METRES_PER_DEGREE,
 };
 
-use super::{boundary::TownDot, checkpoint::get_f64};
-
-/// A town an address names, by its `addr:city` or `addr:place`, and where
-/// the address lies.
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct TownVote {
-    pub name: String,
-    pub point: [f64; 2],
-}
-
-impl Eq for TownVote {}
-
-impl Ord for TownVote {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.name
-            .cmp(&other.name)
-            .then(self.point[0].total_cmp(&other.point[0]))
-            .then(self.point[1].total_cmp(&other.point[1]))
-    }
-}
-
-impl PartialOrd for TownVote {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Spill for TownVote {
-    fn encode(&self, out: &mut Vec<u8>) {
-        put_str(out, &self.name);
-        for value in self.point {
-            out.extend_from_slice(&value.to_bits().to_le_bytes());
-        }
-    }
-
-    fn decode(input: &mut &[u8]) -> Result<Self> {
-        let name = get_string(input)?;
-        Ok(Self {
-            name,
-            point: [get_f64(input)?, get_f64(input)?],
-        })
-    }
-
-    fn resident_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.name.len()
-    }
-}
+use super::{boundary::TownDot, checkpoint::NamedPoint};
 
 /// Votes measured side by side.
 const VOTE_BATCH: usize = 1 << 16;
@@ -84,7 +31,7 @@ type Peer = GeomWithData<[f64; 2], usize>;
 pub(super) fn measure_reach(
     dots: &mut [TownDot],
     names: &[Vec<String>],
-    votes: impl Iterator<Item = Result<TownVote>>,
+    votes: impl Iterator<Item = Result<NamedPoint>>,
 ) -> Result<()> {
     let mut by_name = HashMap::<&str, Vec<usize>>::new();
     for (dot, keys) in names.iter().enumerate() {
@@ -130,7 +77,7 @@ pub(super) fn measure_reach(
             AtomicU64::new(half_way.to_bits())
         })
         .collect::<Vec<_>>();
-    let measure = |vote: &TownVote| {
+    let measure = |vote: &NamedPoint| {
         let Some(key) = dictionary_key(&vote.name) else {
             return;
         };
@@ -240,8 +187,8 @@ mod tests {
         )
     }
 
-    fn vote(name: &str, point: [f64; 2]) -> Result<TownVote> {
-        Ok(TownVote {
+    fn vote(name: &str, point: [f64; 2]) -> Result<NamedPoint> {
+        Ok(NamedPoint {
             name: name.to_string(),
             point,
         })

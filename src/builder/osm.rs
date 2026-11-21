@@ -127,8 +127,8 @@ use boundary::{
     Settlement, SourceContext, TownDot, Vertex, record_context,
 };
 use checkpoint::{
-    AddressState, AuditState, ContextState, GeometryItem, Id, InputState, KeptWays, Pass,
-    PostcodePoint, ScanCounts, State, Step,
+    AddressState, AuditState, ContextState, GeometryItem, Id, InputState, KeptWays, NamedPoint,
+    Pass, ScanCounts, State, Step,
 };
 use containment::Shapes;
 use emitted::{Emitted, Ready};
@@ -144,7 +144,6 @@ use spill::{
     Body, Datasets, House, PendingAddress, PendingNamed, PendingRecord, PlacedAddress, Postcodes,
     WayKind,
 };
-use towns::TownVote;
 
 /// Records written per parallel batch.
 const WRITE_BATCH_RECORDS: usize = 16_384;
@@ -418,7 +417,7 @@ struct Run<'a> {
     /// The books the placed addresses are read back from as they are
     /// written.
     books: Option<AddressBook>,
-    postcodes: Option<SpoolFile<PostcodePoint>>,
+    postcodes: Option<SpoolFile<NamedPoint>>,
     sample: Option<Sampler>,
     sample_saved: Option<ScratchFile>,
     sealing: Option<Sealing>,
@@ -452,7 +451,7 @@ struct Contexts {
 /// How far each town point reaches, measured from the towns the addresses
 /// name or as a checkpoint saved it.
 enum TownReach {
-    Votes(ExternalSorter<TownVote>),
+    Votes(Vec<SpoolFile<NamedPoint>>),
     Measured(HashMap<RecordId, u32>),
 }
 
@@ -581,9 +580,11 @@ impl Contexts {
             }
         }
         match reach {
-            TownReach::Votes(votes) => {
-                towns::measure_reach(&mut dots, &dot_names, votes.finish()?)?
-            }
+            TownReach::Votes(votes) => towns::measure_reach(
+                &mut dots,
+                &dot_names,
+                votes.into_iter().flat_map(SpoolFile::into_reader),
+            )?,
             TownReach::Measured(measured) => {
                 for dot in &mut dots {
                     dot.reach_m = measured.get(&dot.record_id).copied().map_or(0.0, f64::from);
@@ -758,7 +759,8 @@ impl<'a> Run<'a> {
             streets: Some(ExternalSorter::new(&scratch, "streets", &memory, budget)),
             places: Some(ExternalSorter::new(&scratch, "places", &memory, budget)),
             context_records: Some(context_sorter(&scratch, &memory, budget)),
-            town_votes: Some(town_vote_sorter(&scratch, &memory, budget)),
+            town_votes: Some(Spool::create(&scratch, TOWN_VOTES)?),
+            town_votes_saved: Vec::new(),
             datasets: Datasets::default(),
             seq: 0,
             memory,
@@ -865,13 +867,17 @@ impl<'a> Run<'a> {
                 &memory,
                 context_share(budget),
             )?,
-            town_votes: sorter_of(
-                sorters,
-                TOWN_VOTES,
-                &scratch,
-                &memory,
-                town_vote_share(budget),
-            )?,
+            // The votes are read once the contexts exist, and not again.
+            town_votes: if state.contexts.is_none() {
+                Some(Spool::create(&scratch, TOWN_VOTES)?)
+            } else {
+                None
+            },
+            town_votes_saved: state
+                .town_votes
+                .iter()
+                .map(|part| SpoolFile::restore(&scratch, part))
+                .collect::<Result<Vec<_>>>()?,
             datasets: Datasets::from_names(state.datasets.clone()),
             seq: state.seq,
             memory,
@@ -1604,11 +1610,15 @@ impl<'a> Run<'a> {
             }
             ordered.write(&item)?;
         }
-        let votes = self
+        let open = self
             .build
             .town_votes
             .take()
             .ok_or_else(|| missing("the towns the addresses name"))?;
+        let mut votes = std::mem::take(&mut self.build.town_votes_saved);
+        if open.written() > 0 {
+            votes.push(open.finish()?);
+        }
         self.contexts = Some(Contexts::derive(
             boundaries,
             ordered.finish()?,
@@ -1781,7 +1791,10 @@ impl<'a> Run<'a> {
             let [lon, lat] = point_lon_lat(&record.geometry).ok_or_else(|| {
                 Error::BadGeometry(format!("postcode {} has no point", record.postcode))
             })?;
-            points.write(&PostcodePoint(record.postcode.clone(), [lon, lat]))?;
+            points.write(&NamedPoint {
+                name: record.postcode.clone(),
+                point: [lon, lat],
+            })?;
             let records = open(&mut self.build.records, "records")?;
             records.push(PendingRecord {
                 key: hilbert_key(quantize(lon)?, quantize(lat)?),
@@ -1850,7 +1863,7 @@ impl<'a> Run<'a> {
             .ok_or_else(|| missing("the postcode points"))?;
         let points = postcodes
             .into_reader()
-            .map(|point| point.map(|PostcodePoint(postcode, point)| (postcode, point)))
+            .map(|point| point.map(|NamedPoint { name, point }| (name, point)))
             .collect::<Result<Vec<_>>>()?;
         writer.set_postcode_areas(PostcodeAreas::new(points));
         let records = self
@@ -1942,7 +1955,6 @@ impl<'a> Run<'a> {
         save_sorter(&mut self.build.streets, &mut sorters)?;
         save_sorter(&mut self.build.places, &mut sorters)?;
         save_sorter(&mut self.build.context_records, &mut sorters)?;
-        save_sorter(&mut self.build.town_votes, &mut sorters)?;
         save_sorter(&mut self.verdicts, &mut sorters)?;
         for sorter in &sorters {
             files.extend(sorter.files(&scratch));
@@ -1962,6 +1974,20 @@ impl<'a> Run<'a> {
         }
         let geometry = self
             .geometry_saved
+            .iter()
+            .map(SpoolFile::state)
+            .collect::<Vec<_>>();
+        // Votes cast since the last checkpoint close into a spool of their own.
+        if let Some(open) = &mut self.build.town_votes
+            && open.written() > 0
+        {
+            let next = Spool::create(&scratch, TOWN_VOTES)?;
+            let closed = std::mem::replace(open, next);
+            self.build.town_votes_saved.push(closed.finish()?);
+        }
+        let town_votes = self
+            .build
+            .town_votes_saved
             .iter()
             .map(SpoolFile::state)
             .collect::<Vec<_>>();
@@ -1998,7 +2024,7 @@ impl<'a> Run<'a> {
         if let Some(sealing) = &self.sealing {
             files.extend(sealing.files());
         }
-        for state in &geometry {
+        for state in geometry.iter().chain(&town_votes) {
             files.extend(state.files(&scratch));
         }
         let boundaries = self.boundaries_saved.as_ref().map(SpoolFile::state);
@@ -2040,6 +2066,7 @@ impl<'a> Run<'a> {
             imports: self.imports.clone(),
             contexts,
             postcodes,
+            town_votes,
             sample: self
                 .sample_saved
                 .as_ref()
@@ -2244,20 +2271,6 @@ fn context_sorter(
 
 const TOWN_VOTES: &str = "town-votes";
 
-/// The town-vote sorter gets a quarter of a share, as a vote is a part of an
-/// address, and only addresses that name a town cast one.
-fn town_vote_share(budget: usize) -> usize {
-    (budget / 4).max(1)
-}
-
-fn town_vote_sorter(
-    scratch: &Arc<Scratch>,
-    memory: &Arc<Budget>,
-    budget: usize,
-) -> ExternalSorter<TownVote> {
-    ExternalSorter::new(scratch, TOWN_VOTES, memory, town_vote_share(budget))
-}
-
 /// A step ran before the one that makes what it needs.
 fn missing(what: &str) -> Error {
     Error::Inconsistent(format!("{what} is missing: a build step ran out of order"))
@@ -2281,7 +2294,10 @@ struct Build {
     context_records: Option<ExternalSorter<PendingRecord>>,
     /// The towns the addresses name, which measure how far each town
     /// mapped as a point reaches.
-    town_votes: Option<ExternalSorter<TownVote>>,
+    town_votes: Option<Spool<NamedPoint>>,
+    /// The votes of the checkpoints before, as the scans cast them. Their
+    /// order does not matter, as a town reaches as far as its farthest vote.
+    town_votes_saved: Vec<SpoolFile<NamedPoint>>,
     /// The datasets of the imported addresses.
     datasets: Datasets,
     seq: u64,
@@ -2331,10 +2347,13 @@ impl Build {
     fn push_address(&mut self, address: PendingAddress, dataset: u32) -> Result<()> {
         let fields = address.fields();
         for name in [fields.locality, fields.place].into_iter().flatten() {
-            open(&mut self.town_votes, "town votes")?.push(TownVote {
-                name: name.to_string(),
-                point: address.point,
-            })?;
+            self.town_votes
+                .as_mut()
+                .ok_or_else(|| missing("the towns the addresses name"))?
+                .write(&NamedPoint {
+                    name: name.to_string(),
+                    point: address.point,
+                })?;
         }
         self.seq += 1;
         open(&mut self.addresses, "addresses")?.push(address.numbered(self.seq - 1, dataset))
