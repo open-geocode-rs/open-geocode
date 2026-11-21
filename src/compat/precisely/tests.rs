@@ -1031,6 +1031,49 @@ async fn lookup_finds_a_record_by_the_pb_key_og_issued() {
 }
 
 #[tokio::test]
+async fn lookup_keeps_the_country_of_each_key() {
+    let fixture = Fixture::new("lookup-country");
+    let router = fixture.router();
+    let key = address_vendor_id("osm:node:10");
+    let legacy = key.strip_prefix("og_").expect("prefix");
+    let reply = post(
+        &router,
+        "/v1/lookup",
+        &json!({"keys": [
+            {"key": key, "type": "PB_KEY", "country": "CAN"},
+            {"key": legacy, "type": "PB_KEY", "country": "ca"},
+            {"key": key, "type": "PB_KEY", "country": "Canada"},
+            {"key": key, "type": "PB_KEY", "country": "USA"},
+            {"key": key, "type": "PB_KEY", "country": "ZZ"},
+            {"key": key, "type": "PB_KEY"},
+        ]}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::PARTIAL_CONTENT);
+    let body = reply.json();
+    assert_eq!(
+        body["responses"][0]["results"],
+        body["responses"][1]["results"]
+    );
+    assert_eq!(
+        body["responses"][0]["results"],
+        body["responses"][2]["results"]
+    );
+    assert_eq!(body["responses"][0]["status"], "OK", "{body}");
+    assert_eq!(
+        body["responses"][3],
+        json!({"status": "ZERO_RESULTS", "results": []})
+    );
+    for index in [4, 5] {
+        assert_eq!(
+            body["responses"][index]["status"], "INVALID_REQUEST",
+            "{body}"
+        );
+        assert!(body["responses"][index].get("results").is_none(), "{body}");
+    }
+}
+
+#[tokio::test]
 async fn an_unknown_path_or_method_is_not_found() {
     let fixture = Fixture::new("missing");
     let router = fixture.router();

@@ -143,14 +143,14 @@ struct LookupRequest {
     keys: Vec<LookupKey>,
 }
 
-/// `LookupSingleRequest`. Its `country` is not read, since an og id names
-/// one record wherever it is.
+/// `LookupSingleRequest`. Country scopes each key independently.
 #[derive(Debug, Deserialize)]
 struct LookupKey {
     #[serde(default)]
     key: Option<String>,
     #[serde(rename = "type", default)]
     kind: Option<String>,
+    country: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -464,15 +464,9 @@ pub(super) async fn lookup(
                     .to_string(),
             ),
             (_, None) => invalid("Lookup key cannot be null or empty (DIS-LI-1027)".to_string()),
-            ("PB_KEY", Some(value)) => match decode_id(value) {
-                None => Outcome::found(None, &[], 1, Product::Geocode),
-                Some(og_id) => match native::by_id(&state, &og_id, None).await {
-                    Ok(feature) => {
-                        Outcome::of_features(None, feature.as_slice(), 1, Product::Geocode)
-                    }
-                    Err(problem) => Outcome::refused(None, problem, None),
-                },
-            },
+            ("PB_KEY", Some(value)) => {
+                lookup_key(&state, value, given(key.country.as_deref())).await
+            }
             (kind, Some(_)) => invalid(format!("Key type {kind} is not supported by this server")),
         });
     }
@@ -483,6 +477,43 @@ pub(super) async fn lookup(
         started,
         outcomes,
     ))
+}
+
+async fn lookup_key(state: &AppState, value: &str, country: Option<&str>) -> Outcome {
+    let code = country
+        .map(country_code)
+        .map(|code| code.to_ascii_uppercase())
+        .filter(|code| crate::iso::alpha3(code).is_some())
+        .or_else(|| crate::iso::alpha2_of_name(country?).map(str::to_string))
+        .or_else(|| {
+            state
+                .searcher()
+                .country_named(country?)
+                .map(|code| code.as_str().to_string())
+        });
+    let Some(code) = code else {
+        return Outcome::failed(
+            None,
+            Failure::from_parts(400, "invalid", &["country"], country),
+            None,
+        );
+    };
+    let empty = || Outcome::found(None, &[], 1, Product::Geocode);
+    let Some(named) = decode_id(value) else {
+        return empty();
+    };
+    match native::by_id(state, &named, None).await {
+        Ok(Some(hit)) => {
+            let feature = Feature::from(&hit);
+            if feature.country_code() == Some(code.as_str()) {
+                Outcome::found(None, &[feature], 1, Product::Geocode)
+            } else {
+                empty()
+            }
+        }
+        Ok(None) => empty(),
+        Err(problem) => Outcome::refused(None, problem, country),
+    }
 }
 
 #[derive(Debug, Serialize)]

@@ -512,6 +512,15 @@ impl TextSearcher {
         self.tagger.dictionaries().describes_street(word)
     }
 
+    /// A country name or alias written in full, as recorded in the Pack.
+    pub(crate) fn country_named(&self, name: &str) -> Option<CountryCode> {
+        let key = lattice::dictionary_key(name)?;
+        self.tagger
+            .dictionaries()
+            .get(NameField::Country, &key)?
+            .country
+    }
+
     /// The Pack's confidence model, `None` when it has not been calibrated.
     pub fn confidence_model(&self) -> Option<&confidence::Model> {
         self.confidence.as_ref()
