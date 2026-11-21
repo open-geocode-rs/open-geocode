@@ -42,6 +42,42 @@ impl Viewport {
             high: LatLng::of([east, north]),
         })
     }
+
+    fn geocode(common: &Common, [lon, lat]: [f64; 2]) -> Option<Self> {
+        Self::of(common.bbox).or_else(|| {
+            if !matches!(common.layer, Layer::Address | Layer::Interpolation) {
+                return None;
+            }
+            // A display window for an address represented only by a point.
+            // It has no bearing on the record geometry or its accuracy.
+            const HALF_SPAN: f64 = 0.00135;
+            let wrap = |longitude: f64| {
+                if longitude < -180.0 {
+                    longitude + 360.0
+                } else if longitude > 180.0 {
+                    longitude - 360.0
+                } else {
+                    longitude
+                }
+            };
+            Self::of(Some([
+                wrap(lon - HALF_SPAN),
+                (lat - HALF_SPAN).max(-90.0),
+                wrap(lon + HALF_SPAN),
+                (lat + HALF_SPAN).min(90.0),
+            ]))
+        })
+    }
+
+    pub(super) fn contains(&self, point: LatLng) -> bool {
+        let in_lat = (self.low.latitude..=self.high.latitude).contains(&point.latitude);
+        let in_lon = if self.low.longitude <= self.high.longitude {
+            (self.low.longitude..=self.high.longitude).contains(&point.longitude)
+        } else {
+            point.longitude >= self.low.longitude || point.longitude <= self.high.longitude
+        };
+        in_lat && in_lon
+    }
 }
 
 /// Google's `timeZone`. og knows the IANA name, not which release of the
@@ -163,6 +199,7 @@ impl Place {
     pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
         let id = encode_id(common);
         let kind = Kind::of(common);
+        let (postal_address, formatted_address) = address_fields(common);
         Self {
             name: format!("places/{id}"),
             id,
@@ -172,8 +209,8 @@ impl Place {
             },
             types: kind.types(),
             primary_type: kind.primary(),
-            formatted_address: formatted_address(common),
-            postal_address: postal_address(common),
+            formatted_address,
+            postal_address,
             address_components: address_components(common, language),
             location: LatLng::of(coordinates),
             viewport: Viewport::of(common.bbox),
@@ -224,17 +261,7 @@ pub(super) struct GeocodeResult {
 impl GeocodeResult {
     pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
         let place_id = encode_id(common);
-        let mut postal_address = postal_address(common);
-        let formatted_address = if common.layer == Layer::Address
-            && compat::country_code(&common.context) == Some("US")
-        {
-            postal_address
-                .as_mut()
-                .and_then(|postal| formatted_us_address(common, postal))
-                .or_else(|| formatted_address(common))
-        } else {
-            formatted_address(common)
-        };
+        let (postal_address, formatted_address) = address_fields(common);
         Self {
             place: format!("places/{place_id}"),
             place_id,
@@ -244,7 +271,7 @@ impl GeocodeResult {
             postal_address,
             address_components: address_components(common, language),
             types: Kind::of(common).types(),
-            viewport: Viewport::of(common.bbox),
+            viewport: Viewport::geocode(common, coordinates),
             bounds: Viewport::of(common.bbox).filter(|_| common.layer.is_context()),
         }
     }
@@ -346,6 +373,19 @@ fn formatted_address(common: &Common) -> Option<String> {
         return after_name(common);
     }
     (!common.label.is_empty()).then(|| common.label.clone())
+}
+
+fn address_fields(common: &Common) -> (Option<PostalAddress>, Option<String>) {
+    let mut postal = postal_address(common);
+    let formatted =
+        if common.layer == Layer::Address && compat::country_code(&common.context) == Some("US") {
+            postal
+                .as_mut()
+                .and_then(|postal| formatted_us_address(common, postal))
+        } else {
+            None
+        };
+    (postal, formatted.or_else(|| formatted_address(common)))
 }
 
 fn formatted_us_address(common: &Common, postal: &mut PostalAddress) -> Option<String> {

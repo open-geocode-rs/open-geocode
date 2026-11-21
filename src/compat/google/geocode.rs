@@ -87,7 +87,7 @@ async fn geocode_address(
     let language = language(state, query)?;
     let args = args.maybe("lang", language.code());
     let found = native::geocode(state, args).await.map_err(from_problem)?;
-    let results = found
+    let mut results: Vec<_> = found
         .features
         .iter()
         .map(|feature| {
@@ -98,7 +98,35 @@ async fn geocode_address(
             )
         })
         .collect();
+    prefer_precise_address_points(&mut results);
     Ok(respond(&GeocodeResponse { results }, mask.as_ref()))
+}
+
+// Once an address is known at rooftop accuracy, a nearby centre for the
+// same complete postal address is redundant. Keep separately mapped
+// rooftops, distinct units and distant results even when labels agree.
+fn prefer_precise_address_points(results: &mut Vec<GeocodeResult>) {
+    let rooftops = results
+        .iter()
+        .filter(|result| {
+            result.granularity == "ROOFTOP" && result.types.contains(&"street_address")
+        })
+        .filter_map(|result| {
+            let postal = result.postal_address.as_ref()?;
+            postal.region_code.as_ref()?;
+            postal.locality.as_ref()?;
+            postal.postal_code.as_ref()?;
+            postal.address_lines.first()?;
+            Some((postal.clone(), result.viewport?))
+        })
+        .collect::<Vec<_>>();
+    results.retain(|result| {
+        result.granularity != "GEOMETRIC_CENTER"
+            || !result.types.contains(&"street_address")
+            || !rooftops.iter().any(|(postal, viewport)| {
+                result.postal_address.as_ref() == Some(postal) && viewport.contains(result.location)
+            })
+    });
 }
 
 /// An address as Geocoding takes one, as one text or as postal parts.
@@ -318,4 +346,70 @@ pub(super) async fn place(
         Ok(respond(&result, mask.as_ref()))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compat::google::model::{
+        LatLng as ResultPoint, PostalAddress, Viewport as DisplayViewport,
+    };
+
+    #[test]
+    fn a_rooftop_only_supersedes_the_nearby_centre_of_the_same_postal_address() {
+        let rooftop = GeocodeResult {
+            place: "places/og_rooftop".to_string(),
+            place_id: "og_rooftop".to_string(),
+            location: ResultPoint {
+                latitude: 40.0,
+                longitude: -80.0,
+            },
+            granularity: "ROOFTOP",
+            formatted_address: None,
+            postal_address: Some(PostalAddress {
+                region_code: Some("US".to_string()),
+                locality: Some("Town".to_string()),
+                postal_code: Some("15201".to_string()),
+                address_lines: vec!["12 Main Street".to_string()],
+                ..PostalAddress::default()
+            }),
+            address_components: Vec::new(),
+            types: vec!["street_address"],
+            viewport: Some(DisplayViewport {
+                low: ResultPoint {
+                    latitude: 39.999,
+                    longitude: -80.001,
+                },
+                high: ResultPoint {
+                    latitude: 40.001,
+                    longitude: -79.999,
+                },
+            }),
+            bounds: None,
+        };
+        let mut centre = rooftop.clone();
+        centre.place_id = "og_centre".to_string();
+        centre.granularity = "GEOMETRIC_CENTER";
+        let mut unit = centre.clone();
+        unit.place_id = "og_unit".to_string();
+        unit.postal_address
+            .as_mut()
+            .expect("address")
+            .address_lines
+            .push("2".to_string());
+        let mut far = centre.clone();
+        far.place_id = "og_far".to_string();
+        far.location.latitude = 41.0;
+        let mut other_rooftop = rooftop.clone();
+        other_rooftop.place_id = "og_other_rooftop".to_string();
+        let mut results = vec![centre, unit, rooftop, far, other_rooftop];
+        prefer_precise_address_points(&mut results);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.place_id.as_str())
+                .collect::<Vec<_>>(),
+            ["og_unit", "og_rooftop", "og_far", "og_other_rooftop"]
+        );
+    }
 }

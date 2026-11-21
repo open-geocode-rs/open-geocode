@@ -702,6 +702,10 @@ fn address_result() -> Value {
         "placeId": id,
         "location": {"latitude": 43.0, "longitude": -79.0},
         "granularity": "ROOFTOP",
+        "viewport": {
+            "low": {"latitude": 43.0 - 0.00135, "longitude": -79.0 - 0.00135},
+            "high": {"latitude": 43.0 + 0.00135, "longitude": -79.0 + 0.00135},
+        },
         "formattedAddress": "10 King Street, Unit 4B, City of Toronto, ON, M5V 1A1, Canada",
         "postalAddress": {
             "regionCode": "CA",
@@ -1215,7 +1219,18 @@ async fn every_og_value_lands_in_its_google_slot() {
             };
             assert_eq!(place["viewport"]["low"], corner(0), "{og_id}");
             assert_eq!(place["viewport"]["high"], corner(2), "{og_id}");
-            assert_eq!(result["viewport"], place["viewport"]);
+            if !properties["bbox"].is_null() {
+                assert_eq!(result["viewport"], place["viewport"]);
+            } else if properties["layer"] == "address" {
+                for key in ["latitude", "longitude"] {
+                    let location = result["location"][key].as_f64().expect("coordinate");
+                    let low = result["viewport"]["low"][key].as_f64().expect("low corner");
+                    let high = result["viewport"]["high"][key]
+                        .as_f64()
+                        .expect("high corner");
+                    assert!(low < location && location < high, "{result}");
+                }
+            }
             let contact = &properties["contact"];
             assert_eq!(place["websiteUri"], contact["website"]);
             let phone = if place["internationalPhoneNumber"].is_null() {
@@ -1618,7 +1633,7 @@ fn address_destination() -> Value {
     let place = format!("places/{id}");
     let mut primary = address_result();
     let fields = primary.as_object_mut().expect("a result");
-    for field in ["granularity", "types"] {
+    for field in ["granularity", "types", "viewport"] {
         fields.remove(field);
     }
     fields.insert("place".to_string(), json!(place));
