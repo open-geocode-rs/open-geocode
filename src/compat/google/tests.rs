@@ -956,22 +956,15 @@ async fn search_nearby_answers_the_places_inside_the_circle() {
         assert_eq!(reply.status, StatusCode::OK, "{request}");
         assert_eq!(reply.body, found, "{request}");
     }
-    // A type og has no category for would match places og cannot tell
-    // apart, so it is refused, not answered with none.
+    // A type og has no category for holds no place og knows.
     let reply = post(
         &fixture.router,
         SEARCH_NEARBY,
         json!({"locationRestriction": around(1000.0), "includedTypes": ["chinese_restaurant"]}),
     )
     .await;
-    assert_eq!(
-        reply.body,
-        google_error(
-            400,
-            "INVALID_ARGUMENT",
-            "includedTypes \"chinese_restaurant\" is not supported by this server."
-        )
-    );
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body, json!({}));
     // Outside the circle, another type, and the place's own type excluded.
     for request in [
         json!({"locationRestriction": around(100.0)}),
@@ -1841,7 +1834,7 @@ async fn destinations_leave_out_areas_and_refuse_what_google_refuses() {
 }
 
 #[tokio::test]
-async fn filters_og_cannot_honour_are_refused_and_the_rest_applied() {
+async fn filters_og_holds_no_data_for_keep_no_place_and_the_rest_apply() {
     let fixture = fixture();
     let router = &fixture.router;
     let refused = |what: &str| google_error(400, "INVALID_ARGUMENT", what);
@@ -1851,20 +1844,8 @@ async fn filters_og_cannot_honour_are_refused_and_the_rest_applied() {
             "openNow is not supported by this server.",
         ),
         (
-            json!({"textQuery": "Queen", "minRating": 4.0}),
-            "minRating is not supported by this server.",
-        ),
-        (
-            json!({"textQuery": "Queen", "priceLevels": ["PRICE_LEVEL_MODERATE"]}),
-            "priceLevels is not supported by this server.",
-        ),
-        (
             json!({"textQuery": "Queen", "pageToken": "garbage"}),
             "Invalid pageToken \"garbage\".",
-        ),
-        (
-            json!({"textQuery": "Queen", "includedType": "chinese_restaurant"}),
-            "includedType \"chinese_restaurant\" is not supported by this server.",
         ),
         (
             json!({"textQuery": "Queen", "rankPreference": "DISTANCE"}),
@@ -1873,6 +1854,18 @@ async fn filters_og_cannot_honour_are_refused_and_the_rest_applied() {
     ] {
         let reply = post(router, SEARCH_TEXT, body.clone()).await;
         assert_eq!(reply.body, refused(message), "{body}");
+    }
+    // og holds no rating, price or charging options, and no category of
+    // this type, so no place it holds passes them.
+    for body in [
+        json!({"textQuery": "Queen", "minRating": 4.0}),
+        json!({"textQuery": "Queen", "priceLevels": ["PRICE_LEVEL_MODERATE"]}),
+        json!({"textQuery": "Queen", "evOptions": {"minimumChargingRateKw": 10}}),
+        json!({"textQuery": "Queen", "includedType": "chinese_restaurant", "strictTypeFiltering": true}),
+    ] {
+        let reply = post(router, SEARCH_TEXT, body.clone()).await;
+        assert_eq!(reply.status, StatusCode::OK, "{body}");
+        assert_eq!(reply.body, json!({}), "{body}");
     }
     let ids = |reply: &Value, list: &str| {
         reply[list]
@@ -1911,10 +1904,7 @@ async fn filters_og_cannot_honour_are_refused_and_the_rest_applied() {
         )
     };
     let reply = autocomplete(json!(["chinese_restaurant"])).await;
-    assert_eq!(
-        reply.body,
-        refused("includedPrimaryTypes \"chinese_restaurant\" is not supported by this server.")
-    );
+    assert_eq!(reply.body, json!({}), "no place og holds is of the type");
     let bakeries = autocomplete(json!(["bakery"])).await.body;
     assert_eq!(
         bakeries["suggestions"][0]["placePrediction"]["placeId"],

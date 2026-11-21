@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     Area, Code, LatLng, QueryParams, body, both_shapes, error, field_mask, from_problem, invalid,
     language::{Language, accept_language},
-    model::{Kind, Place, after_name, categories_of, place_type_known, type_known},
+    model::{Kind, Place, after_name, categories_of},
     proto_int, respond, run,
 };
 use crate::{
@@ -66,21 +66,12 @@ struct SearchTextRequest {
 }
 
 impl SearchTextRequest {
-    /// Refuses what would narrow or order the answer by data og does not
-    /// hold, since an answer that ignored it would not be the one asked for.
+    /// Refuses what og cannot answer either way. Whether a place is open
+    /// now needs its local time, which the Pack does not hold.
     fn refuse_unheld(&self) -> Result<(), VendorError> {
         let unheld = |what: &str| invalid(format!("{what} is not supported by this server."));
         if self.open_now {
             return Err(unheld("openNow"));
-        }
-        if self.min_rating.is_some_and(|rating| rating > 0.0) {
-            return Err(unheld("minRating"));
-        }
-        if !self.price_levels.is_empty() {
-            return Err(unheld("priceLevels"));
-        }
-        if self.ev_options.is_some() {
-            return Err(unheld("evOptions"));
         }
         if self.search_along_route_parameters.is_some() {
             return Err(unheld("searchAlongRouteParameters"));
@@ -89,15 +80,16 @@ impl SearchTextRequest {
         if let Some(token) = self.page_token.as_deref().filter(|token| !token.is_empty()) {
             return Err(invalid(format!("Invalid pageToken \"{token}\".")));
         }
-        if let Some(named) = self
-            .included_type
-            .as_deref()
-            .filter(|named| !named.is_empty())
-            && !type_known(named)
-        {
-            return Err(unheld(&format!("includedType \"{named}\"")));
-        }
         Ok(())
+    }
+
+    /// Whether the request keeps only places of a rating, a price or EV
+    /// charging options. og holds none of these for any place, so no place
+    /// it holds is one of them.
+    fn keeps_only_unheld(&self) -> bool {
+        self.min_rating.is_some_and(|rating| rating > 0.0)
+            || !self.price_levels.is_empty()
+            || self.ev_options.is_some()
     }
 }
 
@@ -153,6 +145,12 @@ pub(super) async fn search_text(
         )?;
         let rank = TextRank::of(request.rank_preference.as_deref(), focus.as_deref())?;
         let language = places_language(&state, request.language_code.clone())?;
+        if request.keeps_only_unheld() {
+            return Ok(respond(
+                &SearchTextResponse { places: Vec::new() },
+                mask.as_ref(),
+            ));
+        }
         let included = request
             .included_type
             .as_deref()
@@ -346,15 +344,6 @@ impl<'a> TypeRules<'a> {
                 return Err(invalid(format!(
                     "{name} takes at most {MAX_TYPES} types, got {}",
                     list.len()
-                )));
-            }
-        }
-        // A type og has no category for would match no place og knows, or
-        // exclude none, though Google's places of it exist.
-        for (name, list) in lists {
-            if let Some(named) = list.iter().find(|named| !place_type_known(named)) {
-                return Err(invalid(format!(
-                    "{name} \"{named}\" is not supported by this server."
                 )));
             }
         }
@@ -672,14 +661,6 @@ pub(super) async fn autocomplete(
             return Err(invalid(format!(
                 "includedPrimaryTypes takes at most {MAX_PRIMARY_TYPES} types, got {}",
                 primary.len()
-            )));
-        }
-        if let Some(named) = primary
-            .iter()
-            .find(|named| collection(named).is_none() && !type_known(named))
-        {
-            return Err(invalid(format!(
-                "includedPrimaryTypes \"{named}\" is not supported by this server."
             )));
         }
         let admits = |kind: Kind| {

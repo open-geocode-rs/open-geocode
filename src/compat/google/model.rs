@@ -698,6 +698,7 @@ const CATEGORY_TYPES: &[(&str, &str)] = &[
     ("amenity university", "university"),
     ("amenity veterinary", "veterinary_care"),
     ("craft electrician", "electrician"),
+    ("highway bus_stop", "bus_stop"),
     ("craft locksmith", "locksmith"),
     ("craft painter", "painter"),
     ("craft plumber", "plumber"),
@@ -723,7 +724,10 @@ const CATEGORY_TYPES: &[(&str, &str)] = &[
     ("office insurance", "insurance_agency"),
     ("office lawyer", "lawyer"),
     ("office travel_agent", "travel_agency"),
+    ("public_transport station", "transit_station"),
+    ("railway halt", "train_station"),
     ("railway station", "train_station"),
+    ("railway tram_stop", "light_rail_station"),
     ("shop alcohol", "liquor_store"),
     ("shop bakery", "bakery"),
     ("shop beauty", "beauty_salon"),
@@ -770,32 +774,6 @@ const CATEGORY_TYPES: &[(&str, &str)] = &[
 /// Google's types every place has, whatever its kind.
 const ANY_PLACE: [&str; 2] = ["point_of_interest", "establishment"];
 
-/// Whether og can tell a place of Google's type `named` apart from others:
-/// a type every place has, or one og's category table maps.
-pub(super) fn place_type_known(named: &str) -> bool {
-    ANY_PLACE.contains(&named) || CATEGORY_TYPES.iter().any(|(_, google)| *google == named)
-}
-
-/// Whether og can tell a result of Google's type `named` apart from others:
-/// a place type it knows, or a type it gives an address, street or area.
-pub(super) fn type_known(named: &str) -> bool {
-    place_type_known(named)
-        || [
-            Layer::Address,
-            Layer::Street,
-            Layer::Neighbourhood,
-            Layer::Locality,
-            Layer::Region,
-            Layer::Country,
-            Layer::Postcode,
-        ]
-        .into_iter()
-        .any(|layer| match Kind::of_layer(layer) {
-            Kind::Types(types) => types.contains(&named),
-            Kind::Poi(_) | Kind::Unknown => false,
-        })
-}
-
 /// og's POI category (`key:value`) as Google's type.
 fn category_type(category: &str) -> Option<&'static str> {
     let (key, value) = category.split_once(':')?;
@@ -826,4 +804,22 @@ pub(super) fn categories_of<'a>(types: impl IntoIterator<Item = &'a str>) -> Vec
         );
     }
     categories
+}
+
+#[cfg(test)]
+mod transit_tests {
+    use super::categories_of;
+
+    /// Google's transit types find og's stations and stops.
+    #[test]
+    fn transit_types_find_og_stations_and_stops() {
+        for (google, category) in [
+            ("transit_station", "public_transport station"),
+            ("train_station", "railway halt"),
+            ("light_rail_station", "railway tram_stop"),
+            ("bus_stop", "highway bus_stop"),
+        ] {
+            assert!(categories_of([google]).contains(&category), "{google}");
+        }
+    }
 }
