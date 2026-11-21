@@ -575,6 +575,45 @@ impl Feature {
                 encode_parts(&properties.id, Some(properties.layer), &properties.label),
             )]),
         };
+        // A point may have a street-only display label even though its
+        // recorded components identify the municipality and state.
+        if is_street_line
+            && candidate.address.formatted_location_address.is_none()
+            && candidate
+                .address
+                .country
+                .as_ref()
+                .and_then(|country| country.iso_alpha2_code.as_deref())
+                == Some("US")
+            && let (Some(city), Some(region), Some(street)) = (
+                candidate.address.city.as_ref(),
+                candidate.address.admin1.as_ref(),
+                candidate.address.formatted_street_address.as_deref(),
+            )
+        {
+            let state = region.short_name.as_deref().unwrap_or(&region.long_name);
+            let postal = properties.address.postcode.as_deref();
+            let state_and_postal = [Some(state), postal]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let location = format!("{}, {state_and_postal}", city.long_name);
+            let country = candidate
+                .address
+                .country
+                .as_ref()
+                .and_then(|country| country.name.as_deref());
+            let city_state = format!("{} {state_and_postal}", city.long_name);
+            candidate.address.formatted_address = Some(
+                [Some(street), Some(&city_state), country]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            candidate.address.formatted_location_address = Some(location);
+        }
         let holds = Holds::of(&candidate.address);
         candidate.explanation.address_match.description = describe(judged, &holds);
         if product == Product::Verify {
