@@ -289,6 +289,9 @@ pub struct PoiDetails {
     pub extent: Option<Extent>,
     /// The entrances its source maps (see [`Entrance`]).
     pub access: Vec<Entrance>,
+    /// The kinds of food it serves, as its `cuisine` tag lists them, in
+    /// lower case and in order (`pizza`, `italian`).
+    pub cuisine: Vec<String>,
 }
 
 impl PoiDetails {
@@ -1127,6 +1130,12 @@ impl PoiRecord {
         self.details
             .as_ref()
             .map_or(&[], |details| details.access.as_slice())
+    }
+
+    pub fn cuisine(&self) -> &[String] {
+        self.details
+            .as_ref()
+            .map_or(&[], |details| details.cuisine.as_slice())
     }
 }
 

@@ -186,6 +186,9 @@ fn write_pack(dir: &Path) {
                         at: [-790_050_000, 429_995_000],
                         kind: "main".to_string(),
                     }],
+                    // Google has a restaurant type for sandwiches, none for
+                    // coffee.
+                    cuisine: vec!["coffee_shop".to_string(), "french".to_string()],
                 })),
                 aliases: Vec::new(),
             }
@@ -280,7 +283,7 @@ fn bakery_place() -> Value {
         "name": format!("places/{id}"),
         "id": id,
         "displayName": {"text": "Queen Bakery"},
-        "types": ["bakery", "food", "store", "point_of_interest", "establishment"],
+        "types": ["bakery", "french_restaurant", "food", "store", "point_of_interest", "establishment"],
         "primaryType": "bakery",
         "formattedAddress": "12 King Street, Toronto, ON M5V 1A1, Canada",
         "postalAddress": {
@@ -607,7 +610,7 @@ async fn autocomplete_suggests_places_with_matches_and_distance() {
                 "mainText": {"text": "Queen Bakery", "matches": [{"endOffset": 9}]},
                 "secondaryText": {"text": "12 King Street, Toronto, M5V 1A1"},
             },
-            "types": ["bakery", "food", "store", "point_of_interest", "establishment"],
+            "types": ["bakery", "french_restaurant", "food", "store", "point_of_interest", "establishment"],
             "distanceMeters": 407,
         }}]})
     );

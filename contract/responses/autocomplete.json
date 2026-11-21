@@ -59,6 +59,9 @@
             "name": "Ontario"
           }
         },
+        "cuisine": [
+          "coffee_shop"
+        ],
         "highlights": [
           {
             "end": 4,

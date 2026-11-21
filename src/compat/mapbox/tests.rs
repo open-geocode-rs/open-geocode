@@ -217,6 +217,7 @@ fn write_pack() -> Pack {
                         at: [-790_050_000, 430_001_000],
                         kind: "yes".to_string(),
                     }],
+                    cuisine: Vec::new(),
                 }
                 .kept(),
                 aliases: Vec::new(),

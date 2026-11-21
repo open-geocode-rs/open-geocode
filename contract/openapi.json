@@ -216,6 +216,17 @@
             "$ref": "#/components/schemas/Context",
             "description": "Administrative areas containing the result."
           },
+          "cuisine": {
+            "description": "The kinds of food a place serves, as OpenStreetMap's `cuisine` tag\nlists them, in lower case and in order. Absent on a result that\nstates none.",
+            "example": [
+              "pizza",
+              "italian"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "id": {
             "description": "Stable ID from the source data, such as `osm:node:123`. Store it to\nfind the record again: it outlives a Pack rebuild.",
             "type": "string"

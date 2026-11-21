@@ -1009,6 +1009,7 @@ fn write_pack(dir: &PathBuf) {
                         at: [-790_050_000, 429_999_200],
                         kind: "main".to_string(),
                     }],
+                    cuisine: vec!["coffee_shop".to_string()],
                 }
                 .kept(),
                 aliases: Vec::new(),

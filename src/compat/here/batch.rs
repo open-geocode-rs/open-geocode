@@ -2114,6 +2114,12 @@ fn cell_of(item: &Item, column: &str) -> String {
             .map(|category| category.id)
             .collect::<Vec<_>>()
             .join(","),
+        "foodTypes" => item
+            .food_types
+            .iter()
+            .map(|food| food.id)
+            .collect::<Vec<_>>()
+            .join(","),
         "timeZoneName" => item
             .time_zone
             .as_ref()

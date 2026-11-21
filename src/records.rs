@@ -130,7 +130,7 @@ pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 13;
+pub const RECORDS_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogueId {
@@ -167,6 +167,9 @@ const TAG_SOURCE_SHIFT: u8 = 6;
 const POI_EXTENT: u8 = 1 << 4;
 /// Bit of a POI's details byte. When set, its entrances follow its extent.
 const POI_ACCESS: u8 = 1 << 5;
+/// Bit of a POI's details byte. When set, the kinds of food it serves
+/// follow its entrances.
+const POI_CUISINE: u8 = 1 << 6;
 /// Bit of an address's presence byte, past its seven strings. When set, its
 /// entrances follow its street's postcodes.
 const ADDRESS_ACCESS: u8 = 1 << 7;
@@ -213,6 +216,9 @@ pub struct Summary {
     pub contact: Option<Contact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opening_hours: Option<String>,
+    /// The kinds of food a POI serves, as its `cuisine` tag lists them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cuisine: Vec<String>,
     /// The box around a record larger than a point, as [`bbox`] writes it.
     /// It holds a street's line, or the outline a POI is drawn with. An
     /// area's is the Pack's to add, which holds it beside the record.
@@ -868,6 +874,10 @@ impl Writer {
                     out[details_at] |= POI_ACCESS;
                     self.put_access(out, point, record.access())?;
                 }
+                if !record.cuisine().is_empty() {
+                    out[details_at] |= POI_CUISINE;
+                    self.put_strings(out, record.cuisine())?;
+                }
                 match &record.address {
                     Some(address) => {
                         out.push(1);
@@ -1369,6 +1379,7 @@ impl Reader {
         let mut brand = None;
         let mut contact = None;
         let mut opening_hours = None;
+        let mut cuisine = Vec::new();
         let mut extent = None;
         let mut access = Vec::new();
         let mut stated = Address::default();
@@ -1393,6 +1404,7 @@ impl Reader {
                 brand.clone_from(&poi.brand);
                 if let Some(details) = poi.details {
                     (contact, opening_hours) = (details.contact, details.opening_hours);
+                    cuisine = details.cuisine;
                     extent = details.extent;
                     access = details.access;
                 }
@@ -1470,6 +1482,7 @@ impl Reader {
             brand,
             contact,
             opening_hours,
+            cuisine,
             bbox: extent.map(bbox),
             timezone: None,
             street_postcode,
@@ -2167,6 +2180,11 @@ impl Reader {
         } else {
             Vec::new()
         };
+        let cuisine = if flags & POI_CUISINE != 0 {
+            self.string_list(strings, fields)?
+        } else {
+            Vec::new()
+        };
         let address = match get_u8(fields)? {
             0 => None,
             _ => Some(self.address_components(strings, fields)?),
@@ -2184,6 +2202,7 @@ impl Reader {
                 opening_hours,
                 extent,
                 access,
+                cuisine,
             }
             .kept(),
             address,
@@ -2995,6 +3014,7 @@ mod tests {
                     contact: None,
                     opening_hours: text("24/7"),
                     extent: Some(hall),
+                    cuisine: Vec::new(),
                 }
                 .kept(),
             ),
@@ -3136,6 +3156,7 @@ mod tests {
                     opening_hours: Some("24/7".into()),
                     extent: Some([-790_002_000, 429_999_000, -789_998_500, 430_001_250]),
                     access: vec![entrance(-790_002_000, 430_000_000, "staircase")],
+                    cuisine: vec!["pizza".into(), "italian".into()],
                 }
                 .kept(),
             ),

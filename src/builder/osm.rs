@@ -5410,7 +5410,7 @@ mod tests {
             ("places/*", 3),
             ("plate_codes", 1),
             ("postcode_addresses", 1),
-            ("records/*", 13),
+            ("records/*", 14),
             ("spatial/*", 3),
             ("streets/*", 1),
             ("subdivision_codes", 1),

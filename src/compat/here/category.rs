@@ -212,6 +212,22 @@ pub(super) struct ItemCategory {
     primary: bool,
 }
 
+impl ItemCategory {
+    /// An entry of a list whose first is the place's own, marked primary:
+    /// its categories, or its food types.
+    pub(super) fn listed(entries: Vec<(&'static str, &'static str)>) -> Vec<Self> {
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, (id, name))| Self {
+                id,
+                name,
+                primary: index == 0,
+            })
+            .collect()
+    }
+}
+
 /// The HERE categories of a place of og's `category` (`amenity:cafe`), its
 /// own kind marked primary. Empty when the table has none for it.
 pub(super) fn of_place(category: &str) -> Vec<ItemCategory> {
@@ -225,15 +241,12 @@ pub(super) fn of_place(category: &str) -> Vec<ItemCategory> {
     if listed.is_empty() {
         listed = found(GROUPS);
     }
-    listed
-        .into_iter()
-        .enumerate()
-        .map(|(index, listed)| ItemCategory {
-            id: listed.id,
-            name: listed.name,
-            primary: index == 0,
-        })
-        .collect()
+    ItemCategory::listed(
+        listed
+            .into_iter()
+            .map(|listed| (listed.id, listed.name))
+            .collect(),
+    )
 }
 
 /// The categories a typed word begins a word of the name of, as HERE

@@ -508,6 +508,11 @@ fn merge(leader: &mut PoiRecord, member: PoiRecord) {
         } else {
             own.access
         },
+        cuisine: if own.cuisine.is_empty() {
+            theirs.cuisine
+        } else {
+            own.cuisine
+        },
     }
     .kept();
     leader.prominence = leader.prominence.max(member.prominence);
@@ -594,6 +599,23 @@ pub(crate) fn poi_tags(
         .collect()
 }
 
+/// The kinds of food a place's `cuisine` tag lists, each once, in lower
+/// case and in the tag's order: `Pizza; italian` is `pizza` and `italian`.
+fn cuisine(tags: &BTreeMap<String, String>) -> Vec<String> {
+    let mut kinds = Vec::<String>::new();
+    for kind in tags
+        .get("cuisine")
+        .into_iter()
+        .flat_map(|value| value.split(';'))
+    {
+        let kind = kind.trim().to_lowercase();
+        if !kind.is_empty() && !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    kinds
+}
+
 /// Emit a POI from its kept tags; their `addr:*` tags are already validated.
 pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
     let tags = &candidate.tags;
@@ -643,6 +665,7 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
                 .as_deref()
                 .and_then(containment::narrowest_extent),
             access: candidate.entrances.clone(),
+            cuisine: cuisine(tags),
         }
         .kept(),
         aliases: Vec::new(),
@@ -1256,6 +1279,18 @@ mod tests {
     }
 
     #[test]
+    fn a_poi_keeps_the_kinds_of_food_its_cuisine_lists() {
+        assert_eq!(
+            details(&[("cuisine", " Pizza;italian ; pizza;; ")]),
+            Some(PoiDetails {
+                cuisine: vec!["pizza".to_string(), "italian".to_string()],
+                ..PoiDetails::default()
+            })
+        );
+        assert_eq!(details(&[("cuisine", " ; ")]), None);
+    }
+
+    #[test]
     fn a_poi_keeps_its_contact_and_opening_hours_as_written() {
         assert_eq!(
             details(&[
@@ -1273,6 +1308,7 @@ mod tests {
                 }),
                 opening_hours: Some("Mo-Fr 08:00-18:00;  Sa 09:00-13:00".into()),
                 extent: None,
+                cuisine: Vec::new(),
             })
         );
         assert_eq!(
@@ -1338,6 +1374,7 @@ mod tests {
                 contact: None,
                 opening_hours: Some("24/7".into()),
                 extent: None,
+                cuisine: Vec::new(),
             })
         );
         assert_eq!(

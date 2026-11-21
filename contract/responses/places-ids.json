@@ -59,6 +59,9 @@
             "name": "Ontario"
           }
         },
+        "cuisine": [
+          "coffee_shop"
+        ],
         "id": "osm:way:11",
         "label": "Queen Bakery, 12 King Street, Toronto, M5V 1A1",
         "layer": "poi",

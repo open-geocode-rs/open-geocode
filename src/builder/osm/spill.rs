@@ -1149,6 +1149,7 @@ fn record_heap_bytes(record: &Record) -> usize {
                         .map(String::len)
                         .sum::<usize>()
                         + entrances_heap_bytes(&details.access)
+                        + strings_heap_bytes(&details.cuisine)
                 })
         }
         Record::Interpolation(_) => 96,
@@ -1294,6 +1295,10 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
             }
             put_opt_extent(out, record.extent());
             put_entrances(out, record.access());
+            put_u64(out, record.cuisine().len() as u64);
+            for kind in record.cuisine() {
+                put_str(out, kind);
+            }
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
@@ -1395,6 +1400,9 @@ pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
                 opening_hours: get_opt_string(input)?,
                 extent: get_opt_extent(input)?,
                 access: get_entrances(input)?,
+                cuisine: (0..get_u64(input)?)
+                    .map(|_| get_string(input))
+                    .collect::<crate::error::Result<Vec<_>>>()?,
             }
             .kept(),
             source: decode_source(input)?,
@@ -2288,6 +2296,7 @@ mod tests {
             PoiDetails::stated(Contact::stated(None, None, text("peize@shell.nl")), None),
             PoiDetails {
                 extent: Some([65_660_000, 532_190_000, 65_670_000, 532_198_000]),
+                cuisine: vec!["pizza".into(), "italian".into()],
                 ..PoiDetails::default()
             }
             .kept(),

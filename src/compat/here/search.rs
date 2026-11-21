@@ -1202,9 +1202,9 @@ pub(super) async fn discover(
 /// The answer is the places around `at`, nearest first, as far as og looks
 /// around a point. `in=circle` searches that circle instead, and `in=bbox`
 /// that box. `categories` keeps the kinds og has under a HERE id, and `name`
-/// the places whose name holds its words. og's places carry no HERE chain or
-/// food type, so asking for one keeps none. `route` keeps the places along
-/// it.
+/// the places whose name holds its words, and `foodTypes` the places
+/// serving them. og's places carry no HERE chain, so asking for one keeps
+/// none. `route` keeps the places along it.
 pub(super) async fn browse(
     State(state): State<AppState>,
     Rid(request_id): Rid,
@@ -1223,15 +1223,12 @@ pub(super) async fn browse(
         let offset = params.int("offset", 0, 99)?;
         let filter = Filter::parse(params.get("categories"))?;
         let name = params.get("name").and_then(search_key);
-        // og's places carry no HERE chain or food type, so a list that keeps
-        // only places of some keeps none og holds. One that only excludes
-        // keeps them all.
-        let keeps_unheld = ["chains", "foodTypes"]
-            .iter()
-            .any(|list| !Listed::parse(params.get(list)).included.is_empty());
-        if keeps_unheld {
+        // og's places carry no HERE chain, so a list that keeps only places
+        // of some keeps none og holds. One that only excludes keeps them all.
+        if !Listed::parse(params.get("chains")).included.is_empty() {
             return Ok(page(Vec::new(), offset, limit, false));
         }
+        let food = Listed::parse(params.get("foodTypes"));
         let categories = filter.og_categories();
         if categories.is_empty() {
             return Ok(page(Vec::new(), offset, limit, false));
@@ -1276,6 +1273,7 @@ pub(super) async fn browse(
                     .with_time_zone(feature, shows(&params, "tz"))
             })
             .filter(|item| filter.admits(&item.categories))
+            .filter(|item| super::food_types::admits(&food, &item.food_types))
             .filter(|item| {
                 name.as_deref().is_none_or(|name| {
                     search_key(&item.title).is_some_and(|title| title.contains(name))

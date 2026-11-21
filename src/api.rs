@@ -257,6 +257,12 @@ pub struct Common {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "Europe/Monaco")]
     pub timezone: Option<String>,
+    /// The kinds of food a place serves, as OpenStreetMap's `cuisine` tag
+    /// lists them, in lower case and in order. Absent on a result that
+    /// states none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!(["pizza", "italian"]))]
+    pub cuisine: Vec<String>,
     /// For an address that states no postcode, the one postcode the other
     /// addresses of its street state, when they all state the same one. It
     /// is where the address most likely lies, and `address.postcode` stays
@@ -1376,6 +1382,7 @@ fn common(
         opening_hours: summary.opening_hours,
         bbox: summary.bbox,
         timezone: summary.timezone,
+        cuisine: summary.cuisine,
         street_postcode: summary.street_postcode,
         access: summary.access,
         address_lines: crate::address_lines::address_lines(layer, &address, &context),

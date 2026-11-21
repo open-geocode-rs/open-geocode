@@ -223,6 +223,8 @@ pub(super) fn pack(name: &str) -> TestPack {
                     access: Entrance::of_tag(Some("yes"), -79.00502, 43.00002)
                         .into_iter()
                         .collect(),
+                    // HERE has a food type for sandwiches, none for coffee.
+                    cuisine: vec!["coffee_shop".to_string(), "sandwich".to_string()],
                 }
                 .kept(),
                 aliases: Vec::new(),
@@ -455,6 +457,9 @@ fn bakery(distance: Option<i64>) -> Value {
             "name": "Bakery and Baked Goods Store",
             "primary": true,
         }],
+        // Its cuisine names coffee, which HERE has no food type for, and
+        // sandwiches.
+        "foodTypes": [{"id": "800-060", "name": "Sandwich", "primary": true}],
     });
     if let Some(distance) = distance {
         item["distance"] = distance.into();
@@ -943,6 +948,8 @@ async fn browse_answers_the_places_around_a_point_by_kind_and_name() {
         "at=43,-79&in=circle:43,-79.005;r=100",
         "at=43,-79&in=bbox:-79.1,42.9,-78.9,43.1",
         "at=43,-79&chains=!1566&foodTypes=!800-067",
+        "at=43,-79&foodTypes=800-060",
+        "at=43,-79&foodTypes=800-000,!800-067",
     ] {
         let reply = get(&router, &format!("{base}?{query}")).await;
         assert_eq!(reply.status, StatusCode::OK, "{query}");
@@ -961,18 +968,16 @@ async fn browse_answers_the_places_around_a_point_by_kind_and_name() {
         "at=43,-79&in=countryCode:FRA",
         "at=43,-79&in=circle:43,-79;r=100",
         "at=43,-79&in=bbox:0,0,1,1",
+        "at=43,-79&foodTypes=800-067",
+        "at=43,-79&foodTypes=!800-060",
     ] {
         let reply = get(&router, &format!("{base}?{query}")).await;
         assert_eq!(reply.status, StatusCode::OK, "{query}");
         assert_eq!(reply.json(), json!({"items": []}), "{query}");
     }
-    // og's places carry no chain or food type, so asking for one keeps none,
-    // and a page past og's 50 results is cut short.
-    for query in [
-        "at=43,-79&chains=1566",
-        "at=43,-79&foodTypes=800-067",
-        "at=43,-79&limit=20&offset=40",
-    ] {
+    // og's places carry no chain, so asking for one keeps none, and a page
+    // past og's 50 results is cut short.
+    for query in ["at=43,-79&chains=1566", "at=43,-79&limit=20&offset=40"] {
         let reply = get(&router, &format!("{base}?{query}")).await;
         assert_eq!(reply.status, StatusCode::OK, "{query}");
         assert!(

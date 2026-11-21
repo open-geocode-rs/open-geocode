@@ -10,6 +10,7 @@
 
 mod batch;
 mod category;
+mod food_types;
 mod hours;
 mod item;
 mod notify;

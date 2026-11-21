@@ -13,6 +13,7 @@ use crate::{
 use super::{
     LatLng,
     category::{self, ItemCategory},
+    food_types,
     hours::{self, OpeningHours},
 };
 
@@ -62,6 +63,9 @@ struct Properties {
     address_lines: Vec<String>,
     /// The IANA zone the result lies in.
     timezone: Option<String>,
+    /// The kinds of food a place serves, as its `cuisine` tag lists them.
+    #[serde(default)]
+    cuisine: Vec<String>,
 }
 
 /// A way in og maps for the result.
@@ -190,6 +194,7 @@ impl Feature {
                 contact: common.contact.clone(),
                 opening_hours: common.opening_hours.clone(),
                 timezone: common.timezone.clone(),
+                cuisine: common.cuisine.clone(),
                 address_lines: compat::postal_lines(common.layer, &common.address, &common.context),
                 access: common
                     .access
@@ -266,6 +271,8 @@ pub(super) struct Item {
     /// The HERE categories of a place whose kind has one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) categories: Vec<ItemCategory>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) food_types: Vec<ItemCategory>,
     /// How to reach a place, which only place answers carry.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) contacts: Vec<ContactInformation>,
@@ -606,6 +613,7 @@ pub(super) fn item(feature: &Feature) -> Item {
             .as_deref()
             .map(category::of_place)
             .unwrap_or_default(),
+        food_types: ItemCategory::listed(food_types::of_cuisine(&properties.cuisine)),
         contacts: Vec::new(),
         opening_hours: Vec::new(),
         highlights: None,
@@ -839,6 +847,7 @@ impl Item {
             distance: None,
             map_view: None,
             categories: Vec::new(),
+            food_types: Vec::new(),
             contacts: Vec::new(),
             opening_hours: Vec::new(),
             highlights: Some(Highlights {

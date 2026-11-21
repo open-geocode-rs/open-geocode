@@ -711,18 +711,34 @@ pub(super) enum Kind {
     Poi {
         primary: Option<&'static str>,
         shop: bool,
+        /// Google's types of the kinds of food it serves
+        /// (`pizza_restaurant`), as its `cuisine` lists them, each by where
+        /// it stands in [`RESTAURANT_TYPES`].
+        cuisine: [Option<u8>; CUISINE_TYPES],
     },
     Unknown,
 }
+
+/// The most types of food one place's `cuisine` adds to its types.
+const CUISINE_TYPES: usize = 4;
 
 impl Kind {
     pub(super) fn of(common: &Common) -> Self {
         match common.layer {
             Layer::Poi => {
                 let category = common.category.as_deref();
+                let mut cuisine = [None; CUISINE_TYPES];
+                let mut held = common
+                    .cuisine
+                    .iter()
+                    .filter_map(|value| cuisine_type(value));
+                for slot in &mut cuisine {
+                    *slot = held.next();
+                }
                 Self::Poi {
                     primary: category.and_then(category_type),
                     shop: category.is_some_and(|category| category.starts_with("shop:")),
+                    cuisine,
                 }
             }
             layer => Self::of_layer(layer),
@@ -752,12 +768,17 @@ impl Kind {
     pub(super) fn types(self) -> Vec<&'static str> {
         match self {
             Self::Types(types) => types.to_vec(),
-            Self::Poi { primary, shop } => {
+            Self::Poi {
+                primary,
+                shop,
+                cuisine,
+            } => {
                 let mut types = primary.into_iter().collect::<Vec<_>>();
-                for group in primary
-                    .map_or(&[][..], groups_of)
-                    .iter()
-                    .copied()
+                for group in cuisine
+                    .into_iter()
+                    .flatten()
+                    .map(|at| RESTAURANT_TYPES[usize::from(at)])
+                    .chain(primary.map_or(&[][..], groups_of).iter().copied())
                     .chain(shop.then_some("store"))
                 {
                     if !types.contains(&group) {
@@ -781,6 +802,137 @@ impl Kind {
         }
     }
 }
+
+/// Google's type of a kind of food, as OpenStreetMap's `cuisine` names it,
+/// by where it stands in [`RESTAURANT_TYPES`]. It is the restaurant type of
+/// the same name (`pizza` is `pizza_restaurant`), when Google has one.
+fn cuisine_type(value: &str) -> Option<u8> {
+    let wanted = format!("{}_restaurant", value.trim().replace(' ', "_"));
+    RESTAURANT_TYPES
+        .iter()
+        .position(|named| *named == wanted)
+        .and_then(|at| u8::try_from(at).ok())
+}
+
+/// Google's restaurant types, as its place type tables list them.
+const RESTAURANT_TYPES: [&str; 116] = [
+    "afghani_restaurant",
+    "african_restaurant",
+    "american_restaurant",
+    "argentinian_restaurant",
+    "asian_fusion_restaurant",
+    "asian_restaurant",
+    "australian_restaurant",
+    "austrian_restaurant",
+    "bangladeshi_restaurant",
+    "barbecue_restaurant",
+    "basque_restaurant",
+    "bavarian_restaurant",
+    "belgian_restaurant",
+    "brazilian_restaurant",
+    "breakfast_restaurant",
+    "british_restaurant",
+    "brunch_restaurant",
+    "buffet_restaurant",
+    "burmese_restaurant",
+    "burrito_restaurant",
+    "cajun_restaurant",
+    "californian_restaurant",
+    "cambodian_restaurant",
+    "cantonese_restaurant",
+    "caribbean_restaurant",
+    "chicken_restaurant",
+    "chicken_wings_restaurant",
+    "chilean_restaurant",
+    "chinese_noodle_restaurant",
+    "chinese_restaurant",
+    "colombian_restaurant",
+    "croatian_restaurant",
+    "cuban_restaurant",
+    "czech_restaurant",
+    "danish_restaurant",
+    "dessert_restaurant",
+    "dim_sum_restaurant",
+    "dumpling_restaurant",
+    "dutch_restaurant",
+    "eastern_european_restaurant",
+    "ethiopian_restaurant",
+    "european_restaurant",
+    "falafel_restaurant",
+    "family_restaurant",
+    "fast_food_restaurant",
+    "filipino_restaurant",
+    "fine_dining_restaurant",
+    "fish_and_chips_restaurant",
+    "fondue_restaurant",
+    "french_restaurant",
+    "fusion_restaurant",
+    "german_restaurant",
+    "greek_restaurant",
+    "gyro_restaurant",
+    "halal_restaurant",
+    "hamburger_restaurant",
+    "hawaiian_restaurant",
+    "hot_dog_restaurant",
+    "hot_pot_restaurant",
+    "hungarian_restaurant",
+    "indian_restaurant",
+    "indonesian_restaurant",
+    "irish_restaurant",
+    "israeli_restaurant",
+    "italian_restaurant",
+    "japanese_curry_restaurant",
+    "japanese_izakaya_restaurant",
+    "japanese_restaurant",
+    "korean_barbecue_restaurant",
+    "korean_restaurant",
+    "latin_american_restaurant",
+    "lebanese_restaurant",
+    "malaysian_restaurant",
+    "mediterranean_restaurant",
+    "mexican_restaurant",
+    "middle_eastern_restaurant",
+    "mongolian_barbecue_restaurant",
+    "moroccan_restaurant",
+    "north_indian_restaurant",
+    "oyster_bar_restaurant",
+    "pakistani_restaurant",
+    "persian_restaurant",
+    "peruvian_restaurant",
+    "pizza_restaurant",
+    "polish_restaurant",
+    "portuguese_restaurant",
+    "ramen_restaurant",
+    "romanian_restaurant",
+    "russian_restaurant",
+    "scandinavian_restaurant",
+    "seafood_restaurant",
+    "shawarma_restaurant",
+    "soul_food_restaurant",
+    "soup_restaurant",
+    "south_american_restaurant",
+    "south_indian_restaurant",
+    "southwestern_us_restaurant",
+    "spanish_restaurant",
+    "sri_lankan_restaurant",
+    "sushi_restaurant",
+    "swiss_restaurant",
+    "taco_restaurant",
+    "taiwanese_restaurant",
+    "tapas_restaurant",
+    "tex_mex_restaurant",
+    "thai_restaurant",
+    "tibetan_restaurant",
+    "tonkatsu_restaurant",
+    "turkish_restaurant",
+    "ukrainian_restaurant",
+    "vegan_restaurant",
+    "vegetarian_restaurant",
+    "vietnamese_restaurant",
+    "western_restaurant",
+    "yakiniku_restaurant",
+    "yakitori_restaurant",
+];
 
 /// og's POI categories, as the catalog writes them, each beside Google's
 /// Table A type of the same meaning.
@@ -1014,7 +1166,14 @@ mod type_tests {
     /// is a store whatever its kind.
     #[test]
     fn a_place_carries_the_general_type_of_its_group() {
-        let types = |primary, shop| Kind::Poi { primary, shop }.types();
+        let types = |primary, shop| {
+            Kind::Poi {
+                primary,
+                shop,
+                cuisine: [None; super::CUISINE_TYPES],
+            }
+            .types()
+        };
         assert_eq!(
             types(Some("restaurant"), false),
             ["restaurant", "food", "point_of_interest", "establishment"]
