@@ -724,6 +724,9 @@ pub(crate) struct JobQuery {
     /// Comma-separated ISO 3166-1 alpha-2 codes every row is limited to.
     #[param(example = "CA")]
     country: Option<String>,
+    /// ISO 639 language tag, such as `es`, every row's names come in. The Pack must have been built with `--lang`.
+    #[param(example = "es")]
+    lang: Option<String>,
 }
 
 /// Geocode a file

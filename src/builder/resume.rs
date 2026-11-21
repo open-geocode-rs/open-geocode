@@ -127,6 +127,8 @@ pub struct Fingerprint {
     pub addresses: Option<String>,
     /// The address files it imported, once it has.
     pub imported: Vec<FileStamp>,
+    /// The languages whose names the Pack keeps, normalised and sorted.
+    pub languages: Vec<String>,
 }
 
 impl Fingerprint {
@@ -135,6 +137,7 @@ impl Fingerprint {
         inputs: &[PathBuf],
         input_sources: &[String],
         addresses: Option<String>,
+        languages: Vec<String>,
     ) -> Result<Self> {
         Ok(Self {
             og_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -146,6 +149,7 @@ impl Fingerprint {
             input_sources: input_sources.to_vec(),
             addresses,
             imported: Vec::new(),
+            languages,
         })
     }
 
@@ -186,6 +190,12 @@ impl Fingerprint {
                 "addresses were added from {}, are from {}",
                 self.addresses.as_deref().unwrap_or("nothing"),
                 now.addresses.as_deref().unwrap_or("nothing")
+            ));
+        }
+        if self.languages != now.languages {
+            out.push(format!(
+                "names were kept in {:?}, are kept in {:?}",
+                self.languages, now.languages
             ));
         }
         for file in &self.imported {
@@ -249,6 +259,8 @@ pub struct Found {
     /// The last stage it completed; `None` when it reached no checkpoint,
     /// or left one of another format.
     pub stage: Option<String>,
+    /// The format of the manifest it wrote, when it could be read.
+    pub format: Option<u32>,
     /// Bytes it holds on disk, scratch and unpublished Pack file together.
     pub bytes: u64,
 }
@@ -267,13 +279,18 @@ impl Found {
 impl fmt::Display for Found {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let size = self.bytes as f64 / f64::from(1 << 30);
-        match &self.stage {
-            Some(stage) => write!(
+        match (&self.stage, self.format) {
+            (Some(stage), _) => write!(
                 formatter,
                 "a build that stopped after \"{stage}\", {size:.1} GiB in {}",
                 self.scratch.display()
             ),
-            None => write!(
+            (None, Some(format)) if format != FORMAT_VERSION => write!(
+                formatter,
+                "a build that wrote a checkpoint of format {format}, which this og cannot read (it writes {FORMAT_VERSION}), {size:.1} GiB in {}",
+                self.scratch.display()
+            ),
+            (None, _) => write!(
                 formatter,
                 "a build that stopped before its first checkpoint, {size:.1} GiB in {}",
                 self.scratch.display()
@@ -293,8 +310,7 @@ pub fn find(destination: &Path) -> Result<Vec<Found>> {
         let scratch = PathBuf::from(pointer.trim());
         let summary = fs::read(scratch.join(MANIFEST_FILE))
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<Summary>(&bytes).ok())
-            .filter(|summary| summary.format == FORMAT_VERSION);
+            .and_then(|bytes| serde_json::from_slice::<Summary>(&bytes).ok());
         let modified = fs::metadata(scratch.join(MANIFEST_FILE))
             .and_then(|metadata| metadata.modified())
             .ok();
@@ -308,7 +324,10 @@ pub fn find(destination: &Path) -> Result<Vec<Found>> {
             Found {
                 generation,
                 scratch,
-                stage: summary.map(|summary| summary.stage),
+                format: summary.as_ref().map(|summary| summary.format),
+                stage: summary
+                    .filter(|summary| summary.format == FORMAT_VERSION)
+                    .map(|summary| summary.stage),
                 bytes,
             },
         ));

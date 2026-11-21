@@ -66,6 +66,12 @@ pub enum BuildStage {
     Parser,
     /// Key the Pack's streets and places for the structured index. No measure.
     StructuredIndex,
+    /// Read the names in other languages the Pack keeps. Measured in bytes of
+    /// the inputs, and none when the build keeps none.
+    Translations,
+    /// Read the coordinates of the nodes the translated streets stand on.
+    /// Measured in blocks of the input.
+    TranslationNodes,
 }
 
 /// What a stage's work is counted in.
@@ -79,7 +85,7 @@ pub enum StageUnit {
 }
 
 impl BuildStage {
-    pub const ALL: [BuildStage; 11] = [
+    pub const ALL: [BuildStage; 13] = [
         BuildStage::Scan,
         BuildStage::BoundaryMembers,
         BuildStage::NodeJoin,
@@ -91,6 +97,8 @@ impl BuildStage {
         BuildStage::Indexes,
         BuildStage::Parser,
         BuildStage::StructuredIndex,
+        BuildStage::Translations,
+        BuildStage::TranslationNodes,
     ];
 
     /// What the stage's work is counted in, as the build report names it.
@@ -105,8 +113,11 @@ impl BuildStage {
 
     pub const fn unit(self) -> StageUnit {
         match self {
-            Self::Scan | Self::ImportAddresses => StageUnit::Bytes,
-            Self::BoundaryMembers | Self::NodeJoin | Self::AssembleWays => StageUnit::Blocks,
+            Self::Scan | Self::ImportAddresses | Self::Translations => StageUnit::Bytes,
+            Self::BoundaryMembers
+            | Self::NodeJoin
+            | Self::AssembleWays
+            | Self::TranslationNodes => StageUnit::Blocks,
             Self::ContextRecords | Self::Records => StageUnit::Records,
             Self::Boundaries | Self::Indexes | Self::Parser | Self::StructuredIndex => {
                 StageUnit::None
@@ -128,6 +139,8 @@ impl BuildStage {
             Self::Indexes => "finish Pack indexes",
             Self::Parser => "train address parser",
             Self::StructuredIndex => "build the structured index",
+            Self::Translations => "read names in other languages",
+            Self::TranslationNodes => "store translated street coordinates",
         }
     }
 

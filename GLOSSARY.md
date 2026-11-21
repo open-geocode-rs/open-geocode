@@ -42,6 +42,10 @@ _Avoid_: duplicate, conflict
 The postcodes the other addresses of a street state, lent to an address of that street that states none.
 _Avoid_: inferred postcode
 
+**Translation**:
+A name in a requested language, looked up from the OSM object the answer names, or from the nearest way for a street an address states. A Pack holds no translation when built without `--lang`; any name it has none for keeps its local form.
+_Avoid_: locale, language variant
+
 ## Reading a query
 
 **Reading**:

@@ -56,19 +56,19 @@ mod emit;
 mod emitted;
 mod geometry;
 mod interpolation;
-mod locations;
-mod pbf;
+pub(crate) mod locations;
+pub(crate) mod pbf;
 mod place;
 mod poi;
 mod postcode;
 mod scan;
 mod slash;
 mod spill;
-mod street;
-mod tags;
+pub(crate) mod street;
+pub(crate) mod tags;
 
 #[cfg(test)]
-mod test_pbf;
+pub(crate) mod test_pbf;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -199,6 +199,10 @@ pub struct BuildOsmOptions {
     pub imported_rows: u64,
     /// QRank file (see [`crate::builder::qrank`]).
     pub qrank: Option<PathBuf>,
+    /// Languages whose `name:<language>` names the Pack keeps beside the
+    /// local names (see [`crate::translations`]). Empty: the Pack holds none
+    /// and the build skips the extra pass over the inputs.
+    pub languages: Vec<String>,
 }
 
 impl Default for BuildOsmOptions {
@@ -217,6 +221,7 @@ impl Default for BuildOsmOptions {
             addresses: None,
             imported_rows: 0,
             qrank: None,
+            languages: Vec::new(),
         }
     }
 }
@@ -236,6 +241,7 @@ impl fmt::Debug for BuildOsmOptions {
             .field("cancel", &self.cancel)
             .field("addresses", &self.addresses)
             .field("qrank", &self.qrank)
+            .field("languages", &self.languages)
             .finish_non_exhaustive()
     }
 }
@@ -250,6 +256,8 @@ pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
             "a build needs at least one input".to_string(),
         ));
     }
+    // A bad language fails here, not after hours of building.
+    crate::translations::parse_languages(&options.languages)?;
     for input in &options.inputs {
         if !input.is_file() {
             return Err(Error::BadInput(format!(
@@ -486,6 +494,7 @@ impl<'a> Run<'a> {
                 .addresses
                 .as_ref()
                 .map(|source| format!("{source:?}")),
+            crate::translations::parse_languages(&options.languages)?,
         )?;
         match settle_leftovers(options)? {
             Some(found) => Self::resume(options, plan, fingerprint, &found),
@@ -1066,6 +1075,7 @@ impl<'a> Run<'a> {
             &tag_ids,
             slots,
             &self.progress,
+            BuildStage::NodeJoin,
         )?;
         input.locations = Some(locations);
         // Their saved copies go at the next checkpoint: the store holds
@@ -2035,14 +2045,31 @@ impl<'a> Run<'a> {
         let structured = Instant::now();
         crate::structured::add_to(&mut sealed)?;
         crate::ids::add_to(&mut sealed)?;
-        stats.bytes = sealed.bytes();
         self.progress.finish(BuildStage::StructuredIndex);
+        let structured_index_ms = structured.elapsed().as_millis();
+        let names = crate::translations::add_to(
+            &mut sealed,
+            &self.options.inputs,
+            &self.options.languages,
+            &crate::translations::Env {
+                scratch: &self.scratch,
+                memory: &self.memory,
+                budget: self.budget,
+                progress: &self.progress,
+            },
+        )?;
+        stats.bytes = sealed.bytes();
+        if let Some(bytes) = names {
+            stats
+                .sections
+                .insert(crate::translations::SECTION.to_string(), bytes);
+        }
         let mut report = self.report();
         report.checkpoints = self.checkpoints.clone();
         self.progress.check()?;
         report.parser_training = training;
         report.phases.parser_training_ms = parser_training_ms;
-        report.phases.structured_index_ms = structured.elapsed().as_millis();
+        report.phases.structured_index_ms = structured_index_ms;
         for (name, sorted) in &self.sorted {
             report.scratch.sorters.insert(name.clone(), sorted.clone());
         }

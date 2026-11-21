@@ -374,6 +374,24 @@ fn build_step(stage: BuildStage) -> Step {
                 "so most addresses are found without a text search.",
             ],
         ),
+        BuildStage::Translations => (
+            "Read",
+            "Reading",
+            "names in other languages",
+            [
+                "Keeping each street's, place's and area's name in the",
+                "languages you asked for, so a request can answer in one.",
+            ],
+        ),
+        BuildStage::TranslationNodes => (
+            "Stored",
+            "Storing",
+            "translated street coordinates",
+            [
+                "Placing each translated street on the map, so a request",
+                "near it gets the name of the street it stands on.",
+            ],
+        ),
     };
     let unit = match stage.unit() {
         StageUnit::Bytes => Unit::Bytes,

@@ -14,11 +14,15 @@
 
 use std::collections::HashMap;
 
-use crate::error::{Error, Result};
+mod translation;
+
+pub use translation::Language;
+
 use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::{
+    error::{Error, Result},
     labels,
     pack::{Reader, RecordId, Summary},
     record::{
@@ -537,11 +541,12 @@ pub fn forward_collection(
     pack: &Reader,
     query: String,
     hits: Vec<TextSearchHit>,
+    language: Option<&Language>,
 ) -> Result<ForwardCollection> {
     let mut contexts = Contexts::new(pack);
     let features = hits
         .into_iter()
-        .map(|hit| forward_feature(&mut contexts, hit))
+        .map(|hit| forward_feature(&mut contexts, hit, language))
         .collect::<Result<Vec<_>>>()?;
     let attribution = attribution(
         pack,
@@ -563,14 +568,22 @@ pub fn forward_collection(
 /// One search hit as a feature. The hit's summary already holds what search
 /// placed or estimated (an interpolated house number, a street's centre
 /// line), so nothing is read again but its context.
-pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<ForwardFeature> {
+pub fn forward_feature(
+    contexts: &mut Contexts,
+    hit: TextSearchHit,
+    language: Option<&Language>,
+) -> Result<ForwardFeature> {
     let point = hit
         .record
         .point
         .ok_or_else(|| Error::Inconsistent(format!("search hit {} has no point", hit.record.id)))?;
     let accuracy = Accuracy::of(point.precision, &hit.record.source);
+    let mut common = common(contexts, hit.record_id, hit.record, accuracy)?;
+    if let Some(language) = language {
+        language.apply(&mut common, point.lon, point.lat);
+    }
     let properties = ForwardProperties {
-        common: common(contexts, hit.record_id, hit.record, accuracy)?,
+        common,
         score: hit.score,
         confidence: hit.confidence,
         fallback: hit.fallback,
@@ -600,7 +613,11 @@ pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<Fo
 /// An estimated address states its house number only in its label, which
 /// reverse writes as `"{number} {street}, ..."`; the number is read back from
 /// there.
-pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<ReverseCollection> {
+pub fn reverse_collection(
+    pack: &Reader,
+    response: &GeocodeResponse,
+    language: Option<&Language>,
+) -> Result<ReverseCollection> {
     let mut contexts = Contexts::new(pack);
     let mut features = Vec::new();
     let mut primary_record_id = None;
@@ -644,11 +661,18 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
             summary.layer.clone_from(layer);
         }
         summary.label.clone_from(&result.label);
-        let properties = ReverseProperties {
-            common: common(&mut contexts, record_id, summary, accuracy)?,
-            distance_m: result.distance_m,
-        };
-        features.push(ReverseFeature::new(lon, lat, properties));
+        let mut common = common(&mut contexts, record_id, summary, accuracy)?;
+        if let Some(language) = language {
+            language.apply_reverse(&mut common, lon, lat);
+        }
+        features.push(ReverseFeature::new(
+            lon,
+            lat,
+            ReverseProperties {
+                common,
+                distance_m: result.distance_m,
+            },
+        ));
     }
 
     let mut areas = Vec::new();
@@ -668,11 +692,18 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
             Error::Inconsistent(format!("context record {record_id} has no point"))
         })?;
         let accuracy = Accuracy::of(point.precision, &summary.source);
-        let properties = ReverseProperties {
-            common: common(&mut contexts, record_id, summary, accuracy)?,
-            distance_m: None,
-        };
-        features.push(ReverseFeature::new(point.lon, point.lat, properties));
+        let mut common = common(&mut contexts, record_id, summary, accuracy)?;
+        if let Some(language) = language {
+            language.apply_reverse(&mut common, point.lon, point.lat);
+        }
+        features.push(ReverseFeature::new(
+            point.lon,
+            point.lat,
+            ReverseProperties {
+                common,
+                distance_m: None,
+            },
+        ));
     }
 
     let attribution = attribution(
@@ -893,7 +924,7 @@ mod tests {
         let response = geocoder
             .reverse(reverse::GeocodeOptions::at(-58.38, -34.6))
             .expect("answer");
-        let collection = reverse_collection(&pack, &response).expect("collection");
+        let collection = reverse_collection(&pack, &response, None).expect("collection");
         let _ = std::fs::remove_dir_all(&dir);
         let credits = serde_json::to_value(&collection.geocoding.attribution).expect("json");
         assert_eq!(
