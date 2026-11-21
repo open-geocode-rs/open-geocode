@@ -27,6 +27,9 @@ jobs:
       - name: Check region catalog
         run: python3 -I catalog/catalog.py check
 
+      - name: Test the catalog tool
+        run: python3 -I -m unittest discover -s catalog
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
