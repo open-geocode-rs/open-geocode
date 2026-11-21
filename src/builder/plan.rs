@@ -16,8 +16,9 @@
 //!
 //! Every cost is per item, not per PBF byte: a PBF byte of Germany holds four
 //! times the node references of a byte of Canada, so no ratio of input bytes
-//! fits both. Only the estimate before the scan reads counts from bytes, at
-//! the densest input measured, so it errs towards needing more.
+//! fits both. Only the estimate before the scan reads counts from bytes: at
+//! the densest input measured, so it errs towards needing more, but never
+//! past what the planet holds.
 
 use std::path::{Path, PathBuf};
 
@@ -42,6 +43,15 @@ const GERMANY_KEPT_WAYS: f64 = 21_178_798.0;
 const GERMANY_RECORDS: f64 = 26_131_991.0;
 const GERMANY_ADDRESSES: f64 = 19_719_186.0;
 const GERMANY_STREETS: f64 = 4_103_850.0;
+// Items of the planet, from its build report (2026-10-26): 95,631,115,419 B
+// of PBF, half Germany's density, so Germany's reads it at twice the disk it
+// takes. No input holds more than the planet, so these cap the estimate.
+const PLANET_INPUT_BYTES: f64 = 95_631_115_419.0;
+const PLANET_NEEDED_NODES: f64 = 1_646_327_702.0;
+const PLANET_KEPT_WAYS: f64 = 156_619_174.0;
+const PLANET_RECORDS: f64 = 269_486_139.0;
+const PLANET_ADDRESSES: f64 = 173_821_696.0;
+const PLANET_STREETS: f64 = 56_214_445.0;
 /// Boundary vertices per input byte. Never measured: the spill study's
 /// upper estimate of the planet's boundary heap, 15 GB, at
 /// 64 B a vertex over 95.4 GB of PBF. The refined plan
@@ -130,17 +140,25 @@ pub struct ItemCounts {
 }
 
 impl ItemCounts {
-    /// The counts of an input of `input_bytes` at Germany's density.
+    /// The counts of an input of `input_bytes` at Germany's density, at most
+    /// the planet's.
     fn estimate(input_bytes: u64, imported_rows: u64) -> Self {
-        let at = |germany: f64| (input_bytes as f64 * germany / GERMANY_INPUT_BYTES) as u64;
-        let needed_nodes = at(GERMANY_NODE_REFS);
+        let bytes = input_bytes as f64;
+        // A planet newer than the one counted is larger and holds more, at
+        // about the same density.
+        let at = |germany: f64, planet: f64| {
+            let dense = bytes * germany / GERMANY_INPUT_BYTES;
+            let whole = planet * (bytes / PLANET_INPUT_BYTES).max(1.0);
+            dense.min(whole) as u64
+        };
+        let needed_nodes = at(GERMANY_NODE_REFS, PLANET_NEEDED_NODES);
         Self {
             needed_nodes,
             node_set_bytes: node_set_bytes(needed_nodes),
-            kept_ways: at(GERMANY_KEPT_WAYS),
-            records: at(GERMANY_RECORDS),
-            addresses: at(GERMANY_ADDRESSES),
-            streets: at(GERMANY_STREETS),
+            kept_ways: at(GERMANY_KEPT_WAYS, PLANET_KEPT_WAYS),
+            records: at(GERMANY_RECORDS, PLANET_RECORDS),
+            addresses: at(GERMANY_ADDRESSES, PLANET_ADDRESSES),
+            streets: at(GERMANY_STREETS, PLANET_STREETS),
             boundary_refs: (input_bytes as f64 * BOUNDARY_REFS_PER_INPUT_BYTE) as u64,
             imported_rows,
         }
@@ -632,10 +650,9 @@ mod tests {
         let planet = preflight(machine(28), 95_380_942_829, 0, None);
         assert_eq!(planet.threads, 24);
         assert!(planet.memory_budget_bytes > 16 << 30);
-        // Germany's density reads 3.2 billion references, against the
-        // planet's 1.75 billion, so the estimate errs high and still fits.
-        assert!(planet.items.needed_nodes > 3_000_000_000);
-        assert!(!planet.locations_in_memory);
+        // The planet's 1.6 billion needed nodes fit a 20 GiB budget, as its
+        // counted build found.
+        assert!(planet.locations_in_memory);
         assert!(
             planet.shared_disk_needed_bytes < disk / 10 * 9,
             "{} GiB",
@@ -676,6 +693,72 @@ mod tests {
             counted.shared_disk_needed_bytes < disk / 10 * 7,
             "{} GiB",
             counted.shared_disk_needed_bytes >> 30
+        );
+    }
+
+    #[test]
+    fn the_planet_is_estimated_at_its_own_counts_not_germanys_density() {
+        let planet = preflight(machine(28), 95_631_115_419, 0, None);
+        let items = &planet.items;
+        assert_eq!(
+            (
+                items.needed_nodes,
+                items.kept_ways,
+                items.records,
+                items.addresses,
+                items.streets
+            ),
+            (
+                1_646_327_702,
+                156_619_174,
+                269_486_139,
+                173_821_696,
+                56_214_445
+            )
+        );
+        // Its build held 65 GiB of scratch and Pack at its peak with
+        // OpenAddresses added; 80 GB free must not stop it before its scan.
+        assert!(
+            planet.shared_disk_needed_bytes < 80_000_000_000,
+            "{} MiB",
+            planet.shared_disk_needed_bytes >> 20
+        );
+        assert_eq!(planet.output_disk_needed_bytes, 27_487_586_178);
+    }
+
+    #[test]
+    fn a_small_input_is_estimated_at_germanys_density() {
+        let items = preflight(machine(28), 1_000_000_000, 0, None).items;
+        assert_eq!(
+            (
+                items.needed_nodes,
+                items.kept_ways,
+                items.records,
+                items.addresses,
+                items.streets
+            ),
+            (33_593_657, 4_356_830, 5_375_784, 4_056_564, 844_230)
+        );
+    }
+
+    #[test]
+    fn an_input_larger_than_the_planet_is_estimated_at_the_planets_density() {
+        let items = preflight(machine(28), 2 * 95_631_115_419, 0, None).items;
+        assert_eq!(
+            (
+                items.needed_nodes,
+                items.kept_ways,
+                items.records,
+                items.addresses,
+                items.streets
+            ),
+            (
+                2 * 1_646_327_702,
+                2 * 156_619_174,
+                2 * 269_486_139,
+                2 * 173_821_696,
+                2 * 56_214_445
+            )
         );
     }
 
