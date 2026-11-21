@@ -792,9 +792,7 @@ mod tests {
 
     #[test]
     fn a_field_takes_the_translation_of_the_area_at_its_own_level() {
-        // One name on three levels, each translated differently. Looking
-        // finest first gives `locality` the neighbourhood's name; looking
-        // broadest first gives `areas` the province's.
+        // The same name on three levels must resolve per field, not by order.
         let mut tables = empty_tables();
         tables
             .by_id

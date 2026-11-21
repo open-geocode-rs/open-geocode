@@ -348,10 +348,8 @@ fn count_element(element: Element<'_>, languages: &[String], out: &mut BlockName
         .into_iter()
         .map(|at| refs[at])
         .collect::<Vec<_>>();
-    // Every language keeps a row, an empty translation too: a way named like
-    // a translated one must still win on proximity and keep its local name,
-    // rather than borrow the other way's. Rows nothing translates are dropped
-    // later, once every input has shown which names are translated.
+    // Every language keeps a row so a nearer untranslated way still wins; rows
+    // no translated street shares a name with are dropped after the scan.
     let mut translated = vec![String::new(); languages.len()];
     for (index, value) in translations {
         translated[index] = value;
