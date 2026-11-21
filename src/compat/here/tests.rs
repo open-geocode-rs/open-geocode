@@ -804,7 +804,9 @@ async fn autosuggest_autocomplete_and_discover() {
         item["highlights"] = json!({"title": mark, "address": {"label": mark}});
         item
     };
-    let queen = marked(queen, 3);
+    let mut queen = marked(queen, 3);
+    // The street holds the mark too, counted from its own start.
+    queen["highlights"]["address"]["street"] = json!([{"start": 0, "end": 5}]);
     let mut queen_near = queen.clone();
     queen_near["position"] = json!({"lat": 43.0, "lng": -79.002});
     queen_near["distance"] = 163.into();

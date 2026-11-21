@@ -346,6 +346,27 @@ pub(super) struct Highlights {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct LabelHighlights {
     label: Vec<Highlight>,
+    /// Each address field's marks, where the typed text marks it.
+    #[serde(flatten)]
+    fields: std::collections::BTreeMap<&'static str, Vec<Highlight>>,
+}
+
+/// The marks of `label` that fall in `value`, where `label` writes it,
+/// counted from the start of `value`.
+fn field_marks(label: &str, marks: &[Highlight], value: &str) -> Vec<Highlight> {
+    let Some(byte) = label.find(value) else {
+        return Vec::new();
+    };
+    let start = label[..byte].chars().count();
+    let end = start + value.chars().count();
+    marks
+        .iter()
+        .filter(|mark| mark.start < end && mark.end > start)
+        .map(|mark| Highlight {
+            start: mark.start.max(start) - start,
+            end: mark.end.min(end) - start,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -582,7 +603,10 @@ fn highlights(properties: &Properties) -> Highlights {
     };
     Highlights {
         title: in_title,
-        address: LabelHighlights { label: marks },
+        address: LabelHighlights {
+            label: marks,
+            fields: Default::default(),
+        },
     }
 }
 
@@ -713,7 +737,30 @@ impl Item {
 
     /// Where the typed text lies, which only suggestions carry.
     pub(super) fn with_highlights(mut self, feature: &Feature) -> Self {
-        self.highlights = Some(highlights(&feature.properties));
+        let mut found = highlights(&feature.properties);
+        let address = &self.address;
+        if let Some(label) = address.label.as_deref() {
+            let fields = [
+                ("countryName", address.country_name.as_deref()),
+                ("state", address.state.as_deref()),
+                ("county", address.county.as_deref()),
+                ("city", address.city.as_deref()),
+                ("district", address.district.as_deref()),
+                ("subdistrict", address.subdistrict.as_deref()),
+                ("street", address.street.as_deref()),
+                ("postalCode", address.postal_code.as_deref()),
+                ("houseNumber", address.house_number.as_deref()),
+            ];
+            for (name, value) in fields {
+                let marks = value.map_or_else(Vec::new, |value| {
+                    field_marks(label, &found.address.label, value)
+                });
+                if !marks.is_empty() {
+                    found.address.fields.insert(name, marks);
+                }
+            }
+        }
+        self.highlights = Some(found);
         self
     }
 
@@ -853,6 +900,29 @@ mod tests {
             item(&boston).title,
             "240 Washington St, Boston, MA 02108, United States"
         );
+    }
+
+    #[test]
+    fn a_field_takes_the_marks_inside_it_from_its_own_start() {
+        let label = "Pariser Platz 1, 10117 Berlin, Deutschland";
+        let marks = [
+            Highlight { start: 0, end: 5 },
+            Highlight { start: 23, end: 26 },
+        ];
+        assert_eq!(
+            field_marks(label, &marks, "Pariser Platz"),
+            [Highlight { start: 0, end: 5 }]
+        );
+        assert_eq!(
+            field_marks(label, &marks, "Berlin"),
+            [Highlight { start: 0, end: 3 }]
+        );
+        assert_eq!(field_marks(label, &marks, "10117"), []);
+        assert_eq!(
+            field_marks(label, &marks, "Paris"),
+            [Highlight { start: 0, end: 5 }]
+        );
+        assert_eq!(field_marks(label, &marks, "Wien"), []);
     }
 
     #[test]
