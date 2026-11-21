@@ -50,21 +50,6 @@
         },
         "type": "object"
       },
-      "AreaTags": {
-        "description": "The `admin_level`, `boundary` and `place` tags of an area, as OSM writes\nthem.",
-        "properties": {
-          "admin_level": {
-            "type": "string"
-          },
-          "boundary": {
-            "type": "string"
-          },
-          "place": {
-            "type": "string"
-          }
-        },
-        "type": "object"
-      },
       "Attribution": {
         "description": "A data set an answer comes from and how its licence asks it to be\ncredited. OpenStreetMap is always first: every answer's areas and labels\ncome from it.",
         "properties": {
@@ -152,13 +137,6 @@
             "$ref": "#/components/schemas/Context",
             "description": "Administrative areas containing the result."
           },
-          "enclosing": {
-            "description": "Every area the result lies in, with its OSM tags: those of `context`\nand those that lost their tier, such as a `place=city` area beside the\n`admin_level=8` district that holds the locality. Present only with\n`enclosing=true`.\n\nOrdered by the size of each area's outline, smallest first, which does\nnot prove that each lies in the next. Areas of equal size go by OSM\nobject type (relations, then ways, then nodes) and id. A country the\nPack derived from its regions comes last.",
-            "items": {
-              "$ref": "#/components/schemas/EnclosingArea"
-            },
-            "type": "array"
-          },
           "id": {
             "description": "Stable ID from the source data, such as `osm:node:123`. Store it to\nfind the record again: it outlives a Pack rebuild.",
             "type": "string"
@@ -234,27 +212,6 @@
           },
           "name": {
             "type": "string"
-          }
-        },
-        "required": [
-          "id",
-          "name"
-        ],
-        "type": "object"
-      },
-      "EnclosingArea": {
-        "description": "An area a result lies in, as `enclosing` lists it.",
-        "properties": {
-          "id": {
-            "description": "Stable ID of the area, as in `context`.",
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          },
-          "tags": {
-            "$ref": "#/components/schemas/AreaTags",
-            "description": "Absent for an area with none, such as a country derived from regions."
           }
         },
         "required": [
@@ -455,10 +412,6 @@
             "description": "ISO 3166-1 alpha-2 codes, comma-separated.",
             "example": "CA",
             "type": "string"
-          },
-          "enclosing": {
-            "description": "`true` lists every area each result lies in, as on `GET`.",
-            "type": "boolean"
           },
           "id": {
             "description": "Echoed in this item's result, to match it up.",
@@ -715,10 +668,6 @@
             "example": "NL",
             "type": "string"
           },
-          "enclosing": {
-            "description": "`true` lists every area each result lies in, as on `GET`.",
-            "type": "boolean"
-          },
           "focus": {
             "description": "Point to prefer results near, as `lon,lat`.",
             "example": "4.88,52.36",
@@ -916,10 +865,6 @@
       "ReverseItem": {
         "description": "One item of a `/reverse` batch: `GET /reverse`'s parameters and an `id`.\n\n`lon` and `lat` may come from the request's query string instead, for\nevery item.",
         "properties": {
-          "enclosing": {
-            "description": "`true` lists every area each result lies in, as on `GET`.",
-            "type": "boolean"
-          },
           "id": {
             "description": "Echoed in this item's result, to match it up.",
             "example": "row-1",
@@ -1132,16 +1077,6 @@
             "schema": {
               "type": "string"
             }
-          },
-          {
-            "description": "`true` lists every area each result lies in as `enclosing`, with its OSM tags.",
-            "example": true,
-            "in": "query",
-            "name": "enclosing",
-            "required": false,
-            "schema": {
-              "type": "boolean"
-            }
           }
         ],
         "responses": {
@@ -1218,25 +1153,6 @@
               }
             },
             "description": "Internal server error.",
-            "headers": {
-              "X-Request-Id": {
-                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
-                "schema": {
-                  "maxLength": 128,
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "501": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "`enclosing=true` was given to a Pack built before enclosing areas. Rebuild the Pack.",
             "headers": {
               "X-Request-Id": {
                 "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
@@ -1382,16 +1298,6 @@
             "schema": {
               "type": "string"
             }
-          },
-          {
-            "description": "`true` lists every area each result lies in as `enclosing`, with its OSM tags.",
-            "example": true,
-            "in": "query",
-            "name": "enclosing",
-            "required": false,
-            "schema": {
-              "type": "boolean"
-            }
           }
         ],
         "responses": {
@@ -1503,39 +1409,6 @@
               }
             },
             "description": "Internal server error.",
-            "headers": {
-              "Accept-Query": {
-                "description": "The media type a QUERY body is read as.",
-                "schema": {
-                  "example": "application/json",
-                  "type": "string"
-                }
-              },
-              "Allow": {
-                "description": "The methods this route accepts.",
-                "schema": {
-                  "example": "GET, QUERY, POST",
-                  "type": "string"
-                }
-              },
-              "X-Request-Id": {
-                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
-                "schema": {
-                  "maxLength": 128,
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "501": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "`enclosing=true` was given to a Pack built before enclosing areas. Rebuild the Pack.",
             "headers": {
               "Accept-Query": {
                 "description": "The media type a QUERY body is read as.",
@@ -1681,15 +1554,6 @@
             "required": false,
             "schema": {
               "type": "string"
-            }
-          },
-          {
-            "description": "As on `GET`. Applies to every item; an item's own field overrides it.",
-            "in": "query",
-            "name": "enclosing",
-            "required": false,
-            "schema": {
-              "type": "boolean"
             }
           }
         ],
@@ -2076,15 +1940,6 @@
             }
           },
           {
-            "description": "List every area each result lies in, as `enclosing` does on `GET`. A\nrow of a JSONL upload may set its own. Refused for CSV results, which\nhave no column for the areas.",
-            "in": "query",
-            "name": "enclosing",
-            "required": false,
-            "schema": {
-              "type": "boolean"
-            }
-          },
-          {
             "description": "`respond-async` to be answered with the job's status once the upload is in.",
             "example": "respond-async",
             "in": "header",
@@ -2190,7 +2045,7 @@
                 }
               }
             },
-            "description": "The CSV has no header row or no column to look up, a parameter is malformed, or `enclosing=true` is asked of CSV results.",
+            "description": "The CSV has no header row or no column to look up, or a parameter is malformed.",
             "headers": {
               "X-Request-Id": {
                 "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
@@ -2754,16 +2609,6 @@
             "schema": {
               "type": "string"
             }
-          },
-          {
-            "description": "`true` lists every area each result lies in as `enclosing`, with its OSM tags.",
-            "example": true,
-            "in": "query",
-            "name": "enclosing",
-            "required": false,
-            "schema": {
-              "type": "boolean"
-            }
           }
         ],
         "responses": {
@@ -2907,7 +2752,7 @@
                 }
               }
             },
-            "description": "`ids` was given to a Pack built before it had an id catalogue, or `enclosing=true` to one built before enclosing areas. Rebuild the Pack.",
+            "description": "`ids` was given to a Pack built before it had an id catalogue. Rebuild the Pack.",
             "headers": {
               "Accept-Query": {
                 "description": "The media type a QUERY body is read as.",
@@ -3031,15 +2876,6 @@
             "required": false,
             "schema": {
               "type": "string"
-            }
-          },
-          {
-            "description": "As on `GET`. Applies to every item; an item's own field overrides it.",
-            "in": "query",
-            "name": "enclosing",
-            "required": false,
-            "schema": {
-              "type": "boolean"
             }
           }
         ],
@@ -3397,16 +3233,6 @@
             "schema": {
               "$ref": "#/components/schemas/Layer"
             }
-          },
-          {
-            "description": "`true` lists every area each result lies in as `enclosing`, with its OSM tags.",
-            "example": true,
-            "in": "query",
-            "name": "enclosing",
-            "required": false,
-            "schema": {
-              "type": "boolean"
-            }
           }
         ],
         "responses": {
@@ -3542,39 +3368,6 @@
               }
             }
           },
-          "501": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "`enclosing=true` was given to a Pack built before enclosing areas. Rebuild the Pack.",
-            "headers": {
-              "Accept-Query": {
-                "description": "The media type a QUERY body is read as.",
-                "schema": {
-                  "example": "application/json",
-                  "type": "string"
-                }
-              },
-              "Allow": {
-                "description": "The methods this route accepts.",
-                "schema": {
-                  "example": "GET, QUERY, POST",
-                  "type": "string"
-                }
-              },
-              "X-Request-Id": {
-                "description": "ID the request is logged under: the request's own `X-Request-Id` when it sent one. Include it in bug reports.",
-                "schema": {
-                  "maxLength": 128,
-                  "type": "string"
-                }
-              }
-            }
-          },
           "503": {
             "content": {
               "application/problem+json": {
@@ -3649,15 +3442,6 @@
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/Layer"
-            }
-          },
-          {
-            "description": "As on `GET`. Applies to every item; an item's own field overrides it.",
-            "in": "query",
-            "name": "enclosing",
-            "required": false,
-            "schema": {
-              "type": "boolean"
             }
           }
         ],

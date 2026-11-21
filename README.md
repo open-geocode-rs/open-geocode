@@ -125,8 +125,6 @@ Ontario's 2 million addresses build in about a minute on a 24-core machine, then
 Add `--openaddresses` to `og build` to merge in OpenAddresses points (needs an API token in `OA_TOKEN`).
 A build leaves out the OpenAddresses data sets whose licence forbids commercial use or serving them at all, judged by the licence each job states, and warns of each one.
 `open-geocode pack build --openaddresses-non-commercial` takes the non-commercial ones too, for a Pack used only for non-commercial purposes.
-With `enclosing=true`, `/geocode`, `/places`, `/autocomplete`, `/reverse`, their batches and JSONL `/jobs` list every area a result lies in, with its OSM `place`, `boundary` and `admin_level` tags, as `enclosing` beside `context`.
-A Pack built before this answers `enclosing=true` with `501`; rebuild it.
 
 Run `og` with no arguments for the interactive interface: pick a region, build it, search it, and geocode CSV files.
 

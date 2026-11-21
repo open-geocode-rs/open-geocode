@@ -659,7 +659,7 @@ fn geocode_row(
                 fallback.get_or_insert(response);
             }
             Some(response) => {
-                let feature = api::forward_feature(&mut Contexts::new(pack, false), response.hit)?;
+                let feature = api::forward_feature(&mut Contexts::new(pack), response.hit)?;
                 let audit = AuditFields {
                     status: "resolved".to_string(),
                     query: response.query,
@@ -674,7 +674,7 @@ fn geocode_row(
         }
     }
     if let Some(response) = fallback {
-        let feature = api::forward_feature(&mut Contexts::new(pack, false), response.hit)?;
+        let feature = api::forward_feature(&mut Contexts::new(pack), response.hit)?;
         let audit = AuditFields {
             status: "fallback".to_string(),
             query: response.query,

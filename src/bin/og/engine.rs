@@ -121,7 +121,7 @@ impl Engine {
         if hits.is_empty() {
             hits = self.places.search(&options)?;
         }
-        let collection = api::forward_collection(&self.pack, query, hits, false)?;
+        let collection = api::forward_collection(&self.pack, query, hits)?;
         let millis = started.elapsed().as_secs_f64() * 1_000.0;
         let hits = collection
             .features
@@ -159,7 +159,6 @@ impl Engine {
             &self.pack,
             address,
             found.into_iter().map(|found| found.hit).collect(),
-            false,
         )?;
         let millis = started.elapsed().as_secs_f64() * 1_000.0;
         let hits = collection
@@ -184,7 +183,7 @@ impl Engine {
     pub(crate) fn reverse(&self, lat: f64, lon: f64) -> Result<Answer> {
         let started = Instant::now();
         let response = self.reverse.reverse(GeocodeOptions::at(lon, lat))?;
-        let collection = api::reverse_collection(&self.pack, &response, false)?;
+        let collection = api::reverse_collection(&self.pack, &response)?;
         let millis = started.elapsed().as_secs_f64() * 1_000.0;
         let hits = collection
             .features
