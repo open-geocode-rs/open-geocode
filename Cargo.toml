@@ -112,6 +112,7 @@ geojson = "1.0"
 icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
 icu_properties = "2.3"
 indicatif = "0.18"
+jiff = { version = "0.2.39", default-features = false, features = ["std", "tzdb-bundle-always"] }
 # Fuzzy dictionary lookup in the parser; the same automata Tantivy uses.
 levenshtein_automata = "0.2"
 # Checks a downloaded extract against the MD5 sum Geofabrik publishes.

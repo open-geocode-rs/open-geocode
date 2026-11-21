@@ -2114,6 +2114,16 @@ fn cell_of(item: &Item, column: &str) -> String {
             .map(|category| category.id)
             .collect::<Vec<_>>()
             .join(","),
+        "timeZoneName" => item
+            .time_zone
+            .as_ref()
+            .map(|zone| zone.name.clone())
+            .unwrap_or_default(),
+        "timeZoneUtcOffset" => item
+            .time_zone
+            .as_ref()
+            .map(|zone| zone.utc_offset.clone())
+            .unwrap_or_default(),
         "scoringQueryScore" => item
             .scoring
             .as_ref()
@@ -2174,15 +2184,20 @@ fn project(value: &Value, paths: &[Vec<&str>]) -> Value {
 /// The HERE items one og line answered.
 fn line_items(meta: &Meta, carried: &Carried<'_>, response: &OgResponse) -> Vec<Item> {
     match meta.service {
+        // A column asks for the time zone, so every item carries it.
         Service::Geocode => response
             .features
             .iter()
-            .map(item)
+            .map(|feature| item(feature).with_time_zone(feature, true))
             .take(carried.limit)
             .collect(),
-        Service::Revgeocode => {
-            reverse_items(&response.features, carried.radius_m, None, carried.limit)
-        }
+        Service::Revgeocode => reverse_items(
+            &response.features,
+            carried.radius_m,
+            None,
+            carried.limit,
+            true,
+        ),
     }
 }
 

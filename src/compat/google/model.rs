@@ -181,6 +181,10 @@ pub(super) struct Place {
     pub(super) regular_opening_hours: Option<hours::OpeningHours>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) time_zone: Option<TimeZone>,
+    /// The place's offset from UTC now, in minutes, daylight saving time
+    /// included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) utc_offset_minutes: Option<i32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) entrances: Vec<PlaceEntrance>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -303,6 +307,11 @@ impl Place {
                 .and_then(|contact| contact.website.clone()),
             regular_opening_hours: common.opening_hours.as_deref().and_then(hours::parse),
             time_zone: common.timezone.clone().map(|id| TimeZone { id }),
+            utc_offset_minutes: common
+                .timezone
+                .as_deref()
+                .and_then(crate::compat::time_zone::Offset::now)
+                .map(crate::compat::time_zone::Offset::minutes),
             address_descriptor: None,
             entrances: common
                 .access

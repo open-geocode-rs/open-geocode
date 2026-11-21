@@ -319,13 +319,16 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
         .features
         .retain(|feature| item(&Feature::from(feature)).is_any_of(types.as_deref()));
     crate::compat::best_matches(&mut collection.features);
-    let parsing = params
-        .get("show")
-        .is_some_and(|show| show.split(',').any(|value| value.trim() == "parsing"))
-        .then(|| parsing(state, request.q.as_deref(), &request.qualified));
+    let parsing =
+        shows(&params, "parsing").then(|| parsing(state, request.q.as_deref(), &request.qualified));
+    let time_zone = shows(&params, "tz");
     let items = features(&collection)
         .iter()
-        .map(|feature| item(feature).distance_from(at))
+        .map(|feature| {
+            item(feature)
+                .distance_from(at)
+                .with_time_zone(feature, time_zone)
+        })
         .take(limit)
         .map(|mut item| {
             item.parsing.clone_from(&parsing);
@@ -462,6 +465,16 @@ pub(super) struct Reverse {
     pub(super) limit: usize,
     /// og's `lang`, from HERE's `lang`.
     pub(super) lang: Option<String>,
+    /// Whether `show=tz` asks for each item's time zone.
+    pub(super) time_zone: bool,
+}
+
+/// Whether `show` asks for `value`, one of the enrichments HERE adds to
+/// each item only when asked.
+pub(super) fn shows(params: &Params, value: &str) -> bool {
+    params
+        .get("show")
+        .is_some_and(|show| show.split(',').any(|shown| shown.trim() == value))
 }
 
 /// og's `lang`, from HERE's. HERE renders in one language picked from its
@@ -521,6 +534,7 @@ impl Reverse {
             },
             limit: params.limit(1, max_limit)?,
             lang: og_lang(params),
+            time_zone: shows(params, "tz"),
         })
     }
 
@@ -557,10 +571,15 @@ pub(super) fn reverse_items(
     radius_m: Option<f64>,
     types: Option<&[String]>,
     limit: usize,
+    time_zone: bool,
 ) -> Vec<Item> {
     features
         .iter()
-        .map(|feature| item(feature).without_scoring())
+        .map(|feature| {
+            item(feature)
+                .without_scoring()
+                .with_time_zone(feature, time_zone)
+        })
         .filter(|item| {
             radius_m.is_none_or(|radius| {
                 item.distance
@@ -633,6 +652,7 @@ async fn reverse_lookup(state: &AppState, request: &Reverse) -> Result<Vec<Item>
         request.radius_m,
         request.types.as_deref(),
         request.limit,
+        request.time_zone,
     ))
 }
 
@@ -988,6 +1008,7 @@ pub(super) async fn autosuggest(
                         .with_details(feature)
                         .with_highlights(feature)
                         .distance_from(near.center)
+                        .with_time_zone(feature, shows(&params, "tz"))
                 })
                 .filter(|item| near.admits(item))
                 .collect(),
@@ -1143,6 +1164,7 @@ pub(super) async fn discover(
                         .without_scoring()
                         .with_details(feature)
                         .distance_from(near.center)
+                        .with_time_zone(feature, shows(&params, "tz"))
                 })
                 .collect();
             return Ok(page(items, offset, limit, false));
@@ -1166,6 +1188,7 @@ pub(super) async fn discover(
                     .without_scoring()
                     .with_details(feature)
                     .distance_from(near.center)
+                    .with_time_zone(feature, shows(&params, "tz"))
             })
             .filter(|item| near.admits(item))
             .collect();
@@ -1250,6 +1273,7 @@ pub(super) async fn browse(
                     .without_scoring()
                     .with_details(feature)
                     .distance_from(Some(at))
+                    .with_time_zone(feature, shows(&params, "tz"))
             })
             .filter(|item| filter.admits(&item.categories))
             .filter(|item| {
@@ -1293,7 +1317,10 @@ pub(super) async fn lookup(
             .map_err(Gs7Error::of)?
             .ok_or_else(not_found)?;
         let feature = Feature::from(&feature);
-        Ok(item(&feature).without_scoring().with_details(&feature))
+        Ok(item(&feature)
+            .without_scoring()
+            .with_details(&feature)
+            .with_time_zone(&feature, shows(&params, "tz")))
     };
     respond(&request_id, answer.await)
 }

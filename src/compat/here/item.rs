@@ -60,6 +60,8 @@ struct Properties {
     /// The address as the lines of a postal address, in its country's form.
     #[serde(default)]
     address_lines: Vec<String>,
+    /// The IANA zone the result lies in.
+    timezone: Option<String>,
 }
 
 /// A way in og maps for the result.
@@ -173,6 +175,7 @@ impl Feature {
                 code: common.code.clone(),
                 contact: common.contact.clone(),
                 opening_hours: common.opening_hours.clone(),
+                timezone: common.timezone.clone(),
                 address_lines: compat::postal_lines(common.layer, &common.address, &common.context),
                 access: common
                     .access
@@ -262,6 +265,17 @@ pub(super) struct Item {
     /// How og read the query, part by part, when `show=parsing` asks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) parsing: Option<Parsing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) time_zone: Option<ItemTimeZone>,
+}
+
+/// HERE's `timeZone`, the IANA zone and its offset from UTC when the
+/// request is answered.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ItemTimeZone {
+    pub(super) name: String,
+    pub(super) utc_offset: String,
 }
 
 /// A place's contacts by kind, each value as its source writes it.
@@ -581,6 +595,7 @@ pub(super) fn item(feature: &Feature) -> Item {
         highlights: None,
         scoring: scoring(properties),
         parsing: None,
+        time_zone: None,
     }
 }
 
@@ -815,6 +830,7 @@ impl Item {
             }),
             scoring: None,
             parsing: None,
+            time_zone: None,
         }
     }
 
@@ -885,6 +901,24 @@ impl Item {
         if let Some(highlights) = self.highlights.as_mut() {
             highlights.title = moved(&properties.label, &properties.highlights, &self.title);
         }
+        self
+    }
+
+    /// The zone the result lies in and its offset now, when `show=tz` asks
+    /// for it.
+    pub(super) fn with_time_zone(mut self, feature: &Feature, shown: bool) -> Self {
+        self.time_zone = feature
+            .properties
+            .timezone
+            .as_deref()
+            .filter(|_| shown)
+            .and_then(|name| {
+                let offset = crate::compat::time_zone::Offset::now(name)?;
+                Some(ItemTimeZone {
+                    name: name.to_string(),
+                    utc_offset: offset.text(),
+                })
+            });
         self
     }
 

@@ -3093,6 +3093,62 @@ pub(crate) mod router_tests {
         let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
     }
 
+    /// A vendor writes a result's zone with its offset when it answers,
+    /// HERE when `show=tz` asks and Google when the field mask does.
+    #[tokio::test]
+    async fn a_vendor_writes_the_zone_and_its_offset_now() {
+        let pack = temp_path("timezone-vendors");
+        write_zoned_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        let now = |zone: &str| crate::compat::time_zone::Offset::now(zone).expect("a zone");
+        let here = |uri: &'static str| {
+            let router = router.clone();
+            async move {
+                let reply = send(router, request("GET", uri)).await;
+                assert_eq!(reply.status, StatusCode::OK, "{uri}");
+                let body = reply.json();
+                body["items"][0]["timeZone"].clone()
+            }
+        };
+        let zone = |name: &str| serde_json::json!({"name": name, "utcOffset": now(name).text()});
+        assert_eq!(
+            here("/compat/here/v1/geocode?q=10%20King%20Street&show=tz").await,
+            zone("America/Toronto")
+        );
+        assert_eq!(
+            here("/compat/here/v1/revgeocode?at=43.0,-79.1&show=streetInfo,tz").await,
+            zone("America/Detroit")
+        );
+        assert_eq!(
+            here("/compat/here/v1/geocode?q=10%20King%20Street").await,
+            serde_json::Value::Null,
+            "not asked"
+        );
+
+        let google = Request::builder()
+            .method("POST")
+            .uri("/compat/google/v1/places:searchText")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(
+                "x-goog-fieldmask",
+                "places.timeZone,places.utcOffsetMinutes",
+            )
+            .body(Body::from(r#"{"textQuery": "10 King Street"}"#))
+            .unwrap();
+        let reply = send(router.clone(), google).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let place = reply.json()["places"][0].clone();
+        assert_eq!(
+            place,
+            serde_json::json!({
+                "timeZone": {"id": "America/Toronto"},
+                "utcOffsetMinutes": now("America/Toronto").minutes(),
+            })
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+    }
+
     /// A house and a hall with entrances mapped, and a house and a cafe
     /// with none.
     fn write_entered_pack(dir: &Path) {

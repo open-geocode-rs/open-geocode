@@ -24,6 +24,7 @@ pub(crate) mod mapbox;
 pub(crate) mod position;
 pub(crate) mod precisely;
 pub(crate) mod route;
+pub(crate) mod time_zone;
 pub(crate) mod usps;
 
 use axum::{
