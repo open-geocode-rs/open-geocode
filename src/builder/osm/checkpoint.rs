@@ -242,6 +242,8 @@ pub(super) struct ContextState {
     pub country_ids: BTreeMap<String, u64>,
     /// Areas that are settlements.
     pub settled: Vec<u64>,
+    /// The reach of each town point, in whole metres, by its record id.
+    pub town_reach: Vec<(u64, u32)>,
 }
 
 /// A number in a saved list, coded against the one before.

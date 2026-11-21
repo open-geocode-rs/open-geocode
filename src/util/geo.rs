@@ -1,5 +1,9 @@
 use geojson::{Geometry, GeometryValue, Position};
 
+/// Metres in a degree of latitude, near enough for sizing a lookup box or
+/// comparing short distances.
+pub(crate) const METRES_PER_DEGREE: f64 = 111_320.0;
+
 /// Longitude/latitude of a point geometry, or `None` if it is not a point or
 /// either coordinate is non-finite. This is the single canonical, strict
 /// reader; callers that previously skipped the finite check now reject NaN/inf
