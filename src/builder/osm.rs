@@ -453,6 +453,8 @@ struct Contexts {
     area_names: HashMap<RecordId, Vec<String>>,
     country_codes: HashMap<RecordId, CountryCode>,
     subdivision_codes: HashMap<RecordId, String>,
+    plate_codes: HashMap<RecordId, String>,
+    default_languages: HashMap<RecordId, String>,
     language_names: HashMap<RecordId, crate::pack::LanguageNames>,
     extents: Vec<(RecordId, Extent)>,
     region_groups: HashMap<RecordId, Vec<RecordId>>,
@@ -471,6 +473,8 @@ impl Contexts {
     ) -> Self {
         let country_codes = boundaries.country_codes(&boundary_ids, &country_ids);
         let subdivision_codes = boundaries.subdivision_codes(&boundary_ids);
+        let plate_codes = boundaries.plate_codes(&boundary_ids);
+        let default_languages = boundaries.default_languages(&boundary_ids);
         let language_names = boundaries.language_names(&boundary_ids);
         let extents = boundaries.extents(&boundary_ids);
         let area_names = boundaries.context_names(&boundary_ids, &country_ids);
@@ -485,6 +489,8 @@ impl Contexts {
             area_names,
             country_codes,
             subdivision_codes,
+            plate_codes,
+            default_languages,
             language_names,
             extents,
             region_groups,
@@ -1737,6 +1743,8 @@ impl<'a> Run<'a> {
             area_names,
             country_codes,
             subdivision_codes,
+            plate_codes,
+            default_languages,
             language_names,
             extents,
             region_groups,
@@ -1757,6 +1765,8 @@ impl<'a> Run<'a> {
         writer.set_context_names(area_names);
         writer.set_country_codes(country_codes);
         writer.set_subdivision_codes(subdivision_codes);
+        writer.set_plate_codes(plate_codes);
+        writer.set_default_languages(default_languages);
         writer.set_language_names(language_names);
         writer.set_extents(extents);
         writer.set_region_groups(region_groups);
@@ -5391,12 +5401,14 @@ mod tests {
         let expected = [
             ("context/*", 4),
             ("country_codes", 1),
+            ("default_languages", 1),
             ("extents", 1),
             ("gazetteer/*", 1),
             ("language_names", 1),
             ("manifest", 1),
             ("parse/*", 4),
             ("places/*", 3),
+            ("plate_codes", 1),
             ("postcode_addresses", 1),
             ("records/*", 13),
             ("spatial/*", 3),
@@ -5979,6 +5991,83 @@ mod tests {
         assert_eq!(found(703), ["osm:way:703"], "the far road stays its own");
         assert_eq!(found(711), ["osm:way:710"]);
         assert!(found(720).is_empty(), "a platform is no street");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A boundary's vehicle plate code and default language are kept on
+    /// its area record, as its tags write them.
+    #[test]
+    fn a_boundary_keeps_its_plate_code_and_default_language() {
+        let dir = temp_dir("plate-codes");
+        let input = dir.join("germany.osm.pbf");
+        let mut nodes = Vec::new();
+        let mut ways = Vec::new();
+        let mut relations = Vec::new();
+        type Area<'a> = (&'a str, f64, f64, &'a [(&'a str, &'a str)]);
+        let areas: [Area; 3] = [
+            (
+                "2",
+                0.0,
+                10.0,
+                &[
+                    ("name", "Deutschland"),
+                    ("ISO3166-1:alpha2", "DE"),
+                    ("default_language", "de"),
+                ],
+            ),
+            (
+                "6",
+                1.0,
+                5.0,
+                &[
+                    ("name", "Rhein-Hunsrück-Kreis"),
+                    ("license_plate_code", "SIM"),
+                ],
+            ),
+            ("6", 6.0, 9.0, &[("name", "Kreis ohne Kennzeichen")]),
+        ];
+        for (index, (level, low, high, tags)) in areas.into_iter().enumerate() {
+            let id = 100 + 10 * index as i64;
+            nodes.extend([
+                node(id, low, low, &[]),
+                node(id + 1, low, high, &[]),
+                node(id + 2, high, high, &[]),
+                node(id + 3, high, low, &[]),
+            ]);
+            ways.push(way(id, &[id, id + 1, id + 2, id + 3, id], &[]));
+            let mut tags = tags.to_vec();
+            tags.extend([("boundary", "administrative"), ("admin_level", level)]);
+            relations.push(relation(id, &[(id, "outer")], &tags));
+        }
+        write_pbf(&input, &[nodes, ways, relations]);
+        build(&dir.join("pack"), &input, None);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let kept = (0..reader.records().record_count())
+            .filter_map(|record_id| {
+                let summary = reader.record_summary(record_id).ok()?;
+                let defaults = reader.default_languages(record_id).collect::<Vec<_>>();
+                Some((
+                    summary.name,
+                    reader.plate_code(record_id).map(str::to_string),
+                    defaults.join(";"),
+                ))
+            })
+            .filter(|(_, plate, default)| plate.is_some() || !default.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            [
+                ("Deutschland".to_string(), None, "de".to_string()),
+                (
+                    "Rhein-Hunsrück-Kreis".to_string(),
+                    Some("SIM".to_string()),
+                    String::new()
+                ),
+            ]
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

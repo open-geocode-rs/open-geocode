@@ -34,14 +34,16 @@ use super::{
 
 /// Tags a boundary keeps after the scan besides its names. Its Wikidata
 /// and Wikipedia links rank it (see [`prominence`]).
-const BOUNDARY_TAG_KEYS: [&str; 10] = [
+const BOUNDARY_TAG_KEYS: [&str; 12] = [
     "ISO3166-1:alpha2",
     "ISO3166-1:alpha3",
     "ISO3166-2",
     "admin_level",
     "boundary",
     "country_code",
+    "default_language",
     "designation",
+    "license_plate_code",
     "place",
     "wikidata",
     "wikipedia",
@@ -157,6 +159,11 @@ struct BuiltBoundary {
     /// `CA-ON`. Kept whatever tier the boundary is ranked at, which for a
     /// country with many levels need not be the region tier.
     subdivision_code: Option<String>,
+    /// Its `license_plate_code` tag, the code of its vehicle plates (`SIM`).
+    plate_code: Option<String>,
+    /// Its `default_language` tag, the language its local names are written
+    /// in, as it writes it (`en`, `nl;fr`).
+    default_language: Option<String>,
     /// Where its shape lies in the shape file; nothing until it is written.
     shape: ShapeRef,
     bounds: Rect<f64>,
@@ -348,6 +355,8 @@ impl BoundaryCandidate {
             + text(&boundary.designation)
             + text(&boundary.inferred_country_code)
             + text(&boundary.subdivision_code)
+            + text(&boundary.plate_code)
+            + text(&boundary.default_language)
             + boundary.language_names.capacity() * std::mem::size_of::<(String, String)>()
             + boundary
                 .language_names
@@ -732,6 +741,36 @@ impl BoundarySet {
             .filter_map(|(candidate, record_id)| {
                 let code = candidate.boundary.subdivision_code.clone()?;
                 Some((*record_id, code))
+            })
+            .collect()
+    }
+
+    /// The vehicle plate code of each area record whose boundary states one
+    /// (`SIM`), by record id.
+    pub(crate) fn plate_codes(
+        &self,
+        boundary_record_ids: &[RecordId],
+    ) -> HashMap<RecordId, String> {
+        self.candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .filter_map(|(candidate, record_id)| {
+                Some((*record_id, candidate.boundary.plate_code.clone()?))
+            })
+            .collect()
+    }
+
+    /// The default language of each area record whose boundary states one,
+    /// as it writes it, by record id.
+    pub(crate) fn default_languages(
+        &self,
+        boundary_record_ids: &[RecordId],
+    ) -> HashMap<RecordId, String> {
+        self.candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .filter_map(|(candidate, record_id)| {
+                Some((*record_id, candidate.boundary.default_language.clone()?))
             })
             .collect()
     }
@@ -1250,6 +1289,8 @@ fn built(
             designation,
             inferred_country_code: country_code_from_tags(tags, layer),
             subdivision_code: subdivision_code_from_tags(tags, layer),
+            plate_code: tags.cleaned("license_plate_code"),
+            default_language: tags.cleaned("default_language"),
             shape: ShapeRef::default(),
             bounds,
             extent,
@@ -2282,6 +2323,8 @@ impl crate::extsort::Spill for SetItem {
                 put_opt_str(out, boundary.designation.as_deref());
                 put_opt_str(out, boundary.inferred_country_code.as_deref());
                 put_opt_str(out, boundary.subdivision_code.as_deref());
+                put_opt_str(out, boundary.plate_code.as_deref());
+                put_opt_str(out, boundary.default_language.as_deref());
                 put_u64(out, boundary.shape.offset);
                 put_u64(out, boundary.shape.bytes);
                 let (min, max) = (boundary.bounds.min(), boundary.bounds.max());
@@ -2354,6 +2397,8 @@ impl crate::extsort::Spill for SetItem {
                 let designation = get_opt_string(input)?;
                 let inferred_country_code = get_opt_string(input)?;
                 let subdivision_code = get_opt_string(input)?;
+                let plate_code = get_opt_string(input)?;
+                let default_language = get_opt_string(input)?;
                 let shape = ShapeRef {
                     offset: get_u64(input)?,
                     bytes: get_u64(input)?,
@@ -2391,6 +2436,8 @@ impl crate::extsort::Spill for SetItem {
                         designation,
                         inferred_country_code,
                         subdivision_code,
+                        plate_code,
+                        default_language,
                         shape,
                         bounds: Rect::new((min_x, min_y), (max_x, max_y)),
                         extent,
@@ -2772,6 +2819,8 @@ mod tests {
             designation: None,
             inferred_country_code: None,
             subdivision_code: None,
+            plate_code: None,
+            default_language: None,
             representative_point: representative_point(&geometry).expect("point"),
             shape: ShapeRef::default(),
             bounds: geometry.bounding_rect().expect("bounds"),
@@ -3176,6 +3225,8 @@ mod tests {
                         .map(str::to_ascii_uppercase)
                         .or_else(|| (level <= 2).then(|| "AU".to_string())),
                     subdivision_code: None,
+                    plate_code: None,
+                    default_language: None,
                     representative_point: representative_point(&geometry).expect("point"),
                     shape,
                     bounds,

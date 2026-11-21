@@ -73,6 +73,10 @@ const COUNTRY_CODES_SECTION: &str = "country_codes";
 const COUNTRY_CODES_VERSION: u32 = 1;
 const SUBDIVISION_CODES_SECTION: &str = "subdivision_codes";
 const SUBDIVISION_CODES_VERSION: u32 = 1;
+const PLATE_CODES_SECTION: &str = "plate_codes";
+const PLATE_CODES_VERSION: u32 = 1;
+const DEFAULT_LANGUAGES_SECTION: &str = "default_languages";
+const DEFAULT_LANGUAGES_VERSION: u32 = 1;
 const LANGUAGE_NAMES_SECTION: &str = "language_names";
 const LANGUAGE_NAMES_VERSION: u32 = 1;
 const EXTENTS_SECTION: &str = "extents";
@@ -192,9 +196,11 @@ fn country_codes_from_bytes(bytes: &[u8]) -> Result<HashMap<RecordId, CountryCod
         .collect()
 }
 
-/// Each entry is the area record's id, little-endian, then its code's length
-/// in one byte and the code itself: `CA-ON`.
-fn subdivision_codes_to_bytes(codes: &HashMap<RecordId, String>) -> Vec<u8> {
+/// A short text of each area record that has one, such as its ISO 3166-2
+/// code (`CA-ON`), its vehicle plate code (`SIM`) or its default language
+/// (`de`). Each entry is the area record's id, little-endian, then the
+/// text's length in one byte and the text itself.
+fn area_codes_to_bytes(codes: &HashMap<RecordId, String>) -> Vec<u8> {
     let mut sorted = codes
         .iter()
         .filter(|(_, code)| u8::try_from(code.len()).is_ok())
@@ -209,8 +215,8 @@ fn subdivision_codes_to_bytes(codes: &HashMap<RecordId, String>) -> Vec<u8> {
     bytes
 }
 
-fn subdivision_codes_from_bytes(mut bytes: &[u8]) -> Result<HashMap<RecordId, String>> {
-    let truncated = || Error::Decode("subdivision codes are truncated");
+fn area_codes_from_bytes(mut bytes: &[u8]) -> Result<HashMap<RecordId, String>> {
+    let truncated = || Error::Decode("area codes are truncated");
     let mut codes = HashMap::new();
     while !bytes.is_empty() {
         let (record_id, rest) = bytes.split_at_checked(8).ok_or_else(truncated)?;
@@ -219,8 +225,8 @@ fn subdivision_codes_from_bytes(mut bytes: &[u8]) -> Result<HashMap<RecordId, St
             .split_at_checked(usize::from(length))
             .ok_or_else(truncated)?;
         let record_id = RecordId::from_le_bytes(record_id.try_into().expect("eight bytes"));
-        let code = std::str::from_utf8(code)
-            .map_err(|_| Error::Decode("a subdivision code is not text"))?;
+        let code =
+            std::str::from_utf8(code).map_err(|_| Error::Decode("an area code is not text"))?;
         codes.insert(record_id, code.to_string());
         bytes = rest;
     }
@@ -506,6 +512,8 @@ pub struct Writer {
     context_names: Arc<HashMap<RecordId, Vec<String>>>,
     country_codes: Arc<HashMap<RecordId, CountryCode>>,
     subdivision_codes: HashMap<RecordId, String>,
+    plate_codes: HashMap<RecordId, String>,
+    default_languages: HashMap<RecordId, String>,
     language_names: HashMap<RecordId, LanguageNames>,
     extents: Vec<(RecordId, Extent)>,
     /// When the build was given timezone boundaries.
@@ -656,6 +664,8 @@ impl Writer {
             context_names: Arc::default(),
             country_codes: Arc::default(),
             subdivision_codes: HashMap::new(),
+            plate_codes: HashMap::new(),
+            default_languages: HashMap::new(),
             language_names: HashMap::new(),
             extents: Vec::new(),
             timezones: None,
@@ -702,6 +712,18 @@ impl Writer {
     /// (`CA-ON`), by the area's id.
     pub fn set_subdivision_codes(&mut self, codes: HashMap<RecordId, String>) {
         self.subdivision_codes = codes;
+    }
+
+    /// The vehicle plate code of each area record whose boundary states one
+    /// (`SIM`), by the area's id.
+    pub fn set_plate_codes(&mut self, codes: HashMap<RecordId, String>) {
+        self.plate_codes = codes;
+    }
+
+    /// The default language of each area record whose boundary states one,
+    /// as it writes it (`en`, `nl;fr`), by the area's id.
+    pub fn set_default_languages(&mut self, languages: HashMap<RecordId, String>) {
+        self.default_languages = languages;
     }
 
     /// The names of each area record in the languages it has one in, by the
@@ -860,6 +882,8 @@ impl Writer {
             context_names,
             country_codes,
             subdivision_codes,
+            plate_codes,
+            default_languages,
             language_names,
             extents,
             timezones,
@@ -900,9 +924,21 @@ impl Writer {
         pack.add(
             SUBDIVISION_CODES_SECTION,
             SUBDIVISION_CODES_VERSION,
-            &subdivision_codes_to_bytes(&subdivision_codes),
+            &area_codes_to_bytes(&subdivision_codes),
         )?;
         drop(subdivision_codes);
+        pack.add(
+            PLATE_CODES_SECTION,
+            PLATE_CODES_VERSION,
+            &area_codes_to_bytes(&plate_codes),
+        )?;
+        drop(plate_codes);
+        pack.add(
+            DEFAULT_LANGUAGES_SECTION,
+            DEFAULT_LANGUAGES_VERSION,
+            &area_codes_to_bytes(&default_languages),
+        )?;
+        drop(default_languages);
         pack.add(
             LANGUAGE_NAMES_SECTION,
             LANGUAGE_NAMES_VERSION,
@@ -1291,6 +1327,10 @@ pub struct Reader {
     country_codes: HashMap<RecordId, CountryCode>,
     /// The ISO 3166-2 code of each area record that has one, by its id.
     subdivision_codes: HashMap<RecordId, String>,
+    /// The vehicle plate code of each area record that has one, by its id.
+    plate_codes: HashMap<RecordId, String>,
+    /// The default language of each area record that states one, by its id.
+    default_languages: HashMap<RecordId, String>,
     /// The names of each area record in other languages, by its id.
     language_names: HashMap<RecordId, LanguageNames>,
     extents: Extents,
@@ -1339,12 +1379,21 @@ impl Reader {
             HashMap::new()
         };
         let subdivision_codes = if container.sections().contains_key(SUBDIVISION_CODES_SECTION) {
-            subdivision_codes_from_bytes(
+            area_codes_from_bytes(
                 &container.section(SUBDIVISION_CODES_SECTION, SUBDIVISION_CODES_VERSION)?,
             )?
         } else {
             HashMap::new()
         };
+        let codes = |section: &str, version: u32| -> Result<HashMap<RecordId, String>> {
+            if container.sections().contains_key(section) {
+                area_codes_from_bytes(&container.section(section, version)?)
+            } else {
+                Ok(HashMap::new())
+            }
+        };
+        let plate_codes = codes(PLATE_CODES_SECTION, PLATE_CODES_VERSION)?;
+        let default_languages = codes(DEFAULT_LANGUAGES_SECTION, DEFAULT_LANGUAGES_VERSION)?;
         let language_names = if container.sections().contains_key(LANGUAGE_NAMES_SECTION) {
             language_names_from_bytes(
                 &container.section(LANGUAGE_NAMES_SECTION, LANGUAGE_NAMES_VERSION)?,
@@ -1371,6 +1420,8 @@ impl Reader {
             postcode_addresses,
             country_codes,
             subdivision_codes,
+            plate_codes,
+            default_languages,
             language_names,
             extents,
             timezones,
@@ -1415,6 +1466,25 @@ impl Reader {
     /// and for every record of a Pack sealed without subdivision codes.
     pub fn subdivision_code(&self, record_id: RecordId) -> Option<&str> {
         self.subdivision_codes.get(&record_id).map(String::as_str)
+    }
+
+    /// The vehicle plate code of an area record (`SIM` of Rhein-Hunsrück),
+    /// as its boundary states it. `None` for an area that states none, and
+    /// for every record of a Pack sealed without plate codes.
+    pub fn plate_code(&self, record_id: RecordId) -> Option<&str> {
+        self.plate_codes.get(&record_id).map(String::as_str)
+    }
+
+    /// The languages an area record's boundary names as its default, in
+    /// order (`nl` and `fr` of `nl;fr`). None for an area that states none,
+    /// and for every record of a Pack sealed without them.
+    pub fn default_languages(&self, record_id: RecordId) -> impl Iterator<Item = &str> {
+        self.default_languages
+            .get(&record_id)
+            .into_iter()
+            .flat_map(|languages| languages.split(';'))
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
     }
 
     /// An area record's name in `language` (`de`, `zh-Hant`), matched
@@ -1903,12 +1973,9 @@ mod tests {
     #[test]
     fn subdivision_codes_survive_the_section_and_a_cut_one_fails() {
         let codes = HashMap::from([(3, "CA-ON".to_string()), (9, "NZ-AUK".to_string())]);
-        let bytes = subdivision_codes_to_bytes(&codes);
-        assert_eq!(
-            subdivision_codes_from_bytes(&bytes).expect("decodes"),
-            codes
-        );
-        assert!(subdivision_codes_from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        let bytes = area_codes_to_bytes(&codes);
+        assert_eq!(area_codes_from_bytes(&bytes).expect("decodes"), codes);
+        assert!(area_codes_from_bytes(&bytes[..bytes.len() - 1]).is_err());
     }
 
     fn temp_root(name: &str) -> PathBuf {
