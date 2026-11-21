@@ -254,6 +254,33 @@ impl Args {
     }
 }
 
+/// An area's name without the word for its kind, as an address writes it:
+/// `Suffolk` of `Suffolk County`, `Oder-Spree` of `Landkreis Oder-Spree`.
+/// The kind words are og's parser's, from libpostal's lists in every
+/// language. A name with none, or whose rest is not whole words of it,
+/// stays as it is.
+pub(crate) fn without_kind(name: &str) -> String {
+    let Some(key) = crate::util::fold::search_key(name) else {
+        return name.to_string();
+    };
+    let words = name.split_whitespace().collect::<Vec<_>>();
+    let mut best: Option<String> = None;
+    for alias in crate::parse::lattice::dictionary::admin_aliases(&key) {
+        for start in 0..words.len() {
+            for end in start + 1..=words.len() {
+                let span = words[start..end].join(" ");
+                if (end - start) < words.len()
+                    && crate::util::fold::search_key(&span).as_deref() == Some(alias.as_str())
+                    && best.as_ref().is_none_or(|kept| span.len() > kept.len())
+                {
+                    best = Some(span);
+                }
+            }
+        }
+    }
+    best.unwrap_or_else(|| name.to_string())
+}
+
 /// Keeps the results that match the query no worse than the first, when
 /// the first matches every part the query states, fully or in part: a
 /// vendor answers the address it found, not the near misses og also holds
@@ -788,6 +815,17 @@ pub(crate) fn postal_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_area_is_named_without_the_word_for_its_kind() {
+        assert_eq!(without_kind("Suffolk County"), "Suffolk");
+        assert_eq!(without_kind("Landkreis Oder-Spree"), "Oder-Spree");
+        assert_eq!(without_kind("Freistaat Bayern"), "Bayern");
+        assert_eq!(without_kind("Berlin"), "Berlin");
+        assert_eq!(without_kind("County Cork"), "Cork");
+        // A kind word inside a word is none.
+        assert_eq!(without_kind("Statesville"), "Statesville");
+    }
 
     fn area(name: &str, code: Option<&str>) -> Option<crate::api::ContextArea> {
         Some(crate::api::ContextArea {

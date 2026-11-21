@@ -745,10 +745,14 @@ fn address(properties: &Properties) -> ItemAddress {
             .or_else(|| own_code(Layer::Region))
             .and_then(|code| code.split_once('-'))
             .map(|(_, own)| own.to_string()),
+        // HERE names a state and a county without the word for its kind.
         state: area(&context.region)
+            .map(|name| compat::without_kind(&name))
             .or_else(|| stated.region.clone())
             .or_else(|| own(Layer::Region)),
-        county: area(&context.district).or_else(|| own(Layer::District)),
+        county: area(&context.district)
+            .or_else(|| own(Layer::District))
+            .map(|name| compat::without_kind(&name)),
         city: area(&context.locality)
             .or_else(|| stated.locality.clone())
             .or_else(|| own(Layer::Locality)),
