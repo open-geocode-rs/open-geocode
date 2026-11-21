@@ -17,7 +17,10 @@ use super::{
 };
 use crate::{
     api::ForwardFeature,
-    compat::{Args, VendorError, decode_id, native},
+    compat::{
+        Args, VendorError, decode_id, native,
+        route::{self, Corridor},
+    },
     runtime::AppState,
     spatial_index::haversine_m,
 };
@@ -73,9 +76,6 @@ impl SearchTextRequest {
         if self.open_now {
             return Err(unheld("openNow"));
         }
-        if self.search_along_route_parameters.is_some() {
-            return Err(unheld("searchAlongRouteParameters"));
-        }
         // og answers in one page and so never issues a token.
         if let Some(token) = self.page_token.as_deref().filter(|token| !token.is_empty()) {
             return Err(invalid(format!("Invalid pageToken \"{token}\".")));
@@ -86,12 +86,37 @@ impl SearchTextRequest {
     /// Whether the request keeps only places of a rating, a price or EV
     /// charging options. og holds none of these for any place, so no place
     /// it holds is one of them.
+    /// The route `searchAlongRouteParameters` names, as a corridor of
+    /// [`ALONG_ROUTE_M`] either side of it.
+    fn corridor(&self) -> Result<Option<Corridor>, VendorError> {
+        let Some(parameters) = &self.search_along_route_parameters else {
+            return Ok(None);
+        };
+        let encoded = parameters["polyline"]["encodedPolyline"]
+            .as_str()
+            .ok_or_else(|| {
+                invalid("searchAlongRouteParameters.polyline.encodedPolyline is required")
+            })?;
+        let points = route::google_polyline(encoded).map_err(|_| {
+            invalid("searchAlongRouteParameters.polyline.encodedPolyline does not decode")
+        })?;
+        Corridor::new(points, ALONG_ROUTE_M)
+            .map(Some)
+            .ok_or_else(|| {
+                invalid("searchAlongRouteParameters.polyline holds fewer than two points")
+            })
+    }
+
     fn keeps_only_unheld(&self) -> bool {
         self.min_rating.is_some_and(|rating| rating > 0.0)
             || !self.price_levels.is_empty()
             || self.ev_options.is_some()
     }
 }
+
+/// How far from a route a place along it may lie: a place a kilometre off
+/// the road is a short detour, and one further is no longer on the way.
+const ALONG_ROUTE_M: f64 = 1_000.0;
 
 /// A Text Search `rankPreference`. og ranks by relevance, and by distance
 /// only from a point the request gives.
@@ -156,10 +181,19 @@ pub(super) async fn search_text(
             .as_deref()
             .filter(|named| !named.is_empty());
         // A type filter or a reordering reads more than the page holds.
-        let window = match (included, rank) {
-            (None, TextRank::Relevance) => limit,
+        let corridor = request.corridor()?;
+        let window = match (included, rank, &corridor) {
+            (None, TextRank::Relevance, None) => limit,
             _ => i64::try_from(NEARBY_WINDOW).unwrap_or(limit),
         };
+        // Along a route og searches the box around it, unless the request
+        // restricts the search to a box of its own.
+        let bbox = bbox.or_else(|| {
+            corridor.as_ref().map(|corridor| {
+                let [west, south, east, north] = corridor.bbox();
+                format!("{west},{south},{east},{north}")
+            })
+        });
         let args = Args::new()
             .set("q", text)
             .set("limit", window.to_string())
@@ -180,6 +214,19 @@ pub(super) async fn search_text(
                 // first, the rest after in their order.
                 false => features.sort_by_key(|feature| !is(feature)),
             }
+        }
+        if let Some(corridor) = &corridor {
+            // Along a route, the places on the way, the shortest detour first.
+            let detour = |feature: &ForwardFeature| {
+                let [lon, lat] = feature.geometry.coordinates;
+                corridor.reach([lon, lat]).map(|reach| reach.off_m)
+            };
+            features.retain(|feature| detour(feature).is_some());
+            features.sort_by(|a, b| {
+                detour(a)
+                    .partial_cmp(&detour(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
         if rank == TextRank::Distance {
             features.sort_by(|a, b| {

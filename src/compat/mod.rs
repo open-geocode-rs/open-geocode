@@ -22,6 +22,7 @@ pub(crate) mod hours;
 pub(crate) mod house;
 pub(crate) mod mapbox;
 pub(crate) mod precisely;
+pub(crate) mod route;
 pub(crate) mod usps;
 
 use axum::{

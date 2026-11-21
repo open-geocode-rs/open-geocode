@@ -1833,6 +1833,25 @@ async fn destinations_leave_out_areas_and_refuse_what_google_refuses() {
     }
 }
 
+/// A text search along a route keeps the places by the route.
+#[tokio::test]
+async fn search_text_along_a_route_keeps_the_places_by_it() {
+    let fixture = fixture();
+    let router = &fixture.router;
+    let along = |polyline: &str| {
+        json!({"textQuery": "Queen Bakery",
+               "searchAlongRouteParameters": {"polyline": {"encodedPolyline": polyline}}})
+    };
+    // 55 m north of Queen Bakery, from 407 m west of it to 407 m east.
+    let near = post(router, SEARCH_TEXT, along("cpmeGnsfaN?o}@")).await;
+    assert_eq!(near.status, StatusCode::OK, "{}", near.body);
+    assert_eq!(near.body["places"][0]["id"], bakery_id(), "{}", near.body);
+    let far = post(router, SEARCH_TEXT, along("_wpkG~~ggNo}@?")).await;
+    assert_eq!(far.body, json!({}));
+    let bad = post(router, SEARCH_TEXT, along("_p~iF")).await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{}", bad.body);
+}
+
 #[tokio::test]
 async fn filters_og_holds_no_data_for_keep_no_place_and_the_rest_apply() {
     let fixture = fixture();

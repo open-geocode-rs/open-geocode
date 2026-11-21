@@ -864,15 +864,6 @@ async fn autosuggest_autocomplete_and_discover() {
     for path in ["discover", "autosuggest"] {
         let uri = format!("/compat/here/v1/{path}?q=Queen&at=43,-79");
         let form = "application/x-www-form-urlencoded";
-        let reply = send(
-            &router,
-            "POST",
-            &uri,
-            Some((form, "route=BFoz5xJ67i1B1B7PzIhaxL7Y")),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}");
-        assert_eq!(reply.json()["title"], "Illegal input for parameter 'route'");
         let reply = send(&router, "POST", &uri, Some((form, "limit=1"))).await;
         assert_eq!(
             reply.json()["title"],
@@ -964,28 +955,6 @@ async fn browse_answers_the_places_around_a_point_by_kind_and_name() {
     }
     let reply = get(&router, &format!("{base}?at=43,-79&limit=100")).await;
     assert_eq!(reply.json(), found);
-    // A route og cannot search along is refused.
-    for (query, param) in [("at=43,-79&route=BFoz5xJ67i1B1B7PzIhaxL7Y", "route")] {
-        let reply = get(&router, &format!("{base}?{query}")).await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{query}");
-        assert_eq!(
-            reply.json()["title"],
-            format!("Illegal input for parameter '{param}'"),
-            "{query}"
-        );
-    }
-    let reply = send(
-        &router,
-        "POST",
-        &format!("{base}?at=43,-79"),
-        Some((
-            "application/x-www-form-urlencoded",
-            "route=BFoz5xJ67i1B1B7PzIhaxL7Y",
-        )),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-    assert_eq!(reply.json()["title"], "Illegal input for parameter 'route'");
 
     let reply = get(&router, &format!("{base}?at=43,-79&offset=0&limit=1")).await;
     assert_eq!(
@@ -2519,41 +2488,90 @@ async fn a_feature_reads_alike_from_og_and_from_its_json() {
 /// A route og cannot search along is refused, in the query string as in
 /// the body, rather than answered as a search around nothing.
 #[tokio::test]
-async fn a_route_is_refused_wherever_it_is_sent() {
+async fn a_search_along_a_route_keeps_what_lies_by_it() {
     let pack = pack("route");
     let router = pack.router();
-    let route = "BFoz5xJ67i1B1B7PzIhaxL7Y";
+    // 55 m north of Queen Bakery, from 407 m west of it to 407 m east.
+    let near = "BFkxumIv0niPAw-B";
+    let far = "BFg4xsI__ooPw-BA";
     for path in ["discover", "autosuggest", "browse"] {
-        let extra = if path == "browse" { "" } else { "&q=zoo" };
-        let query = send(
+        let extra = if path == "browse" {
+            ""
+        } else {
+            "&q=queen%20bakery"
+        };
+        let titles = |reply: &Reply| {
+            reply.json()["items"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| item["title"].clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let query = get(
             &router,
-            "GET",
-            &format!("/compat/here/v1/{path}?at=43,-79&route={route}{extra}"),
-            None,
+            &format!("/compat/here/v1/{path}?at=43,-79&route={near}{extra}"),
         )
         .await;
-        assert_eq!(
-            query.status,
-            StatusCode::BAD_REQUEST,
+        assert_eq!(query.status, StatusCode::OK, "{path}: {}", query.text());
+        assert!(
+            titles(&query).contains(&json!("Queen Bakery")),
             "{path}: {}",
             query.text()
         );
+        let bakery = query.json()["items"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["title"] == "Queen Bakery")
+                    .cloned()
+            })
+            .expect("the bakery");
+        // Along the route plus off it.
+        let distance = bakery["distance"].as_i64().expect("a distance");
+        assert!((455..=470).contains(&distance), "{path}: {distance}");
         let body = send(
             &router,
             "POST",
             &format!("/compat/here/v1/{path}?at=43,-79{extra}"),
             Some((
                 "application/x-www-form-urlencoded",
-                &format!("route={route}"),
+                &format!("route={near};w=100"),
             )),
         )
         .await;
-        assert_eq!(
-            body.status,
-            StatusCode::BAD_REQUEST,
-            "{path}: {}",
-            body.text()
+        assert_eq!(titles(&body), titles(&query), "{path}: in the body");
+        let narrow = get(
+            &router,
+            &format!("/compat/here/v1/{path}?at=43,-79&route={near};w=50{extra}"),
+        )
+        .await;
+        assert!(
+            !titles(&narrow).contains(&json!("Queen Bakery")),
+            "{path}: 55 m off a 50 m corridor"
         );
-        assert_eq!(query.json()["title"], body.json()["title"], "{path}");
+        let elsewhere = get(
+            &router,
+            &format!("/compat/here/v1/{path}?at=43,-79&route={far}{extra}"),
+        )
+        .await;
+        assert_eq!(titles(&elsewhere), Vec::<Value>::new(), "{path}");
+        for bad in [
+            format!("{near};w=50001"),
+            "B".to_string(),
+            format!("{near};w=wide"),
+        ] {
+            let reply = get(
+                &router,
+                &format!("/compat/here/v1/{path}?at=43,-79&route={bad}{extra}"),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{path}: {bad}");
+            assert_eq!(reply.json()["title"], "Illegal input for parameter 'route'");
+        }
     }
 }

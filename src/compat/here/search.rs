@@ -20,6 +20,7 @@ use crate::{
 };
 
 use super::{
+    super::route::{self, Corridor},
     Area, Gs7Error, LatLng, Params, Rid,
     category::{Filter, Listed},
     item::{Feature, Item, item},
@@ -770,38 +771,81 @@ fn fetch(offset: Option<usize>, limit: usize, max: usize) -> usize {
     .min(max)
 }
 
-/// `route`, a polyline to search along, sent in the query string. og
-/// cannot search along one, so it is refused wherever it is sent.
-fn refuse_route(params: &Params) -> Result<(), Gs7Error> {
-    params.get("route").map_or(Ok(()), |value| {
-        Err(Gs7Error::illegal(
-            "route",
-            value,
-            "This server cannot search along a route; search around a point with 'at' instead",
-        ))
-    })
-}
+/// HERE's widest corridor either side of a route, and the one it takes
+/// when `route` names no width.
+const MAX_ROUTE_WIDTH_M: u32 = 50_000;
+const DEFAULT_ROUTE_WIDTH_M: u32 = 1_000;
+/// The most points a route may have.
+const MAX_ROUTE_POINTS: usize = 2_000;
 
-/// The form body a POST may carry. HERE lets it hold only `route`, a
-/// polyline to search along, which og cannot search along.
-fn refuse_body(body: &Bytes) -> Result<(), Gs7Error> {
+/// `route`, a flexible polyline to search along with an optional width,
+/// `{polyline};w={metres}`, from the query string or the form body a POST
+/// may carry, which may hold nothing else.
+fn corridor(params: &Params, body: &Bytes) -> Result<Option<Corridor>, Gs7Error> {
     let fields = serde_urlencoded::from_bytes::<Vec<(String, String)>>(body).map_err(|_| {
         Gs7Error::new(StatusCode::BAD_REQUEST, "Invalid request body")
             .action("Send the body as application/x-www-form-urlencoded")
     })?;
-    match fields.first() {
-        None => Ok(()),
-        Some((name, value)) if name == "route" => Err(Gs7Error::illegal(
-            "route",
-            value,
-            "This server cannot search along a route; search around a point with 'at' instead",
-        )),
-        Some((name, _)) => Err(Gs7Error::new(
-            StatusCode::BAD_REQUEST,
-            format!("Parameter '{name}' is not allowed in the request body"),
-        )
-        .action("Send every parameter but 'route' in the query string")),
+    let in_body = match fields.into_iter().next() {
+        None => None,
+        Some((name, value)) if name == "route" => Some(value),
+        Some((name, _)) => {
+            return Err(Gs7Error::new(
+                StatusCode::BAD_REQUEST,
+                format!("Parameter '{name}' is not allowed in the request body"),
+            )
+            .action("Send every parameter but 'route' in the query string"));
+        }
+    };
+    let Some(value) = in_body.or_else(|| params.get("route").map(str::to_string)) else {
+        return Ok(None);
+    };
+    let illegal = |reason: &str| Gs7Error::illegal("route", &value, reason);
+    let (line, width) = match value.split_once(";w=") {
+        Some((line, width)) => (
+            line,
+            width
+                .parse::<u32>()
+                .map_err(|_| illegal("The width 'w' is a whole number of metres"))?,
+        ),
+        None => (value.as_str(), DEFAULT_ROUTE_WIDTH_M),
+    };
+    if width > MAX_ROUTE_WIDTH_M {
+        return Err(illegal("A route must not be wider than 50000 meters"));
     }
+    let points =
+        route::flexible_polyline(line).map_err(|_| illegal("The route is no flexible polyline"))?;
+    if points.len() > MAX_ROUTE_POINTS {
+        return Err(illegal("A route must not hold more than 2000 points"));
+    }
+    Corridor::new(points, f64::from(width))
+        .map(Some)
+        .ok_or_else(|| illegal("A route must hold at least two points"))
+}
+
+/// og's fields that narrow a search to the box around a route.
+fn route_fields(corridor: Option<&Corridor>) -> Option<(&'static str, String)> {
+    corridor.map(|corridor| {
+        let [west, south, east, north] = corridor.bbox();
+        ("bbox", format!("{west},{south},{east},{north}"))
+    })
+}
+
+/// The items that lie along the route, each at its distance along the route
+/// plus its distance off it, as HERE measures a result found along one.
+fn along(items: Vec<Item>, corridor: Option<&Corridor>) -> Vec<Item> {
+    let Some(corridor) = corridor else {
+        return items;
+    };
+    items
+        .into_iter()
+        .filter_map(|mut item| {
+            let position = item.position?;
+            let reach = corridor.reach([position.lng, position.lat])?;
+            item.distance = Some((reach.along_m + reach.off_m).round() as i64);
+            Some(item)
+        })
+        .collect()
 }
 
 pub(super) async fn autosuggest(
@@ -811,9 +855,8 @@ pub(super) async fn autosuggest(
     body: Bytes,
 ) -> Response {
     let answer = async {
-        refuse_body(&body)?;
         let params = Params::parse(query.as_deref())?;
-        refuse_route(&params)?;
+        let corridor = corridor(&params, &body)?;
         let q = required_q(&params)?;
         let near = Near::read(&params, true)?;
         let limit = params.limit(20, 100)?;
@@ -825,10 +868,15 @@ pub(super) async fn autosuggest(
             ("q", q.to_string()),
             (
                 "limit",
-                fetch(offset, limit, MAX_AUTOCOMPLETE_LIMIT).to_string(),
+                match corridor {
+                    Some(_) => MAX_AUTOCOMPLETE_LIMIT,
+                    None => fetch(offset, limit, MAX_AUTOCOMPLETE_LIMIT),
+                }
+                .to_string(),
             ),
         ];
         fields.extend(near.fields.iter().cloned());
+        fields.extend(route_fields(corridor.as_ref()));
         let collection = native::autocomplete(&state, args(fields).maybe("lang", og_lang(&params)))
             .await
             .map_err(Gs7Error::of)?;
@@ -843,7 +891,7 @@ pub(super) async fn autosuggest(
             })
             .filter(|item| near.admits(item))
             .collect();
-        Ok(page(items, offset, limit, true))
+        Ok(page(along(items, corridor.as_ref()), offset, limit, true))
     };
     respond(&request_id, answer.await)
 }
@@ -900,9 +948,8 @@ pub(super) async fn discover(
     body: Bytes,
 ) -> Response {
     let answer = async {
-        refuse_body(&body)?;
         let params = Params::parse(query.as_deref())?;
-        refuse_route(&params)?;
+        let corridor = corridor(&params, &body)?;
         let q = required_q(&params)?;
         let near = Near::read(&params, true)?;
         let limit = params.limit(20, 100)?;
@@ -910,11 +957,15 @@ pub(super) async fn discover(
         if q.trim().is_empty() {
             return Ok(page(Vec::new(), offset, limit, false));
         }
-        let mut fields = vec![
-            ("q", q.to_string()),
-            ("limit", fetch(offset, limit, MAX_SEARCH_LIMIT).to_string()),
-        ];
+        // Along a route og is asked for all it gives, since the corridor
+        // drops what lies off it.
+        let ask = match corridor {
+            Some(_) => MAX_SEARCH_LIMIT,
+            None => fetch(offset, limit, MAX_SEARCH_LIMIT),
+        };
+        let mut fields = vec![("q", q.to_string()), ("limit", ask.to_string())];
         fields.extend(near.fields.iter().cloned());
+        fields.extend(route_fields(corridor.as_ref()));
         let collection = native::search(&state, args(fields).maybe("lang", og_lang(&params)))
             .await
             .map_err(Gs7Error::of)?;
@@ -928,7 +979,7 @@ pub(super) async fn discover(
             })
             .filter(|item| near.admits(item))
             .collect();
-        Ok(page(items, offset, limit, false))
+        Ok(page(along(items, corridor.as_ref()), offset, limit, false))
     };
     respond(&request_id, answer.await)
 }
@@ -939,7 +990,8 @@ pub(super) async fn discover(
 /// around a point. `in=circle` searches that circle instead, and `in=bbox`
 /// that box. `categories` keeps the kinds og has under a HERE id, and `name`
 /// the places whose name holds its words. og's places carry no HERE chain or
-/// food type, so asking for one is refused.
+/// food type, so asking for one keeps none. `route` keeps the places along
+/// it.
 pub(super) async fn browse(
     State(state): State<AppState>,
     Rid(request_id): Rid,
@@ -947,9 +999,8 @@ pub(super) async fn browse(
     body: Bytes,
 ) -> Response {
     let answer = async {
-        refuse_body(&body)?;
         let params = Params::parse(query.as_deref())?;
-        refuse_route(&params)?;
+        let corridor = corridor(&params, &body)?;
         let at = params.get("at").ok_or_else(|| {
             Gs7Error::new(StatusCode::BAD_REQUEST, "Missing parameter 'at'").action("Provide 'at'")
         })?;
@@ -989,6 +1040,12 @@ pub(super) async fn browse(
             }
             None => fields.push(("focus", at.og_point())),
         }
+        // Along a route the corridor's box is searched in place of the
+        // circle around `at`.
+        if let Some(field) = route_fields(corridor.as_ref()) {
+            fields.retain(|(name, _)| *name != "radius");
+            fields.push(field);
+        }
         let collection = native::of_categories(
             &state,
             categories,
@@ -1011,8 +1068,9 @@ pub(super) async fn browse(
                 })
             })
             .collect::<Vec<_>>();
+        items = along(items, corridor.as_ref());
         // A circle or a box is searched from its own middle, and Browse ranks
-        // by the distance from `at`.
+        // by the distance from `at`, or along a route.
         items.sort_by_key(|item| item.distance);
         Ok(page(items, offset, limit, false))
     };
