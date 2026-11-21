@@ -899,10 +899,12 @@ impl Item {
             .filter(|contacts| !contacts.is_empty())
             .into_iter()
             .collect();
+        let kind = self.categories.first().map(|category| category.id);
         self.opening_hours = properties
             .opening_hours
             .as_deref()
             .and_then(hours::parse)
+            .map(|hours| hours.of_kind(kind))
             .into_iter()
             .collect();
         self

@@ -442,6 +442,8 @@ fn bakery(distance: Option<i64>) -> Value {
             "www": [{"value": "https://queenbakery.example/"}],
         }],
         "openingHours": [{
+            // The place's hours, of its own kind.
+            "categories": [{"id": "600-6300-0244"}],
             "text": ["Mon-Fri: 08:00 - 18:00", "Sat: 09:00 - 13:00"],
             "structured": [
                 {"start": "T080000", "duration": "PT10H00M", "recurrence": "FREQ:DAILY;BYDAY:MO,TU,WE,TH,FR"},
@@ -1482,9 +1484,13 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
         }
         _ => assert_eq!(item.get("contacts"), None, "{at}"),
     }
+    let kind = item["categories"][0]["id"]
+        .as_str()
+        .map(|id| -> &'static str { Box::leak(id.to_string().into_boxed_str()) });
     let hours = properties["opening_hours"]
         .as_str()
         .and_then(super::hours::parse)
+        .map(|hours| hours.of_kind(kind))
         .filter(|_| details);
     assert_eq!(
         item.get("openingHours").cloned(),

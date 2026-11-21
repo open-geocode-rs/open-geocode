@@ -11,9 +11,30 @@ use crate::compat::hours::{DAY_MINUTES, Span, Week, Weekday};
 /// request time in the place's own zone, which og does not compute.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct OpeningHours {
+    /// The categories the hours are of. OpenStreetMap's hours are the
+    /// place's, so they are of its own kind.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    categories: Vec<CategoryId>,
     /// One line per group of days that share their hours, Monday first.
     text: Vec<String>,
     structured: Vec<Structured>,
+}
+
+/// A category as hours and contacts name it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct CategoryId {
+    pub(super) id: String,
+}
+
+impl OpeningHours {
+    /// The hours, of the place's own kind when it has one.
+    pub(super) fn of_kind(mut self, id: Option<&str>) -> Self {
+        self.categories = id
+            .map(|id| CategoryId { id: id.to_string() })
+            .into_iter()
+            .collect();
+        self
+    }
 }
 
 /// One span of hours in iCalendar terms, on every day of `recurrence`.
@@ -83,7 +104,11 @@ pub(super) fn parse(value: &str) -> Option<OpeningHours> {
             })
         })
         .collect();
-    Some(OpeningHours { text, structured })
+    Some(OpeningHours {
+        categories: Vec::new(),
+        text,
+        structured,
+    })
 }
 
 /// A time of day as HERE writes it. A close at midnight is `24:00`, and a
