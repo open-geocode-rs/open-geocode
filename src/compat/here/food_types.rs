@@ -1,11 +1,27 @@
 //! HERE's food types, the cuisines a place's `foodTypes` name, and the
 //! kinds of food OpenStreetMap's `cuisine` tag lists that each one is.
 //!
-//! A `cuisine` value is the food type of the same name: its words are the
-//! value's with underscores as spaces, read without regard to case or to a
-//! plural `s`. A variation is also named by its own part after the dash or
-//! either side of a slash, so `sushi` is `Japanese-Sushi` and `kosher` is
-//! `Jewish/Kosher`. A base food type wins over a variation of the same name.
+//! A `cuisine` value is the food type of the same whole name: its words are
+//! the value's with underscores as spaces, read without regard to case or
+//! to a plural `s` (`ice_cream` is Ice Cream, `burger` is Burgers). A common
+//! value HERE files as a variation of one country's kitchen, or spells
+//! otherwise, is listed in [`NAMED`], each reviewed by hand. A part of a
+//! variation's name alone names nothing: `chicken` is Chicken, not
+//! Japanese-Yakitori/Chicken.
+
+/// Common `cuisine` values and the food type each one is, where no food
+/// type has the value's own name.
+const NAMED: [(&str, &str); 9] = [
+    ("sushi", "203-026"),
+    ("ramen", "203-060"),
+    ("tapas", "311-034"),
+    ("kosher", "800-079"),
+    ("cantonese", "201-010"),
+    ("szechuan", "201-009"),
+    ("sichuan", "201-009"),
+    ("crepe", "800-068"),
+    ("pastry", "800-069"),
+];
 
 /// Every food type, as HERE's food type system lists them: its id and name.
 const FOOD_TYPES: [(&str, &str); 189] = [
@@ -235,28 +251,22 @@ pub(super) fn admits(
     (listed.included.is_empty() || any(&listed.included)) && !any(&listed.excluded)
 }
 
-/// The food type `value` names, a base one before a variation.
+/// The food type `value` names: the one of its whole name, else the one
+/// [`NAMED`] gives it.
 fn named(value: &str) -> Option<(&'static str, &'static str)> {
+    let value = value.trim().to_lowercase();
     let wanted = words(&value.replace('_', " "));
     if wanted.is_empty() {
         return None;
     }
-    let base = |id: &str| id.ends_with("-000");
-    let mut matching = FOOD_TYPES
+    FOOD_TYPES
         .iter()
-        .filter(|(_, name)| names(name).any(|name| words(name) == wanted))
+        .find(|(_, name)| words(name) == wanted)
+        .or_else(|| {
+            let (_, id) = NAMED.iter().find(|(listed, _)| *listed == value)?;
+            FOOD_TYPES.iter().find(|(own, _)| own == id)
+        })
         .copied()
-        .collect::<Vec<_>>();
-    matching.sort_by_key(|(id, _)| !base(id));
-    matching.into_iter().next()
-}
-
-/// A food type's name whole, and each part a dash or a slash sets apart.
-fn names(name: &str) -> impl Iterator<Item = &str> {
-    let after_dash = name.split_once('-').map(|(_, rest)| rest);
-    std::iter::once(name)
-        .chain(after_dash)
-        .chain(after_dash.unwrap_or(name).split('/'))
 }
 
 /// The words of a name, in lower case, each without a plural `s`.
@@ -289,19 +299,76 @@ mod tests {
     }
 
     #[test]
-    fn a_cuisine_is_the_food_type_of_its_name() {
+    fn a_cuisine_is_the_food_type_of_its_whole_name() {
         assert_eq!(ids(&["pizza", "italian"]), ["800-057", "304-000"]);
         assert_eq!(ids(&["ice_cream"]), ["800-063"]);
         assert_eq!(ids(&["burger"]), ["800-067"]);
         assert_eq!(ids(&["steak_house"]), ["800-056"]);
+        assert_eq!(ids(&["chinese", "Chinese"]), ["201-000"], "each once");
     }
 
+    /// A part of a variation's name names nothing of its own: chicken is
+    /// HERE's Chicken, and fish, bakery and northwestern no kitchen of one
+    /// country.
     #[test]
-    fn a_variation_is_named_by_its_own_part_and_a_base_comes_first() {
-        assert_eq!(ids(&["sushi"]), ["203-026"]);
-        assert_eq!(ids(&["kosher"]), ["800-079"]);
-        assert_eq!(ids(&["american"]), ["101-000"]);
-        assert_eq!(ids(&["chinese", "Chinese"]), ["201-000"], "each once");
-        assert!(ids(&["coffee_shop", ""]).is_empty(), "no such food type");
+    fn a_part_of_a_variations_name_names_no_variation() {
+        assert_eq!(ids(&["chicken"]), ["800-062"]);
+        for value in ["fish", "bakery", "northwestern", "coffee_shop", ""] {
+            assert!(ids(&[value]).is_empty(), "{value}");
+        }
+    }
+
+    /// The most used OSM `cuisine` values, each beside the food type it is,
+    /// none where HERE has none of that meaning.
+    #[test]
+    fn the_most_used_cuisines_are_their_food_types() {
+        let expected = [
+            ("pizza", Some("800-057")),
+            ("burger", Some("800-067")),
+            ("coffee_shop", None),
+            ("italian", Some("304-000")),
+            ("chinese", Some("201-000")),
+            ("mexican", Some("102-000")),
+            ("sandwich", Some("800-060")),
+            ("chicken", Some("800-062")),
+            ("kebab", Some("800-087")),
+            ("japanese", Some("203-000")),
+            ("regional", None),
+            ("indian", Some("202-000")),
+            ("american", Some("101-000")),
+            ("sushi", Some("203-026")),
+            ("asian", Some("200-000")),
+            ("thai", Some("205-000")),
+            ("ice_cream", Some("800-063")),
+            ("french", Some("301-000")),
+            ("greek", Some("303-000")),
+            ("german", Some("302-000")),
+            ("vietnamese", Some("206-000")),
+            ("seafood", Some("800-075")),
+            ("donut", None),
+            ("steak_house", Some("800-056")),
+            ("turkish", Some("252-000")),
+            ("korean", Some("207-000")),
+            ("spanish", Some("311-000")),
+            ("bakery", None),
+            ("breakfast", Some("800-061")),
+            ("fish_and_chips", None),
+            ("mediterranean", Some("372-000")),
+            ("lebanese", Some("253-000")),
+            ("tapas", Some("311-034")),
+            ("noodle", Some("800-085")),
+            ("barbecue", None),
+            ("bubble_tea", None),
+            ("crepe", Some("800-068")),
+            ("portuguese", Some("313-000")),
+            ("vegan", Some("800-076")),
+            ("vegetarian", Some("800-077")),
+            ("ramen", Some("203-060")),
+            ("kosher", Some("800-079")),
+            ("halal", Some("800-086")),
+        ];
+        for (value, id) in expected {
+            assert_eq!(ids(&[value]).first().copied(), id, "{value}");
+        }
     }
 }
