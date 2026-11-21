@@ -25,6 +25,7 @@ use crate::{
 use super::{
     admin_levels::{self, admin_levels},
     containment::{ShapeRef, ShapeWriter, Shapes, encode_shape},
+    cut::Cut,
     place::place_layer,
     poi::{PoiCandidate, outline},
     street::is_settlement,
@@ -199,10 +200,30 @@ struct Draft {
     block: Vec<u8>,
 }
 
+impl Draft {
+    fn of_relation(
+        stub: &BoundaryRelationStub,
+        (boundary, block): (BuiltBoundary, Vec<u8>),
+    ) -> Self {
+        Self {
+            candidate: BoundaryCandidate {
+                source_object_type: ObjectType::Relation,
+                source_object_id: stub.object_id,
+                label: stub.label,
+                boundary,
+            },
+            block,
+        }
+    }
+}
+
 /// Boundaries as they are assembled. Each shape goes to the shape file as
 /// soon as it is built, so the heap holds only what describes the areas.
 pub(crate) struct BoundaryBuilder {
     candidates: Vec<BoundaryCandidate>,
+    /// Areas with a `label` the input left some of the ways of out, for
+    /// [`Self::add_cut_relations`].
+    cut: Vec<BoundaryRelationStub>,
     shapes: ShapeWriter,
     heap_bytes: usize,
     vertices: u64,
@@ -212,6 +233,7 @@ impl BoundaryBuilder {
     pub(crate) fn new(scratch: &Arc<crate::extsort::Scratch>) -> crate::error::Result<Self> {
         Ok(Self {
             candidates: Vec::new(),
+            cut: Vec::new(),
             shapes: ShapeWriter::create(scratch)?,
             heap_bytes: 0,
             vertices: 0,
@@ -247,23 +269,68 @@ impl BoundaryBuilder {
         relations: &[BoundaryRelationStub],
         member_line: impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>> + Sync,
     ) -> crate::error::Result<()> {
-        let drafts = relations
+        let assembled = relations
             .par_iter()
-            .map(|stub| {
-                Ok(
-                    boundary_from_relation(stub, &member_line)?.map(|(boundary, block)| Draft {
-                        candidate: BoundaryCandidate {
-                            source_object_type: ObjectType::Relation,
-                            source_object_id: stub.object_id,
-                            label: stub.label,
-                            boundary,
-                        },
-                        block,
-                    }),
-                )
+            .map(|stub| match boundary_from_relation(stub, &member_line)? {
+                Some(built) => Ok(Some(Ok(Draft::of_relation(stub, built)))),
+                None => Ok(is_cut(stub, &member_line)?.then(|| Err(stub.clone()))),
             })
             .collect::<crate::error::Result<Vec<_>>>()?;
-        self.write(drafts.into_iter().flatten().collect())
+        let mut drafts = Vec::new();
+        for item in assembled.into_iter().flatten() {
+            match item {
+                Ok(draft) => drafts.push(draft),
+                Err(stub) => self.cut.push(stub),
+            }
+        }
+        self.write(drafts)
+    }
+
+    /// The `label` nodes of the areas the input left some of the ways of
+    /// out, whose points [`Self::add_cut_relations`] needs.
+    pub(crate) fn cut_labels(&self) -> HashSet<i64> {
+        self.cut.iter().filter_map(|stub| stub.label).collect()
+    }
+
+    /// The part inside `cut` of each area the input left some of the ways
+    /// of out, whose `label` node lies in `labels`, a point by node id (see
+    /// [`boundary_from_cut_relation`]). The rest stay left out.
+    /// They are built a batch at a time, each batch's vertices `batch_vertices`
+    /// at most as `vertices` counts a relation's, and written before the
+    /// next, as [`Self::add_relations`] is fed.
+    pub(crate) fn add_cut_relations(
+        &mut self,
+        cut: &Cut,
+        labels: &HashMap<i64, [f64; 2]>,
+        member_line: impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>> + Sync,
+        batch_vertices: usize,
+        vertices: impl Fn(&BoundaryRelationStub) -> usize,
+    ) -> crate::error::Result<()> {
+        let stubs = std::mem::take(&mut self.cut);
+        let mut start = 0;
+        let mut held = 0;
+        for (at, stub) in stubs.iter().enumerate() {
+            held += vertices(stub);
+            if held < batch_vertices && at + 1 < stubs.len() {
+                continue;
+            }
+            let drafts = stubs[start..=at]
+                .par_iter()
+                .map(|stub| {
+                    let Some(anchor) = stub.label.and_then(|label| labels.get(&label)) else {
+                        return Ok(None);
+                    };
+                    Ok(
+                        boundary_from_cut_relation(stub, &member_line, cut, *anchor)?
+                            .map(|built| Draft::of_relation(stub, built)),
+                    )
+                })
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            self.write(drafts.into_iter().flatten().collect())?;
+            start = at + 1;
+            held = 0;
+        }
+        Ok(())
     }
 
     fn write(&mut self, drafts: Vec<Draft>) -> crate::error::Result<()> {
@@ -914,11 +981,52 @@ fn boundary_from_relation(
     let Some(parts) = area_parts(&stub.tags) else {
         return Ok(None);
     };
-    let Some((geometry, rings_closed)) = member_lines(stub, member_line)?.and_then(rings_geometry)
+    let Some((geometry, rings_closed)) =
+        whole_member_lines(stub, member_line)?.and_then(rings_geometry)
     else {
         return Ok(None);
     };
     Ok(built(parts, &stub.tags, &geometry, rings_closed))
+}
+
+/// Whether `stub` is an area the input left some of the ways of out.
+fn is_cut(
+    stub: &BoundaryRelationStub,
+    member_line: &impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>>,
+) -> crate::error::Result<bool> {
+    if area_parts(&stub.tags).is_none() || stub.label.is_none() {
+        return Ok(false);
+    }
+    for member in &stub.members {
+        if member_line(member.way_id)?.is_none() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The part inside `cut` of an area the input left some of the ways of
+/// out, found from the side of its outline its `label` point, `anchor`,
+/// lies on (see [`Cut::close`]). Its rings do not close, as it covers only
+/// that part.
+fn boundary_from_cut_relation(
+    stub: &BoundaryRelationStub,
+    member_line: &impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>>,
+    cut: &Cut,
+    anchor: [f64; 2],
+) -> crate::error::Result<Option<(BuiltBoundary, Vec<u8>)>> {
+    let Some(parts) = area_parts(&stub.tags) else {
+        return Ok(None);
+    };
+    let lines = member_lines(stub, member_line)?;
+    let (mut rings, mut open) = stitch_chains(lines.outer);
+    let (inner_rings, inner_open) = stitch_chains(lines.inner);
+    rings.extend(inner_rings);
+    open.extend(inner_open);
+    let Some(geometry) = cut.close(&rings, &open, anchor) else {
+        return Ok(None);
+    };
+    Ok(built(parts, &stub.tags, &geometry, false))
 }
 
 /// Point inside the outline, not the centre: a ring's centre can lie in its
@@ -931,7 +1039,7 @@ pub(crate) fn place_relations(
         .par_iter()
         .filter(|stub| area_parts(&stub.tags).is_none())
         .map(|stub| {
-            let Some(lines) = member_lines(stub, &member_line)? else {
+            let Some(lines) = whole_member_lines(stub, &member_line)? else {
                 return Ok(None);
             };
             let nodes = lines
@@ -966,29 +1074,39 @@ pub(crate) fn place_relations(
 struct MemberLines {
     outer: Vec<Vec<Vertex>>,
     inner: Vec<Vec<Vertex>>,
+    /// A member's line is not in the input: the extract left its way out.
+    missing: bool,
 }
 
-/// None when a member's line is missing.
 fn member_lines(
     stub: &BoundaryRelationStub,
     member_line: &impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>>,
-) -> crate::error::Result<Option<MemberLines>> {
-    let mut outer_segments = Vec::new();
-    let mut inner_segments = Vec::new();
+) -> crate::error::Result<MemberLines> {
+    let mut lines = MemberLines {
+        outer: Vec::new(),
+        inner: Vec::new(),
+        missing: false,
+    };
     for member in &stub.members {
         let Some(line) = member_line(member.way_id)? else {
-            return Ok(None);
+            lines.missing = true;
+            continue;
         };
         match member.role {
-            BoundaryMemberRole::Outer => outer_segments.push(line),
-            BoundaryMemberRole::Inner => inner_segments.push(line),
+            BoundaryMemberRole::Outer => lines.outer.push(line),
+            BoundaryMemberRole::Inner => lines.inner.push(line),
         }
     }
+    Ok(lines)
+}
 
-    Ok(Some(MemberLines {
-        outer: outer_segments,
-        inner: inner_segments,
-    }))
+/// Whole lines only: none when a member's line is missing.
+fn whole_member_lines(
+    stub: &BoundaryRelationStub,
+    member_line: &impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>>,
+) -> crate::error::Result<Option<MemberLines>> {
+    let lines = member_lines(stub, member_line)?;
+    Ok((!lines.missing).then_some(lines))
 }
 
 /// The shape the rings of `lines` make, and whether every outer way closed
@@ -1094,28 +1212,33 @@ fn ring_line_string(ring: &[Vertex]) -> LineString<f64> {
 
 /// The rings `segments` join into, and whether every segment ended in one:
 /// a chain that cannot close is left out.
-fn stitch_rings(mut segments: Vec<Vec<Vertex>>) -> (Vec<Vec<Vertex>>, bool) {
-    segments.retain(|segment| segment.len() >= 2);
-    let mut rings = Vec::new();
-    let mut closed = true;
+fn stitch_rings(segments: Vec<Vec<Vertex>>) -> (Vec<Vec<Vertex>>, bool) {
+    let (rings, open) = stitch_chains(segments);
+    (rings, open.is_empty())
+}
 
-    while let Some(mut ring) = segments.pop() {
+/// The rings `segments` join into, and the chains that cannot close.
+fn stitch_chains(mut segments: Vec<Vec<Vertex>>) -> (Vec<Vec<Vertex>>, Vec<Vec<Vertex>>) {
+    segments.retain(|segment| segment.len() >= 2);
+    let (mut rings, mut open) = (Vec::new(), Vec::new());
+    while let Some(mut chain) = segments.pop() {
         loop {
-            if ring.len() >= 4 && ends(&ring).is_some_and(|(first, last)| first == last) {
-                rings.push(ring);
+            if chain.len() >= 4 && ends(&chain).is_some_and(|(first, last)| first == last) {
+                rings.push(chain);
                 break;
             }
-
-            let Some(index) = segments.iter().position(|segment| can_join(&ring, segment)) else {
-                closed = false;
+            let Some(index) = segments
+                .iter()
+                .position(|segment| can_join(&chain, segment))
+            else {
+                open.push(chain);
                 break;
             };
             let segment = segments.swap_remove(index);
-            join_segment(&mut ring, segment);
+            join_segment(&mut chain, segment);
         }
     }
-
-    (rings, closed)
+    (rings, open)
 }
 
 fn ends(line: &[Vertex]) -> Option<(i64, i64)> {

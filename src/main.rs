@@ -208,6 +208,13 @@ enum PackCommand {
         /// by their tags alone.
         #[arg(long, value_name = "PATH")]
         qrank: Option<PathBuf>,
+
+        /// The polygon the input was cut to, a `.poly` file as extracts are
+        /// cut by. A boundary the cut runs through is built clipped to it, so
+        /// records near the cut keep their region and country. Without one,
+        /// the bounds the input's header states stand in for it.
+        #[arg(long, value_name = "POLY")]
+        cut: Option<PathBuf>,
     },
 
     /// Inspect Pack records as readable JSON.
@@ -612,6 +619,7 @@ async fn main() -> Result<()> {
             openaddresses_non_commercial,
             address_files,
             qrank,
+            cut,
         }) => {
             resources::opt_out_of_power_throttling();
             resources::yield_to_interactive_programs();
@@ -627,6 +635,7 @@ async fn main() -> Result<()> {
                 pack,
                 addresses,
                 qrank,
+                cut,
                 memory_budget_bytes: memory_budget_mb
                     .map(|mb| usize::try_from(mb << 20))
                     .transpose()

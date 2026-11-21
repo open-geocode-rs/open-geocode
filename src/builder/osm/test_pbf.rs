@@ -62,8 +62,26 @@ pub(crate) fn relation(
 }
 
 pub(crate) fn write_pbf(path: &Path, blocks: &[Vec<TestElement>]) {
+    write_bounded_pbf(path, None, blocks);
+}
+
+/// [`write_pbf`] with a header stating `bounds`, `[min_lon, min_lat,
+/// max_lon, max_lat]`, as an extract's header states the box around the
+/// polygon it was cut to.
+pub(crate) fn write_bounded_pbf(
+    path: &Path,
+    bounds: Option<[f64; 4]>,
+    blocks: &[Vec<TestElement>],
+) {
     let mut file = Vec::new();
     let mut header = Vec::new();
+    if let Some([min_lon, min_lat, max_lon, max_lat]) = bounds {
+        let mut bbox = Vec::new();
+        for (field, degrees) in [(1, min_lon), (2, max_lon), (3, max_lat), (4, min_lat)] {
+            varint_field(&mut bbox, field, zigzag((degrees * 1e9).round() as i64));
+        }
+        bytes_field(&mut header, 1, &bbox);
+    }
     for feature in ["OsmSchema-V0.6", "DenseNodes"] {
         bytes_field(&mut header, 4, feature.as_bytes());
     }

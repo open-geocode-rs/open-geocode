@@ -127,6 +127,9 @@ pub struct Fingerprint {
     pub addresses: Option<String>,
     /// The address files it imported, once it has.
     pub imported: Vec<FileStamp>,
+    /// The polygon file the inputs were cut to, if the build was given one.
+    #[serde(default)]
+    pub cut: Option<FileStamp>,
 }
 
 impl Fingerprint {
@@ -135,6 +138,7 @@ impl Fingerprint {
         inputs: &[PathBuf],
         input_sources: &[String],
         addresses: Option<String>,
+        cut: Option<&Path>,
     ) -> Result<Self> {
         Ok(Self {
             og_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -146,6 +150,7 @@ impl Fingerprint {
             input_sources: input_sources.to_vec(),
             addresses,
             imported: Vec::new(),
+            cut: cut.map(FileStamp::of).transpose()?,
         })
     }
 
@@ -187,6 +192,15 @@ impl Fingerprint {
                 self.addresses.as_deref().unwrap_or("nothing"),
                 now.addresses.as_deref().unwrap_or("nothing")
             ));
+        }
+        match (&self.cut, &now.cut) {
+            (Some(was), Some(is)) => was.differences(is, "cut polygon", &mut out),
+            (None, None) => {}
+            (was, _) => out.push(format!(
+                "the build was {} a cut polygon, is {}",
+                if was.is_some() { "given" } else { "not given" },
+                if was.is_some() { "not" } else { "given one" }
+            )),
         }
         for file in &self.imported {
             match FileStamp::of(&file.path) {
