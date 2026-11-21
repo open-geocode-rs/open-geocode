@@ -127,6 +127,79 @@ const CATEGORIES: &[Category] = &[
         &["leisure fitness_centre"],
     ),
     category("800-8600-0193", "Golf Course", &["leisure golf_course"]),
+    category("400-4100-0042", "Bus Stop", &["highway bus_stop"]),
+    category(
+        "600-6600-0077",
+        "Home Improvement",
+        &["shop doityourself", "shop hardware"],
+    ),
+    category("600-6600-0080", "Furniture Store", &["shop furniture"]),
+    category(
+        "600-6800-0000",
+        "Clothing and Accessories",
+        &["shop clothes"],
+    ),
+    category(
+        "600-6900-0094",
+        "Sporting Goods Store",
+        &["shop sports", "shop outdoor"],
+    ),
+    category("600-6900-0097", "Pet Supply", &["shop pet"]),
+    category("600-6900-0103", "Gift, Antique and Art", &["shop gift"]),
+    category(
+        "600-6900-0246",
+        "Bicycle and Bicycle Accessories Shop",
+        &["shop bicycle"],
+    ),
+    category("600-6900-0356", "Jeweler", &["shop jewelry"]),
+    category(
+        "600-6950-0000",
+        "Hair and Beauty",
+        &["shop beauty", "shop hairdresser"],
+    ),
+    category(
+        "700-7400-0133",
+        "Travel Agent-Ticketing",
+        &["shop travel_agency", "office travel_agent"],
+    ),
+    category(
+        "700-7460-0115",
+        "Tourist Information",
+        &["tourism information"],
+    ),
+    category(
+        "700-7851-0117",
+        "Rental Car Agency",
+        &["amenity car_rental"],
+    ),
+    category(
+        "800-8000-0158",
+        "Medical Services-Clinics",
+        &["amenity clinic"],
+    ),
+    category(
+        "800-8100-0169",
+        "Civic-Community Center",
+        &["amenity community_centre"],
+    ),
+    category("800-8100-0171", "Government Office", &["office government"]),
+];
+
+/// The general category of a group, for a place of a key whose kind the
+/// table names no category for: a shop is consumer goods, an office a
+/// commercial service, a craft a consumer service, as HERE's category system
+/// groups them.
+const GROUPS: &[Category] = &[
+    category("550-5520-0000", "Leisure", &["leisure"]),
+    category("600-6900-0000", "Consumer Goods", &["shop"]),
+    category("700-7200-0000", "Commercial Services", &["office"]),
+    category("700-7400-0000", "Consumer Services", &["craft"]),
+    category(
+        "800-8000-0000",
+        "Hospital or Health Care Facility",
+        &["healthcare"],
+    ),
+    category("900-9300-0000", "Building", &["building"]),
 ];
 
 /// A category as a result item states it.
@@ -142,9 +215,18 @@ pub(super) struct ItemCategory {
 /// The HERE categories of a place of og's `category` (`amenity:cafe`), its
 /// own kind marked primary. Empty when the table has none for it.
 pub(super) fn of_place(category: &str) -> Vec<ItemCategory> {
-    CATEGORIES
-        .iter()
-        .filter(|listed| categories::holds(listed.og, category))
+    let found = |table: &'static [Category]| {
+        table
+            .iter()
+            .filter(|listed| categories::holds(listed.og, category))
+            .collect::<Vec<_>>()
+    };
+    let mut listed = found(CATEGORIES);
+    if listed.is_empty() {
+        listed = found(GROUPS);
+    }
+    listed
+        .into_iter()
         .enumerate()
         .map(|(index, listed)| ItemCategory {
             id: listed.id,
@@ -230,7 +312,7 @@ impl Filter {
             return categories::keys();
         }
         let mut found = Vec::new();
-        for listed in CATEGORIES {
+        for listed in CATEGORIES.iter().chain(GROUPS) {
             if self.0.included.iter().any(|asked| names(asked, listed.id)) {
                 for category in listed.og {
                     if !found.contains(category) {
@@ -260,7 +342,7 @@ mod tests {
 
     #[test]
     fn every_listed_category_is_one_og_has() {
-        for listed in CATEGORIES {
+        for listed in CATEGORIES.iter().chain(GROUPS) {
             for category in listed.og {
                 assert!(categories::is_known(category), "{} {category}", listed.id);
             }
@@ -290,6 +372,16 @@ mod tests {
         assert!(!filter.admits(&of_place("amenity:fast_food")));
         assert!(!filter.admits(&of_place("shop:bakery")));
         assert!(!filter.admits(&of_place("craft:brewery")));
+        // A kind the table has no category for takes its group's.
+        assert_eq!(of_place("craft:brewery")[0].id, "700-7400-0000");
+        assert_eq!(of_place("shop:music")[0].id, "600-6900-0000");
+        assert_eq!(of_place("shop:bicycle")[0].id, "600-6900-0246");
+        assert_eq!(
+            of_place("shop:bicycle").len(),
+            1,
+            "an exact kind takes no group"
+        );
+        assert!(of_place("amenity:bench").is_empty());
 
         let any = Filter::parse(None).expect("filter");
         assert!(any.admits(&of_place("craft:brewery")));
@@ -310,6 +402,6 @@ mod tests {
             stated,
             serde_json::json!([{"id": "200-2000-0011", "name": "Bar or Pub", "primary": true}])
         );
-        assert!(of_place("craft:brewery").is_empty());
+        assert!(of_place("amenity:bench").is_empty());
     }
 }
