@@ -52,6 +52,7 @@ mod book;
 mod boundary;
 mod checkpoint;
 mod containment;
+mod cut;
 mod emit;
 mod emitted;
 mod geometry;
@@ -129,6 +130,7 @@ use checkpoint::{
     PostcodePoint, ScanCounts, State, Step,
 };
 use containment::Shapes;
+use cut::Cut;
 use emitted::{Emitted, Ready};
 pub(crate) use locations::{
     CHUNK_BYTES as NODE_SET_CHUNK_BYTES, LOCATION_BYTES as NODE_SLOT_BYTES, LoadStats,
@@ -197,6 +199,10 @@ pub struct BuildOsmOptions {
     pub imported_rows: u64,
     /// QRank file (see [`crate::builder::qrank`]).
     pub qrank: Option<PathBuf>,
+    /// The polygon the inputs were cut to, a `.poly` file. An area whose
+    /// outline the cut runs through is built clipped to it. Without one,
+    /// the bounds the inputs' headers state stand in for it.
+    pub cut: Option<PathBuf>,
 }
 
 impl Default for BuildOsmOptions {
@@ -215,6 +221,7 @@ impl Default for BuildOsmOptions {
             addresses: None,
             imported_rows: 0,
             qrank: None,
+            cut: None,
         }
     }
 }
@@ -234,6 +241,7 @@ impl fmt::Debug for BuildOsmOptions {
             .field("cancel", &self.cancel)
             .field("addresses", &self.addresses)
             .field("qrank", &self.qrank)
+            .field("cut", &self.cut)
             .finish_non_exhaustive()
     }
 }
@@ -484,6 +492,7 @@ impl<'a> Run<'a> {
                 .addresses
                 .as_ref()
                 .map(|source| format!("{source:?}")),
+            options.cut.as_deref(),
         )?;
         match settle_leftovers(options)? {
             Some(found) => Self::resume(options, plan, fingerprint, &found),
@@ -1249,6 +1258,14 @@ impl<'a> Run<'a> {
                 vertices = 0;
             }
         }
+        let labels = builder.cut_labels();
+        if !labels.is_empty()
+            && let Some(cut) = self.extract_cut()?
+        {
+            self.progress.check()?;
+            let points = self.label_points(&labels)?;
+            builder.add_cut_relations(&cut, &points, member_line)?;
+        }
         self.progress.check()?;
         let mut places = Emitted::default();
         for candidate in boundary::place_relations(&relations, member_line)? {
@@ -1278,6 +1295,51 @@ impl<'a> Run<'a> {
         self.progress.finish(BuildStage::Boundaries);
         self.build.report.phases.boundary_build_ms = phase.elapsed().as_millis();
         Ok(())
+    }
+
+    /// The polygon the inputs were cut to: the one the options name, else
+    /// the box around the bounds every input's header states. None when an
+    /// input states none.
+    fn extract_cut(&self) -> Result<Option<Cut>> {
+        if let Some(path) = &self.options.cut {
+            return Ok(Some(Cut::read_poly(path)?));
+        }
+        let Some(bounds) = self
+            .options
+            .inputs
+            .iter()
+            .map(|input| pbf::header_bbox(input))
+            .collect::<Result<Option<Vec<_>>>>()?
+        else {
+            return Ok(None);
+        };
+        Ok(bounds
+            .into_iter()
+            .reduce(|[a, b, c, d], [e, f, g, h]| [a.min(e), b.min(f), c.max(g), d.max(h)])
+            .map(Cut::of_bounds))
+    }
+
+    /// The point of each place node of `nodes` among the place records.
+    fn label_points(&mut self, nodes: &HashSet<i64>) -> Result<HashMap<i64, [f64; 2]>> {
+        let mut found = HashMap::new();
+        let Some(points) = self.build.context_records.take() else {
+            return Ok(found);
+        };
+        let mut kept = context_sorter(&self.scratch, &self.memory, self.budget);
+        for pending in points.finish()? {
+            let pending = pending?;
+            if let Body::Record(record) = &pending.body
+                && let Record::Place(_, place) = record.as_ref()
+                && place.source.object_type == ObjectType::Node
+                && nodes.contains(&place.source.object_id)
+                && let Some(point) = point_lon_lat(&place.geometry)
+            {
+                found.insert(place.source.object_id, point);
+            }
+            kept.push(pending)?;
+        }
+        self.build.context_records = Some(kept);
+        Ok(found)
     }
 
     /// Merges place points into the boundaries they name, dropping their own records.
@@ -3191,7 +3253,7 @@ mod tests {
     };
 
     use super::{
-        test_pbf::{TestElement, node, relation, way, write_pbf},
+        test_pbf::{TestElement, node, relation, way, write_bounded_pbf, write_pbf},
         *,
     };
 
@@ -3581,6 +3643,95 @@ mod tests {
         assert_eq!(top("16 King Street"), vec!["openaddresses:test:row:2"]);
         assert_eq!(top("10 King Street"), vec!["osm:node:1"]);
         assert_eq!(top("3 Queen Street"), vec!["openaddresses:test:row:4"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Two states share a border running through the extract, and the cut
+    /// left out the rest of each one's outline. The state whose `label`
+    /// point the extract holds is built clipped to the cut, so its
+    /// addresses lie in it and its OpenAddresses sources are asked for; the
+    /// other, whose label lies past the cut, stays out and covers nothing.
+    #[test]
+    fn a_state_the_cut_runs_through_is_built_inside_the_cut() {
+        let dir = temp_dir("cut-state");
+        let input = dir.join("west.osm.pbf");
+        let state = |id: i64, label: i64, name: &'static str, code: &'static str, rest: i64| {
+            TestElement::Relation {
+                id,
+                members: vec![(1, "outer"), (rest, "outer")],
+                nodes: vec![(label, "label")],
+                tags: vec![
+                    ("type", "boundary"),
+                    ("boundary", "administrative"),
+                    ("admin_level", "4"),
+                    ("name", name),
+                    ("ISO3166-2", code),
+                ],
+            }
+        };
+        write_bounded_pbf(
+            &input,
+            Some([0.0, 0.0, 10.0, 10.0]),
+            &[
+                vec![
+                    node(1, 12.0, 5.0, &[]),
+                    node(2, 5.0, 5.0, &[]),
+                    node(3, -2.0, 5.0, &[]),
+                    node(100, 5.0, 2.0, &[("place", "state"), ("name", "West")]),
+                    node(
+                        200,
+                        3.0,
+                        2.0,
+                        &[("addr:housenumber", "1"), ("addr:street", "West Street")],
+                    ),
+                    node(
+                        201,
+                        3.0,
+                        8.0,
+                        &[("addr:housenumber", "2"), ("addr:street", "East Street")],
+                    ),
+                ],
+                vec![way(1, &[1, 2, 3], &[])],
+                vec![
+                    state(10, 100, "West", "US-IL", 2),
+                    state(11, 101, "East", "US-IN", 3),
+                ],
+            ],
+        );
+        let source = Arc::new(RecordingSource::default());
+        build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::clone(&source) as Arc<dyn AddressSource>),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        let asked = source.asked.lock().expect("lock");
+        assert_eq!(
+            asked[0].subdivisions,
+            std::collections::BTreeSet::from(["US-IL".to_string()])
+        );
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let west = reader
+            .find_by_source_id("osm:relation:10")
+            .expect("lookup")
+            .expect("the state the extract holds the label of");
+        assert!(
+            reader
+                .find_by_source_id("osm:relation:11")
+                .expect("lookup")
+                .is_none()
+        );
+        let region = |id: &str| {
+            let record = reader.find_by_source_id(id).expect("lookup").expect(id);
+            reader
+                .boundary_context(record)
+                .expect("context")
+                .and_then(|context| context.admin_context.region_record_id())
+        };
+        assert_eq!(region("osm:node:200"), Some(west));
+        assert_eq!(region("osm:node:201"), None);
         let _ = fs::remove_dir_all(dir);
     }
 
