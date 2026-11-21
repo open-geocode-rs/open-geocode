@@ -436,6 +436,8 @@ impl BoundarySet {
             brought: HashMap::new(),
             waiting: Vec::new(),
             strongest: vec![None; self.candidates.len()],
+            lookup_bytes: 0,
+            brought_list_bytes: 0,
         };
         for (index, candidate) in self.candidates.iter_mut().enumerate() {
             let layer = candidate.boundary.layer;
@@ -451,6 +453,7 @@ impl BoundarySet {
                 .or_default()
                 .push(index);
         }
+        links.lookup_bytes = links.measure_lookups();
         links
     }
 
@@ -474,7 +477,11 @@ impl BoundarySet {
             (Some((index, link)), item) => {
                 links.matched.insert(at, (index, link));
                 if let Some(item) = item {
-                    links.brought.entry((item, layer)).or_default().push(index);
+                    let list = links.brought.entry((item, layer)).or_default();
+                    let capacity = list.capacity();
+                    list.push(index);
+                    links.brought_list_bytes +=
+                        (list.capacity() - capacity) * std::mem::size_of::<usize>();
                 }
             }
             (None, Some(item)) => {
@@ -1954,6 +1961,10 @@ pub(crate) struct PlaceLinks {
     waiting: Vec<(u64, u32, PlaceLayer, [f64; 2])>,
     /// Each boundary's strongest link merged so far.
     strongest: Vec<Option<Strongest>>,
+    /// Heap of the lookups above, which stay as built.
+    lookup_bytes: usize,
+    /// Heap the lists inside `brought` hold.
+    brought_list_bytes: usize,
 }
 
 /// The strongest link merged into a boundary, with the point and the
@@ -1965,9 +1976,43 @@ struct Strongest {
     item: Option<u32>,
 }
 
+/// Heap a hash table of `map`'s capacity holds, its control bytes included.
+fn table_bytes<K, V>(map: &HashMap<K, V>) -> usize {
+    map.capacity() * 8 / 7 * (std::mem::size_of::<(K, V)>() + 1)
+}
+
 impl PlaceLinks {
     pub(crate) fn is_empty(&self) -> bool {
         self.labels.is_empty() && self.items.is_empty() && self.names.is_empty()
+    }
+
+    /// Heap the lookups hold, which matching does not change.
+    fn measure_lookups(&self) -> usize {
+        let word = std::mem::size_of::<usize>();
+        table_bytes(&self.labels)
+            + table_bytes(&self.items)
+            + self
+                .items
+                .values()
+                .map(|list| list.capacity() * word)
+                .sum::<usize>()
+            + table_bytes(&self.names)
+            + self
+                .names
+                .iter()
+                .map(|((name, _), list)| name.capacity() + list.capacity() * word)
+                .sum::<usize>()
+            + self.strongest.capacity() * std::mem::size_of::<Option<Strongest>>()
+    }
+
+    /// Heap the links hold now, outside the memory budget unless a caller
+    /// reserves it: the lookups, and what matching has found so far.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.lookup_bytes
+            + table_bytes(&self.matched)
+            + table_bytes(&self.brought)
+            + self.brought_list_bytes
+            + self.waiting.capacity() * std::mem::size_of::<(u64, u32, PlaceLayer, [f64; 2])>()
     }
 
     /// The boundary a place point names, and how. An `admin_centre` member doesn't
@@ -2499,6 +2544,59 @@ mod tests {
             set.context_names(&[7], &HashMap::new()),
             HashMap::from([(7, vec!["Seattle".to_string()])])
         );
+    }
+
+    /// The links' heap grows with the points matched, so a build can reserve it.
+    #[test]
+    fn place_links_count_the_points_they_hold() {
+        let scratch = test_scratch();
+        let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
+        let vertex = |node_id, lon, lat| Vertex { node_id, lat, lon };
+        let ring = vec![
+            vertex(1, 0.0, 0.0),
+            vertex(2, 1.0, 0.0),
+            vertex(3, 1.0, 1.0),
+            vertex(4, 0.0, 1.0),
+            vertex(1, 0.0, 0.0),
+        ];
+        builder
+            .add_relations(
+                &[BoundaryRelationStub {
+                    object_id: 900,
+                    members: vec![BoundaryRelationMember {
+                        way_id: 500,
+                        role: BoundaryMemberRole::Outer,
+                    }],
+                    label: None,
+                    tags: boundary_tags(&BTreeMap::from([
+                        ("boundary".to_string(), "administrative".to_string()),
+                        ("admin_level".to_string(), "8".to_string()),
+                        ("name".to_string(), "Seattle".to_string()),
+                    ])),
+                }],
+                |_| Ok(Some(ring.clone())),
+            )
+            .expect("relations");
+        let mut set = builder.finish().expect("boundaries");
+        let mut links = set.place_links();
+        let empty = links.heap_bytes();
+        let point = |name: &str, item| PlaceRecord {
+            name: name.to_string(),
+            alt_names: Vec::new(),
+            place_type: "city".to_string(),
+            geometry: point_geometry(0.3, 0.2),
+            source: SourceProvenance::osm(ObjectType::Node, 10),
+            prominence: Prominence::default(),
+            wikidata: Some(item),
+        };
+        let points = 10_000u64;
+        for at in 0..points {
+            let name = if at % 2 == 0 { "Seattle" } else { "Elsewhere" };
+            set.match_place_point(&mut links, at, PlaceLayer::Locality, &point(name, 1));
+        }
+        // A matched point costs a table slot and a waiting one a list entry, 8 B or more each.
+        let grown = links.heap_bytes() - empty;
+        assert!(grown >= points as usize * 8, "{grown}");
     }
 
     fn test_boundary(layer: PlaceLayer) -> BuiltBoundary {

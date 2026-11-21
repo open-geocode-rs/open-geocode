@@ -1292,6 +1292,8 @@ impl<'a> Run<'a> {
         if links.is_empty() {
             return Ok(());
         }
+        // The links grow with the points, so the budget holds them and spills the sorters for them.
+        let mut link_memory = Reservation::forced(&self.memory, links.heap_bytes());
         let Some(points) = self.build.context_records.take() else {
             return Ok(());
         };
@@ -1302,6 +1304,7 @@ impl<'a> Run<'a> {
             let pending = pending?;
             if let Some((layer, point)) = place_point(&pending) {
                 boundaries.match_place_point(&mut links, at as u64, layer, point);
+                link_memory.force_grow(links.heap_bytes().saturating_sub(link_memory.bytes()));
             }
             staged.write(&pending)?;
         }
@@ -1319,6 +1322,7 @@ impl<'a> Run<'a> {
             }
         }
         boundaries.finish_place_merges(links);
+        drop(link_memory);
         self.build.context_records = Some(kept);
         self.build.report.accepted.place_points_merged = merged;
         Ok(())
@@ -6332,26 +6336,24 @@ mod tests {
     /// that item inside the boundary joins it too, whichever comes first.
     #[test]
     fn a_place_node_joins_the_boundary_another_node_of_its_item_named() {
-        // Points arrive in id order, so swapping the ids swaps which comes first.
-        let alpha = |id| {
+        // Points match in spatial order, so swapping the places swaps which is matched first.
+        let town = |id, lat, name| {
             node(
                 id,
-                0.3,
-                0.3,
-                &[("place", "town"), ("name", "Alpha"), ("wikidata", "Q100")],
-            )
-        };
-        let beta = |id| {
-            node(
-                id,
-                0.6,
-                0.6,
-                &[("place", "town"), ("name", "Beta"), ("wikidata", "Q100")],
+                lat,
+                lat,
+                &[("place", "town"), ("name", name), ("wikidata", "Q100")],
             )
         };
         for (name, towns) in [
-            ("merge-by-item-alpha-first", vec![alpha(10), beta(11)]),
-            ("merge-by-item-beta-first", vec![beta(10), alpha(11)]),
+            (
+                "merge-by-item-alpha-first",
+                vec![town(10, 0.3, "Alpha"), town(11, 0.6, "Beta")],
+            ),
+            (
+                "merge-by-item-beta-first",
+                vec![town(10, 0.3, "Beta"), town(11, 0.6, "Alpha")],
+            ),
         ] {
             let (dir, report, reader) = merged_towns(
                 name,
