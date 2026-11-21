@@ -23,7 +23,7 @@ use super::{
     super::route::{self, Corridor},
     Area, Gs7Error, LatLng, Params, Rid,
     category::{Filter, Listed},
-    item::{Feature, Item, item},
+    item::{Feature, Item, ParsedTerm, Parsing, item},
     media_type, respond,
 };
 
@@ -143,6 +143,22 @@ impl Qualified {
             *slot = text;
         }
         Ok(qualified)
+    }
+
+    /// Each field given, by HERE's name of it.
+    fn fields(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        [
+            ("country", &self.country),
+            ("state", &self.state),
+            ("county", &self.county),
+            ("city", &self.city),
+            ("district", &self.district),
+            ("street", &self.street),
+            ("houseNumber", &self.house_number),
+            ("postalCode", &self.postal_code),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.as_deref().map(|value| (name, value)))
     }
 
     /// The country as an og filter, when it is given as a code. A country
@@ -298,13 +314,89 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
         .await
         .map_err(Gs7Error::of)?;
     prefer_postcode_correction(&mut collection);
+    let parsing = params
+        .get("show")
+        .is_some_and(|show| show.split(',').any(|value| value.trim() == "parsing"))
+        .then(|| parsing(state, request.q.as_deref(), &request.qualified));
     let items = features(&collection)
         .iter()
         .map(|feature| item(feature).distance_from(at))
         .filter(|item| item.is_any_of(types.as_deref()))
         .take(limit)
+        .map(|mut item| {
+            item.parsing.clone_from(&parsing);
+            item
+        })
         .collect();
     Ok(Items { items })
+}
+
+/// How og reads `q`, each run of words of one label a part, by HERE's name
+/// of the part, and each `qq` field a part of its own, where it stands in
+/// the field. A word og reads as none of these is left out.
+fn parsing(state: &AppState, q: Option<&str>, qualified: &Qualified) -> Parsing {
+    use crate::parse::types::Label;
+    let mut parsing = Parsing::new();
+    if let Some(q) = q
+        && let Some(parsed) = state.searcher().best_parse(q)
+    {
+        // The words as written, in order, which the parser's words are,
+        // folded.
+        let mut written = Vec::new();
+        let mut start = None;
+        for (at, (byte, character)) in q.char_indices().enumerate() {
+            match (character.is_alphanumeric(), start) {
+                (true, None) => start = Some((at, byte)),
+                (false, Some((from, from_byte))) => {
+                    written.push((from, at, &q[from_byte..byte]));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some((from, from_byte)) = start {
+            written.push((from, q.chars().count(), &q[from_byte..]));
+        }
+        if written.len() == parsed.tokens.len() {
+            let name = |label: Label| match label {
+                Label::HouseNumber => Some("houseNumber"),
+                Label::Unit => Some("secondaryUnits"),
+                Label::Street => Some("street"),
+                Label::Locality => Some("city"),
+                Label::Region => Some("state"),
+                Label::Postcode => Some("postalCode"),
+                Label::Country => Some("country"),
+                Label::Other => None,
+            };
+            let mut index = 0;
+            while index < written.len() {
+                let label = parsed.tokens[index].label;
+                let mut last = index;
+                while last + 1 < written.len() && parsed.tokens[last + 1].label == label {
+                    last += 1;
+                }
+                if let Some(field) = name(label) {
+                    let (from, to) = (written[index].0, written[last].1);
+                    parsing.entry(field).or_default().push(ParsedTerm {
+                        start: from,
+                        end: to,
+                        value: q.chars().skip(from).take(to - from).collect(),
+                        qq: None,
+                    });
+                }
+                index = last + 1;
+            }
+        }
+    }
+    for (field, value) in qualified.fields() {
+        parsing.entry(field).or_default().push(ParsedTerm {
+            start: 0,
+            end: value.chars().count(),
+            value: value.to_string(),
+            qq: Some(field),
+        });
+    }
+    parsing
 }
 
 // A uniquely identified house can correct the stated postcode when the

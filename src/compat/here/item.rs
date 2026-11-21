@@ -244,6 +244,9 @@ pub(super) struct Item {
     pub(super) highlights: Option<Highlights>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) scoring: Option<Scoring>,
+    /// How og read the query, part by part, when `show=parsing` asks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) parsing: Option<Parsing>,
 }
 
 /// A place's contacts by kind, each value as its source writes it.
@@ -367,6 +370,21 @@ fn field_marks(label: &str, marks: &[Highlight], value: &str) -> Vec<Highlight> 
             end: mark.end.min(end) - start,
         })
         .collect()
+}
+
+/// HERE's `parsing`: each part of the query og read, by HERE's name of it,
+/// with where it stands in the query.
+pub(super) type Parsing = std::collections::BTreeMap<&'static str, Vec<ParsedTerm>>;
+
+/// A part of the query: its text, where it starts and ends in characters,
+/// and the `qq` field it came from when it came from one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(super) struct ParsedTerm {
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) qq: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -538,6 +556,7 @@ pub(super) fn item(feature: &Feature) -> Item {
         opening_hours: Vec::new(),
         highlights: None,
         scoring: scoring(properties),
+        parsing: None,
     }
 }
 

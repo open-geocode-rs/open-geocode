@@ -512,6 +512,11 @@ impl TextSearcher {
         self.tagger.dictionaries().describes_street(word)
     }
 
+    /// The best labelling of a query's words, `None` for a query with none.
+    pub(crate) fn best_parse(&self, query: &str) -> Option<lattice::ParsedQuery> {
+        self.tagger.parse(query).into_iter().next()
+    }
+
     /// A country name or alias written in full, as recorded in the Pack.
     pub(crate) fn country_named(&self, name: &str) -> Option<CountryCode> {
         let key = lattice::dictionary_key(name)?;

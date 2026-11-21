@@ -2509,6 +2509,45 @@ async fn discover_answers_the_address_nearest_a_position_query() {
     }
 }
 
+/// `show=parsing` tells how og read the query, part by part, where each
+/// part stands, and each `qq` field as a part of its own.
+#[tokio::test]
+async fn geocode_shows_how_it_read_the_query() {
+    let pack = pack("parsing");
+    let router = pack.router();
+    let reply = get(
+        &router,
+        "/compat/here/v1/geocode?q=12%20King%20Street%2C%20Toronto&qq=postalCode%3DM5V%201A1&show=parsing",
+    )
+    .await;
+    let parsing = &reply.json()["items"][0]["parsing"];
+    assert_eq!(
+        parsing["houseNumber"],
+        json!([{"start": 0, "end": 2, "value": "12"}]),
+        "{parsing}"
+    );
+    assert_eq!(
+        parsing["street"],
+        json!([{"start": 3, "end": 14, "value": "King Street"}]),
+        "{parsing}"
+    );
+    assert_eq!(
+        parsing["city"],
+        json!([{"start": 16, "end": 23, "value": "Toronto"}]),
+        "{parsing}"
+    );
+    assert_eq!(
+        parsing["postalCode"],
+        json!([{"start": 0, "end": 7, "value": "M5V 1A1", "qq": "postalCode"}])
+    );
+    let plain = get(
+        &router,
+        "/compat/here/v1/geocode?q=12%20King%20Street%2C%20Toronto",
+    )
+    .await;
+    assert!(plain.json()["items"][0].get("parsing").is_none());
+}
+
 #[tokio::test]
 async fn a_search_along_a_route_keeps_what_lies_by_it() {
     let pack = pack("route");
