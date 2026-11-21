@@ -1,8 +1,9 @@
 //! Search Destinations of Geocoding API v4.
 //!
-//! og knows a destination's place and the entrances OpenStreetMap maps for
-//! it. Navigation points, landmarks, outlines and the places a destination
-//! sits in or holds are left out, as og has none of them.
+//! og knows a destination's place, the entrances OpenStreetMap maps for it,
+//! the places whose outline holds it and the best known places near it.
+//! Navigation points, outlines and the places a destination holds are left
+//! out, as og has none of them.
 
 use axum::{
     body::Bytes,
@@ -17,13 +18,13 @@ use super::{
     geocode::AddressQuery,
     invalid,
     language::Language,
-    model::{Entrance, PlaceView},
+    model::{Entrance, LocalizedText, PlaceView},
     places::by_place_id,
     respond, run,
 };
 use crate::{
     api::Common,
-    compat::{Args, VendorError, native},
+    compat::{Args, VendorError, fieldmask::FieldMask, native},
     record::Layer,
     runtime::AppState,
 };
@@ -75,11 +76,41 @@ struct SearchDestinationsResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Destination {
     primary: PlaceView,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    containing_places: Vec<PlaceView>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    landmarks: Vec<Landmark>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     entrances: Vec<Entrance>,
+    /// og's id of the primary place and where it is, to find its
+    /// surroundings.
+    #[serde(skip)]
+    og_id: String,
+    #[serde(skip)]
+    point: [f64; 2],
 }
+
+/// A place near a destination that tells where it is.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Landmark {
+    place: PlaceView,
+    /// `Near ...`, written in English only, the one language og words it in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relational_description: Option<LocalizedText>,
+    /// A landmark og finds tells where the address is. og cannot tell
+    /// where one arrives, so it never tags `ARRIVAL`.
+    tags: [&'static str; 1],
+    straight_line_distance_meters: f64,
+}
+
+/// How far around a destination its surroundings are looked for, a short
+/// walk, and how many landmarks tell where it is.
+const SURROUNDINGS_RADIUS_M: f64 = 300.0;
+const MAX_LANDMARKS: usize = 5;
 
 impl Destination {
     fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
@@ -89,7 +120,67 @@ impl Destination {
             .iter()
             .map(|access| Entrance::of(access, &primary.place))
             .collect();
-        Self { primary, entrances }
+        Self {
+            primary,
+            containing_places: Vec::new(),
+            landmarks: Vec::new(),
+            entrances,
+            og_id: common.id.clone(),
+            point: coordinates,
+        }
+    }
+
+    /// The places whose outline holds the destination, and the best known
+    /// of the others near it.
+    async fn with_surroundings(
+        mut self,
+        state: &AppState,
+        language: &Language<'_>,
+    ) -> Result<Self, VendorError> {
+        let around = native::landmarks(
+            state,
+            self.point,
+            SURROUNDINGS_RADIUS_M,
+            crate::http::bounds::MAX_SEARCH_LIMIT,
+            language.code().map(str::to_string),
+            &self.og_id,
+        )
+        .await
+        .map_err(from_problem)?;
+        let [lon, lat] = self.point;
+        let holds = |feature: &crate::api::ForwardFeature| {
+            feature
+                .properties
+                .common
+                .bbox
+                .is_some_and(|[west, south, east, north]| {
+                    (west..=east).contains(&lon) && (south..=north).contains(&lat)
+                })
+        };
+        let english = language
+            .code()
+            .is_none_or(|code| code == "en" || code.starts_with("en-"));
+        for feature in &around {
+            let common = &feature.properties.common;
+            let view = PlaceView::of(common, feature.geometry.coordinates, language);
+            if holds(feature) {
+                self.containing_places.push(view);
+            } else if self.landmarks.len() < MAX_LANDMARKS {
+                let [x, y] = feature.geometry.coordinates;
+                self.landmarks.push(Landmark {
+                    relational_description: english.then(|| LocalizedText {
+                        text: format!("Near {}", common.name),
+                        language_code: Some("en".to_string()),
+                    }),
+                    place: view,
+                    tags: ["ADDRESS"],
+                    straight_line_distance_meters: crate::spatial_index::haversine_m(
+                        lon, lat, x, y,
+                    ),
+                });
+            }
+        }
+        Ok(self)
     }
 }
 
@@ -127,8 +218,22 @@ pub(super) async fn search(
                 ));
             }
         };
+        // The surroundings are a lookup of their own, so a mask that leaves
+        // them out costs none.
+        let surroundings = ["landmarks", "containingPlaces"]
+            .iter()
+            .any(|field| FieldMask::asks(mask.as_ref(), &["destinations", field]));
+        let mut described = Vec::new();
+        for destination in destinations {
+            described.push(match surroundings {
+                true => destination.with_surroundings(&state, &language).await?,
+                false => destination,
+            });
+        }
         Ok(respond(
-            &SearchDestinationsResponse { destinations },
+            &SearchDestinationsResponse {
+                destinations: described,
+            },
             mask.as_ref(),
         ))
     })

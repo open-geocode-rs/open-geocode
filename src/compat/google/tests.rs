@@ -2405,3 +2405,45 @@ async fn a_place_is_described_by_its_best_known_neighbours() {
     .await;
     assert!(plain.body.get("addressDescriptor").is_none());
 }
+
+/// A destination lists the places whose outline holds it, and the best known
+/// of the others near it, worded in English only.
+#[tokio::test]
+async fn a_destination_lists_what_holds_it_and_what_stands_near_it() {
+    let fixture = landmark_fixture();
+    let router = &fixture.router;
+    let cafe = encode_parts("osm:way:21", Some(Layer::Poi), "");
+    let reply = post(
+        router,
+        DESTINATIONS,
+        json!({"place": format!("places/{cafe}")}),
+    )
+    .await;
+    let destination = &reply.body["destinations"][0];
+    let holding = destination["containingPlaces"]
+        .as_array()
+        .expect("containing places")
+        .iter()
+        .map(|place| place["displayName"]["text"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(holding, [json!("Queen Mall")], "{}", reply.body);
+    let landmarks = destination["landmarks"].as_array().expect("landmarks");
+    assert_eq!(landmarks.len(), 1, "{}", reply.body);
+    assert_eq!(landmarks[0]["place"]["displayName"]["text"], "Corner Shop");
+    assert_eq!(
+        landmarks[0]["relationalDescription"],
+        json!({"text": "Near Corner Shop", "languageCode": "en"})
+    );
+    assert_eq!(landmarks[0]["tags"], json!(["ADDRESS"]));
+    let german = post(
+        router,
+        DESTINATIONS,
+        json!({"place": format!("places/{cafe}"), "languageCode": "de"}),
+    )
+    .await;
+    assert!(
+        german.body["destinations"][0]["landmarks"][0]
+            .get("relationalDescription")
+            .is_none()
+    );
+}
