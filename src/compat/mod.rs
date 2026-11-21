@@ -1268,6 +1268,8 @@ mod tests {
         let state = area(PlaceLayer::Region, "California", 2);
         let county = area(PlaceLayer::District, "Rhein-Hunsrück-Kreis", 3);
         let town = area(PlaceLayer::Locality, "Mountain View", 4);
+        // A county with an ISO code and no plate code.
+        let paris = area(PlaceLayer::District, "Paris", 5);
         let named = |names: &[(&str, &str)]| {
             names
                 .iter()
@@ -1310,6 +1312,7 @@ mod tests {
             .collect(),
         );
         writer.set_plate_codes([(county, "SIM".to_string())].into_iter().collect());
+        writer.set_subdivision_codes([(paris, "FR-75C".to_string())].into_iter().collect());
         let context = Some(RecordContext {
             admin_context: crate::context::AdminContextTuple::from_tiers([
                 (PlaceLayer::Country, country),
@@ -1360,8 +1363,30 @@ mod tests {
             geometry: point_geometry(-122.09, 37.43),
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, 11),
+            ..house.clone()
+        };
+        let rivoli = AddressRecord {
+            building: None,
+            access: Vec::new(),
+            address: AddressComponents {
+                number: "5".to_string(),
+                street: Some("Rue Daunou".to_string()),
+                ..house.address.clone()
+            },
+            geometry: point_geometry(-122.07, 37.41),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, 12),
             ..house
         };
+        let in_paris = Some(RecordContext {
+            admin_context: crate::context::AdminContextTuple::from_tiers([(
+                PlaceLayer::District,
+                paris,
+            )]),
+            flags: 0,
+            zone: None,
+        });
+        writer.write(&rivoli.into(), in_paris).expect("paris house");
         writer.write(&front.into(), context).expect("front door");
         writer.finish().expect("finish");
     }
@@ -1403,6 +1428,14 @@ mod tests {
         assert_eq!(route["languageCode"], "en", "{google}");
         let here = get("/compat/here/v1/geocode?q=1600%20Amphitheatre%20Parkway").await;
         assert_eq!(here["items"][0]["address"]["countyCode"], "SIM", "{here}");
+        // A county's ISO code is no county code HERE writes.
+        let paris = get("/compat/here/v1/geocode?q=5%20Rue%20Daunou").await;
+        assert_eq!(paris["items"][0]["address"]["county"], "Paris", "{paris}");
+        assert_eq!(
+            paris["items"][0]["address"].get("countyCode"),
+            None,
+            "{paris}"
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 
@@ -1436,6 +1469,11 @@ mod tests {
             "/compat/google/v4/geocode/address?addressQuery=1600%20Amphitheatre%20Parkway",
         ))
         .await;
+        assert_eq!(
+            google["results"][0]["types"],
+            serde_json::json!(["premise", "street_address"]),
+            "{google}"
+        );
         let first = &google["results"][0]["addressComponents"][0];
         assert_eq!(
             (

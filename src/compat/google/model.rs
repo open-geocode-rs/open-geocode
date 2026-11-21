@@ -754,6 +754,16 @@ impl Kind {
                     cuisine,
                 }
             }
+            // An address naming the building it is drawn as is that
+            // building, a premise, as well as its street address.
+            Layer::Address
+                if common
+                    .building
+                    .as_ref()
+                    .is_some_and(|building| building.name.is_some()) =>
+            {
+                Self::Types(&["premise", "street_address"])
+            }
             layer => Self::of_layer(layer),
         }
     }

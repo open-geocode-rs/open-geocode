@@ -113,18 +113,6 @@ impl Area {
             plate_code: area.plate_code.clone(),
         }
     }
-
-    /// The area's short code, as HERE writes a county's: the code on its
-    /// vehicle plates (`SIM`), else its code within its country (`HAM` of
-    /// `GB-HAM`).
-    fn short_code(&self) -> Option<String> {
-        self.plate_code.clone().or_else(|| {
-            self.code
-                .as_deref()
-                .and_then(|code| code.split_once('-'))
-                .map(|(_, own)| own.to_string())
-        })
-    }
 }
 
 /// The parts of a forward or a reverse answer HERE reads that `Common`
@@ -792,7 +780,12 @@ fn address(properties: &Properties) -> ItemAddress {
         county: area(&context.district)
             .or_else(|| own(Layer::District))
             .map(|name| compat::without_kind(&name)),
-        county_code: context.district.as_ref().and_then(Area::short_code),
+        // A county's own code is the one on its vehicle plates (`SIM`). An
+        // ISO code would invent one where HERE writes none (`75C` of Paris).
+        county_code: context
+            .district
+            .as_ref()
+            .and_then(|county| county.plate_code.clone()),
         city: area(&context.locality)
             .or_else(|| stated.locality.clone())
             .or_else(|| own(Layer::Locality)),
