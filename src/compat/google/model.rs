@@ -595,14 +595,25 @@ fn region_short(code: Option<&str>, name: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
     Types(&'static [&'static str]),
-    Poi(Option<&'static str>),
+    /// A place: Google's type of its category, and whether OSM maps it as a
+    /// shop, which Google writes `store` whatever its type.
+    Poi {
+        primary: Option<&'static str>,
+        shop: bool,
+    },
     Unknown,
 }
 
 impl Kind {
     pub(super) fn of(common: &Common) -> Self {
         match common.layer {
-            Layer::Poi => Self::Poi(common.category.as_deref().and_then(category_type)),
+            Layer::Poi => {
+                let category = common.category.as_deref();
+                Self::Poi {
+                    primary: category.and_then(category_type),
+                    shop: category.is_some_and(|category| category.starts_with("shop:")),
+                }
+            }
             layer => Self::of_layer(layer),
         }
     }
@@ -630,7 +641,21 @@ impl Kind {
     pub(super) fn types(self) -> Vec<&'static str> {
         match self {
             Self::Types(types) => types.to_vec(),
-            Self::Poi(category) => category.into_iter().chain(ANY_PLACE).collect(),
+            Self::Poi { primary, shop } => {
+                let mut types = primary.into_iter().collect::<Vec<_>>();
+                for group in primary
+                    .map_or(&[][..], groups_of)
+                    .iter()
+                    .copied()
+                    .chain(shop.then_some("store"))
+                {
+                    if !types.contains(&group) {
+                        types.push(group);
+                    }
+                }
+                types.extend(ANY_PLACE);
+                types
+            }
             Self::Unknown => Vec::new(),
         }
     }
@@ -639,7 +664,7 @@ impl Kind {
     /// type such as `establishment`.
     pub(super) fn primary(self) -> Option<&'static str> {
         match self {
-            Self::Poi(category) => category,
+            Self::Poi { primary, .. } => primary,
             Self::Types(types) => types.first().copied().filter(|kind| *kind != "political"),
             Self::Unknown => None,
         }
@@ -771,6 +796,70 @@ const CATEGORY_TYPES: &[(&str, &str)] = &[
     ("tourism zoo", "zoo"),
 ];
 
+/// The general types Google writes beside a type of one of its groups:
+/// `food` for Food and Drink, `store` for Shopping, `lodging`, `finance`,
+/// `health` and `place_of_worship`, as its place type tables group them.
+fn groups_of(named: &str) -> &'static [&'static str] {
+    const FOOD: &[&str] = &[
+        "bakery",
+        "bar",
+        "cafe",
+        "fast_food_restaurant",
+        "food_court",
+        "ice_cream_shop",
+        "pub",
+        "restaurant",
+    ];
+    const STORE: &[&str] = &[
+        "bicycle_store",
+        "book_store",
+        "butcher_shop",
+        "car_dealer",
+        "cell_phone_store",
+        "clothing_store",
+        "convenience_store",
+        "department_store",
+        "drugstore",
+        "electronics_store",
+        "florist",
+        "furniture_store",
+        "gift_shop",
+        "grocery_store",
+        "hardware_store",
+        "home_improvement_store",
+        "jewelry_store",
+        "liquor_store",
+        "market",
+        "pet_store",
+        "shoe_store",
+        "shopping_mall",
+        "sporting_goods_store",
+        "supermarket",
+    ];
+    const LODGING: &[&str] = &["campground", "guest_house", "hostel", "hotel", "motel"];
+    const FINANCE: &[&str] = &["accounting", "atm", "bank"];
+    const HEALTH: &[&str] = &[
+        "dentist",
+        "doctor",
+        "drugstore",
+        "hospital",
+        "medical_lab",
+        "pharmacy",
+        "physiotherapist",
+    ];
+    match named {
+        "bakery" | "butcher_shop" => &["food", "store"],
+        "drugstore" => &["health", "store"],
+        "place_of_worship" => &[],
+        named if FOOD.contains(&named) => &["food"],
+        named if STORE.contains(&named) => &["store"],
+        named if LODGING.contains(&named) => &["lodging"],
+        named if FINANCE.contains(&named) => &["finance"],
+        named if HEALTH.contains(&named) => &["health"],
+        _ => &[],
+    }
+}
+
 /// Google's types every place has, whatever its kind.
 const ANY_PLACE: [&str; 2] = ["point_of_interest", "establishment"];
 
@@ -807,8 +896,37 @@ pub(super) fn categories_of<'a>(types: impl IntoIterator<Item = &'a str>) -> Vec
 }
 
 #[cfg(test)]
-mod transit_tests {
-    use super::categories_of;
+mod type_tests {
+    use super::{Kind, categories_of};
+
+    /// A place carries its group's general type beside its own, and a shop
+    /// is a store whatever its kind.
+    #[test]
+    fn a_place_carries_the_general_type_of_its_group() {
+        let types = |primary, shop| Kind::Poi { primary, shop }.types();
+        assert_eq!(
+            types(Some("restaurant"), false),
+            ["restaurant", "food", "point_of_interest", "establishment"]
+        );
+        assert_eq!(
+            types(Some("bakery"), true),
+            [
+                "bakery",
+                "food",
+                "store",
+                "point_of_interest",
+                "establishment"
+            ]
+        );
+        assert_eq!(
+            types(None, true),
+            ["store", "point_of_interest", "establishment"]
+        );
+        assert_eq!(
+            types(Some("museum"), false),
+            ["museum", "point_of_interest", "establishment"]
+        );
+    }
 
     /// Google's transit types find og's stations and stops.
     #[test]

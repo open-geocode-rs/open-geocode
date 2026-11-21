@@ -272,7 +272,7 @@ fn bakery_place() -> Value {
         "name": format!("places/{id}"),
         "id": id,
         "displayName": {"text": "Queen Bakery"},
-        "types": ["bakery", "point_of_interest", "establishment"],
+        "types": ["bakery", "food", "store", "point_of_interest", "establishment"],
         "primaryType": "bakery",
         "formattedAddress": "12 King Street, Toronto, ON M5V 1A1, Canada",
         "postalAddress": {
@@ -583,7 +583,7 @@ async fn autocomplete_suggests_places_with_matches_and_distance() {
                 "mainText": {"text": "Queen Bakery", "matches": [{"endOffset": 9}]},
                 "secondaryText": {"text": "12 King Street, Toronto, M5V 1A1"},
             },
-            "types": ["bakery", "point_of_interest", "establishment"],
+            "types": ["bakery", "food", "store", "point_of_interest", "establishment"],
             "distanceMeters": 407,
         }}]})
     );
