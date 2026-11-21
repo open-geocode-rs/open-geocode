@@ -261,6 +261,7 @@ pub(super) async fn geocode(
 
 async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, Gs7Error> {
     let params = Params::parse(query)?;
+    super::check_show(params.get("show"), &super::GEOCODE_SHOW)?;
     let qualified = params
         .get("qq")
         .map(Qualified::parse)
@@ -496,6 +497,7 @@ pub(super) fn first_language(list: &str) -> Option<String> {
 impl Reverse {
     fn read(params: &Params, max_limit: usize) -> Result<Self, Gs7Error> {
         let (center, radius_m) = location(params.get("at"), params.get("in"))?;
+        super::check_show(params.get("show"), &super::REVGEOCODE_SHOW)?;
         let types = params.types(&REVGEOCODE_TYPES)?;
         let bearing = params.int("bearing", 0, 359)?;
         if bearing.is_some()

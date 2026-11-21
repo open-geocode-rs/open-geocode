@@ -1740,6 +1740,7 @@ async fn a_geocode_batch_runs_on_og_jobs() {
     let href = format!("http://og.test/compat/here/v7/batch/jobs/{id}");
     assert_eq!(created["serviceHrn"], GEOCODE_HRN);
     assert_eq!(created["tag"], "nightly");
+    assert_eq!(created["status"], "submitted", "a created job is submitted");
     assert_eq!(created["billingTags"], json!([]));
     assert_eq!(created["href"], href);
 
@@ -1817,10 +1818,10 @@ async fn a_geocode_batch_runs_on_og_jobs() {
         serde_json::from_str(rest).expect("message is JSON")
     };
     assert_eq!(
-        message(lines[1], "InputLine_4|999|"),
+        message(lines[1], "InputLine_3|999|"),
         json!({
             "status": 999,
-            "recordId": "InputLine_4",
+            "recordId": "InputLine_3",
             "title": "Illegal input line",
             "cause": "The recId 'bad id!' holds a character outside [a-zA-Z0-9.,_-].",
             "action": "Please correct the recId and resubmit in new job.",
@@ -1833,8 +1834,8 @@ async fn a_geocode_batch_runs_on_og_jobs() {
             "status": 400,
             "title": "Missing parameter 'q' or 'qq'",
             "action": "Provide 'q', 'qq' or qualified columns",
-            "correlationId": "rid-1-6",
-            "requestId": "rid-1-6",
+            "correlationId": "rid-1-5",
+            "requestId": "rid-1-5",
         })
     );
 
@@ -1978,6 +1979,11 @@ async fn a_revgeocode_batch_waits_for_its_start() {
 
     let started = send(&router, "PUT", &format!("{job}/start"), None).await;
     assert_eq!(started.status, StatusCode::OK);
+    assert_eq!(
+        started.json()["status"],
+        "queued",
+        "a started job is queued"
+    );
     let details = finished(&router, &id).await;
     assert_eq!(details["status"], "completed");
     assert_eq!(
@@ -2052,6 +2058,51 @@ async fn batch_input_takes_query_lines_and_gzip() {
     );
     let errors = get(&router, &format!("/compat/here/v7/batch/jobs/{id}/errors")).await;
     assert_eq!(errors.status, StatusCode::NO_CONTENT);
+}
+
+/// A record HERE cannot read, short of a column with no default, is an
+/// error of its input line, numbered among the records. A record whose
+/// `show` names a value the endpoint does not list is refused as the
+/// endpoint refuses it, and so is the live request.
+#[tokio::test]
+async fn a_short_line_and_an_unknown_show_are_the_errors_here_writes() {
+    let pack = pack("batch-errors-here");
+    let router = pack.router();
+    let id = finished_job(
+        &router,
+        "recId|q|show\n1|10 King Street|tz\n2|10 King Street\n3|10 King Street|something",
+    )
+    .await;
+    let errors = get(&router, &format!("/compat/here/v7/batch/jobs/{id}/errors"))
+        .await
+        .text();
+    let lines = errors.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3, "{errors}");
+    assert_eq!(
+        lines[1],
+        "InputLine_2|999|{\"status\":999,\"recordId\":\"InputLine_2\",\"title\":\"Illegal input line\",\
+         \"cause\":\"The input line does not conform to given input format for job.\",\
+         \"action\":\"Please check format for job record and resubmit in new job.\",\
+         \"jobRecord\":\"2|10 King Street\"}"
+    );
+    let (rec_id, rest) = lines[2].split_once('|').expect("a cell");
+    assert_eq!(rec_id, "3");
+    let (code, message) = rest.split_once('|').expect("a cell");
+    assert_eq!(code, "400");
+    let message = serde_json::from_str::<Value>(message).expect("JSON");
+    assert_eq!(message["title"], "Illegal input for parameter 'show'");
+    assert_eq!(
+        message["action"],
+        "Unsupported value: 'something'. Supported values: 'countryInfo', 'parsing', \
+         'postalCodeDetails', 'secondaryUnitInfo', 'streetInfo', 'tz'"
+    );
+    let live = get(
+        &router,
+        "/compat/here/v1/geocode?q=10%20King%20Street&show=something",
+    )
+    .await;
+    assert_eq!(live.status, StatusCode::BAD_REQUEST);
+    assert_eq!(live.json()["title"], "Illegal input for parameter 'show'");
 }
 
 #[tokio::test]

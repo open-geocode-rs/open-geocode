@@ -732,7 +732,8 @@ fn delimiter(value: Option<&str>, output: bool) -> Result<char, BatchError> {
 
 /// `billingTags`, at most 6 tags of 4 to 16 of `[A-Za-z0-9._-]` with the
 /// punctuation never first or last, joined by `+` or `,` but not both. A
-/// `+` sent unescaped arrives as a space, and is read as the `+` it was.
+/// `+` sent unescaped arrives as a space, and is read as the `+` it was. A
+/// tag given twice is taken once.
 fn billing_tags(value: Option<&str>) -> Result<Vec<String>, BatchError> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -746,10 +747,12 @@ fn billing_tags(value: Option<&str>) -> Result<Vec<String>, BatchError> {
     if value.contains(['+', ' ']) && value.contains(',') {
         return Err(invalid());
     }
-    let tags = value
-        .split(['+', ' ', ','])
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let mut tags = Vec::<String>::new();
+    for tag in value.split(['+', ' ', ',']) {
+        if !tags.iter().any(|held| held == tag) {
+            tags.push(tag.to_string());
+        }
+    }
     let valid_tag = |tag: &String| {
         let punct = |byte: u8| matches!(byte, b'-' | b'_' | b'.');
         (4..=16).contains(&tag.len())
@@ -759,11 +762,7 @@ fn billing_tags(value: Option<&str>) -> Result<Vec<String>, BatchError> {
             && !tag.bytes().next().is_some_and(punct)
             && !tag.bytes().last().is_some_and(punct)
     };
-    let unique = tags
-        .iter()
-        .enumerate()
-        .all(|(index, tag)| !tags[..index].contains(tag));
-    if tags.len() > 6 || !unique || !tags.iter().all(valid_tag) {
+    if tags.len() > 6 || !tags.iter().all(valid_tag) {
         return Err(invalid());
     }
     Ok(tags)
@@ -964,7 +963,12 @@ impl Reader<'_> {
             let broken = too_long
                 || text.chars().count() > MAX_LINE_CHARS
                 || std::str::from_utf8(&line).is_err();
-            self.record(layout, number, &text, broken)
+            // HERE numbers the input's records, the header line not counted.
+            let record_number = match layout {
+                Layout::Delimited(_) => number - 1,
+                Layout::Query => number,
+            };
+            self.record(layout, record_number, &text, broken)
                 .map_err(|error| Refusal::Unreadable(error.to_string()))?;
             if self.intake.items > self.max_items {
                 return Err(Refusal::TooManyRecords(self.max_items));
@@ -1021,7 +1025,7 @@ impl Reader<'_> {
                 self.intake.items += 1;
             }
             Err(error) => {
-                let message = error.body(&format!("{}-{number}", self.request_id));
+                let message = error.body_text(&format!("{}-{number}", self.request_id));
                 self.reject(&rec_id, error.status.as_u16(), &message)?;
                 self.intake.rejected += 1;
             }
@@ -1030,19 +1034,32 @@ impl Reader<'_> {
     }
 
     fn invalid(&mut self, rec_id: &str, text: &str, invalid: &Invalid) -> io::Result<()> {
-        let message = json!({
-            "status": 999,
-            "recordId": rec_id,
-            "title": "Illegal input line",
-            "cause": invalid.cause,
-            "action": invalid.action,
-            "jobRecord": text,
-        });
+        /// HERE's message for a line it cannot read, its fields in HERE's
+        /// order, as the errors file quotes it.
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Message<'a> {
+            status: u16,
+            record_id: &'a str,
+            title: &'a str,
+            cause: &'a str,
+            action: &'a str,
+            job_record: &'a str,
+        }
+        let message = serde_json::to_string(&Message {
+            status: 999,
+            record_id: rec_id,
+            title: "Illegal input line",
+            cause: &invalid.cause,
+            action: invalid.action,
+            job_record: text,
+        })?;
         self.intake.invalid += 1;
         self.reject(rec_id, 999, &message)
     }
 
-    fn reject(&mut self, rec_id: &str, code: u16, message: &Value) -> io::Result<()> {
+    /// A record refused before it runs, its message already as text.
+    fn reject(&mut self, rec_id: &str, code: u16, message: &str) -> io::Result<()> {
         serde_json::to_writer(
             &mut self.rejects,
             &json!({ "recId": rec_id, "code": code, "message": message }),
@@ -1091,7 +1108,14 @@ fn read_record(layout: &Layout, text: &str, delimiter: char) -> Option<Record> {
         }
         Layout::Delimited(columns) => {
             let cells = cells(text, delimiter);
-            if cells.len() > columns.len() {
+            // A line has a cell for each column, but for trailing columns
+            // whose header gives a default: one missing any other does not
+            // conform to the job's format.
+            let short_of_default = columns
+                .iter()
+                .skip(cells.len())
+                .any(|column| column.default.is_none());
+            if cells.len() > columns.len() || short_of_default {
                 return None;
             }
             Some(Record(
@@ -1155,8 +1179,16 @@ fn translate(service: Service, record: &Record) -> Result<Translated, Gs7Error> 
             .filter(|limit| (1..=100).contains(limit))
             .ok_or_else(|| Gs7Error::illegal("limit", value, "Provide an integer from 1 to 100"))?,
     };
-    // `lang` is an input column like any query parameter of the endpoint.
+    // `lang` and `show` are input columns like any query parameter of the
+    // endpoint, and are checked as it checks them.
     let lang = record.get("lang").and_then(first_language);
+    super::check_show(
+        record.get("show"),
+        match service {
+            Service::Geocode => &super::GEOCODE_SHOW,
+            Service::Revgeocode => &super::REVGEOCODE_SHOW,
+        },
+    )?;
     let translated = match service {
         Service::Geocode => {
             let qualified = match record.get("qq") {
@@ -1462,7 +1494,10 @@ async fn create_job(
         return Err(error);
     }
     save(state, &meta).map_err(internal)?;
-    let view = view(state, meta).ok_or_else(BatchError::job_not_found)?;
+    let mut view = view(state, meta).ok_or_else(BatchError::job_not_found)?;
+    // A created job is submitted, whether its start follows or not; a read
+    // after tells how far it has run.
+    view.status = "submitted";
     let links = Links::of(state, headers, uri);
     Ok((StatusCode::CREATED, axum::Json(job_response(&view, &links))).into_response())
 }
@@ -1792,7 +1827,11 @@ pub(super) async fn start(
         };
         launch(&state, &mut meta, uuid).await?;
         save(&state, &meta).map_err(internal)?;
-        view(&state, meta).ok_or_else(BatchError::job_not_found)
+        // A started job is scheduled, queued; a read after tells how far it
+        // has run.
+        let mut view = view(&state, meta).ok_or_else(BatchError::job_not_found)?;
+        view.status = "queued";
+        Ok::<_, BatchError>(view)
     };
     match answer.await {
         Ok(view) => {
@@ -2300,7 +2339,11 @@ fn write_errors(state: &AppState, meta: &Meta, out: &mut impl Write) -> io::Resu
                 "{}{delimiter}{}{delimiter}{}",
                 quoted(reject["recId"].as_str().unwrap_or_default(), delimiter),
                 reject["code"],
-                reject["message"],
+                // A job written before the message was kept as text holds
+                // it as an object.
+                reject["message"]
+                    .as_str()
+                    .map_or_else(|| reject["message"].to_string(), str::to_string),
             )?;
         }
     }
@@ -2323,7 +2366,7 @@ fn write_errors(state: &AppState, meta: &Meta, out: &mut impl Write) -> io::Resu
             "{}{delimiter}{}{delimiter}{}",
             quoted(carried.rec_id, delimiter),
             line.status,
-            error.body(&format!("{request_id}-{}", carried.ordinal + 1)),
+            error.body_text(&format!("{request_id}-{}", carried.ordinal + 1)),
         )
     })
 }
@@ -2532,8 +2575,9 @@ mod tests {
         assert_eq!(billing_tags(Some("abc")).unwrap_err().code, "E6004001");
         assert_eq!(billing_tags(Some("-abcd")).unwrap_err().code, "E6004001");
         assert_eq!(
-            billing_tags(Some("abcd,abcd")).unwrap_err().code,
-            "E6004001"
+            billing_tags(Some("abcd,abcd")).ok(),
+            Some(vec!["abcd".to_string()]),
+            "a tag given twice is taken once"
         );
     }
 

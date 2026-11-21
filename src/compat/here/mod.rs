@@ -227,6 +227,32 @@ impl Gs7Error {
         body
     }
 
+    /// The body as text, its fields in the order HERE writes them, for a
+    /// batch error line, which quotes it.
+    fn body_text(&self, request_id: &str) -> String {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Text<'a> {
+            status: u16,
+            title: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cause: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            action: Option<&'a str>,
+            correlation_id: &'a str,
+            request_id: &'a str,
+        }
+        serde_json::to_string(&Text {
+            status: self.status.as_u16(),
+            title: &self.title,
+            cause: self.cause.as_deref(),
+            action: self.action.as_deref(),
+            correlation_id: request_id,
+            request_id,
+        })
+        .unwrap_or_default()
+    }
+
     fn into_vendor(self, request_id: &str) -> VendorError {
         let mut error = VendorError::new(self.status, self.body(request_id));
         if let Some(problem) = self.problem {
@@ -350,6 +376,34 @@ impl Params {
             ));
         }
         Ok(Some(types))
+    }
+}
+
+/// The `show` values geocode names when it refuses one, and revgeocode's.
+/// `addressUsage` is accepted too, though HERE's message leaves it out.
+const GEOCODE_SHOW: [&str; 6] = [
+    "countryInfo",
+    "parsing",
+    "postalCodeDetails",
+    "secondaryUnitInfo",
+    "streetInfo",
+    "tz",
+];
+const REVGEOCODE_SHOW: [&str; 4] = ["countryInfo", "postalCodeDetails", "streetInfo", "tz"];
+
+/// `show`, each value one the endpoint lists, as HERE refuses any other.
+fn check_show(value: Option<&str>, listed: &[&str]) -> Result<(), Gs7Error> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let unknown = value
+        .split(',')
+        .map(str::trim)
+        .filter(|shown| !shown.is_empty())
+        .find(|shown| *shown != "addressUsage" && !listed.contains(shown));
+    match unknown {
+        Some(unknown) => Err(Gs7Error::illegal("show", value, supported(unknown, listed))),
+        None => Ok(()),
     }
 }
 
