@@ -593,7 +593,7 @@ fn restated(mut fields: Value) -> Value {
     fields
 }
 
-/// The street's type and direction are judged apart from its name: each
+/// The street's type and direction are judged apart from its name. Each
 /// agrees, neither stating one included, or not.
 #[tokio::test]
 async fn geocode_judges_a_streets_type_and_direction_apart() {

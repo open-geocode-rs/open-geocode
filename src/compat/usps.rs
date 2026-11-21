@@ -125,7 +125,7 @@ impl UsAddress {
             .map(|kind| style.abbreviation(kind))
     }
 
-    /// The unit, its designator first: `Ste 2` in a display.
+    /// The unit, its designator first, `Ste 2` in a display.
     pub(crate) fn unit(&self, style: Style) -> Option<String> {
         let unit = self.unit.as_ref()?;
         Some(join([

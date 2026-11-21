@@ -458,7 +458,7 @@ impl Feature {
     }
 
     /// Judges the street's type and direction apart from its name, as
-    /// Precisely describes them: each is `EXACT` where the asked street and
+    /// Precisely describes them. Each is `EXACT` where the asked street and
     /// the record agree on it, neither stating one included, and `NONE`
     /// where they differ or the street did not match. The record's part
     /// agrees when any asked word is a form of it, wherever it stands, so a
@@ -804,7 +804,7 @@ impl Feature {
         (candidate, us)
     }
 
-    /// The street's own name and its type: the postal form's for a US
+    /// The street's own name and its type, the postal form's for a US
     /// address, og's parts for any other.
     fn street_name_and_type(&self, us: Option<&UsAddress>) -> Option<(String, Option<String>)> {
         if let Some(us) = us {
@@ -1046,9 +1046,9 @@ impl Holds {
 /// How a record was found when no address was asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FoundBy {
-    /// Reverse geocoding: the street segment the point lies on.
+    /// Reverse geocoding, by the street segment the point lies on.
     Point,
-    /// Lookup: the whole record its key names.
+    /// Lookup, by the whole record its key names.
     Key,
 }
 
@@ -1535,7 +1535,7 @@ mod tests {
         assert!(!verified.contains_key(GEOHASH) && verified.contains_key(MATCH_TYPE));
     }
 
-    /// Each autocomplete restates what its documented predictions do: the
+    /// Each autocomplete restates what its documented predictions do, the
     /// first the address on one line and the number and street matched,
     /// express its formatted address and the unit.
     #[test]

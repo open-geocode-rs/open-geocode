@@ -2756,7 +2756,7 @@ fn add_delta(base: i32, delta: i64) -> Result<i32> {
         .map_err(|_| Error::Decode("coordinate delta is out of range"))
 }
 
-/// The one postcode `postcodes` agree on, as the first writes it: none
+/// The one postcode `postcodes` agree on, as the first writes it. None
 /// when they are none or name more than one, written in any case or
 /// spacing.
 fn agreed_postcode(postcodes: &[String]) -> Option<String> {
