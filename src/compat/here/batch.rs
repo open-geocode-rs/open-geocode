@@ -1802,6 +1802,9 @@ pub(super) async fn start(
     }
 }
 
+/// The longest a stop waits for its run to end before it answers.
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(super) async fn stop(
     State(state): State<AppState>,
     Rid(request_id): Rid,
@@ -1816,11 +1819,15 @@ pub(super) async fn stop(
             return Ok(current);
         }
         let mut meta = current.meta;
-        if let Some(job) = meta.runs.last().and_then(|run| state.jobs().get(run)) {
-            job.cancel();
-        }
         meta.stopped = true;
         save(&state, &meta).map_err(internal)?;
+        if let Some(job) = meta.runs.last().and_then(|run| state.jobs().get(run)) {
+            job.cancel();
+            // The run stops at its next record. Its end is awaited, so the
+            // answer is the job stopped, as HERE answers a stop, or completed
+            // when its last record was already written.
+            let _ = tokio::time::timeout(STOP_WAIT, job.ended()).await;
+        }
         view(&state, meta).ok_or_else(BatchError::job_not_found)
     };
     match answer.await {

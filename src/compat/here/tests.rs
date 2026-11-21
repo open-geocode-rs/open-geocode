@@ -1886,6 +1886,39 @@ async fn a_geocode_batch_runs_on_og_jobs() {
     assert_eq!(listed.json()["count"], 0);
 }
 
+/// A stop answers the job stopped, as HERE does, or completed when its last
+/// record was already written. It never answers the job still in progress,
+/// however soon after the start it comes.
+#[tokio::test]
+async fn a_stopped_batch_answers_stopped_never_in_progress() {
+    let pack = pack("batch-stop");
+    let router = pack.router();
+    let input = std::iter::once("recId|q".to_string())
+        .chain((0..2000).map(|row| format!("r{row}|{row} King Street")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for _ in 0..20 {
+        let created = send(
+            &router,
+            "POST",
+            &format!("/compat/here/v7/batch/jobs?serviceHrn={GEOCODE_HRN}"),
+            Some(("text/plain", input.as_str())),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
+        let id = created.json()["id"].as_str().expect("id").to_string();
+        let stopped = send(
+            &router,
+            "PUT",
+            &format!("/compat/here/v7/batch/jobs/{id}/stop"),
+            None,
+        )
+        .await;
+        let status = stopped.json()["status"].clone();
+        assert!(status == "stopped" || status == "completed", "{status}");
+    }
+}
+
 #[tokio::test]
 async fn a_revgeocode_batch_waits_for_its_start() {
     let pack = pack("batch-revgeocode");
