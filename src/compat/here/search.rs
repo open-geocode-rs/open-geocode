@@ -299,12 +299,7 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
     prefer_postcode_correction(&mut collection);
     let items = features(&collection)
         .iter()
-        .zip(&collection.features)
-        .map(|(feature, native)| {
-            item(feature)
-                .with_geocoded_label(&native.properties.common)
-                .distance_from(at)
-        })
+        .map(|feature| item(feature).distance_from(at))
         .filter(|item| item.is_any_of(types.as_deref()))
         .take(limit)
         .collect();
@@ -433,6 +428,13 @@ impl Reverse {
         let mut fields = vec![
             ("lon", self.center.lng.to_string()),
             ("lat", self.center.lat.to_string()),
+            (
+                "radius",
+                crate::compat::radius(
+                    self.radius_m
+                        .unwrap_or(crate::compat::NEAREST_HOUSE_RADIUS_M),
+                ),
+            ),
         ];
         if let Some(layer) = self.layer {
             fields.push(("layer", layer.to_string()));
@@ -772,6 +774,18 @@ fn within(
     ))
 }
 
+/// `route`, a polyline to search along, sent in the query string. og
+/// cannot search along one, so it is refused wherever it is sent.
+fn refuse_route(params: &Params) -> Result<(), Gs7Error> {
+    params.get("route").map_or(Ok(()), |value| {
+        Err(Gs7Error::illegal(
+            "route",
+            value,
+            "This server cannot search along a route; search around a point with 'at' instead",
+        ))
+    })
+}
+
 /// The form body a POST may carry. HERE lets it hold only `route`, a
 /// polyline to search along, which og cannot search along.
 fn refuse_body(body: &Bytes) -> Result<(), Gs7Error> {
@@ -803,6 +817,7 @@ pub(super) async fn autosuggest(
     let answer = async {
         refuse_body(&body)?;
         let params = Params::parse(query.as_deref())?;
+        refuse_route(&params)?;
         let q = required_q(&params)?;
         let near = Near::read(&params, true)?;
         let limit = params.limit(20, 100)?;
@@ -869,6 +884,7 @@ pub(super) async fn autocomplete(
                 item(feature)
                     .without_scoring()
                     .with_highlights(feature)
+                    .titled_country_first(feature)
                     .distance_from(near.center)
             })
             .filter(|item| near.admits(item))
@@ -891,6 +907,7 @@ pub(super) async fn discover(
     let answer = async {
         refuse_body(&body)?;
         let params = Params::parse(query.as_deref())?;
+        refuse_route(&params)?;
         let q = required_q(&params)?;
         let near = Near::read(&params, true)?;
         let limit = params.limit(20, 100)?;
@@ -938,6 +955,7 @@ pub(super) async fn browse(
     let answer = async {
         refuse_body(&body)?;
         let params = Params::parse(query.as_deref())?;
+        refuse_route(&params)?;
         let at = params.get("at").ok_or_else(|| {
             Gs7Error::new(StatusCode::BAD_REQUEST, "Missing parameter 'at'").action("Provide 'at'")
         })?;

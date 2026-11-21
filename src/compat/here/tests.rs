@@ -364,7 +364,7 @@ pub(super) async fn get(router: &Router, uri: &str) -> Reply {
 /// context, the unit and postcode from the record.
 fn king_address() -> Value {
     json!({
-        "label": "10 King Street, Unit 5, M5V 1A1",
+        "label": "10 King Street, Unit 5, Toronto, ON M5V 1A1, Canada",
         "countryCode": "CAN",
         "countryName": "Canada",
         "stateCode": "ON",
@@ -382,7 +382,7 @@ fn king_address() -> Value {
 
 fn king(extra: Value) -> Value {
     let mut item = json!({
-        "title": "10 King Street, Unit 5, M5V 1A1",
+        "title": "10 King Street, Unit 5, Toronto, ON M5V 1A1, Canada",
         "id": address_vendor_id("osm:node:10"),
         "resultType": "houseNumber",
         "houseNumberType": "PA",
@@ -896,9 +896,13 @@ async fn autosuggest_autocomplete_and_discover() {
         assert_eq!(reply.status, StatusCode::OK, "{path}");
     }
 
-    // Autocomplete is addresses alone, with no position.
+    // Autocomplete is addresses alone, with no position, titled from the
+    // largest area down, its marks following "Queen" there.
+    let mut suggested = queen.clone();
+    suggested["title"] = json!("M5H 2N2, Toronto City, 20 Queen Street");
+    suggested["highlights"]["title"] = json!([{"start": 26, "end": 31}]);
     let reply = get(&router, "/compat/here/v1/autocomplete?q=Queen").await;
-    assert_eq!(reply.json(), json!({"items": [queen]}));
+    assert_eq!(reply.json(), json!({"items": [suggested]}));
     let reply = get(&router, "/compat/here/v1/autocomplete?q=Queen&types=street").await;
     assert_eq!(reply.json(), json!({"items": []}));
     let reply = get(&router, "/compat/here/v1/autocomplete?q=Queen&limit=21").await;
@@ -1069,10 +1073,13 @@ async fn lookup_finds_a_record_the_catalogue_does_not_hold() {
 
     // An imported row renumbered by a newer release of its data: the
     // record with the label the id carries.
+    let Some(crate::compat::OgRef::Labelled { label, .. }) = decode_id(id) else {
+        panic!("{id} carries no label");
+    };
     let renumbered = encode_parts(
         "openaddresses:ca/on/toronto:row:999999",
         Some(Layer::Interpolation),
-        range["title"].as_str().expect("title"),
+        &label,
     );
     let reply = get(&router, &format!("/compat/here/v1/lookup?id={renumbered}")).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
@@ -1319,15 +1326,54 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
         encode_parts(id, Layer::parse(layer), label),
         "{at}"
     );
-    let title = if layer == "poi" {
-        &properties["name"]
-    } else {
-        &properties["label"]
+    // A house or street is labelled by its postal lines, the house's own
+    // line first; anything else by og's label.
+    let lines = properties["address_lines"]
+        .as_array()
+        .map(|lines| lines.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let label = match (layer, lines.as_slice()) {
+        ("address" | "interpolation" | "street", [_, _, ..]) => {
+            let street = properties["address"]["street"].as_str().unwrap_or_default();
+            let mut lines = lines.clone();
+            if let Some(at) = lines.iter().position(|line| line.contains(street)) {
+                let line = lines.remove(at);
+                lines.insert(0, line);
+            }
+            json!(lines.join(", "))
+        }
+        _ => properties["label"].clone(),
     };
-    assert_eq!(&item["title"], title, "{at}");
-    assert_eq!(item["address"]["label"], properties["label"], "{at}");
-    // An `/autocomplete` suggestion has no point, no way in and no box.
+    // An `/autocomplete` suggestion has no point, no way in and no box, and
+    // is titled from the largest area down to its own line.
     let suggestion = uri.contains("/v1/autocomplete?");
+    let own_line = label.as_str().and_then(|label| label.split(", ").next());
+    let title = if layer == "poi" {
+        properties["name"].clone()
+    } else if suggestion {
+        let address = &item["address"];
+        let mut parts = Vec::<&str>::new();
+        for part in [
+            address["countryName"].as_str(),
+            address["postalCode"]
+                .as_str()
+                .filter(|_| item["resultType"] != "street"),
+            address["city"].as_str(),
+            own_line,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !parts.contains(&part) {
+                parts.push(part);
+            }
+        }
+        json!(parts.join(", "))
+    } else {
+        label.clone()
+    };
+    assert_eq!(item["title"], title, "{at}");
+    assert_eq!(item["address"]["label"], label, "{at}");
     match suggestion {
         true => assert_eq!(item.get("position"), None, "{at}"),
         false => {
@@ -1476,11 +1522,43 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
         let label = properties["highlights"].clone();
         let label = if label.is_null() { json!([]) } else { label };
         assert_eq!(item["highlights"]["address"]["label"], label, "{at}");
-        // The title holds the marks that lie in it when the label starts
-        // with it.
+        // A suggestion's title is written anew, and its marks hold the
+        // texts the label's marks hold.
+        let texts = |text: &str, marks: &Value| {
+            let chars = text.chars().collect::<Vec<_>>();
+            let mut texts = marks
+                .as_array()
+                .expect("marks")
+                .iter()
+                .map(|mark| {
+                    let (start, end) = (
+                        mark["start"].as_u64().expect("start"),
+                        mark["end"].as_u64().expect("end"),
+                    );
+                    chars[start as usize..end as usize]
+                        .iter()
+                        .collect::<String>()
+                        .to_lowercase()
+                })
+                .collect::<Vec<_>>();
+            texts.sort();
+            texts
+        };
+        if suggestion {
+            assert_eq!(
+                texts(
+                    item["title"].as_str().unwrap_or_default(),
+                    &item["highlights"]["title"]
+                ),
+                texts(properties["label"].as_str().unwrap_or_default(), &label),
+                "{at}"
+            );
+        }
+        // Elsewhere the title holds the marks that lie in it when the label
+        // starts with it.
         let title = item["title"].as_str().unwrap_or_default();
         let length = title.chars().count() as u64;
-        let in_title = match properties["label"].as_str().unwrap_or_default().starts_with(title) {
+        let in_title = match item["address"]["label"].as_str().unwrap_or_default().starts_with(title) {
             true => label
                 .as_array()
                 .expect("marks")
@@ -1490,7 +1568,9 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
                 .collect(),
             false => Vec::new(),
         };
-        assert_eq!(item["highlights"]["title"], json!(in_title), "{at}");
+        if !suggestion {
+            assert_eq!(item["highlights"]["title"], json!(in_title), "{at}");
+        }
     } else {
         assert_eq!(item.get("highlights"), None, "{at}");
     }
@@ -1631,7 +1711,7 @@ async fn a_geocode_batch_runs_on_og_jobs() {
         "POST",
         &format!(
             "/compat/here/v7/batch/jobs?serviceHrn={GEOCODE_HRN}&tag=nightly\
-             &outputColumns=addressPostalCode,houseNumberType,bogus,title"
+             &outputColumns=addressPostalCode%7ChouseNumberType%7Cbogus%7Ctitle"
         ),
         Some(("text/plain", input)),
     )
@@ -1701,7 +1781,7 @@ async fn a_geocode_batch_runs_on_og_jobs() {
         sorted_lines(&results.text()),
         [
             "recId|seqNumber|seqLength|addressPostalCode|houseNumberType|title",
-            "a1|1|1|M5V 1A1|PA|10 King Street, Unit 5, M5V 1A1",
+            "a1|1|1|M5V 1A1|PA|10 King Street, Unit 5, Toronto, ON M5V 1A1, Canada",
             "a2|1|1|||",
             "a3|1|1|||",
         ]
@@ -1866,7 +1946,7 @@ async fn a_revgeocode_batch_waits_for_its_start() {
         .collect::<Vec<_>>();
     lines.sort_by_key(|line| line["recId"].as_str().unwrap_or_default().to_string());
     let king = json!({
-        "title": "10 King Street, Unit 5, M5V 1A1",
+        "title": "10 King Street, Unit 5, Toronto, ON M5V 1A1, Canada",
         "address": {"city": "Toronto"},
         "distance": 0,
     });
@@ -1916,7 +1996,7 @@ async fn batch_input_takes_query_lines_and_gzip() {
         sorted_lines(&results.text()),
         [
             "recId;seqNumber;seqLength;position;addressLabel;title",
-            "g1;1;1;(43,-79);10 King Street, Unit 5, M5V 1A1;10 King Street, Unit 5, M5V 1A1",
+            "g1;1;1;(43,-79);10 King Street, Unit 5, Toronto, ON M5V 1A1, Canada;10 King Street, Unit 5, Toronto, ON M5V 1A1, Canada",
             "g2;1;1;(43.0005,-79.01);Queen Street 2-98 even, Toronto;Queen Street 2-98 even, Toronto",
         ]
     );
@@ -2438,4 +2518,46 @@ async fn a_feature_reads_alike_from_og_and_from_its_json() {
         checked += 1;
     }
     assert!(checked > 5, "{checked}");
+}
+
+/// A route og cannot search along is refused, in the query string as in
+/// the body, rather than answered as a search around nothing.
+#[tokio::test]
+async fn a_route_is_refused_wherever_it_is_sent() {
+    let pack = pack("route");
+    let router = pack.router();
+    let route = "BFoz5xJ67i1B1B7PzIhaxL7Y";
+    for path in ["discover", "autosuggest", "browse"] {
+        let extra = if path == "browse" { "" } else { "&q=zoo" };
+        let query = send(
+            &router,
+            "GET",
+            &format!("/compat/here/v1/{path}?at=43,-79&route={route}{extra}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            query.status,
+            StatusCode::BAD_REQUEST,
+            "{path}: {}",
+            query.text()
+        );
+        let body = send(
+            &router,
+            "POST",
+            &format!("/compat/here/v1/{path}?at=43,-79{extra}"),
+            Some((
+                "application/x-www-form-urlencoded",
+                &format!("route={route}"),
+            )),
+        )
+        .await;
+        assert_eq!(
+            body.status,
+            StatusCode::BAD_REQUEST,
+            "{path}: {}",
+            body.text()
+        );
+        assert_eq!(query.json()["title"], body.json()["title"], "{path}");
+    }
 }

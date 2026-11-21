@@ -641,25 +641,28 @@ impl Plan {
                 ));
             }
         };
-        let list = |name: &str| {
+        let list = |name: &str, separator: char| {
             params.get(name).map(|value| {
                 value
-                    .split(',')
+                    .split(separator)
                     .map(str::trim)
                     .filter(|part| !part.is_empty())
                     .map(str::to_string)
                     .collect::<Vec<_>>()
             })
         };
+        let output_delimiter = delimiter(params.get("outputDelimiter"), true)?;
         Ok(Self {
             service,
             tag: params.get("tag").map(str::to_string),
             billing_tags: billing_tags(params.get("billingTags"))?,
             input_delimiter: delimiter(params.get("inputDelimiter"), false)?,
-            output_delimiter: delimiter(params.get("outputDelimiter"), true)?,
+            output_delimiter,
             input_columns: params.get("inputColumns").map(str::to_string),
-            output_columns: list("outputColumns"),
-            output_filter: list("outputFilter"),
+            // The descriptor is written as a result row is, split by the
+            // output delimiter; the filter is a list of comma-separated paths.
+            output_columns: list("outputColumns", output_delimiter),
+            output_filter: list("outputFilter", ','),
             start,
             output_type,
             notification_ids: notification_ids(params.get("notificationIds"))?,

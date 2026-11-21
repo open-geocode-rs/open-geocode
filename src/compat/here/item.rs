@@ -4,11 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     api::{self, Accuracy, ForwardFeature, Highlight, PartMatch, QueryMatch, ReverseFeature},
-    compat::encode_parts,
+    compat::{self, encode_parts},
     iso,
     record::{Contact, Layer},
     spatial_index::haversine_m,
-    util::fold::search_key,
 };
 
 use super::{
@@ -58,6 +57,9 @@ struct Properties {
     contact: Option<Contact>,
     /// OpenStreetMap's `opening_hours`, as written.
     opening_hours: Option<String>,
+    /// The address as the lines of a postal address, in its country's form.
+    #[serde(default)]
+    address_lines: Vec<String>,
 }
 
 /// A way in og maps for the result.
@@ -154,6 +156,7 @@ impl Feature {
                 code: common.code.clone(),
                 contact: common.contact.clone(),
                 opening_hours: common.opening_hours.clone(),
+                address_lines: common.address_lines.clone(),
                 access: common
                     .access
                     .iter()
@@ -470,7 +473,7 @@ pub(super) fn item(feature: &Feature) -> Item {
     };
     let [lon, lat] = feature.geometry.coordinates;
     Item {
-        title: title(properties).to_string(),
+        title: title(properties),
         id: encode_parts(&properties.id, Some(properties.layer), &properties.label),
         result_type,
         house_number_type,
@@ -511,25 +514,89 @@ pub(super) fn item(feature: &Feature) -> Item {
     }
 }
 
-/// A place is titled by its name, anything else by its label.
-fn title(properties: &Properties) -> &str {
+/// A place is titled by its name, a house or street by its postal label,
+/// anything else by og's label.
+fn title(properties: &Properties) -> String {
     match properties.layer {
-        Layer::Poi => &properties.name,
-        _ => &properties.label,
+        Layer::Poi => properties.name.clone(),
+        _ => label(properties),
     }
 }
 
-/// og's highlights mark the label, which is HERE's address label. The
-/// title is the label, or the name the label starts with, so the marks
-/// that lie in it carry over; a title the label does not start with gets
-/// none.
+/// HERE's label: for a house or street its postal address lines in its
+/// country's form, joined (`Heinestraße 42, 1020 Wien, Austria`), else
+/// og's label. The town is the one [`compat::town`] names, and a US street
+/// is abbreviated as the postal service writes it, as HERE writes both.
+fn label(properties: &Properties) -> String {
+    postal_label(properties).unwrap_or_else(|| properties.label.clone())
+}
+
+fn postal_label(properties: &Properties) -> Option<String> {
+    let lines = &properties.address_lines;
+    if !matches!(
+        properties.layer,
+        Layer::Address | Layer::Interpolation | Layer::Street
+    ) || lines.len() < 2
+    {
+        return None;
+    }
+    let address = &properties.address;
+    let context = &properties.context;
+    fn name(area: &Option<Area>) -> Option<&str> {
+        area.as_ref().map(|area| area.name.as_str())
+    }
+    let mut lines = lines.clone();
+    // HERE writes the house's own line first; a country whose post puts
+    // the unit on a line above it still gets the house line first.
+    if let Some(street) = address.street.as_deref()
+        && let Some(at) = lines[1..].iter().position(|line| line.contains(street))
+    {
+        let line = lines.remove(at + 1);
+        lines.insert(0, line);
+    }
+    if let Some(stated) = address.locality.as_deref()
+        && let Some(town) = compat::town(
+            Some(stated),
+            name(&context.locality),
+            &[
+                name(&context.neighbourhood),
+                name(&context.sublocality),
+                name(&context.district),
+                name(&context.region),
+            ],
+        )
+        .filter(|town| *town != stated)
+    {
+        for line in &mut lines[1..] {
+            *line = line.replacen(stated, town, 1);
+        }
+    }
+    let us = context
+        .country
+        .as_ref()
+        .and_then(|country| country.code.as_deref())
+        == Some("US");
+    if us && let Some(street) = address.street.as_deref() {
+        lines[0] = lines[0].replacen(
+            street,
+            &compat::usps::display_street(street, None, None, None),
+            1,
+        );
+    }
+    Some(lines.join(", "))
+}
+
+/// og's highlights mark og's label. Each marked text is found again in
+/// HERE's label, which may write the parts in another order, and the title
+/// keeps the marks that lie in it when the label starts with it.
 fn highlights(properties: &Properties) -> Highlights {
+    let label = label(properties);
+    let marks = moved(&properties.label, &properties.highlights, &label);
     let title = title(properties);
-    let in_title = match properties.label.starts_with(title) {
+    let in_title = match label.starts_with(&title) {
         true => {
             let length = title.chars().count();
-            properties
-                .highlights
+            marks
                 .iter()
                 .filter(|mark| mark.start < length)
                 .map(|mark| Highlight {
@@ -542,10 +609,54 @@ fn highlights(properties: &Properties) -> Highlights {
     };
     Highlights {
         title: in_title,
-        address: LabelHighlights {
-            label: properties.highlights.clone(),
-        },
+        address: LabelHighlights { label: marks },
     }
+}
+
+/// `marks` on `from`, placed on `to` where the text each marks is found,
+/// in order and without overlap, ignoring case. A mark whose text `to` does
+/// not hold is dropped.
+fn moved(from: &str, marks: &[Highlight], to: &str) -> Vec<Highlight> {
+    if from == to {
+        return marks.to_vec();
+    }
+    let from = from.chars().collect::<Vec<_>>();
+    let to_chars = to.chars().flat_map(char::to_lowercase).collect::<Vec<_>>();
+    // Lowercasing can change a character's length, and then offsets would
+    // not line up; such a label keeps no marks.
+    if to_chars.len() != to.chars().count() {
+        return Vec::new();
+    }
+    let mut taken = vec![false; to_chars.len()];
+    let mut placed = Vec::new();
+    for mark in marks {
+        let Some(text) = from.get(mark.start..mark.end.min(from.len())) else {
+            continue;
+        };
+        let needle = text
+            .iter()
+            .flat_map(|c| c.to_lowercase())
+            .collect::<Vec<_>>();
+        if needle.is_empty() || needle.len() != text.len() {
+            continue;
+        }
+        let found = (0..=to_chars.len().saturating_sub(needle.len())).find(|&at| {
+            to_chars.len() >= at + needle.len()
+                && to_chars[at..at + needle.len()] == needle[..]
+                && !taken[at..at + needle.len()].contains(&true)
+        });
+        if let Some(at) = found {
+            taken[at..at + needle.len()]
+                .iter_mut()
+                .for_each(|t| *t = true);
+            placed.push(Highlight {
+                start: at,
+                end: at + needle.len(),
+            });
+        }
+    }
+    placed.sort_by_key(|mark| mark.start);
+    placed
 }
 
 /// The areas the feature lies in first. HERE's tiers are admin areas, and
@@ -583,7 +694,7 @@ fn address(properties: &Properties) -> ItemAddress {
         (None, None) => (stated.areas.first().cloned(), stated.areas.get(1).cloned()),
     };
     ItemAddress {
-        label: Some(properties.label.clone()),
+        label: Some(label(properties)),
         country_code,
         country_name: area(&context.country).or_else(|| own(Layer::Country)),
         // The region's code within its country: `ON` of `CA-ON`.
@@ -611,34 +722,6 @@ fn address(properties: &Properties) -> ItemAddress {
 }
 
 impl Item {
-    /// Render the city in a geocoded house's label when the source used
-    /// the enclosing district for its locality. The original label stays
-    /// in the lookup reference.
-    pub(super) fn with_geocoded_label(mut self, common: &api::Common) -> Self {
-        let (Some(city), Some(district), Some(locality)) = (
-            &common.context.locality,
-            &common.context.sublocality,
-            &common.address.locality,
-        ) else {
-            return self;
-        };
-        if self.result_type == "houseNumber"
-            && city.id != district.id
-            && search_key(locality) == search_key(&district.name)
-            && search_key(locality) != search_key(&city.name)
-        {
-            let mut address = common.address.clone();
-            address.locality = Some(city.name.clone());
-            let lines =
-                crate::address_lines::address_lines(common.layer, &address, &common.context);
-            if let [_, _, ..] = lines.as_slice() {
-                self.title = lines.join(", ");
-                self.address.label = Some(self.title.clone());
-            }
-        }
-        self
-    }
-
     /// The crow-flies distance from the search center to the result, in
     /// whole meters, as HERE counts it.
     pub(super) fn distance_from(mut self, center: Option<LatLng>) -> Self {
@@ -658,6 +741,47 @@ impl Item {
     /// Where the typed text lies, which only suggestions carry.
     pub(super) fn with_highlights(mut self, feature: &Feature) -> Self {
         self.highlights = Some(highlights(&feature.properties));
+        self
+    }
+
+    /// An autocomplete suggestion's title, its parts from the country down
+    /// as HERE's autocomplete writes it: `Deutschland, 60486, Frankfurt am
+    /// Main, Pariser Straße 2`. A street spans postcodes, so it names none.
+    /// The typed text's marks follow their text into it.
+    pub(super) fn titled_country_first(mut self, feature: &Feature) -> Self {
+        let properties = &feature.properties;
+        let address = &self.address;
+        let own_line = match self.result_type {
+            // og's name of a house or street is its own line.
+            "houseNumber" | "street" => postal_label(properties)
+                .and_then(|label| label.split(", ").next().map(str::to_string))
+                .or_else(|| Some(properties.name.clone())),
+            _ => None,
+        };
+        let parts = [
+            address.country_name.clone(),
+            address
+                .postal_code
+                .clone()
+                .filter(|_| self.result_type != "street"),
+            address.city.clone(),
+            own_line,
+        ]
+        .into_iter()
+        .flatten()
+        .fold(Vec::<String>::new(), |mut parts, part| {
+            if !parts.contains(&part) {
+                parts.push(part);
+            }
+            parts
+        });
+        if parts.len() < 2 {
+            return self;
+        }
+        self.title = parts.join(", ");
+        if let Some(highlights) = self.highlights.as_mut() {
+            highlights.title = moved(&properties.label, &properties.highlights, &self.title);
+        }
         self
     }
 
@@ -709,5 +833,70 @@ impl Item {
 
     pub(super) fn is_any_of(&self, kinds: Option<&[String]>) -> bool {
         kinds.is_none_or(|kinds| kinds.iter().any(|kind| self.is_of(kind)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feature(properties: &serde_json::Value) -> Feature {
+        serde_json::from_value(serde_json::json!({
+            "geometry": {"coordinates": [16.39, 48.218]},
+            "properties": properties,
+        }))
+        .expect("an og feature")
+    }
+
+    #[test]
+    fn a_house_is_labelled_by_its_postal_lines_in_its_town() {
+        let vienna = feature(&serde_json::json!({
+            "id": "osm:node:1", "layer": "address", "accuracy": "rooftop",
+            "name": "42 Heinestraße", "label": "42 Heinestraße, Leopoldstadt, 1020, AT",
+            "address": {"housenumber": "42", "street": "Heinestraße",
+                        "locality": "Leopoldstadt", "postcode": "1020"},
+            "context": {"sublocality": {"name": "Leopoldstadt"}, "locality": {"name": "Wien"},
+                        "country": {"name": "Austria", "code": "AT"}},
+            "address_lines": ["Heinestraße 42", "1020 Leopoldstadt", "Austria"],
+            "highlights": [{"start": 3, "end": 14}],
+        }));
+        let found = item(&vienna);
+        assert_eq!(found.title, "Heinestraße 42, 1020 Wien, Austria");
+        assert_eq!(found.address.label.as_deref(), Some(found.title.as_str()));
+        let marks = highlights(&vienna.properties);
+        assert_eq!(marks.address.label, [Highlight { start: 0, end: 11 }]);
+        assert_eq!(marks.title, [Highlight { start: 0, end: 11 }]);
+
+        let boston = feature(&serde_json::json!({
+            "id": "osm:node:2", "layer": "address", "accuracy": "rooftop",
+            "name": "240 Washington Street", "label": "240 Washington Street, Boston, MA, 02108",
+            "address": {"housenumber": "240", "street": "Washington Street",
+                        "locality": "Boston", "region": "MA", "postcode": "02108"},
+            "context": {"locality": {"name": "Boston"},
+                        "country": {"name": "United States", "code": "US"}},
+            "address_lines": ["240 Washington Street", "Boston, MA 02108", "United States"],
+        }));
+        assert_eq!(
+            item(&boston).title,
+            "240 Washington St, Boston, MA 02108, United States"
+        );
+    }
+
+    #[test]
+    fn marks_follow_their_text_to_the_new_label() {
+        let from = "15 Schillerstraße, Frankfurt, 60313";
+        let marks = [
+            Highlight { start: 0, end: 2 },
+            Highlight { start: 3, end: 9 },
+        ];
+        let to = "Schillerstraße 15, 60313 Frankfurt";
+        assert_eq!(
+            moved(from, &marks, to),
+            [
+                Highlight { start: 0, end: 6 },
+                Highlight { start: 15, end: 17 }
+            ]
+        );
+        assert_eq!(moved(from, &marks, "Elsewhere"), []);
     }
 }
