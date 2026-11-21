@@ -995,9 +995,9 @@ pub(super) async fn autosuggest(
 }
 
 /// The searches HERE offers ahead of the places: a `categoryQuery` for each
-/// category whose name the typed word begins, and a `chainQuery` for a chain
-/// the query names whole. Their titles are og's English names, so they are
-/// offered in English only. Each runs as og's own `/discover`.
+/// category whose name the typed word begins, in the language asked, and a
+/// `chainQuery` for a chain the query names whole, whose name is its own in
+/// every language. Each runs as og's own `/discover`.
 fn query_items(
     state: &AppState,
     headers: &HeaderMap,
@@ -1006,10 +1006,7 @@ fn query_items(
     q: &str,
     collection: &ForwardCollection,
 ) -> Vec<Item> {
-    let english = og_lang(params).is_none_or(|lang| lang == "en" || lang.starts_with("en-"));
-    if !english {
-        return Vec::new();
-    }
+    let language = og_lang(params);
     let path = uri.path();
     let prefix = path.find("/v1/").map_or("", |at| &path[..at]);
     let href = |title: &str| {
@@ -1025,7 +1022,7 @@ fn query_items(
             serde_urlencoded::to_string(&query).unwrap_or_default()
         )
     };
-    let mut items = super::category::begun_by(q)
+    let mut items = super::category::begun_by(q, language.as_deref())
         .into_iter()
         .map(|(id, name, start, end)| {
             Item::query(

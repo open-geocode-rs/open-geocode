@@ -2604,17 +2604,32 @@ async fn autosuggest_offers_category_and_chain_searches() {
             .iter()
             .all(|item| item["resultType"] != "categoryQuery")
     );
+    // In German, og's German name of the kind, and a chain's own name.
     let german = get(
         &router,
-        "/compat/here/v1/autosuggest?q=bake&at=43,-79&lang=de",
+        "/compat/here/v1/autosuggest?q=b%C3%A4ck&at=43,-79&lang=de",
+    )
+    .await;
+    let first = &german.json()["items"][0];
+    assert_eq!(first["resultType"], "categoryQuery", "{}", german.text());
+    assert!(
+        first["title"]
+            .as_str()
+            .is_some_and(|title| title.starts_with("Bäck")),
+        "{}",
+        german.text()
+    );
+    let chain = get(
+        &router,
+        "/compat/here/v1/autosuggest?q=Queen%20Bakery&at=43,-79&lang=de",
     )
     .await;
     assert!(
-        german.json()["items"]
+        chain.json()["items"]
             .as_array()
             .expect("items")
             .iter()
-            .all(|item| item["resultType"] != "categoryQuery")
+            .any(|item| item["resultType"] == "chainQuery")
     );
 }
 

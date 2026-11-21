@@ -26,13 +26,15 @@ use crate::util::fold::search_key;
 #[derive(Deserialize)]
 struct Catalog {
     /// `[preset id, category, group indexes]`.
-    presets: Vec<(IgnoredAny, String, Vec<usize>)>,
+    presets: Vec<(String, String, Vec<usize>)>,
     /// `[group id, words of every language]`.
     groups: Vec<(IgnoredAny, Vec<GroupWord>)>,
     /// Preset names of every language, then preset indexes.
     names: BTreeMap<String, Vec<usize>>,
     /// Names only a regional variant gives (en-AU "Pharmacy" for a chemist).
     regional: BTreeMap<String, Vec<usize>>,
+    /// Each preset's name in each language as written, by preset index.
+    titles: Vec<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +53,10 @@ struct Table {
     /// Strong words with a minimum prefix length, sorted by word for a range
     /// scan from a typed prefix.
     prefixed: Vec<Prefixed>,
+    /// Each category's name in each language as written, from the preset of
+    /// the category's own tag (`amenity/cafe` for `amenity cafe`), else its
+    /// first preset.
+    titles: HashMap<String, BTreeMap<String, String>>,
 }
 
 struct Prefixed {
@@ -152,12 +158,31 @@ fn build(catalog: &Catalog) -> Table {
             .map(|(word, set)| (word, set.into_iter().collect()))
             .collect()
     };
+    let mut titles = HashMap::<String, BTreeMap<String, String>>::new();
+    for ((id, category, _), named) in catalog.presets.iter().zip(&catalog.titles) {
+        let own = id.replace('/', " ") == *category;
+        if own || !titles.contains_key(category) {
+            titles.insert(category.clone(), named.clone());
+        }
+    }
     Table {
         categories,
         strong: frozen(strong),
         name_words: frozen(name_words),
         prefixed,
+        titles,
     }
+}
+
+/// The name of a category (`amenity cafe`) in `language` (`de`, `pt-BR`),
+/// as the catalog writes it, or in the language's base (`pt` of `pt-BR`).
+/// `None` where the catalog names it in neither.
+pub fn title(category: &str, language: &str) -> Option<&'static str> {
+    let named = table().titles.get(category)?;
+    named
+        .get(language)
+        .or_else(|| named.get(language.split('-').next()?))
+        .map(String::as_str)
 }
 
 /// The categories a whole word or phrase names, sorted, from its strongest
@@ -487,6 +512,15 @@ mod tests {
         );
         assert_eq!(request("pharmacy near me"), Some(None));
         assert_eq!(request("starbucks seattle"), None);
+    }
+
+    #[test]
+    fn a_category_is_titled_in_the_language_asked() {
+        assert_eq!(title("amenity cafe", "de"), Some("Café"));
+        assert_eq!(title("shop bakery", "fr"), Some("Boulangerie"));
+        assert_eq!(title("shop bakery", "fr-CA"), Some("Boulangerie"));
+        assert_eq!(title("shop bakery", "xx"), None);
+        assert_eq!(title("no such", "en"), None);
     }
 
     /// The binary carries the compressed copy; it must be the catalog's.

@@ -237,21 +237,37 @@ pub(super) fn of_place(category: &str) -> Vec<ItemCategory> {
 }
 
 /// The categories a typed word begins a word of the name of, as HERE
-/// offers them as searches, each with its id, its name and where the typed
-/// word lies in the name, in characters. A word as short as `re` begins
-/// many names and means none of them, so a shorter one offers none.
-pub(super) fn begun_by(typed: &str) -> Vec<(&'static str, &'static str, usize, usize)> {
+/// offers them as searches, each with its id, its name in `language` and
+/// where the typed word lies in that name, in characters. In English the
+/// name is HERE's, in another language og's catalog name of the kind, and
+/// a kind the catalog does not name in that language is offered in none. A
+/// word as short as `re` begins many names and means none of them, so a
+/// shorter one offers none.
+pub(super) fn begun_by(
+    typed: &str,
+    language: Option<&str>,
+) -> Vec<(&'static str, &'static str, usize, usize)> {
     let typed = typed.trim().to_lowercase();
     let length = typed.chars().count();
     if length < crate::search::MIN_TYPO_CHARS || typed.contains(char::is_whitespace) {
         return Vec::new();
     }
+    let english = language.is_none_or(|code| code == "en" || code.starts_with("en-"));
     let mut found = Vec::new();
     for listed in CATEGORIES {
+        let name = match english {
+            true => Some(listed.name),
+            false => language
+                .zip(listed.og.first())
+                .and_then(|(code, kind)| categories::title(kind, code)),
+        };
+        let Some(name) = name else {
+            continue;
+        };
         let mut at = 0;
-        for word in listed.name.split(|c: char| c.is_whitespace() || c == '-') {
+        for word in name.split(|c: char| c.is_whitespace() || c == '-') {
             if word.to_lowercase().starts_with(&typed) {
-                found.push((listed.id, listed.name, at, at + length));
+                found.push((listed.id, name, at, at + length));
                 break;
             }
             at += word.chars().count() + 1;
@@ -376,8 +392,11 @@ mod tests {
 
     #[test]
     fn a_typed_word_offers_the_categories_whose_names_it_begins() {
-        assert_eq!(begun_by("rest"), [("100-1000-0000", "Restaurant", 0, 4)]);
-        let stores = begun_by("Store");
+        assert_eq!(
+            begun_by("rest", None),
+            [("100-1000-0000", "Restaurant", 0, 4)]
+        );
+        let stores = begun_by("Store", None);
         assert!(
             stores.contains(&("600-6600-0080", "Furniture Store", 10, 15)),
             "{stores:?}"
@@ -387,8 +406,18 @@ mod tests {
                 .iter()
                 .all(|(_, name, from, to)| &name[*from..*to] == "Store")
         );
-        assert!(begun_by("res").is_empty(), "too short to mean a kind");
-        assert!(begun_by("zzzz").is_empty());
+        assert!(begun_by("res", None).is_empty(), "too short to mean a kind");
+        assert!(begun_by("zzzz", None).is_empty());
+        // In another language, og's catalog name of the kind.
+        assert!(
+            begun_by("bäck", Some("de"))
+                .iter()
+                .any(|(id, name, from, to)| *id == "600-6300-0244"
+                    && name.starts_with("Bäck")
+                    && (*from, *to) == (0, 4)),
+            "{:?}",
+            begun_by("bäck", Some("de"))
+        );
     }
 
     #[test]
