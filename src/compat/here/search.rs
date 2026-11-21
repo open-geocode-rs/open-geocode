@@ -957,6 +957,28 @@ pub(super) async fn discover(
         if q.trim().is_empty() {
             return Ok(page(Vec::new(), offset, limit, false));
         }
+        // A query that is a position answers the address nearest it.
+        if let Some([lon, lat]) = super::super::position::parse(q) {
+            let fields = vec![
+                ("lon", lon.to_string()),
+                ("lat", lat.to_string()),
+                ("layer", "address".to_string()),
+                ("radius", crate::reverse::MAX_RADIUS_M.to_string()),
+            ];
+            let collection = native::reverse(&state, args(fields).maybe("lang", og_lang(&params)))
+                .await
+                .map_err(Gs7Error::of)?;
+            let items = reverse_features(&collection)
+                .iter()
+                .map(|feature| {
+                    item(feature)
+                        .without_scoring()
+                        .with_details(feature)
+                        .distance_from(near.center)
+                })
+                .collect();
+            return Ok(page(items, offset, limit, false));
+        }
         // Along a route og is asked for all it gives, since the corridor
         // drops what lies off it.
         let ask = match corridor {

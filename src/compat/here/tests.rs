@@ -2487,6 +2487,26 @@ async fn a_feature_reads_alike_from_og_and_from_its_json() {
 
 /// A route og cannot search along is refused, in the query string as in
 /// the body, rather than answered as a search around nothing.
+/// A query that is a position answers the address nearest it, at its
+/// distance from `at`.
+#[tokio::test]
+async fn discover_answers_the_address_nearest_a_position_query() {
+    let pack = pack("position");
+    let router = pack.router();
+    for q in ["43.0001,-79.0021", "43%200%200.4%20N%2079%200%207.6%20W"] {
+        let reply = get(
+            &router,
+            &format!("/compat/here/v1/discover?at=43.01,-79&q={q}"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{q}: {}", reply.text());
+        let item = &reply.json()["items"][0];
+        assert_eq!(item["resultType"], "houseNumber", "{q}: {}", reply.text());
+        let distance = item["distance"].as_i64().expect("a distance");
+        assert!((1_000..1_200).contains(&distance), "{q}: {distance}");
+    }
+}
+
 #[tokio::test]
 async fn a_search_along_a_route_keeps_what_lies_by_it() {
     let pack = pack("route");
