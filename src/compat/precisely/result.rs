@@ -427,6 +427,59 @@ impl Feature {
         })
     }
 
+    /// Judges the street's type and direction apart from its name, as
+    /// Precisely describes them: each is `EXACT` where the asked street and
+    /// the record agree on it, neither stating one included, and `NONE`
+    /// where they differ or the street did not match. og reads both streets
+    /// with its own street split.
+    pub(super) fn judge_street_parts(&self, candidate: &mut Candidate, asked: Option<&str>) {
+        let description = &mut candidate.explanation.address_match.description;
+        let street_matched = description
+            .iter()
+            .any(|entry| entry.label == "street" && entry.match_type != "NONE");
+        let Some(asked) = asked.filter(|_| street_matched) else {
+            return;
+        };
+        let held = self
+            .properties
+            .address
+            .street
+            .as_deref()
+            .unwrap_or_default();
+        let (asked, held) = (
+            crate::road::StreetParts::of(asked).unwrap_or_default(),
+            crate::road::StreetParts::of(held).unwrap_or_default(),
+        );
+        let key = |word: &str| {
+            crate::util::fold::search_key(word.trim_end_matches('.')).unwrap_or_default()
+        };
+        let same_kind = |left: Option<&str>, right: Option<&str>| match (left, right) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                let (left, right) = (key(left), key(right));
+                left == right
+                    || crate::parse::lattice::other_forms(&left).contains(&right)
+                    || crate::parse::lattice::other_forms(&right).contains(&left)
+            }
+            _ => false,
+        };
+        let direction = |parts: &crate::road::StreetParts<'_>| {
+            parts
+                .prefix
+                .or(parts.suffix)
+                .and_then(|word| crate::road::direction_of(&key(word)))
+        };
+        let judged = [
+            ("streetType", same_kind(asked.kind, held.kind)),
+            ("streetDirectional", direction(&asked) == direction(&held)),
+        ];
+        for entry in description.iter_mut() {
+            if let Some((_, agrees)) = judged.iter().find(|(label, _)| *label == entry.label) {
+                entry.match_type = if *agrees { "EXACT" } else { "NONE" };
+            }
+        }
+    }
+
     /// A reverse geocode candidate. It carries how far the result is from
     /// the asked point in the custom fields Precisely writes it to. An area
     /// holds the point, so it has none.

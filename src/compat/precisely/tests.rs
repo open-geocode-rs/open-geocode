@@ -508,7 +508,10 @@ fn address_result(score: &Value, exact: &[&str]) -> Value {
     ]
     .iter()
     .map(|label| {
-        let kind = if exact.contains(label) {
+        // The street is asked whole, so its type and direction agree too.
+        let street_part =
+            matches!(*label, "streetType" | "streetDirectional") && exact.contains(&"street");
+        let kind = if exact.contains(label) || street_part {
             "EXACT"
         } else {
             "NONE"
@@ -553,6 +556,44 @@ fn address_result(score: &Value, exact: &[&str]) -> Value {
         "explanation": {"addressMatch": {"type": "ADDRESS", "description": description}},
         "customFields": {"PB_KEY": address_vendor_id("osm:node:10")},
     })
+}
+
+/// The street's type and direction are judged apart from its name: each
+/// agrees, neither stating one included, or not.
+#[tokio::test]
+async fn geocode_judges_a_streets_type_and_direction_apart() {
+    let fixture = Fixture::new("street-parts");
+    let router = fixture.router();
+    let judged = |line: &'static str| {
+        let router = router.clone();
+        async move {
+            let reply = post(
+                &router,
+                "/v1/geocode",
+                &json!({"addresses": [{"addressLines": [line], "country": "CAN"}]}),
+            )
+            .await;
+            let description = reply.json()["responses"][0]["results"][0]["explanation"]["addressMatch"]["description"].clone();
+            let of = |label: &str| {
+                description
+                    .as_array()
+                    .and_then(|parts| parts.iter().find(|part| part["label"] == label))
+                    .map(|part| part["matchType"].clone())
+            };
+            (of("street"), of("streetType"), of("streetDirectional"))
+        }
+    };
+    assert_eq!(
+        judged("100 King Street West, Toronto").await,
+        (
+            Some(json!("EXACT")),
+            Some(json!("EXACT")),
+            Some(json!("EXACT"))
+        )
+    );
+    // `St` is the type written short, and no direction is asked.
+    assert_eq!(judged("100 King St, Toronto").await.1, Some(json!("EXACT")));
+    assert_eq!(judged("100 King St, Toronto").await.2, Some(json!("NONE")));
 }
 
 #[tokio::test]

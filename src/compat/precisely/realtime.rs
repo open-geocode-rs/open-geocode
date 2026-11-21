@@ -240,12 +240,22 @@ impl Outcome {
         features: &'a [T],
         max: usize,
         product: Product,
+        asked_street: Option<&str>,
     ) -> Self
     where
         &'a T: Into<Feature>,
     {
         let features = features.iter().map(Into::into).collect::<Vec<_>>();
-        Self::found(address_id, &features, max, product)
+        let results = features
+            .iter()
+            .take(max)
+            .map(|feature| {
+                let mut candidate = feature.candidate(product);
+                feature.judge_street_parts(&mut candidate, asked_street);
+                candidate
+            })
+            .collect::<Vec<_>>();
+        Self::answered(address_id, results)
     }
 }
 
@@ -363,6 +373,15 @@ async fn addresses(
     let mut outcomes = Vec::new();
     for address in checked(body.addresses)? {
         let address_id = address.address_id.clone();
+        // The street as og reads the asked address, to judge its type and
+        // direction apart.
+        let asked = address.street_line().unwrap_or_else(|| address.text());
+        let asked_street = state.searcher().best_parse(&asked).map(|parsed| {
+            parsed
+                .words(crate::parse::types::Label::Street)
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
         outcomes.push(
             match native::geocode(
                 &state,
@@ -370,9 +389,13 @@ async fn addresses(
             )
             .await
             {
-                Ok(collection) => {
-                    Outcome::of_features(address_id, &collection.features, max, product)
-                }
+                Ok(collection) => Outcome::of_features(
+                    address_id,
+                    &collection.features,
+                    max,
+                    product,
+                    asked_street.as_deref().filter(|street| !street.is_empty()),
+                ),
                 Err(problem) => Outcome::refused(address_id, problem, address.country()),
             },
         );
