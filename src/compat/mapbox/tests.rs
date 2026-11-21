@@ -1205,6 +1205,22 @@ async fn search_box_reverse_keys_context_by_id() {
         None
     );
     assert_eq!(body["features"].as_array().map(Vec::len), Some(1));
+
+    // Without a type the point's areas follow the house, as many as asked.
+    let count = |limit: &str| {
+        let router = router.clone();
+        let uri = format!(
+            "/compat/mapbox/search/searchbox/v1/reverse?longitude=-79.0&latitude=43.0{limit}"
+        );
+        async move {
+            let (status, body) = get(&router, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["features"].as_array().map(Vec::len).expect("features")
+        }
+    };
+    assert!(count("").await > 1);
+    assert_eq!(count("&limit=1").await, 1);
+    assert_eq!(count("&limit=2").await, 2);
 }
 
 #[tokio::test]

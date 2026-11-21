@@ -759,6 +759,10 @@ fn reverse_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
                 .filter(|_| layer.is_some())
                 .map(|limit| limit.to_string()),
         )
+        .set(
+            "radius",
+            crate::compat::radius(crate::compat::NEAREST_HOUSE_RADIUS_M),
+        )
         .maybe("lang", (!languages.is_empty()).then(|| languages.join(",")));
     Ok(Plan {
         lookup: Lookup::Reverse {

@@ -255,6 +255,23 @@ pub(super) fn language(params: &Params) -> &str {
 /// Search Box's largest `limit` on `suggest` and `forward`.
 const MAX_LIMIT: usize = 10;
 
+/// `limit`, checked against Search Box's largest.
+fn limit(params: &Params) -> Result<Option<usize>, VendorError> {
+    params
+        .get("limit")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|limit| (1..=MAX_LIMIT).contains(limit))
+                .ok_or_else(|| {
+                    Api::SearchBox
+                        .invalid(format!("limit must be a number between 1 and {MAX_LIMIT}"))
+                })
+        })
+        .transpose()
+}
+
 /// What a text search asks of og beyond its text, checked.
 struct Asked {
     limit: Option<usize>,
@@ -288,19 +305,7 @@ impl Asked {
         {
             return Err(Api::SearchBox.invalid(format!("{name} is not supported by this server")));
         }
-        let limit = params
-            .get("limit")
-            .map(|value| {
-                value
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|limit| (1..=MAX_LIMIT).contains(limit))
-                    .ok_or_else(|| {
-                        Api::SearchBox
-                            .invalid(format!("limit must be a number between 1 and {MAX_LIMIT}"))
-                    })
-            })
-            .transpose()?;
+        let limit = limit(params)?;
         let categories = |name: &str| {
             params
                 .get(name)
@@ -474,12 +479,28 @@ pub(super) async fn reverse(
     let types = params.types(Api::SearchBox)?;
     let countries = super::countries(Api::SearchBox, &params)?;
     let (lon, lat) = params.point(Api::SearchBox)?;
+    let limit = limit(&params)?;
+    let layer = types.as_ref().and_then(Types::reverse_layer);
     let args = Args::new()
         .set("lon", lon)
         .set("lat", lat)
-        .maybe("layer", types.as_ref().and_then(Types::reverse_layer))
+        .maybe("layer", layer)
+        // og answers several of one layer only when asked for that layer.
+        .maybe(
+            "limit",
+            limit
+                .filter(|_| layer.is_some())
+                .map(|limit| limit.to_string()),
+        )
+        .set(
+            "radius",
+            crate::compat::radius(crate::compat::NEAREST_HOUSE_RADIUS_M),
+        )
         .set("lang", language(&params));
     let mut collection = native::reverse(&state, args).await.map_err(failed)?;
     super::keep_countries(&mut collection, &countries);
+    if let Some(limit) = limit {
+        collection.features.truncate(limit);
+    }
     Ok(Json(Collection::reverse(&collection, types.as_ref())))
 }
