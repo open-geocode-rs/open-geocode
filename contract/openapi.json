@@ -419,6 +419,11 @@
             "maxLength": 128,
             "type": "string"
           },
+          "lang": {
+            "description": "ISO 639 language tag, such as es. Names come in this language where the Pack has one, and in the local language where it has not. The Pack must have been built with --lang.",
+            "example": "es",
+            "type": "string"
+          },
           "layer": {
             "$ref": "#/components/schemas/Layer"
           },
@@ -684,6 +689,11 @@
             "example": "osm:node:1383955044",
             "type": "string"
           },
+          "lang": {
+            "description": "ISO 639 language tag, such as es. Names come in this language where the Pack has one, and in the local language where it has not. The Pack must have been built with --lang.",
+            "example": "es",
+            "type": "string"
+          },
           "limit": {
             "description": "Maximum number of results. `0`, the default, lets the server choose.",
             "maximum": 50,
@@ -869,6 +879,11 @@
             "description": "Echoed in this item's result, to match it up.",
             "example": "row-1",
             "maxLength": 128,
+            "type": "string"
+          },
+          "lang": {
+            "description": "ISO 639 language tag, such as es. Names come in this language where the Pack has one, and in the local language where it has not. The Pack must have been built with --lang.",
+            "example": "es",
             "type": "string"
           },
           "lat": {
@@ -1073,6 +1088,16 @@
             "example": "-79.64,43.58,-79.12,43.86",
             "in": "query",
             "name": "bbox",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "ISO 639 language tag, such as es. Names come in this language where the Pack has one, and in the local language where it has not. The Pack must have been built with --lang.",
+            "example": "es",
+            "in": "query",
+            "name": "lang",
             "required": false,
             "schema": {
               "type": "string"
@@ -1294,6 +1319,16 @@
             "example": "NZ,AU",
             "in": "query",
             "name": "country",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "ISO 639 language tag, such as es. Names come in this language where the Pack has one, and in the local language where it has not. The Pack must have been built with --lang.",
+            "example": "es",
+            "in": "query",
+            "name": "lang",
             "required": false,
             "schema": {
               "type": "string"
@@ -1551,6 +1586,16 @@
             "example": "CA",
             "in": "query",
             "name": "country",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "ISO 639 language tag, such as es. Names come in this language where the Pack has one, and in the local language where it has not. The Pack must have been built with --lang. Applies to every item; an item's own field overrides it.",
+            "example": "es",
+            "in": "query",
+            "name": "lang",
             "required": false,
             "schema": {
               "type": "string"
@@ -1934,6 +1979,16 @@
             "example": "CA",
             "in": "query",
             "name": "country",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "ISO 639 language tag, such as `es`, every row's names come in. The Pack must have been built with `--lang`.",
+            "example": "es",
+            "in": "query",
+            "name": "lang",
             "required": false,
             "schema": {
               "type": "string"
@@ -2609,6 +2664,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "ISO 639 language tag, such as es. Names come in this language where the Pack has one, and in the local language where it has not. The Pack must have been built with --lang.",
+            "example": "es",
+            "in": "query",
+            "name": "lang",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -2873,6 +2938,16 @@
             "description": "Return only results inside this box, as `min_lon,min_lat,max_lon,max_lat`. Applies to every item; an item's own field overrides it.",
             "in": "query",
             "name": "bbox",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "ISO 639 language tag, such as es. Names come in this language where the Pack has one, and in the local language where it has not. The Pack must have been built with --lang. Applies to every item; an item's own field overrides it.",
+            "example": "es",
+            "in": "query",
+            "name": "lang",
             "required": false,
             "schema": {
               "type": "string"
@@ -3233,6 +3308,16 @@
             "schema": {
               "$ref": "#/components/schemas/Layer"
             }
+          },
+          {
+            "description": "ISO 639 language tag, such as es. Names come in this language where the Pack has one, and in the local language where it has not. The Pack must have been built with --lang.",
+            "example": "es",
+            "in": "query",
+            "name": "lang",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -3442,6 +3527,16 @@
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/Layer"
+            }
+          },
+          {
+            "description": "ISO 639 language tag, such as es. Names come in this language where the Pack has one, and in the local language where it has not. The Pack must have been built with --lang. Applies to every item; an item's own field overrides it.",
+            "example": "es",
+            "in": "query",
+            "name": "lang",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],

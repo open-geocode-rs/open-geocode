@@ -255,6 +255,9 @@ pub(crate) struct GeocodeItem {
     /// ISO 3166-1 alpha-2 codes, comma-separated.
     #[schema(example = "CA")]
     pub country: Option<String>,
+    /// ISO 639 language tag, such as es. Names come in this language where the Pack has one, and in the local language where it has not. The Pack must have been built with --lang.
+    #[schema(example = "es")]
+    pub lang: Option<String>,
 }
 
 /// One item of a `/places` batch: `GET /places`' parameters and an `id`.
@@ -287,6 +290,9 @@ pub(crate) struct PlacesItem {
     /// `min_lon,min_lat,max_lon,max_lat`.
     #[schema(example = "4.73,52.28,5.07,52.43")]
     pub bbox: Option<String>,
+    /// ISO 639 language tag, such as es. Names come in this language where the Pack has one, and in the local language where it has not. The Pack must have been built with --lang.
+    #[schema(example = "es")]
+    pub lang: Option<String>,
 }
 
 /// One item of a `/reverse` batch: `GET /reverse`'s parameters and an `id`.
@@ -304,6 +310,9 @@ pub(crate) struct ReverseItem {
     #[schema(example = 43.6532, minimum = -90.0, maximum = 90.0)]
     pub lat: Option<f64>,
     pub layer: Option<Layer>,
+    /// ISO 639 language tag, such as es. Names come in this language where the Pack has one, and in the local language where it has not. The Pack must have been built with --lang.
+    #[schema(example = "es")]
+    pub lang: Option<String>,
 }
 
 /// A forward batch's answer: one result per item, in input order.

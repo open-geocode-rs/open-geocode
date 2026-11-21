@@ -127,6 +127,8 @@ pub struct Fingerprint {
     pub addresses: Option<String>,
     /// The address files it imported, once it has.
     pub imported: Vec<FileStamp>,
+    /// The languages whose names the Pack keeps, normalised and sorted.
+    pub languages: Vec<String>,
 }
 
 impl Fingerprint {
@@ -135,6 +137,7 @@ impl Fingerprint {
         inputs: &[PathBuf],
         input_sources: &[String],
         addresses: Option<String>,
+        languages: Vec<String>,
     ) -> Result<Self> {
         Ok(Self {
             og_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -146,6 +149,7 @@ impl Fingerprint {
             input_sources: input_sources.to_vec(),
             addresses,
             imported: Vec::new(),
+            languages,
         })
     }
 
@@ -186,6 +190,12 @@ impl Fingerprint {
                 "addresses were added from {}, are from {}",
                 self.addresses.as_deref().unwrap_or("nothing"),
                 now.addresses.as_deref().unwrap_or("nothing")
+            ));
+        }
+        if self.languages != now.languages {
+            out.push(format!(
+                "names were kept in {:?}, are kept in {:?}",
+                self.languages, now.languages
             ));
         }
         for file in &self.imported {

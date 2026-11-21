@@ -27,7 +27,7 @@ use tower_http::{
 };
 
 use crate::{
-    api::{self, ForwardCollection, ReverseCollection},
+    api::{self, ForwardCollection, Language, ReverseCollection},
     categories,
     http::{
         batch::{self, Lookup},
@@ -202,6 +202,8 @@ pub(crate) struct PlacesParams {
     country: Param,
     focus: Param,
     bbox: Param,
+    /// ISO 639 language tag; see [`parse_language`].
+    lang: Param,
 }
 
 /// `/autocomplete`: unlike `/places`, an empty `q` answers no suggestions
@@ -221,6 +223,8 @@ pub(crate) struct AutocompleteParams {
     focus: Param,
     /// `min_lon,min_lat,max_lon,max_lat`; see [`bounds::parse_bbox`].
     bbox: Param,
+    /// ISO 639 language tag; see [`parse_language`].
+    lang: Param,
 }
 
 /// Resolve the `layer` filter, rejecting a layer that does not exist.
@@ -286,6 +290,41 @@ fn parse_countries(country: &Param) -> Result<Vec<String>, Problem> {
     Ok(codes)
 }
 
+fn parse_language(lang: &Param, pack: &Reader) -> Result<Option<Language>, Problem> {
+    let value = match lang {
+        Param::Missing | Param::Empty => return Ok(None),
+        Param::Value(value) => value.trim(),
+    };
+    let Some(tag) = crate::translations::parse_language(value) else {
+        return Err(Problem::malformed_parameter(format!(
+            "language {value:?} is not a language tag, such as es or zh-Hans"
+        ))
+        .with_invalid_params(vec![InvalidParam::new("lang", "not a language tag")]));
+    };
+    match pack.translations() {
+        None => Err(language_not_built(&tag, &[])),
+        Some(translations) if !translations.holds(&tag) => {
+            Err(language_not_built(&tag, &translations.languages()))
+        }
+        Some(translations) => Ok(Some(Language::new(Arc::clone(translations), tag))),
+    }
+}
+
+fn language_not_built(tag: &str, held: &[&str]) -> Problem {
+    let detail = if held.is_empty() {
+        format!("this Pack was built without languages; rebuild it with --lang {tag}")
+    } else {
+        format!(
+            "this Pack was built with {}; rebuild it with --lang {tag}",
+            held.join(", ")
+        )
+    };
+    Problem::malformed_parameter(detail).with_invalid_params(vec![InvalidParam::new(
+        "lang",
+        "the Pack has no such language",
+    )])
+}
+
 /// `/geocode`: an address as free text in `q`, or one whose parts the
 /// caller already has apart.
 #[derive(Debug, Deserialize)]
@@ -305,6 +344,8 @@ pub(crate) struct GeocodeParams {
     layer: Param,
     /// Comma-separated ISO 3166-1 alpha-2 codes; see [`parse_countries`].
     country: Param,
+    /// ISO 639 language tag; see [`parse_language`].
+    lang: Param,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,6 +354,8 @@ pub(crate) struct ReverseParams {
     lat: f64,
     /// See [`parse_layer`].
     layer: Param,
+    /// ISO 639 language tag; see [`parse_language`].
+    lang: Param,
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
@@ -613,6 +656,12 @@ fn malformed_parameters(_: QueryRejection) -> Problem {
                         `min_lon,min_lat,max_lon,max_lat`. The box cannot cross \
                         the antimeridian.",
          example = "4.73,52.28,5.07,52.43"),
+        ("lang" = Option<String>, Query,
+         description = "ISO 639 language tag, such as es. Names come in this \
+                        language where the Pack has one, and in the local \
+                        language where it has not. The Pack must have been \
+                        built with --lang.",
+         example = "es"),
     ),
     responses(
         (status = 200, description = "Matching places, highest `score` first.",
@@ -684,6 +733,13 @@ pub(crate) async fn places(
          description = "Return only results inside this box, as \
                         `min_lon,min_lat,max_lon,max_lat`. Applies to every item; \
                         an item's own field overrides it."),
+        ("lang" = Option<String>, Query,
+         description = "ISO 639 language tag, such as es. Names come in this \
+                        language where the Pack has one, and in the local \
+                        language where it has not. The Pack must have been \
+                        built with --lang. Applies to every item; an item's \
+                        own field overrides it.",
+         example = "es"),
     ),
     request_body(content = Vec<openapi::PlacesItem>, content_type = "application/json"),
     responses(
@@ -719,16 +775,18 @@ pub(crate) const PLACES: Lookup<PlacesParams, PlacesRequest, ForwardCollection, 
 
 #[derive(Clone)]
 pub(crate) enum PlacesRequest {
-    Text(TextSearchOptions),
+    Text(TextSearchOptions, Option<Language>),
     Ids {
         catalogue: Arc<Catalogue>,
         /// In the order asked, without the ids no record can have.
         ids: Vec<(ObjectType, i64)>,
+        language: Option<Language>,
     },
 }
 
 /// `/places`' parameters, checked.
 fn places_request(state: &AppState, params: PlacesParams) -> Result<PlacesRequest, Problem> {
+    let language = parse_language(&params.lang, state.pack())?;
     let q = match (params.q, params.ids) {
         (Param::Missing, Param::Missing) => {
             return Err(Problem::invalid_query("give q, or ids"));
@@ -743,7 +801,11 @@ fn places_request(state: &AppState, params: PlacesParams) -> Result<PlacesReques
                     "this Pack has no id catalogue: rebuild it to look places up by id",
                 ));
             };
-            return Ok(PlacesRequest::Ids { catalogue, ids });
+            return Ok(PlacesRequest::Ids {
+                catalogue,
+                ids,
+                language,
+            });
         }
         (Param::Empty | Param::Value(_), Param::Empty | Param::Value(_)) => {
             return Err(Problem::malformed_parameter("give q or ids, not both")
@@ -757,7 +819,7 @@ fn places_request(state: &AppState, params: PlacesParams) -> Result<PlacesReques
         focus: params.focus,
         bbox: params.bbox,
     })
-    .map(PlacesRequest::Text)
+    .map(|options| PlacesRequest::Text(options, language))
 }
 
 /// Names that read alike sit together, as `/geocode`'s text queries do. An
@@ -765,18 +827,22 @@ fn places_request(state: &AppState, params: PlacesParams) -> Result<PlacesReques
 /// place and run first.
 fn places_place(request: &PlacesRequest) -> String {
     match request {
-        PlacesRequest::Text(options) => options.query.to_lowercase(),
+        PlacesRequest::Text(options, _) => options.query.to_lowercase(),
         PlacesRequest::Ids { .. } => String::new(),
     }
 }
 
 fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardCollection> {
-    let (catalogue, ids) = match request {
-        PlacesRequest::Text(options) => {
+    let (catalogue, ids, language) = match request {
+        PlacesRequest::Text(options, language) => {
             let hits = state.places.search(&options)?;
-            return api::forward_collection(&state.pack, options.query, hits);
+            return api::forward_collection(&state.pack, options.query, hits, language.as_ref());
         }
-        PlacesRequest::Ids { catalogue, ids } => (catalogue, ids),
+        PlacesRequest::Ids {
+            catalogue,
+            ids,
+            language,
+        } => (catalogue, ids, language),
     };
     let records = state.pack.records();
     let mut hits = Vec::new();
@@ -792,7 +858,7 @@ fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardColl
         .iter()
         .map(|(kind, id)| labels::osm_record_id(*kind, *id))
         .collect::<Vec<_>>();
-    api::forward_collection(&state.pack, asked.join(","), hits)
+    api::forward_collection(&state.pack, asked.join(","), hits, language.as_ref())
 }
 
 fn no_ids() -> Problem {
@@ -906,6 +972,12 @@ fn text_request(params: TextParams) -> Result<TextSearchOptions, Problem> {
                         `min_lon,min_lat,max_lon,max_lat`. The box cannot cross \
                         the antimeridian.",
          example = "-79.64,43.58,-79.12,43.86"),
+        ("lang" = Option<String>, Query,
+         description = "ISO 639 language tag, such as es. Names come in this \
+                        language where the Pack has one, and in the local \
+                        language where it has not. The Pack must have been \
+                        built with --lang.",
+         example = "es"),
     ),
     responses(
         (status = 200, description = "Suggested results, best first.",
@@ -932,6 +1004,7 @@ pub(crate) async fn autocomplete(
         Param::Value(q) => bounds::validate_query_length(q)?,
     };
     bounds::validate_autocomplete_limit(params.limit)?;
+    let language = parse_language(&params.lang, state.pack())?;
     let layer = parse_layer(&params.layer)?;
     let countries = parse_countries(&params.country)?;
     let focus = bounds::parse_focus(&params.focus)?;
@@ -958,7 +1031,7 @@ pub(crate) async fn autocomplete(
                 nearest_of_category(&worker, &options, named)?
             }
         };
-        api::forward_collection(&worker.pack, query, hits)
+        api::forward_collection(&worker.pack, query, hits, language.as_ref())
     })
     .await?;
 
@@ -1157,6 +1230,12 @@ fn place_named(
                         returns `400`. A code the Pack does not cover returns no \
                         results.",
          example = "NZ,AU"),
+        ("lang" = Option<String>, Query,
+         description = "ISO 639 language tag, such as es. Names come in this \
+                        language where the Pack has one, and in the local \
+                        language where it has not. The Pack must have been \
+                        built with --lang.",
+         example = "es"),
     ),
     responses(
         (status = 200,
@@ -1232,6 +1311,13 @@ pub(crate) async fn geocode(
          description = "Comma-separated ISO 3166-1 alpha-2 codes. Applies to every \
                         item; an item's own field overrides it.",
          example = "CA"),
+        ("lang" = Option<String>, Query,
+         description = "ISO 639 language tag, such as es. Names come in this \
+                        language where the Pack has one, and in the local \
+                        language where it has not. The Pack must have been \
+                        built with --lang. Applies to every item; an item's \
+                        own field overrides it.",
+         example = "es"),
     ),
     request_body(content = Vec<openapi::GeocodeItem>, content_type = "application/json"),
     responses(
@@ -1266,12 +1352,13 @@ pub(crate) const GEOCODE: Lookup<GeocodeParams, GeocodeRequest, ForwardCollectio
 
 #[derive(Debug, Clone)]
 pub(crate) enum GeocodeRequest {
-    Text(TextSearchOptions),
-    Fields(AddressGeocodeOptions),
+    Text(TextSearchOptions, Option<Language>),
+    Fields(AddressGeocodeOptions, Option<Language>),
 }
 
 /// `/geocode`'s parameters, checked.
-fn geocode_request(_: &AppState, params: GeocodeParams) -> Result<GeocodeRequest, Problem> {
+fn geocode_request(state: &AppState, params: GeocodeParams) -> Result<GeocodeRequest, Problem> {
+    let language = parse_language(&params.lang, state.pack())?;
     // A field sent empty is still sent: `q=&address=10 King Street` names two
     // ways of giving the address, and which one the caller meant is a guess.
     let fields = [
@@ -1292,7 +1379,8 @@ fn geocode_request(_: &AppState, params: GeocodeParams) -> Result<GeocodeRequest
         (Param::Empty, false) => return Err(bounds::empty_query()),
         (Param::Value(q), false) => q.clone(),
         (Param::Missing, _) => {
-            return geocode_fields(&params).map(GeocodeRequest::Fields);
+            return geocode_fields(&params)
+                .map(|options| GeocodeRequest::Fields(options, language));
         }
     };
     let mut options = text_request(TextParams {
@@ -1303,7 +1391,7 @@ fn geocode_request(_: &AppState, params: GeocodeParams) -> Result<GeocodeRequest
         bbox: params.bbox,
     })?;
     options.layer = parse_layer(&params.layer)?.map(|layer| layer.as_str().to_string());
-    Ok(GeocodeRequest::Text(options))
+    Ok(GeocodeRequest::Text(options, language))
 }
 
 fn geocode_fields(params: &GeocodeParams) -> Result<AddressGeocodeOptions, Problem> {
@@ -1345,29 +1433,31 @@ fn context_field(field: &Param) -> Result<Option<String>, Problem> {
 fn geocode_place(request: &GeocodeRequest) -> [String; 3] {
     let field = |value: &Option<String>| value.as_deref().unwrap_or_default().to_lowercase();
     match request {
-        GeocodeRequest::Fields(options) => [
+        GeocodeRequest::Fields(options, _) => [
             field(&options.postcode).replace(' ', ""),
             field(&options.region),
             field(&options.locality),
         ],
-        GeocodeRequest::Text(options) => {
+        GeocodeRequest::Text(options, _) => {
             [String::new(), String::new(), options.query.to_lowercase()]
         }
     }
 }
 
 fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCollection> {
-    let (query, hits) = match request {
-        GeocodeRequest::Text(options) => {
+    let (query, hits, language) = match request {
+        GeocodeRequest::Text(options, language) => {
             let hits = state.searcher.search(&options)?;
-            (options.query, hits)
+            (options.query, hits, language)
         }
-        GeocodeRequest::Fields(options) => match state.searcher.geocode_address(&options)? {
-            Some(found) => (found.query, vec![found.hit]),
-            None => (options.address, Vec::new()),
-        },
+        GeocodeRequest::Fields(options, language) => {
+            match state.searcher.geocode_address(&options)? {
+                Some(found) => (found.query, vec![found.hit], language),
+                None => (options.address, Vec::new(), language),
+            }
+        }
     };
-    api::forward_collection(&state.pack, query, hits)
+    api::forward_collection(&state.pack, query, hits, language.as_ref())
 }
 
 /// Reverse geocode a point
@@ -1388,6 +1478,12 @@ fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCo
          description = "Return only the nearest result of this layer, or for an area \
                         layer the area of that layer the point lies in, and no other \
                         area. An unknown layer returns `400`."),
+        ("lang" = Option<String>, Query,
+         description = "ISO 639 language tag, such as es. Names come in this \
+                        language where the Pack has one, and in the local \
+                        language where it has not. The Pack must have been \
+                        built with --lang.",
+         example = "es"),
     ),
     responses(
         (status = 200, description = "Results at the point, most precise first. \
@@ -1438,6 +1534,13 @@ pub(crate) async fn reverse(
         ("layer" = Option<Layer>, Query,
          description = "Return only results of this layer. Applies to every item; an \
                         item's own field overrides it."),
+        ("lang" = Option<String>, Query,
+         description = "ISO 639 language tag, such as es. Names come in this \
+                        language where the Pack has one, and in the local \
+                        language where it has not. The Pack must have been \
+                        built with --lang. Applies to every item; an item's \
+                        own field overrides it.",
+         example = "es"),
     ),
     request_body(content = Vec<openapi::ReverseItem>, content_type = "application/json"),
     responses(
@@ -1462,7 +1565,12 @@ pub(crate) async fn reverse_batch(State(state): State<AppState>, request: Reques
 }
 
 /// `/reverse` as a batch item, in `QUERY /reverse` and in `/jobs`.
-pub(crate) const REVERSE: Lookup<ReverseParams, GeocodeOptions, ReverseCollection, u64> = Lookup {
+pub(crate) const REVERSE: Lookup<
+    ReverseParams,
+    (GeocodeOptions, Option<Language>),
+    ReverseCollection,
+    u64,
+> = Lookup {
     route: "/reverse",
     prepare: reverse_request,
     place: reverse_place,
@@ -1470,28 +1578,43 @@ pub(crate) const REVERSE: Lookup<ReverseParams, GeocodeOptions, ReverseCollectio
 };
 
 /// `/reverse`'s parameters, checked.
-fn reverse_request(_: &AppState, params: ReverseParams) -> Result<GeocodeOptions, Problem> {
-    let ReverseParams { lon, lat, layer } = params;
-    bounds::validate_coords(lon, lat)?;
-    Ok(GeocodeOptions {
+fn reverse_request(
+    state: &AppState,
+    params: ReverseParams,
+) -> Result<(GeocodeOptions, Option<Language>), Problem> {
+    let ReverseParams {
         lon,
         lat,
-        layer: parse_layer(&layer)?,
-    })
+        layer,
+        lang,
+    } = params;
+    bounds::validate_coords(lon, lat)?;
+    let language = parse_language(&lang, state.pack())?;
+    Ok((
+        GeocodeOptions {
+            lon,
+            lat,
+            layer: parse_layer(&layer)?,
+        },
+        language,
+    ))
 }
 
 /// The Pack stores records in Hilbert order, so points close on this curve
 /// read neighbouring pages.
-fn reverse_place(options: &GeocodeOptions) -> u64 {
+fn reverse_place((options, _): &(GeocodeOptions, Option<Language>)) -> u64 {
     hilbert_key(
         (options.lon * 1e7).round() as i32,
         (options.lat * 1e7).round() as i32,
     )
 }
 
-fn reverse_answer(state: &AppState, options: GeocodeOptions) -> Result<ReverseCollection> {
+fn reverse_answer(
+    state: &AppState,
+    (options, language): (GeocodeOptions, Option<Language>),
+) -> Result<ReverseCollection> {
     let response = state.reverse_geocoder.reverse(options)?;
-    api::reverse_collection(&state.pack, &response)
+    api::reverse_collection(&state.pack, &response, language.as_ref())
 }
 
 #[cfg(test)]
@@ -2679,7 +2802,7 @@ mod router_tests {
 
     fn panic_on_boom(state: &AppState, query: String) -> Result<ForwardCollection> {
         assert_ne!(query, "boom", "label {} out of range", 7);
-        api::forward_collection(&state.pack, query, Vec::new())
+        api::forward_collection(&state.pack, query, Vec::new(), None)
     }
 
     /// A panic fails its item with a bare 500, logged with the item's place,
@@ -2860,7 +2983,7 @@ mod router_tests {
             std::thread::sleep(Duration::from_millis(20));
             stop::check()?;
         }
-        api::forward_collection(&state.pack, query, Vec::new())
+        api::forward_collection(&state.pack, query, Vec::new(), None)
     }
 
     /// An item past the lookup timeout fails alone with 503 `timeout`, and
@@ -3331,7 +3454,7 @@ mod router_tests {
                 route: "/geocode",
                 batchable: true,
                 fields: field_names::<GeocodeParams>(),
-                fixed: &[("limit", "0")],
+                fixed: &[("limit", "0"), ("lang", "")],
                 filled: &[
                     ("q", "10 King Street"),
                     ("focus", "-79,43"),
@@ -3345,7 +3468,7 @@ mod router_tests {
                 ],
                 modes: &["q", "address", "locality", "region", "postcode"],
                 empty_is_missing: &[
-                    "focus", "bbox", "locality", "region", "postcode", "layer", "country",
+                    "focus", "bbox", "locality", "region", "postcode", "layer", "country", "lang",
                 ],
                 expect: |sent| {
                     let fields = ["address", "locality", "region", "postcode"]
@@ -3367,7 +3490,7 @@ mod router_tests {
                 route: "/places",
                 batchable: true,
                 fields: field_names::<PlacesParams>(),
-                fixed: &[("limit", "0")],
+                fixed: &[("limit", "0"), ("lang", "")],
                 filled: &[
                     ("q", "King Street"),
                     ("ids", "osm:node:1"),
@@ -3376,7 +3499,7 @@ mod router_tests {
                     ("bbox", "-80,42,-78,44"),
                 ],
                 modes: &["q", "ids"],
-                empty_is_missing: &["country", "focus", "bbox"],
+                empty_is_missing: &["country", "focus", "bbox", "lang"],
                 expect: |sent| match (sent["q"], sent["ids"]) {
                     (Sent::Missing, Sent::Missing) => Expect::Problem {
                         error_code: "invalid_query",
@@ -3398,7 +3521,7 @@ mod router_tests {
                 route: "/autocomplete",
                 batchable: false,
                 fields: field_names::<AutocompleteParams>(),
-                fixed: &[("limit", "0")],
+                fixed: &[("limit", "0"), ("lang", "")],
                 filled: &[
                     ("q", "10 King"),
                     ("country", "CA"),
@@ -3407,20 +3530,64 @@ mod router_tests {
                     ("bbox", "-80,42,-78,44"),
                 ],
                 modes: &["q"],
-                empty_is_missing: &["q", "country", "layer", "focus", "bbox"],
+                empty_is_missing: &["q", "country", "layer", "focus", "bbox", "lang"],
                 expect: |_| Expect::Answer,
             },
             Rules {
                 route: "/reverse",
                 batchable: true,
                 fields: field_names::<ReverseParams>(),
-                fixed: &[("lon", "-79"), ("lat", "43")],
+                fixed: &[("lon", "-79"), ("lat", "43"), ("lang", "")],
                 filled: &[("layer", "address")],
                 modes: &["layer"],
-                empty_is_missing: &["layer"],
+                empty_is_missing: &["layer", "lang"],
                 expect: |_| Expect::Answer,
             },
         ]
+    }
+
+    /// A bad tag is a 400, and a good tag on a Pack built without languages
+    /// is a 400 too: a typo must not look like no translation exists.
+    #[tokio::test]
+    async fn lang_requires_a_tag_the_pack_was_built_with() {
+        let pack = temp_path("lang-400");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        for (uri, detail) in [
+            (
+                "/geocode?q=10%20King%20Street&lang=ES",
+                "language \"ES\" is not a language tag, such as es or zh-Hans",
+            ),
+            (
+                "/geocode?q=10%20King%20Street&lang=es",
+                "this Pack was built without languages; rebuild it with --lang es",
+            ),
+            (
+                "/places?q=King%20Street&lang=English",
+                "language \"English\" is not a language tag, such as es or zh-Hans",
+            ),
+            (
+                "/autocomplete?q=10%20King&lang=es",
+                "this Pack was built without languages; rebuild it with --lang es",
+            ),
+            (
+                "/reverse?lon=-79&lat=43&lang=es",
+                "this Pack was built without languages; rebuild it with --lang es",
+            ),
+        ] {
+            let reply = send(router.clone(), request("GET", uri)).await;
+            assert_eq!(
+                reply.status,
+                StatusCode::BAD_REQUEST,
+                "{uri}: {}",
+                reply.json()
+            );
+            let body = reply.json();
+            assert_eq!(body["error_code"], "malformed_parameter", "{uri}");
+            assert_eq!(body["detail"], detail, "{uri}");
+            assert_eq!(body["invalid_params"][0]["name"], "lang", "{uri}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// Every text parameter of every endpoint missing, empty and filled,

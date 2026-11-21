@@ -140,7 +140,7 @@ pub(crate) fn prominence(tags: &BTreeMap<String, String>) -> Prominence {
 
 /// `ja`, `ja-Hira`, `ja_rm`, `zh-Hant-TW`: a two or three letter lower case
 /// language, then subtags of letters and digits.
-fn is_language_tag(value: &str) -> bool {
+pub(crate) fn is_language_tag(value: &str) -> bool {
     let mut parts = value.split(['-', '_']);
     let language = parts.next().unwrap_or_default();
     (2..=3).contains(&language.len())

@@ -155,6 +155,13 @@ enum PackCommand {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1 << 30))]
         scratch_budget_mb: Option<u64>,
 
+        /// Languages whose OSM `name:<lang>` the Pack keeps for streets,
+        /// places and areas, comma-separated, such as `es,ca`. A request's
+        /// `lang` answers in one of them. Each adds a name table to the Pack
+        /// and one pass over the inputs; none keeps it as it was.
+        #[arg(long = "lang", value_delimiter = ',')]
+        languages: Vec<String>,
+
         /// Build even when the pre-flight check finds too little memory or
         /// disk for the input.
         #[arg(long)]
@@ -602,6 +609,7 @@ async fn main() -> Result<()> {
             inputs,
             pack,
             memory_budget_mb,
+            languages,
             scratch_dir,
             scratch_budget_mb,
             force,
@@ -626,6 +634,7 @@ async fn main() -> Result<()> {
                 inputs,
                 pack,
                 addresses,
+                languages,
                 qrank,
                 memory_budget_bytes: memory_budget_mb
                     .map(|mb| usize::try_from(mb << 20))
@@ -1125,7 +1134,7 @@ fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize
         bbox: None,
     })?;
     write_json(&serde_json::to_value(api::forward_collection(
-        &pack, query, hits,
+        &pack, query, hits, None,
     )?)?)
 }
 
@@ -1135,7 +1144,7 @@ fn reverse_pack(pack: PathBuf, lon: f64, lat: f64) -> Result<()> {
     let geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
     let response = geocoder.reverse(reverse::GeocodeOptions::at(lon, lat))?;
     write_json(&serde_json::to_value(api::reverse_collection(
-        &pack, &response,
+        &pack, &response, None,
     )?)?)
 }
 
