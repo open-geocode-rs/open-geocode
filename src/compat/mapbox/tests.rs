@@ -1093,8 +1093,8 @@ async fn search_box_suggest_then_retrieve() {
                 "language": "en",
                 "maki": "cafe",
                 "brand": ["Queen Coffee"],
-                "poi_category": ["Coffee", "Cafe", "Food and Drink"],
-                "poi_category_ids": ["coffee", "cafe", "food_and_drink"],
+                "poi_category": ["cafe", "coffee", "coffee shop", "food", "food and drink"],
+                "poi_category_ids": ["cafe", "coffee", "coffee_shop", "food", "food_and_drink"],
                 "metadata": metadata,
             }],
             "attribution": OSM,
@@ -1132,8 +1132,8 @@ async fn search_box_suggest_then_retrieve() {
                     "bbox": [-79.0052, 42.9999, -79.0048, 43.0001],
                     "maki": "cafe",
                     "brand": ["Queen Coffee"],
-                    "poi_category": ["Coffee", "Cafe", "Food and Drink"],
-                    "poi_category_ids": ["coffee", "cafe", "food_and_drink"],
+                    "poi_category": ["cafe", "coffee", "coffee shop", "food", "food and drink"],
+                    "poi_category_ids": ["cafe", "coffee", "coffee_shop", "food", "food_and_drink"],
                     "metadata": metadata,
                 },
             }],
@@ -1253,11 +1253,11 @@ async fn search_box_category_answers_the_places_of_one_kind() {
     assert_eq!(properties["maki"], "cafe");
     assert_eq!(
         properties["poi_category"],
-        json!(["Coffee", "Cafe", "Food and Drink"])
+        json!(["cafe", "coffee", "coffee shop", "food", "food and drink"])
     );
     assert_eq!(
         properties["poi_category_ids"],
-        json!(["coffee", "cafe", "food_and_drink"])
+        json!(["cafe", "coffee", "coffee_shop", "food", "food_and_drink"])
     );
     assert_eq!(
         body["features"][0]["geometry"],

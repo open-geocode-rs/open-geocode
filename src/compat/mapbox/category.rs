@@ -38,6 +38,7 @@ struct Category {
 const CATEGORIES: &[Category] = &[
     category("coffee", "Coffee", "cafe", &["amenity cafe"]),
     category("cafe", "Cafe", "cafe", &["amenity cafe"]),
+    category("coffee_shop", "Coffee Shop", "cafe", &["amenity cafe"]),
     category(
         "restaurant",
         "Restaurant",
@@ -57,6 +58,25 @@ const CATEGORIES: &[Category] = &[
         "Ice Cream",
         "ice-cream",
         &["amenity ice_cream"],
+    ),
+    category(
+        "food",
+        "Food",
+        "restaurant",
+        &[
+            "amenity cafe",
+            "amenity fast_food",
+            "amenity food_court",
+            "amenity ice_cream",
+            "amenity restaurant",
+        ],
+    ),
+    category("stadium", "Stadium", "stadium", &["leisure stadium"]),
+    category(
+        "sports",
+        "Sports",
+        "pitch",
+        &["leisure pitch", "leisure sports_centre", "leisure stadium"],
     ),
     category(
         "food_and_drink",
@@ -190,17 +210,18 @@ pub(super) fn og_categories(id: &str) -> Option<Vec<&'static str>> {
 
 /// The listed kinds a place of og's `category` (`amenity:cafe`) is, as their
 /// names and their canonical ids, closest kind first.
-pub(super) fn kinds(category: &str) -> Option<(Vec<&'static str>, Vec<&'static str>)> {
-    let listed = CATEGORIES
+/// The listed kinds a place of og's `category` is, as a place states them:
+/// their names in lower case, in the order of their names, and their ids
+/// beside them.
+pub(super) fn kinds(category: &str) -> Option<(Vec<String>, Vec<&'static str>)> {
+    let mut listed = CATEGORIES
         .iter()
         .filter(|listed| categories::holds(listed.og, category))
+        .map(|listed| (listed.name.to_lowercase(), listed.id))
         .collect::<Vec<_>>();
-    (!listed.is_empty()).then(|| {
-        (
-            listed.iter().map(|listed| listed.name).collect(),
-            listed.iter().map(|listed| listed.id).collect(),
-        )
-    })
+    listed.sort();
+    listed.dedup_by(|a, b| a.0 == b.0);
+    (!listed.is_empty()).then(|| listed.into_iter().unzip())
 }
 
 /// `list/category`'s answer.
@@ -341,17 +362,26 @@ mod tests {
     }
 
     #[test]
-    fn a_place_lists_its_closest_kind_first() {
+    fn a_place_lists_its_kinds_by_name_in_lower_case() {
         assert_eq!(
             kinds("amenity:cafe"),
             Some((
-                vec!["Coffee", "Cafe", "Food and Drink"],
-                vec!["coffee", "cafe", "food_and_drink"]
+                ["cafe", "coffee", "coffee shop", "food", "food and drink"]
+                    .map(str::to_string)
+                    .to_vec(),
+                vec!["cafe", "coffee", "coffee_shop", "food", "food_and_drink"]
+            ))
+        );
+        assert_eq!(
+            kinds("leisure:stadium"),
+            Some((
+                ["sports", "stadium"].map(str::to_string).to_vec(),
+                vec!["sports", "stadium"]
             ))
         );
         assert_eq!(
             kinds("shop:florist"),
-            Some((vec!["Shopping"], vec!["shopping"]))
+            Some((vec!["shopping".to_string()], vec!["shopping"]))
         );
         assert_eq!(kinds("craft:brewery"), None);
     }

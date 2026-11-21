@@ -53,7 +53,7 @@ struct Poi {
     brand: Option<Vec<String>>,
     /// The names of the listed kinds the place is, closest first.
     #[serde(skip_serializing_if = "Option::is_none")]
-    poi_category: Option<Vec<&'static str>>,
+    poi_category: Option<Vec<String>>,
     /// The canonical ids of those kinds, as `list/category` gives them.
     #[serde(skip_serializing_if = "Option::is_none")]
     poi_category_ids: Option<Vec<&'static str>>,
