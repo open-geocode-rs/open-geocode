@@ -254,6 +254,53 @@ impl Args {
     }
 }
 
+/// Keeps the results that match the query no worse than the first, when
+/// the first matches every part the query states, fully or in part: a
+/// vendor answers the address it found, not the near misses og also holds
+/// ("Back Bay, Boston" is the district, not Back Bay Road in Newark). A
+/// first result that leaves a stated part unmatched is no sure match, and
+/// every result stays.
+pub(crate) fn best_matches(features: &mut Vec<crate::api::ForwardFeature>) {
+    use crate::api::{PartMatch, QueryMatch};
+    fn parts(found: QueryMatch) -> [Option<PartMatch>; 7] {
+        [
+            found.housenumber,
+            found.street,
+            found.unit,
+            found.locality,
+            found.region,
+            found.postcode,
+            found.country,
+        ]
+    }
+    fn rank(part: Option<PartMatch>) -> u8 {
+        match part {
+            Some(PartMatch::Matched) => 0,
+            Some(PartMatch::Partial) => 1,
+            Some(PartMatch::Unmatched) | None => 2,
+        }
+    }
+    let Some(first) = features
+        .first()
+        .and_then(|feature| feature.properties.matched)
+        .filter(|found| !found.is_empty())
+        .map(parts)
+    else {
+        return;
+    };
+    if first.contains(&Some(PartMatch::Unmatched)) {
+        return;
+    }
+    features.retain(|feature| {
+        feature.properties.matched.is_some_and(|found| {
+            parts(found)
+                .iter()
+                .zip(&first)
+                .all(|(part, best)| best.is_none() || rank(*part) <= rank(*best))
+        })
+    });
+}
+
 /// og's native lookups, called as their routes would be.
 pub(crate) mod native {
     use super::*;

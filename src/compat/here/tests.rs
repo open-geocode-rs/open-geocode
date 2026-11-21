@@ -599,6 +599,25 @@ async fn geocode_reads_qualified_queries() {
     );
 }
 
+/// A sure match answers alone: the street named in full and its town, not a
+/// house whose town the query names only in part.
+#[tokio::test]
+async fn geocode_answers_the_best_match_alone() {
+    let pack = pack("best-match");
+    let router = pack.router();
+    let reply = get(&router, "/compat/here/v1/geocode?q=Queen+Street+Toronto").await;
+    let items = reply.json()["items"].as_array().expect("items").clone();
+    assert_eq!(items.len(), 1, "{}", reply.text());
+    assert_eq!(items[0]["resultType"], "street");
+    // Asked for a house, the best house answers.
+    let house = get(
+        &router,
+        "/compat/here/v1/geocode?q=Queen+Street+Toronto&types=houseNumber",
+    )
+    .await;
+    assert_eq!(house.json()["items"][0]["resultType"], "houseNumber");
+}
+
 #[tokio::test]
 async fn geocode_types_keep_the_kinds_asked() {
     let pack = pack("geocode-types");
@@ -1239,9 +1258,24 @@ async fn every_og_value_lands_in_its_here_slot() {
             None => vec![reply],
         };
         let features = og["features"].as_array().expect("features");
-        assert_eq!(features.len(), items.len(), "{here} dropped a result");
         assert!(!features.is_empty(), "{native} found nothing");
-        for (feature, item) in features.iter().zip(&items) {
+        assert!(!items.is_empty(), "{here} answered nothing");
+        // Each item is one of og's results, by its id: HERE keeps the best
+        // matches of an address search, so it may answer fewer.
+        for item in &items {
+            let feature = features
+                .iter()
+                .find(|feature| {
+                    let properties = &feature["properties"];
+                    let layer = Layer::parse(properties["layer"].as_str().unwrap_or_default());
+                    item["id"]
+                        == encode_parts(
+                            properties["id"].as_str().unwrap_or_default(),
+                            layer,
+                            properties["label"].as_str().unwrap_or_default(),
+                        )
+                })
+                .unwrap_or_else(|| panic!("{here} answered {} og did not", item["id"]));
             let properties = &feature["properties"];
             layers.insert(properties["layer"].as_str().unwrap_or_default().to_string());
             assert_fidelity(properties, &feature["geometry"]["coordinates"], item, &here);

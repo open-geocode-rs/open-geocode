@@ -314,6 +314,11 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
         .await
         .map_err(Gs7Error::of)?;
     prefer_postcode_correction(&mut collection);
+    // The kinds asked for first, then the best of them.
+    collection
+        .features
+        .retain(|feature| item(&Feature::from(feature)).is_any_of(types.as_deref()));
+    crate::compat::best_matches(&mut collection.features);
     let parsing = params
         .get("show")
         .is_some_and(|show| show.split(',').any(|value| value.trim() == "parsing"))
@@ -321,7 +326,6 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
     let items = features(&collection)
         .iter()
         .map(|feature| item(feature).distance_from(at))
-        .filter(|item| item.is_any_of(types.as_deref()))
         .take(limit)
         .map(|mut item| {
             item.parsing.clone_from(&parsing);
