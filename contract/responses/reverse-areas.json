@@ -11,40 +11,13 @@
       "properties": {
         "accuracy": "centroid",
         "bbox": [
-          -141.0027,
-          41.6765,
-          -52.3231,
-          83.3362
-        ],
-        "code": "CA",
-        "id": "osm:relation:1",
-        "label": "Toronto, Ontario, Canada",
-        "layer": "country",
-        "name": "Canada",
-        "source": {
-          "dataset": "osm"
-        }
-      },
-      "type": "Feature"
-    },
-    {
-      "geometry": {
-        "coordinates": [
-          -79.0,
-          43.0
-        ],
-        "type": "Point"
-      },
-      "properties": {
-        "accuracy": "centroid",
-        "bbox": [
           -79.6392727,
           43.5796082,
           -79.1132193,
           43.8554425
         ],
         "id": "osm:relation:3",
-        "label": "Toronto",
+        "label": "Toronto, Ontario, Canada",
         "layer": "locality",
         "name": "Toronto",
         "source": {
@@ -75,6 +48,33 @@
         "label": "Ontario",
         "layer": "region",
         "name": "Ontario",
+        "source": {
+          "dataset": "osm"
+        }
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "centroid",
+        "bbox": [
+          -141.0027,
+          41.6765,
+          -52.3231,
+          83.3362
+        ],
+        "code": "CA",
+        "id": "osm:relation:1",
+        "label": "Canada",
+        "layer": "country",
+        "name": "Canada",
         "source": {
           "dataset": "osm"
         }

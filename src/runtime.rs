@@ -390,6 +390,8 @@ pub(crate) struct ReverseParams {
     /// default, is 1, and above 1 needs a `layer`.
     #[serde(default)]
     limit: usize,
+    /// How far to look for the nearest house, street or place, in metres.
+    radius: Option<f64>,
     /// See [`parse_lang`].
     lang: Param,
 }
@@ -1653,6 +1655,11 @@ fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCo
                         lies in one area of each layer, so an area layer returns at \
                         most one.",
          minimum = 0, maximum = 50),
+        ("radius" = Option<f64>, Query,
+         description = "How far to look for the nearest address, street or place, in \
+                        metres, up to 1000. Default 30. Areas hold the point, so it \
+                        does not bound them.",
+         example = 150.0, minimum = 0.0, maximum = 1000.0),
         ("lang" = Option<String>, Query,
          description = "Languages to name results and their areas in, as \
                         comma-separated language codes. The first names each \
@@ -1667,8 +1674,9 @@ fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCo
                                       `features` is empty when nothing is near.",
          body = ReverseCollection),
         (status = 400, description = "`lon` or `lat` is missing or out of range, \
-                                      `layer` is unknown, or `limit` is out of range or \
-                                      above 1 with no `layer`.",
+                                      `layer` is unknown, `limit` is out of range or \
+                                      above 1 with no `layer`, or `radius` is out of \
+                                      range.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
         (status = 500, description = "Internal server error.",
          body = openapi::Problem, content_type = openapi::PROBLEM_JSON),
@@ -1760,9 +1768,19 @@ fn reverse_request(_: &AppState, params: ReverseParams) -> Result<ReverseRequest
         lat,
         layer,
         limit,
+        radius,
         lang: _,
     } = params;
     bounds::validate_coords(lon, lat)?;
+    let radius_m = radius.unwrap_or(crate::reverse::DEFAULT_RADIUS_M);
+    if !(radius_m > 0.0 && radius_m <= crate::reverse::MAX_RADIUS_M) {
+        let reason = format!(
+            "must be a number of metres above 0 and at most {}",
+            crate::reverse::MAX_RADIUS_M
+        );
+        return Err(Problem::malformed_parameter(format!("radius {reason}"))
+            .with_invalid_params(vec![InvalidParam::new("radius", &reason)]));
+    }
     let layer = parse_layer(&layer)?;
     let limit = limit.max(1);
     bounds::validate_search_limit(limit)?;
@@ -1772,7 +1790,12 @@ fn reverse_request(_: &AppState, params: ReverseParams) -> Result<ReverseRequest
             .with_invalid_params(vec![InvalidParam::new("limit", reason)]));
     }
     Ok(ReverseRequest {
-        options: GeocodeOptions { lon, lat, layer },
+        options: GeocodeOptions {
+            lon,
+            lat,
+            layer,
+            radius_m,
+        },
         limit,
     })
 }
@@ -2098,6 +2121,42 @@ mod router_tests {
 
         let reply = send(router, request("GET", "/reverse?lon=-79.0&lat=43.0")).await;
         assert_eq!(reply.status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// The house 67 m from the point is past the default reach and inside
+    /// an asked radius; a radius og cannot search is refused.
+    #[tokio::test]
+    async fn reverse_looks_as_far_as_its_radius() {
+        let pack = temp_path("reverse-radius");
+        write_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        let at = "/reverse?lon=-79.0&lat=43.0006";
+        let reply = send(router.clone(), request("GET", at)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.json()["features"],
+            serde_json::json!([]),
+            "{}",
+            reply.json()
+        );
+
+        let reply = send(router.clone(), request("GET", &format!("{at}&radius=100"))).await;
+        let house = &reply.json()["features"][0]["properties"];
+        assert_eq!(house["name"], "10 King Street", "{}", reply.json());
+        let distance = house["distance_m"].as_f64().expect("distance");
+        assert!((66.0..68.0).contains(&distance), "{distance}");
+
+        for radius in ["0", "-5", "1001", "NaN"] {
+            let reply = send(
+                router.clone(),
+                request("GET", &format!("{at}&radius={radius}")),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "radius {radius}");
+            assert_eq!(reply.json()["invalid_params"][0]["name"], "radius");
+        }
 
         let _ = std::fs::remove_dir_all(&pack);
     }
@@ -5298,7 +5357,12 @@ mod router_tests {
                 route: "/reverse",
                 batchable: true,
                 fields: field_names::<ReverseParams>(),
-                fixed: &[("lon", "-79"), ("lat", "43"), ("limit", "0")],
+                fixed: &[
+                    ("lon", "-79"),
+                    ("lat", "43"),
+                    ("limit", "0"),
+                    ("radius", "150"),
+                ],
                 filled: &[("layer", "address"), ("lang", "fr,de")],
                 modes: &["layer"],
                 empty_is_missing: &["layer", "lang"],

@@ -1095,6 +1095,14 @@
             "maximum": 180,
             "minimum": -180,
             "type": "number"
+          },
+          "radius": {
+            "description": "How far to look for the nearest address, street or place, in metres.",
+            "example": 150.0,
+            "format": "double",
+            "maximum": 1000,
+            "minimum": 0,
+            "type": "number"
           }
         },
         "type": "object"
@@ -3509,6 +3517,19 @@
             }
           },
           {
+            "description": "How far to look for the nearest address, street or place, in metres, up to 1000. Default 30. Areas hold the point, so it does not bound them.",
+            "example": 150.0,
+            "in": "query",
+            "name": "radius",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "maximum": 1000,
+              "minimum": 0,
+              "type": "number"
+            }
+          },
+          {
             "description": "Languages to name results and their areas in, as comma-separated language codes. The first names each result and area, falling back to its local name; each other one goes into `translations` where a name in it exists. Repeats count once. A malformed code, or more than 20 distinct codes, returns `400`.",
             "example": "fr,de",
             "in": "query",
@@ -3561,7 +3582,7 @@
                 }
               }
             },
-            "description": "`lon` or `lat` is missing or out of range, `layer` is unknown, or `limit` is out of range or above 1 with no `layer`.",
+            "description": "`lon` or `lat` is missing or out of range, `layer` is unknown, `limit` is out of range or above 1 with no `layer`, or `radius` is out of range.",
             "headers": {
               "Accept-Query": {
                 "description": "The media type a QUERY body is read as.",

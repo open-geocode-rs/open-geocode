@@ -10,9 +10,13 @@ use crate::{
     spatial_index,
 };
 
-const ADDRESS_RADIUS_M: f64 = 30.0;
-const INTERPOLATION_RADIUS_M: f64 = 30.0;
-const STREET_RADIUS_M: f64 = 30.0;
+/// How far reverse looks for the nearest house, street or place when the
+/// caller names no distance. Past it, a house says less about where the
+/// point is than the areas holding it.
+pub const DEFAULT_RADIUS_M: f64 = 30.0;
+/// The farthest a caller may ask reverse to look. Candidates are read cell
+/// by cell, so the cost grows with the square of the radius.
+pub const MAX_RADIUS_M: f64 = 1_000.0;
 const CONTEXT_RADIUS_M: f64 = 50_000.0;
 const CANDIDATE_LIMIT: usize = 16;
 
@@ -28,6 +32,9 @@ pub struct GeocodeOptions {
     pub lat: f64,
     /// Answer only with a record of this layer, and list no other area.
     pub layer: Option<Layer>,
+    /// How far to look for the nearest house, street or place, in metres.
+    /// Areas hold the point, so it does not bound them.
+    pub radius_m: f64,
 }
 
 impl GeocodeOptions {
@@ -36,6 +43,7 @@ impl GeocodeOptions {
             lon,
             lat,
             layer: None,
+            radius_m: DEFAULT_RADIUS_M,
         }
     }
 }
@@ -215,7 +223,7 @@ impl PackReverseGeocoder {
         let found = match layer {
             Layer::Address => self
                 .spatial
-                .address_candidates(lon, lat, ADDRESS_RADIUS_M, limit)?
+                .address_candidates(lon, lat, options.radius_m, limit)?
                 .iter()
                 .map(|candidate| {
                     let (mut context, mut ids) = fresh();
@@ -224,7 +232,7 @@ impl PackReverseGeocoder {
                 .collect::<Result<Vec<_>>>()?,
             Layer::Poi => self
                 .spatial
-                .poi_candidates(lon, lat, ADDRESS_RADIUS_M, limit)?
+                .poi_candidates(lon, lat, options.radius_m, limit)?
                 .iter()
                 .map(|candidate| {
                     let (mut context, mut ids) = fresh();
@@ -233,7 +241,7 @@ impl PackReverseGeocoder {
                 .collect::<Result<Vec<_>>>()?,
             Layer::Street => self
                 .spatial
-                .segment_candidates(lon, lat, Layer::Street, STREET_RADIUS_M, limit)?
+                .segment_candidates(lon, lat, Layer::Street, options.radius_m, limit)?
                 .iter()
                 .map(|candidate| {
                     let (mut context, mut ids) = fresh();
@@ -242,13 +250,7 @@ impl PackReverseGeocoder {
                 .collect::<Result<Vec<_>>>()?,
             Layer::Interpolation => self
                 .spatial
-                .segment_candidates(
-                    lon,
-                    lat,
-                    Layer::Interpolation,
-                    INTERPOLATION_RADIUS_M,
-                    limit,
-                )?
+                .segment_candidates(lon, lat, Layer::Interpolation, options.radius_m, limit)?
                 .iter()
                 .map(|candidate| {
                     let (mut context, mut ids) = fresh();
@@ -323,7 +325,7 @@ impl PackReverseGeocoder {
     ) -> Result<Option<GeocodeResult>> {
         let Some(candidate) = self
             .spatial
-            .address_candidates(options.lon, options.lat, ADDRESS_RADIUS_M, 1)?
+            .address_candidates(options.lon, options.lat, options.radius_m, 1)?
             .into_iter()
             .next()
         else {
@@ -380,7 +382,7 @@ impl PackReverseGeocoder {
             options.lon,
             options.lat,
             Layer::Interpolation,
-            INTERPOLATION_RADIUS_M,
+            options.radius_m,
             CANDIDATE_LIMIT,
         )? {
             crate::stop::check()?;
@@ -441,7 +443,7 @@ impl PackReverseGeocoder {
     ) -> Result<Option<GeocodeResult>> {
         let Some(candidate) = self
             .spatial
-            .segment_candidates(options.lon, options.lat, Layer::Street, STREET_RADIUS_M, 1)?
+            .segment_candidates(options.lon, options.lat, Layer::Street, options.radius_m, 1)?
             .into_iter()
             .next()
         else {
@@ -495,7 +497,7 @@ impl PackReverseGeocoder {
     ) -> Result<Option<GeocodeResult>> {
         let Some(candidate) = self
             .spatial
-            .poi_candidates(options.lon, options.lat, ADDRESS_RADIUS_M, 1)?
+            .poi_candidates(options.lon, options.lat, options.radius_m, 1)?
             .into_iter()
             .next()
         else {
@@ -583,15 +585,24 @@ impl PackReverseGeocoder {
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<Option<GeocodeResult>> {
         self.enrich_context(options, context, context_record_ids)?;
-        let Some(primary_record_id) = context_record_ids.first().copied() else {
+        // The answer is the area its label leads with, the first found of
+        // the most precise tier, so its id and layer name what it says.
+        let mut primary: Option<(usize, RecordId, ContextRecord)> = None;
+        for &record_id in context_record_ids.iter() {
+            let Some(record) = self.pack.context_record(record_id)? else {
+                continue;
+            };
+            let Some(rank) = LABEL_TIERS.iter().position(|tier| *tier == record.layer) else {
+                continue;
+            };
+            if primary.as_ref().is_none_or(|(best, ..)| rank < *best) {
+                primary = Some((rank, record_id, record));
+            }
+        }
+        let Some((_, primary_record_id, record)) = primary else {
             return Ok(None);
         };
-        let Some(record) = self.pack.context_record(primary_record_id)? else {
-            return Ok(None);
-        };
-        let Some(label) = context_only_label(context).or_else(|| Some(record.label.clone())) else {
-            return Ok(None);
-        };
+        let label = context_only_label(context).unwrap_or_else(|| record.label.clone());
 
         Ok(Some(GeocodeResult {
             match_kind: MatchKind::ContextOnly,
@@ -710,6 +721,18 @@ fn compose_label(primary: &str, context: &Context) -> String {
     }
     parts.join(", ")
 }
+
+/// The area tiers a point's label names, most precise first, as
+/// [`context_only_label`] reads them.
+const LABEL_TIERS: [&str; 7] = [
+    "place",
+    "neighbourhood",
+    "locality",
+    "district",
+    "region",
+    "postcode",
+    "country",
+];
 
 fn context_only_label(context: &Context) -> Option<String> {
     [
