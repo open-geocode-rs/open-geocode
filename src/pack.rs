@@ -1108,10 +1108,6 @@ impl Reader {
         Ok(context.filter(|context| !context.admin_context.is_empty()))
     }
 
-    pub fn has_enclosing(&self) -> bool {
-        self.enclosing.is_some()
-    }
-
     /// Every area the record lies in, smallest first; empty for a record with
     /// no context and for a Pack that has no enclosing areas.
     pub fn enclosing_areas(&self, record_id: RecordId) -> Result<Vec<RecordId>> {
