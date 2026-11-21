@@ -274,7 +274,7 @@ fn bakery_place() -> Value {
         "displayName": {"text": "Queen Bakery"},
         "types": ["bakery", "point_of_interest", "establishment"],
         "primaryType": "bakery",
-        "formattedAddress": "12 King Street, Toronto, M5V 1A1",
+        "formattedAddress": "12 King Street, Toronto, ON M5V 1A1, Canada",
         "postalAddress": {
             "regionCode": "CA",
             "postalCode": "M5V 1A1",
@@ -706,7 +706,7 @@ fn address_result() -> Value {
             "low": {"latitude": 43.0 - 0.00135, "longitude": -79.0 - 0.00135},
             "high": {"latitude": 43.0 + 0.00135, "longitude": -79.0 + 0.00135},
         },
-        "formattedAddress": "10 King Street, Unit 4B, City of Toronto, ON, M5V 1A1, Canada",
+        "formattedAddress": "Unit 4B, 10 King Street, City of Toronto, ON M5V 1A1, Canada",
         "postalAddress": {
             "regionCode": "CA",
             "postalCode": "M5V 1A1",
@@ -1190,11 +1190,19 @@ async fn every_og_value_lands_in_its_google_slot() {
             prediction["structuredFormat"]["secondaryText"]["text"],
             rest
         );
-        let formatted = if properties["layer"] == "poi" {
-            rest
-        } else {
-            label
-        };
+        // A house or place with postal lines is formatted by them.
+        let lines = properties["address_lines"]
+            .as_array()
+            .map(|lines| lines.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let formatted =
+            if lines.len() > 1 && matches!(properties["layer"].as_str(), Some("address" | "poi")) {
+                lines.join(", ")
+            } else if properties["layer"] == "poi" {
+                rest.to_string()
+            } else {
+                label.to_string()
+            };
         assert_eq!(result["formattedAddress"], formatted);
         assert_eq!(result["location"]["longitude"], coordinates[0]);
         assert_eq!(result["location"]["latitude"], coordinates[1]);
@@ -1267,7 +1275,12 @@ async fn every_og_value_lands_in_its_google_slot() {
         assert_eq!(primary["placeId"], id);
         assert_eq!(primary["place"], format!("places/{id}"));
         assert_eq!(primary["displayName"]["text"], name);
-        assert_eq!(primary["formattedAddress"], label);
+        let expected = if properties["layer"] == "poi" {
+            json!(format!("{name}, {}", formatted))
+        } else {
+            json!(formatted)
+        };
+        assert_eq!(primary["formattedAddress"], expected);
         assert_eq!(primary["location"], result["location"]);
         assert_eq!(primary["addressComponents"], result["addressComponents"]);
         assert_eq!(primary["postalAddress"], result["postalAddress"]);
@@ -1676,7 +1689,7 @@ fn bakery_destination() -> Value {
     fields.insert("placeId".to_string(), json!(id));
     fields.insert(
         "formattedAddress".to_string(),
-        json!("Queen Bakery, 12 King Street, Toronto, M5V 1A1"),
+        json!("Queen Bakery, 12 King Street, Toronto, ON M5V 1A1, Canada"),
     );
     // Its outline is a box, so it is no bare point, and og cannot tell a
     // building from grounds.

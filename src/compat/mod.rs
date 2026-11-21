@@ -555,13 +555,136 @@ pub(crate) fn town<'a>(
     };
     match stated {
         Some(name) if holding.is_some() && names_other(name) => holding,
+        // The locality's own spelling, where the source shouts it (`BOSTON`).
+        Some(name) if holding.is_some_and(|holding| holding.eq_ignore_ascii_case(name)) => holding,
         stated => stated.or(holding),
     }
+}
+
+/// The town of a result as a vendor writes it, by [`town`] over the areas
+/// holding it.
+pub(crate) fn town_of<'a>(
+    address: &'a crate::api::Address,
+    context: &'a crate::api::Context,
+) -> Option<&'a str> {
+    let name =
+        |area: &'a Option<crate::api::ContextArea>| area.as_ref().map(|area| area.name.as_str());
+    town(
+        address.locality.as_deref(),
+        name(&context.locality),
+        &[
+            name(&context.neighbourhood),
+            name(&context.sublocality),
+            name(&context.district),
+            name(&context.subregion),
+            name(&context.region),
+        ],
+    )
+}
+
+/// A US street in the postal abbreviation, by og's split of it where og
+/// made one: `Amphitheatre Pkwy`, `W El Camino Real`.
+pub(crate) fn us_street(address: &crate::api::Address) -> Option<String> {
+    let street = address.street.as_deref()?;
+    let parts = address.street_parts.as_ref();
+    Some(usps::display_street(
+        parts.map_or(street, |parts| parts.name.as_str()),
+        parts.and_then(|parts| parts.prefix.as_deref()),
+        parts.and_then(|parts| parts.kind.as_deref()),
+        parts.and_then(|parts| parts.suffix.as_deref()),
+    ))
+}
+
+/// A result's postal lines in its country's form, as a vendor writes them.
+/// They are rendered again from og's parts with the town a vendor writes
+/// ([`town_of`]) and, in the US, the street in the postal abbreviation, so
+/// no rendered text is rewritten. Empty where og has no lines for it.
+pub(crate) fn postal_lines(
+    layer: Layer,
+    address: &crate::api::Address,
+    context: &crate::api::Context,
+) -> Vec<String> {
+    let mut written = address.clone();
+    written.locality = town_of(address, context).map(str::to_string);
+    if country_code(context) == Some("US") {
+        written.street = us_street(address).or(written.street);
+    }
+    crate::address_lines::address_lines(layer, &written, context)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn area(name: &str, code: Option<&str>) -> Option<crate::api::ContextArea> {
+        Some(crate::api::ContextArea {
+            id: format!("osm:relation:{}", name.len()),
+            name: name.to_string(),
+            code: code.map(str::to_string),
+            translations: None,
+            record_id: 0,
+            local_name: None,
+        })
+    }
+
+    fn house(number: &str, street: &str, locality: &str, postcode: &str) -> crate::api::Address {
+        crate::api::Address {
+            housenumber: Some(number.to_string()),
+            street: Some(street.to_string()),
+            locality: Some(locality.to_string()),
+            postcode: Some(postcode.to_string()),
+            ..crate::api::Address::default()
+        }
+    }
+
+    /// A house's lines are rendered from its parts in its country's form,
+    /// with the town a vendor writes: the locality holding it where the
+    /// source wrote a district of it or shouted its name.
+    #[test]
+    fn postal_lines_are_rendered_in_the_town_a_vendor_writes() {
+        let vienna = crate::api::Context {
+            sublocality: area("Leopoldstadt", None),
+            locality: area("Wien", None),
+            country: area("Austria", Some("AT")),
+            ..crate::api::Context::default()
+        };
+        assert_eq!(
+            postal_lines(
+                Layer::Address,
+                &house("42", "Heinestraße", "Leopoldstadt", "1020"),
+                &vienna
+            ),
+            ["Heinestraße 42", "1020 Wien", "Austria"]
+        );
+        let paris = crate::api::Context {
+            sublocality: area("Paris 2e Arrondissement", None),
+            locality: area("Paris", None),
+            country: area("France", Some("FR")),
+            ..crate::api::Context::default()
+        };
+        assert_eq!(
+            postal_lines(
+                Layer::Address,
+                &house("5", "Rue Daunou", "Paris 2e Arrondissement", "75002"),
+                &paris
+            ),
+            ["5 Rue Daunou", "75002 Paris", "France"]
+        );
+        let boston = crate::api::Context {
+            locality: area("Boston", None),
+            region: area("Massachusetts", Some("US-MA")),
+            country: area("United States", Some("US")),
+            ..crate::api::Context::default()
+        };
+        assert_eq!(
+            postal_lines(
+                Layer::Address,
+                &house("240", "Washington Street", "BOSTON", "02108"),
+                &boston
+            ),
+            ["240 Washington St", "Boston, MA 02108", "United States"]
+        );
+    }
 
     /// Every vendor names a house's town and country as og's answer in the
     /// language asked does, never the source's spelling beside translated
@@ -605,7 +728,7 @@ mod tests {
             assert_eq!(result["postalAddress"]["locality"], town, "{google}");
             assert_eq!(
                 result["formattedAddress"],
-                format!("42 Heinestraße, {town}, 1020, AT"),
+                format!("Heinestraße 42, 1020 {town}, {country}"),
                 "{google}"
             );
             let here = get(format!("/compat/here/v1/geocode?{q}&lang={lang}")).await;

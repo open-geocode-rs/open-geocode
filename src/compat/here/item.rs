@@ -156,7 +156,7 @@ impl Feature {
                 code: common.code.clone(),
                 contact: common.contact.clone(),
                 opening_hours: common.opening_hours.clone(),
-                address_lines: common.address_lines.clone(),
+                address_lines: compat::postal_lines(common.layer, &common.address, &common.context),
                 access: common
                     .access
                     .iter()
@@ -541,10 +541,6 @@ fn postal_label(properties: &Properties) -> Option<String> {
         return None;
     }
     let address = &properties.address;
-    let context = &properties.context;
-    fn name(area: &Option<Area>) -> Option<&str> {
-        area.as_ref().map(|area| area.name.as_str())
-    }
     let mut lines = lines.clone();
     // HERE writes the house's own line first; a country whose post puts
     // the unit on a line above it still gets the house line first.
@@ -553,35 +549,6 @@ fn postal_label(properties: &Properties) -> Option<String> {
     {
         let line = lines.remove(at + 1);
         lines.insert(0, line);
-    }
-    if let Some(stated) = address.locality.as_deref()
-        && let Some(town) = compat::town(
-            Some(stated),
-            name(&context.locality),
-            &[
-                name(&context.neighbourhood),
-                name(&context.sublocality),
-                name(&context.district),
-                name(&context.region),
-            ],
-        )
-        .filter(|town| *town != stated)
-    {
-        for line in &mut lines[1..] {
-            *line = line.replacen(stated, town, 1);
-        }
-    }
-    let us = context
-        .country
-        .as_ref()
-        .and_then(|country| country.code.as_deref())
-        == Some("US");
-    if us && let Some(street) = address.street.as_deref() {
-        lines[0] = lines[0].replacen(
-            street,
-            &compat::usps::display_street(street, None, None, None),
-            1,
-        );
     }
     Some(lines.join(", "))
 }
@@ -857,7 +824,7 @@ mod tests {
                         "locality": "Leopoldstadt", "postcode": "1020"},
             "context": {"sublocality": {"name": "Leopoldstadt"}, "locality": {"name": "Wien"},
                         "country": {"name": "Austria", "code": "AT"}},
-            "address_lines": ["Heinestraße 42", "1020 Leopoldstadt", "Austria"],
+            "address_lines": ["Heinestraße 42", "1020 Wien", "Austria"],
             "highlights": [{"start": 3, "end": 14}],
         }));
         let found = item(&vienna);
@@ -874,7 +841,7 @@ mod tests {
                         "locality": "Boston", "region": "MA", "postcode": "02108"},
             "context": {"locality": {"name": "Boston"},
                         "country": {"name": "United States", "code": "US"}},
-            "address_lines": ["240 Washington Street", "Boston, MA 02108", "United States"],
+            "address_lines": ["240 Washington St", "Boston, MA 02108", "United States"],
         }));
         assert_eq!(
             item(&boston).title,
