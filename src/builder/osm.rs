@@ -113,7 +113,9 @@ use crate::{
         train::{self, Sampler},
         weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
     },
-    record::{OSM_DATASET, ObjectType, Record, RejectedRecord, StreetRecord},
+    record::{
+        OSM_DATASET, ObjectType, PlaceLayer, PlaceRecord, Record, RejectedRecord, StreetRecord,
+    },
     records::quantize,
     resources::Resources,
     text_index::PostcodeAreas,
@@ -1280,7 +1282,11 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Merges place points into the boundaries they name, dropping their own records.
+    /// Merges place points into the boundaries they name, dropping their own
+    /// records. Every point is matched before any merges, so a point can
+    /// join the boundary another point of its Wikidata item named, and each
+    /// boundary takes its point and item from its strongest link, whatever
+    /// order the points come in.
     fn merge_place_points(&mut self, boundaries: &mut BoundarySet) -> Result<()> {
         let mut links = boundaries.place_links();
         if links.is_empty() {
@@ -1291,19 +1297,28 @@ impl<'a> Run<'a> {
         };
         self.sorted
             .insert("place_points".to_string(), sorter_report(&points));
+        let mut staged = Spool::<PendingRecord>::create(&self.scratch, "place-points")?;
+        for (at, pending) in points.finish()?.enumerate() {
+            let pending = pending?;
+            if let Some((layer, point)) = place_point(&pending) {
+                boundaries.match_place_point(&mut links, at as u64, layer, point);
+            }
+            staged.write(&pending)?;
+        }
+        boundaries.group_place_points(&mut links);
         let mut kept = context_sorter(&self.scratch, &self.memory, self.budget);
         let mut merged = 0;
-        for pending in points.finish()? {
+        for (at, pending) in staged.into_reader()?.enumerate() {
             let pending = pending?;
-            if let Body::Record(record) = &pending.body
-                && let Record::Place(layer, place) = record.as_ref()
-                && boundaries.merge_place_point(&mut links, *layer, place)
-            {
+            if place_point(&pending).is_some_and(|(_, point)| {
+                boundaries.merge_place_point(&mut links, at as u64, point)
+            }) {
                 merged += 1;
             } else {
                 kept.push(pending)?;
             }
         }
+        boundaries.finish_place_merges(links);
         self.build.context_records = Some(kept);
         self.build.report.accepted.place_points_merged = merged;
         Ok(())
@@ -2110,6 +2125,17 @@ const CONTEXT_RECORDS: &str = "context-records";
 /// The context-record sorter gets a sixteenth of a share, since context records are few.
 fn context_share(budget: usize) -> usize {
     (budget / 16).max(1)
+}
+
+/// The place a pending context record is, with its layer.
+fn place_point(pending: &PendingRecord) -> Option<(PlaceLayer, &PlaceRecord)> {
+    match &pending.body {
+        Body::Record(record) => match record.as_ref() {
+            Record::Place(layer, place) => Some((*layer, place)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn context_sorter(
@@ -6182,5 +6208,220 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(labels, ["Main Street, Kingston"]);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The corners of a unit square from `west`, as nodes `first` to `first + 3`,
+    /// and the closed way `first` over them.
+    fn unit_square(first: i64, west: f64) -> (Vec<TestElement>, TestElement) {
+        let corners = [
+            (west, 0.0),
+            (west, 1.0),
+            (west + 1.0, 1.0),
+            (west + 1.0, 0.0),
+        ];
+        let nodes = (first..)
+            .zip(corners)
+            .map(|(id, (lon, lat))| node(id, lat, lon, &[]))
+            .collect();
+        let ring = [first, first + 1, first + 2, first + 3, first];
+        (nodes, way(first, &ring, &[]))
+    }
+
+    /// Builds the town nodes and the town boundaries, one a unit square
+    /// from each given west edge, and opens the Pack.
+    fn merged_towns(
+        name: &str,
+        towns: Vec<TestElement>,
+        boundaries: Vec<(f64, TestElement)>,
+    ) -> (PathBuf, BuilderReport, Reader) {
+        let dir = temp_dir(name);
+        let input = dir.join("towns.osm.pbf");
+        let (mut nodes, mut ways) = (towns, Vec::new());
+        for (at, (west, _)) in boundaries.iter().enumerate() {
+            let (corners, ring) = unit_square(100 + 10 * at as i64, *west);
+            nodes.extend(corners);
+            ways.push(ring);
+        }
+        let relations = boundaries
+            .into_iter()
+            .map(|(_, relation)| relation)
+            .collect();
+        write_pbf(&input, &[nodes, ways, relations]);
+        let report = build(&dir.join("pack"), &input, None);
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        (dir, report, reader)
+    }
+
+    fn town_boundary(
+        id: i64,
+        ring: i64,
+        label: Option<i64>,
+        tags: &[(&'static str, &'static str)],
+    ) -> TestElement {
+        TestElement::Relation {
+            id,
+            members: vec![(ring, "outer")],
+            nodes: label.map(|node| (node, "label")).into_iter().collect(),
+            tags: [("boundary", "administrative"), ("admin_level", "8")]
+                .iter()
+                .chain(tags)
+                .copied()
+                .collect(),
+        }
+    }
+
+    /// The point and Wikidata item of the record `id`.
+    fn point_and_item(reader: &Reader, id: &str) -> (serde_json::Value, Option<u32>) {
+        let record = reader.find_by_source_id(id).expect("lookup").expect(id);
+        let point = reader
+            .records_json_by_layer("locality", 0)
+            .expect("towns")
+            .into_iter()
+            .find(|town| town["id"] == id)
+            .expect("a town")["geometry"]["coordinates"]
+            .clone();
+        (point, reader.records().wikidata(record).expect("wikidata"))
+    }
+
+    /// One Wikidata item can be two disjoint boundaries. A point of the item
+    /// whose name neither boundary has merges into the one whose box holds it.
+    #[test]
+    fn a_place_node_merges_into_the_boundary_of_its_item_that_holds_it() {
+        let (dir, report, reader) = merged_towns(
+            "merge-by-item-of-two",
+            vec![node(
+                10,
+                0.5,
+                2.5,
+                &[
+                    ("place", "town"),
+                    ("name", "Springfield Centre"),
+                    ("wikidata", "Q100"),
+                ],
+            )],
+            vec![
+                (
+                    0.0,
+                    town_boundary(
+                        900,
+                        100,
+                        None,
+                        &[("name", "Springfield"), ("wikidata", "Q100")],
+                    ),
+                ),
+                (
+                    2.0,
+                    town_boundary(
+                        910,
+                        110,
+                        None,
+                        &[("name", "Springfield East"), ("wikidata", "Q100")],
+                    ),
+                ),
+            ],
+        );
+        assert_eq!(report.accepted.place_points_merged, 1);
+        assert_eq!(
+            point_and_item(&reader, "osm:relation:910").0,
+            serde_json::json!([2.5, 0.5])
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A point that names the boundary brings its item, and another point of
+    /// that item inside the boundary joins it too, whichever comes first.
+    #[test]
+    fn a_place_node_joins_the_boundary_another_node_of_its_item_named() {
+        // Points arrive in id order, so swapping the ids swaps which comes first.
+        let alpha = |id| {
+            node(
+                id,
+                0.3,
+                0.3,
+                &[("place", "town"), ("name", "Alpha"), ("wikidata", "Q100")],
+            )
+        };
+        let beta = |id| {
+            node(
+                id,
+                0.6,
+                0.6,
+                &[("place", "town"), ("name", "Beta"), ("wikidata", "Q100")],
+            )
+        };
+        for (name, towns) in [
+            ("merge-by-item-alpha-first", vec![alpha(10), beta(11)]),
+            ("merge-by-item-beta-first", vec![beta(10), alpha(11)]),
+        ] {
+            let (dir, report, reader) = merged_towns(
+                name,
+                towns,
+                vec![(0.0, town_boundary(900, 100, None, &[("name", "Alpha")]))],
+            );
+            assert_eq!(report.accepted.place_points_merged, 2, "{name}");
+            assert_eq!(
+                point_and_item(&reader, "osm:relation:900").1,
+                Some(100),
+                "{name}"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A boundary keeps its own Wikidata item, and takes its point from its
+    /// strongest link. A boundary with no item takes the item of its
+    /// strongest link, whichever point comes first.
+    #[test]
+    fn a_boundary_takes_its_strongest_links_point_and_keeps_its_own_item() {
+        let town = |id, lon, name, item| {
+            node(
+                id,
+                0.5,
+                lon,
+                &[("place", "town"), ("name", name), ("wikidata", item)],
+            )
+        };
+        // Points arrive in their build's order, so each layout puts the name
+        // match and the `label` node the other way round.
+        for (name, label_at, named_at) in [
+            ("merge-label-item-east", 2.5, 2.3),
+            ("merge-label-item-west", 2.3, 2.5),
+        ] {
+            let (dir, report, reader) = merged_towns(
+                name,
+                vec![
+                    town(10, 0.5, "Kingston", "Q200"),
+                    town(20, named_at, "Hastings", "Q300"),
+                    town(21, label_at, "Hastings Town", "Q400"),
+                ],
+                vec![
+                    (
+                        0.0,
+                        town_boundary(
+                            900,
+                            100,
+                            Some(10),
+                            &[("name", "Kingston"), ("wikidata", "Q100")],
+                        ),
+                    ),
+                    (
+                        2.0,
+                        town_boundary(910, 110, Some(21), &[("name", "Hastings")]),
+                    ),
+                ],
+            );
+            assert_eq!(report.accepted.place_points_merged, 3, "{name}");
+            assert_eq!(
+                point_and_item(&reader, "osm:relation:900"),
+                (serde_json::json!([0.5, 0.5]), Some(100)),
+                "{name}"
+            );
+            assert_eq!(
+                point_and_item(&reader, "osm:relation:910"),
+                (serde_json::json!([label_at, 0.5]), Some(400)),
+                "{name}"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 }
