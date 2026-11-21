@@ -318,7 +318,7 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
     collection
         .features
         .retain(|feature| item(&Feature::from(feature)).is_any_of(types.as_deref()));
-    crate::compat::best_matches(&mut collection.features);
+    crate::compat::best_matches(&mut collection.features, request.q.as_deref());
     let parsing =
         shows(&params, "parsing").then(|| parsing(state, request.q.as_deref(), &request.qualified));
     let time_zone = shows(&params, "tz");

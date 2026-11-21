@@ -406,8 +406,10 @@ pub(crate) fn without_kind(name: &str) -> String {
 /// vendor answers the address it found, not the near misses og also holds
 /// ("Back Bay, Boston" is the district, not Back Bay Road in Newark). A
 /// first result that leaves a stated part unmatched is no sure match, and
-/// every result stays.
-pub(crate) fn best_matches(features: &mut Vec<crate::api::ForwardFeature>) {
+/// every result stays. Of the areas kept, when one is named as `asked`, one
+/// named otherwise matched by another of its names only, and goes too: a
+/// county labelled Providence is not the town Providence asked for.
+pub(crate) fn best_matches(features: &mut Vec<crate::api::ForwardFeature>, asked: Option<&str>) {
     use crate::api::{PartMatch, QueryMatch};
     fn parts(found: QueryMatch) -> [Option<PartMatch>; 7] {
         [
@@ -446,6 +448,20 @@ pub(crate) fn best_matches(features: &mut Vec<crate::api::ForwardFeature>) {
                 .all(|(part, best)| best.is_none() || rank(*part) <= rank(*best))
         })
     });
+    let key = |text: &str| crate::util::fold::search_key(text);
+    let Some(asked) = asked.and_then(key) else {
+        return;
+    };
+    let area = |feature: &crate::api::ForwardFeature| feature.properties.common.layer.is_context();
+    let named = |feature: &crate::api::ForwardFeature| {
+        key(&feature.properties.common.name).as_deref() == Some(asked.as_str())
+    };
+    if features
+        .iter()
+        .any(|feature| area(feature) && named(feature))
+    {
+        features.retain(|feature| !area(feature) || named(feature));
+    }
 }
 
 /// og's native lookups, called as their routes would be.
