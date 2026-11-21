@@ -1910,3 +1910,227 @@ async fn filters_og_cannot_honour_are_refused_and_the_rest_applied() {
     let cities = autocomplete(json!(["(cities)"])).await.body;
     assert_eq!(cities, json!({}), "a bakery is no city");
 }
+
+/// United States > California > Santa Clara County > Mountain View, holding
+/// 1600 Amphitheatre Parkway as its county source writes it, the county
+/// standing in for the town, and the place at that address.
+fn us_fixture() -> Fixture {
+    let pack = std::env::temp_dir().join(format!(
+        "open-geocode-compat-google-us-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut writer = Writer::create(&pack).expect("writer");
+    let (lon, lat) = (-122.0846, 37.4218);
+    let mut place = |layer, name: &str, id| {
+        writer
+            .write(
+                &Record::Place(
+                    layer,
+                    PlaceRecord {
+                        alt_names: Vec::new(),
+                        name: name.to_string(),
+                        place_type: "admin_level:8".to_string(),
+                        geometry: point_geometry(lon, lat),
+                        source: SourceProvenance::osm(ObjectType::Relation, id),
+                        prominence: Default::default(),
+                        wikidata: None,
+                    },
+                ),
+                None,
+            )
+            .expect("place")
+    };
+    let tiers = [
+        (
+            PlaceLayer::Country,
+            place(PlaceLayer::Country, "United States", 1),
+        ),
+        (
+            PlaceLayer::Region,
+            place(PlaceLayer::Region, "California", 2),
+        ),
+        (
+            PlaceLayer::SubRegion,
+            place(PlaceLayer::SubRegion, "Santa Clara County", 3),
+        ),
+        (
+            PlaceLayer::Locality,
+            place(PlaceLayer::Locality, "Mountain View", 4),
+        ),
+    ];
+    writer.set_country_codes(
+        [(
+            tiers[0].1,
+            crate::parse::lattice::CountryCode::parse("US").expect("code"),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    writer.set_subdivision_codes([(tiers[1].1, "US-CA".to_string())].into_iter().collect());
+    let context = Some(RecordContext {
+        admin_context: AdminContextTuple::from_tiers(tiers),
+        flags: 0,
+        zone: None,
+    });
+    let address = AddressComponents {
+        areas: Vec::new(),
+        number: "1600".to_string(),
+        street: Some("Amphitheatre Parkway".to_string()),
+        place: None,
+        unit: None,
+        locality: Some("Santa Clara County".to_string()),
+        region: Some("CA".to_string()),
+        postcode: Some("94043".to_string()),
+        country: None,
+    };
+    writer
+        .write(
+            &AddressRecord {
+                access: Vec::new(),
+                disputed: false,
+                street_postcodes: Vec::new(),
+                address: address.clone(),
+                geometry: point_geometry(lon, lat),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, 10),
+            }
+            .into(),
+            context.clone(),
+        )
+        .expect("address");
+    // A house mapped as its building's outline.
+    writer
+        .write(
+            &AddressRecord {
+                access: Vec::new(),
+                disputed: false,
+                street_postcodes: Vec::new(),
+                address: AddressComponents {
+                    number: "1601".to_string(),
+                    ..address.clone()
+                },
+                geometry: point_geometry(lon + 0.001, lat),
+                location_precision: LocationPrecision::Centroid,
+                source: SourceProvenance::osm(ObjectType::Way, 12),
+            }
+            .into(),
+            context.clone(),
+        )
+        .expect("outline address");
+    writer
+        .write(
+            &PoiRecord {
+                alt_names: Vec::new(),
+                name: "Googleplex".to_string(),
+                category: "office:company".to_string(),
+                address: Some(address),
+                geometry: point_geometry(lon, lat),
+                location_precision: LocationPrecision::Centroid,
+                source: SourceProvenance::osm(ObjectType::Way, 11),
+                prominence: Default::default(),
+                wikidata: None,
+                brand: None,
+                details: None,
+                aliases: Vec::new(),
+            }
+            .into(),
+            context,
+        )
+        .expect("poi");
+    writer.finish().expect("finish");
+    let state = AppState::open(&pack, &pack.with_extension("jobs"), Limits::DEFAULT).expect("pack");
+    let router = build_router(state, None, None);
+    Fixture { pack, router }
+}
+
+#[tokio::test]
+async fn a_us_address_is_written_as_google_writes_it_in_its_town() {
+    let fixture = us_fixture();
+    let reply = get(
+        &fixture.router,
+        "/compat/google/v4/geocode/address/1600%20Amphitheatre%20Parkway,%20Mountain%20View,%20CA",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let result = &reply.body["results"][0];
+    let formatted = "1600 Amphitheatre Pkwy, Mountain View, CA 94043, USA";
+    assert_eq!(result["formattedAddress"], formatted, "{result}");
+    assert_eq!(
+        result["postalAddress"]["addressLines"],
+        json!(["1600 Amphitheatre Pkwy"])
+    );
+    assert_eq!(result["postalAddress"]["locality"], "Mountain View");
+    let route = result["addressComponents"]
+        .as_array()
+        .expect("components")
+        .iter()
+        .find(|component| component["types"][0] == "route")
+        .expect("a route");
+    assert_eq!(
+        route,
+        &json!({"longText": "Amphitheatre Parkway", "shortText": "Amphitheatre Pkwy",
+                "types": ["route"]})
+    );
+
+    // The place at the address writes its address alike.
+    let found = post(
+        &fixture.router,
+        "/compat/google/v1/places:searchText",
+        json!({"textQuery": "Googleplex"}),
+    )
+    .await;
+    let place = &found.body["places"][0];
+    assert_eq!(place["displayName"]["text"], "Googleplex", "{}", found.body);
+    assert_eq!(place["formattedAddress"], formatted);
+    let details = get(
+        &fixture.router,
+        &format!(
+            "/compat/google/v1/{}",
+            place["name"].as_str().expect("name")
+        ),
+    )
+    .await;
+    assert_eq!(
+        details.body["formattedAddress"], formatted,
+        "{}",
+        details.body
+    );
+}
+
+/// Google answers the house nearest a point on its lot or the street before
+/// it, here 67 m off, past og's own default reach.
+#[tokio::test]
+async fn reverse_answers_the_house_nearest_the_point() {
+    let fixture = us_fixture();
+    let reply = get(
+        &fixture.router,
+        "/compat/google/v4/geocode/location/37.4224,-122.0846",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(
+        reply.body["results"][0]["formattedAddress"],
+        "1600 Amphitheatre Pkwy, Mountain View, CA 94043, USA",
+        "{}",
+        reply.body
+    );
+}
+
+/// A house mapped as its building's outline stands at the house, Google's
+/// street-address precision.
+#[tokio::test]
+async fn a_house_mapped_as_an_outline_is_a_rooftop() {
+    let fixture = us_fixture();
+    let reply = get(
+        &fixture.router,
+        "/compat/google/v4/geocode/address/1601%20Amphitheatre%20Parkway,%20Mountain%20View,%20CA",
+    )
+    .await;
+    let result = &reply.body["results"][0];
+    assert_eq!(
+        result["formattedAddress"], "1601 Amphitheatre Pkwy, Mountain View, CA 94043, USA",
+        "{result}"
+    );
+    assert_eq!(result["granularity"], "ROOFTOP", "{result}");
+}

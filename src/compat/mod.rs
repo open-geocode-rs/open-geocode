@@ -21,6 +21,7 @@ pub(crate) mod here;
 pub(crate) mod hours;
 pub(crate) mod mapbox;
 pub(crate) mod precisely;
+pub(crate) mod usps;
 
 use axum::{
     Router,
@@ -505,9 +506,81 @@ pub(crate) fn country_code(context: &crate::api::Context) -> Option<&str> {
     context.country.as_ref()?.code.as_deref()
 }
 
+/// How far a vendor that states no distance looks for the house nearest a
+/// point. The vendors answer the nearest house wherever the point falls on
+/// its lot or the street before it, and a lot runs to about 100 m deep.
+pub(crate) const NEAREST_HOUSE_RADIUS_M: f64 = 150.0;
+
+/// A vendor's search distance as og's reverse `radius`. It only widens
+/// og's search, up to the farthest og looks: a nearer limit is the
+/// vendor's filter on what og finds, so og still answers the house and
+/// areas it would answer without one.
+pub(crate) fn radius(metres: f64) -> String {
+    metres
+        .clamp(
+            crate::reverse::DEFAULT_RADIUS_M,
+            crate::reverse::MAX_RADIUS_M,
+        )
+        .to_string()
+}
+
+/// The town a vendor's city slot names: the one the record's address is
+/// written with, else the locality holding it. The stated one comes first
+/// since it is often the postal town where the holding area names a wider
+/// municipality. A stated name that is another tier's area holding the
+/// record is no town, and the locality holding the record is: a county
+/// (OpenAddresses `district` stands in for an empty `city`) or a district
+/// of the town (`Paris 2e Arrondissement`).
+pub(crate) fn town<'a>(
+    stated: Option<&'a str>,
+    holding: Option<&'a str>,
+    others: &[Option<&str>],
+) -> Option<&'a str> {
+    let names_other = |name: &str| {
+        others
+            .iter()
+            .flatten()
+            .any(|area| area.eq_ignore_ascii_case(name))
+    };
+    match stated {
+        Some(name) if holding.is_some() && names_other(name) => holding,
+        stated => stated.or(holding),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_county_written_as_the_town_gives_way_to_the_town_holding_the_record() {
+        let county = Some("Lycoming County");
+        assert_eq!(
+            town(
+                county,
+                Some("Montoursville"),
+                &[county, Some("Pennsylvania")]
+            ),
+            Some("Montoursville")
+        );
+        // A postal town the holding township does not name stays.
+        assert_eq!(
+            town(Some("Montoursville"), Some("Loyalsock Township"), &[county]),
+            Some("Montoursville")
+        );
+        // A district of the town is no town either.
+        assert_eq!(
+            town(
+                Some("Paris 2e Arrondissement"),
+                Some("Paris"),
+                &[Some("Paris 2e Arrondissement")]
+            ),
+            Some("Paris")
+        );
+        // With no town holding it, the stated name is all og has.
+        assert_eq!(town(county, None, &[county]), county);
+        assert_eq!(town(None, Some("Troy"), &[]), Some("Troy"));
+    }
 
     #[test]
     fn only_a_place_area_or_street_id_reaches_the_catalogue() {

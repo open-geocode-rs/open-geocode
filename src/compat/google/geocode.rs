@@ -297,6 +297,10 @@ async fn reverse(
         Args::new()
             .set("lon", lon.to_string())
             .set("lat", lat.to_string())
+            .set(
+                "radius",
+                crate::compat::radius(crate::compat::NEAREST_HOUSE_RADIUS_M),
+            )
             .maybe("lang", language.code()),
     )
     .await
@@ -311,7 +315,7 @@ async fn reverse(
         .iter()
         .filter(|feature| {
             granularities.is_empty()
-                || granularities.contains(&granularity(feature.properties.common.accuracy))
+                || granularities.contains(&granularity(&feature.properties.common))
         })
         .map(|feature| {
             GeocodeResult::of(

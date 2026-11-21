@@ -57,8 +57,9 @@ const INVALID_CLIENT_INPUT: &str = "Request is not valid (DIS-LI-1018)";
 struct StoredFile {
     file_id: String,
     file_name: String,
-    /// Unix seconds.
-    created_at: u64,
+    /// Unix nanoseconds, so files asked for within one second list in the
+    /// order they were.
+    created_ns: u64,
 }
 
 /// A job started here, og's job and the upload it read.
@@ -110,6 +111,12 @@ fn job_id(raw: &str) -> Option<String> {
         .map(|id| id.simple().to_string())
 }
 
+/// og's job id as Precisely writes a job id, a hyphenated UUID.
+fn vendor_job_id(job_id: &str) -> String {
+    uuid::Uuid::try_parse(job_id)
+        .map_or_else(|_| job_id.to_string(), |id| id.hyphenated().to_string())
+}
+
 fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
@@ -141,7 +148,7 @@ fn stored_file(state: &AppState, id: &str) -> Option<StoredFile> {
     let id = file_id(id)?;
     let file = read_record::<StoredFile>(&files_dir(state).join(format!("{id}.json")))?;
     let retention = state.limits().job_retention().as_secs();
-    (file.created_at.saturating_add(retention) > now().as_secs()).then_some(file)
+    ((file.created_ns / 1_000_000_000).saturating_add(retention) > now().as_secs()).then_some(file)
 }
 
 fn content_path(state: &AppState, id: &str) -> PathBuf {
@@ -181,8 +188,9 @@ pub(crate) fn sweep(state: &AppState) {
         for entry in entries.flatten() {
             let path = entry.path();
             let record = files.join(format!("{}.json", id_of(&path)));
-            let expired = read_record::<StoredFile>(&record)
-                .is_none_or(|file| file.created_at.saturating_add(retention) <= now);
+            let expired = read_record::<StoredFile>(&record).is_none_or(|file| {
+                (file.created_ns / 1_000_000_000).saturating_add(retention) <= now
+            });
             if expired {
                 let _ = fs::remove_file(&path);
             }
@@ -234,7 +242,7 @@ pub(super) async fn upload_url(
     let file = StoredFile {
         file_id: id.clone(),
         file_name: file_name.to_string(),
-        created_at: now().as_secs(),
+        created_ns: u64::try_from(now().as_nanos()).unwrap_or(u64::MAX),
     };
     write_record(&files_dir(&state).join(format!("{id}.json")), &file).map_err(internal)?;
     Ok(Json(UploadUrl {
@@ -382,7 +390,7 @@ pub(super) async fn list_files(State(state): State<AppState>) -> Json<InputFiles
         })
         .unwrap_or_default();
     files.sort_by(|left, right| {
-        (left.created_at, &left.file_id).cmp(&(right.created_at, &right.file_id))
+        (left.created_ns, &left.file_id).cmp(&(right.created_ns, &right.file_id))
     });
     Json(InputFiles {
         results: files
@@ -693,7 +701,7 @@ async fn submit(
     Ok((
         StatusCode::ACCEPTED,
         Json(Submitted {
-            status_url: format!("{base}/v2/bulk/jobs/{job_id}"),
+            status_url: format!("{base}/v2/bulk/jobs/{}", vendor_job_id(&job_id)),
         }),
     )
         .into_response())
@@ -731,7 +739,7 @@ pub(super) async fn job_status(
     Ok(Json(JobStatus {
         status: status_name(status.status),
         download_url: (status.status == Status::Completed)
-            .then(|| format!("{base}/v2/bulk/jobs/{}/output", job.job_id)),
+            .then(|| format!("{base}/v2/bulk/jobs/{}/output", vendor_job_id(&job.job_id))),
         error: status.error,
     }))
 }
@@ -762,7 +770,7 @@ pub(super) async fn cancel_job(
         ));
     }
     Ok(Json(Cancelled {
-        job_id: job.job_id,
+        job_id: vendor_job_id(&job.job_id),
         message: "Request received for job cancellation",
     }))
 }
@@ -830,7 +838,7 @@ pub(super) async fn list_jobs(
             .map(|job| QueuedJob {
                 status: status_name(Status::Running),
                 submitted_at: iso8601(job.submitted_at),
-                job_id: job.job_id,
+                job_id: vendor_job_id(&job.job_id),
                 file_id: job.file_id,
                 file_name: job.file_name,
             })

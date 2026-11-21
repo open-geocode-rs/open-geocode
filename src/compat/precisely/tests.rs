@@ -293,6 +293,7 @@ async fn native(router: &Router, path: &str) -> Value {
 enum Route {
     Geocode,
     Reverse,
+    Lookup,
     Autocomplete,
 }
 
@@ -332,9 +333,14 @@ fn assert_carries(
         result["location"]["explanation"]["additionalMetadata"]["SOURCE"],
         properties["source"]["dataset"]
     );
-    match properties["confidence"].as_f64() {
-        Some(confidence) => assert_eq!(result["score"], json!((confidence * 100.0).round() as u8)),
-        None => assert_eq!(result.get("score"), None),
+    // With no address asked there is nothing to score, and Precisely
+    // writes 0.
+    match (route, properties["confidence"].as_f64()) {
+        (Route::Reverse | Route::Lookup, _) => assert_eq!(result["score"], 0, "{result}"),
+        (_, Some(confidence)) => {
+            assert_eq!(result["score"], json!((confidence * 100.0).round() as u8));
+        }
+        (_, None) => assert_eq!(result.get("score"), None),
     }
 
     slot("address_lines", &properties["address_lines"]);
@@ -348,7 +354,8 @@ fn assert_carries(
     let judged = &properties["match"];
     slot("match", judged);
     let description = &result["explanation"]["addressMatch"]["description"];
-    if judged.is_null() {
+    // Autocomplete judges no part; it says which the typed text marked.
+    if judged.is_null() && route != Route::Autocomplete {
         assert_eq!(description, &Value::Null, "{feature} as {result}");
     }
     for (part, label) in [
@@ -358,7 +365,6 @@ fn assert_carries(
         ("locality", "city"),
         ("region", "admin1"),
         ("postcode", "postalCode"),
-        ("country", "country"),
     ] {
         let Some(judged) = judged[part].as_str() else {
             continue;
@@ -378,7 +384,7 @@ fn assert_carries(
 
     let distance = &properties["distance_m"];
     let (value, unit) = match route {
-        Route::Geocode => (Value::Null, Value::Null),
+        Route::Geocode | Route::Lookup => (Value::Null, Value::Null),
         Route::Reverse => {
             slot("reverse distance", distance);
             let fields = &result["customFields"];
@@ -395,6 +401,12 @@ fn assert_carries(
                 result["distance"]["distanceUnit"].clone(),
             )
         }
+    };
+    // An autocomplete asked with no origin measures from nowhere, and
+    // Precisely writes 0.
+    let distance = match (route, distance) {
+        (Route::Autocomplete, Value::Null) => &json!(0.0),
+        _ => distance,
     };
     assert_eq!(&value, distance, "{feature} as {result}");
     let metres = match route {
@@ -480,23 +492,34 @@ fn assert_carries(
     );
 }
 
-/// The address result, `described` its matchType per part as og judged it,
-/// in Precisely's order.
-fn address_result(score: &Value, described: &[&str; 7]) -> Value {
-    let labels = [
+/// The address result, `exact` the parts og matched, every other part
+/// Precisely lists `NONE`, in Precisely's order.
+fn address_result(score: &Value, exact: &[&str]) -> Value {
+    let description = [
+        "placeName",
         "addressNumber",
-        "street",
-        "unitMatch",
-        "city",
         "admin1",
+        "admin2",
+        "city",
+        "neighborhood",
+        "suburb",
+        "street",
         "postalCode",
-        "country",
-    ];
-    let description = labels
-        .iter()
-        .zip(described.iter())
-        .map(|(label, kind)| json!({"label": label, "matchType": kind}))
-        .collect::<Vec<_>>();
+        "streetType",
+        "postalCodeExt",
+        "streetDirectional",
+        "unitMatch",
+    ]
+    .iter()
+    .map(|label| {
+        let kind = if exact.contains(label) {
+            "EXACT"
+        } else {
+            "NONE"
+        };
+        json!({"label": label, "matchType": kind})
+    })
+    .collect::<Vec<_>>();
     json!({
         "score": score,
         "address": {
@@ -585,12 +608,12 @@ async fn geocode_answers_each_address_in_order() {
         json!({"responses": [
             {"addressId": "1", "status": "OK", "results": [address_result(
                 &score,
-                &["EXACT", "EXACT", "ADDED", "ADDED", "ADDED", "ADDED", "EXACT"],
+                &["addressNumber", "street"],
             )]},
             {"addressId": "2", "status": "ZERO_RESULTS", "results": []},
             {"addressId": "3", "status": "OK", "results": [address_result(
                 &structured_score,
-                &["EXACT", "EXACT", "ADDED", "EXACT", "ADDED", "EXACT", "EXACT"],
+                &["addressNumber", "street", "city", "postalCode"],
             )]},
         ]})
     );
@@ -654,7 +677,8 @@ async fn every_og_value_lands_in_its_precisely_slot() {
     let reply = post(
         &router,
         "/v1/reverse-geocode",
-        &json!({"preferences": {"maxResults": 10},
+        &json!({"preferences": {"maxResults": 10,
+                                "distance": {"value": 30, "distanceUnit": "METER"}},
                 "locations": [{"longitude": -79.3815, "latitude": 43.6495, "country": "CAN"}]}),
     )
     .await;
@@ -732,6 +756,26 @@ async fn a_poi_says_what_it_is_and_where() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::OK);
+    // The typed name marks the place's name whole, and no other part.
+    let typed = [
+        "placeName",
+        "addressNumber",
+        "admin1",
+        "admin2",
+        "city",
+        "neighborhood",
+        "suburb",
+        "street",
+        "postalCode",
+        "streetType",
+        "postalCodeExt",
+        "streetDirectional",
+    ]
+    .map(|label| match label {
+        "placeName" => json!({"label": label, "matchType": "EXACT",
+                              "matchedSubstring": "QUEEN BAKERY"}),
+        _ => json!({"label": label, "matchType": "NONE"}),
+    });
     // og's autocomplete is not calibrated, so it carries no score.
     assert_eq!(
         reply.json(),
@@ -758,8 +802,9 @@ async fn a_poi_says_what_it_is_and_where() {
                             "geometry": {"type": "Point", "coordinates": [-79.383, 43.649]}},
             },
             "addressLines": ["120 King Street West", "Toronto, ON M5X 1A9", "Canada"],
-            "explanation": {"addressMatch": {"type": "POI"}},
+            "explanation": {"addressMatch": {"type": "POI", "description": typed}},
             "customFields": {"PB_KEY": encode_parts("osm:way:11", Some(Layer::Poi), "")},
+            "distance": {"value": 0.0, "distanceUnit": "METER"},
         }]}})
     );
 
@@ -920,10 +965,9 @@ async fn reverse_geocode_answers_each_point() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::PARTIAL_CONTENT);
-    // A point judges no stated part, so the result has no score and no
-    // match description.
-    let mut expected = address_result(&json!(null), &["NONE"; 7]);
-    expected.as_object_mut().expect("result").remove("score");
+    // A point judges no stated part, so the result scores 0, as Precisely
+    // writes for no address asked, and has no match description.
+    let mut expected = address_result(&json!(0), &[]);
     expected["explanation"]["addressMatch"]
         .as_object_mut()
         .expect("addressMatch")
@@ -960,6 +1004,29 @@ async fn reverse_geocode_answers_each_point() {
         .map(|result| result["explanation"]["addressMatch"]["type"].clone())
         .collect::<Vec<_>>();
     assert_eq!(kinds, [json!("ADMIN")], "{near}");
+
+    // The house 55 m off is found within the documented 150 m, past og's
+    // own default reach, and not within Precisely's default 5 m.
+    let far = |preferences: Value| {
+        let router = router.clone();
+        async move {
+            post(
+                &router,
+                "/v1/reverse-geocode",
+                &json!({"preferences": preferences,
+                        "locations": [{"longitude": -79.3817, "latitude": 43.6498,
+                                       "country": "CAN"}]}),
+            )
+            .await
+            .json()["responses"][0]["results"][0]["explanation"]["addressMatch"]["type"]
+                .clone()
+        }
+    };
+    assert_eq!(
+        far(json!({"distance": {"value": 150, "distanceUnit": "METER"}})).await,
+        "ADDRESS"
+    );
+    assert_eq!(far(json!({})).await, "ADMIN");
 }
 
 #[tokio::test]
@@ -978,7 +1045,7 @@ async fn lookup_finds_a_record_by_the_pb_key_og_issued() {
     assert_eq!(body["responses"][0]["status"], "OK");
     assert_eq!(body["responses"][0].get("addressId"), None);
     assert_carries(
-        Route::Geocode,
+        Route::Lookup,
         &og["features"][0],
         &body["responses"][0]["results"][0],
         &mut BTreeSet::new(),
@@ -1222,6 +1289,19 @@ async fn a_bulk_job_runs_on_og_jobs_and_downloads_as_precisely_csv() {
         status_url,
         format!("http://localhost/compat/precisely/v2/bulk/jobs/{job_id}")
     );
+    // Precisely writes a job id as a hyphenated UUID; og's own is the same
+    // UUID without hyphens.
+    let og_id = uuid::Uuid::try_parse(&job_id)
+        .expect("a UUID")
+        .simple()
+        .to_string();
+    assert_eq!(
+        uuid::Uuid::try_parse(&job_id)
+            .expect("a UUID")
+            .hyphenated()
+            .to_string(),
+        job_id
+    );
 
     assert_eq!(
         finished(&router, &job_id).await,
@@ -1230,7 +1310,7 @@ async fn a_bulk_job_runs_on_og_jobs_and_downloads_as_precisely_csv() {
             "downloadUrl": format!("http://localhost/compat/precisely/v2/bulk/jobs/{job_id}/output"),
         })
     );
-    let og_job = native(&router, &format!("/jobs/{job_id}")).await;
+    let og_job = native(&router, &format!("/jobs/{og_id}")).await;
     assert_eq!(og_job["status"], "completed");
     assert_eq!(
         og_job["summary"],
@@ -1536,7 +1616,7 @@ async fn uploads_and_job_records_expire_with_og_jobs() {
     let record = files.join(format!("{expired}.json"));
     let mut stale =
         serde_json::from_slice::<Value>(&std::fs::read(&record).expect("record")).expect("JSON");
-    stale["createdAt"] = json!(0);
+    stale["createdNs"] = json!(0);
     std::fs::write(&record, stale.to_string()).expect("write");
     // Past its retention it is gone at once, before any sweep.
     assert_eq!(
@@ -1551,9 +1631,13 @@ async fn uploads_and_job_records_expire_with_og_jobs() {
         .expect("job id")
         .to_string();
     assert_eq!(finished(&router, &job_id).await["status"], "COMPLETED");
+    let og_id = uuid::Uuid::try_parse(&job_id)
+        .expect("a UUID")
+        .simple()
+        .to_string();
     let deleted = send(
         &router,
-        Request::delete(format!("/jobs/{job_id}"))
+        Request::delete(format!("/jobs/{og_id}"))
             .body(Body::empty())
             .expect("delete"),
     )
@@ -1588,13 +1672,8 @@ async fn uploads_and_job_records_expire_with_og_jobs() {
 /// The standardized result verify gives for 100 King Street West, with
 /// the score og's confidence makes.
 fn verified_result(score: &Value, stated: &[&str], codes: [&str; 2]) -> Value {
-    let match_type = |label: &str| {
-        if stated.contains(&label) {
-            "EXACT"
-        } else {
-            "ADDED"
-        }
-    };
+    let description =
+        address_result(score, stated)["explanation"]["addressMatch"]["description"].clone();
     json!({
         "score": score,
         "address": {
@@ -1614,15 +1693,7 @@ fn verified_result(score: &Value, stated: &[&str], codes: [&str; 2]) -> Value {
                         "isoNumericCode": "124"},
         },
         "addressLines": ["Unit 5", "100 King Street West", "Toronto, ON M5X 1A9", "Canada"],
-        "explanation": {"addressMatch": {"type": "ADDRESS", "description": [
-            {"label": "addressNumber", "matchType": match_type("addressNumber")},
-            {"label": "street", "matchType": match_type("street")},
-            {"label": "unitMatch", "matchType": "ADDED"},
-            {"label": "city", "matchType": match_type("city")},
-            {"label": "admin1", "matchType": "ADDED"},
-            {"label": "postalCode", "matchType": match_type("postalCode")},
-            {"label": "country", "matchType": match_type("country")},
-        ]}},
+        "explanation": {"addressMatch": {"type": "ADDRESS", "description": description}},
         "customFields": {
             "PB_KEY": address_vendor_id("osm:node:10"),
             "SIMPLE_MATCH_CODE": codes[0],
@@ -2091,4 +2162,22 @@ async fn express_autocomplete_v2_refuses_a_filter_it_cannot_honour() {
             "filterBias is not supported by this server (DIS-LI-1018)"
         )
     );
+}
+
+/// Files asked for within one second list in the order they were asked for.
+#[tokio::test]
+async fn files_list_in_the_order_they_were_uploaded() {
+    let fixture = Fixture::new("file-order");
+    let router = fixture.router();
+    let mut ids = Vec::new();
+    for _ in 0..6 {
+        ids.push(upload(&router, "addressid|address|country\n").await);
+    }
+    let listed = get(&router, "/compat/precisely/v2/files").await.json()["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|file| file["fileId"].as_str().expect("fileId").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(listed, ids);
 }

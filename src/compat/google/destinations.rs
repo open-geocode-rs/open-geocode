@@ -201,6 +201,10 @@ async fn by_location(
                 .set("lon", lon.to_string())
                 .set("lat", lat.to_string())
                 .set("layer", layer)
+                .set(
+                    "radius",
+                    crate::compat::radius(crate::compat::NEAREST_HOUSE_RADIUS_M),
+                )
                 .maybe("lang", language.code()),
         )
     };

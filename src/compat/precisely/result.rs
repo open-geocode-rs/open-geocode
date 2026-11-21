@@ -10,8 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use super::match_code::{Holds, MatchCode};
 use crate::{
-    api::{self, Accuracy, PartMatch, QueryMatch},
-    compat::encode_parts,
+    api::{self, Accuracy, Highlight, PartMatch, QueryMatch},
+    compat::{
+        encode_parts, town,
+        usps::{self, Style, UsAddress},
+    },
     iso,
     record::Layer,
 };
@@ -59,6 +62,8 @@ struct Properties {
     #[serde(rename = "match")]
     matched: Option<QueryMatch>,
     distance_m: Option<f64>,
+    #[serde(default)]
+    highlights: Vec<Highlight>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -73,6 +78,17 @@ struct Address {
     region: Option<String>,
     postcode: Option<String>,
     country: Option<String>,
+    street_parts: Option<StreetParts>,
+}
+
+/// og's `street_parts`, the street as its prefix, name, type and suffix.
+#[derive(Debug, Deserialize)]
+struct StreetParts {
+    prefix: Option<String>,
+    name: String,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    suffix: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -114,13 +130,8 @@ struct Source {
 }
 
 impl Feature {
-    fn of(
-        common: &api::Common,
-        coordinates: [f64; 2],
-        confidence: Option<f32>,
-        matched: Option<QueryMatch>,
-        distance_m: Option<f64>,
-    ) -> Self {
+    /// The parts both a forward and a reverse feature have.
+    fn of(common: &api::Common, coordinates: [f64; 2]) -> Self {
         let address = &common.address;
         let context = &common.context;
         let area = |area: &Option<api::ContextArea>| {
@@ -148,6 +159,12 @@ impl Feature {
                     region: address.region.clone(),
                     postcode: address.postcode.clone(),
                     country: address.country.clone(),
+                    street_parts: address.street_parts.as_ref().map(|parts| StreetParts {
+                        prefix: parts.prefix.clone(),
+                        name: parts.name.clone(),
+                        kind: parts.kind.clone(),
+                        suffix: parts.suffix.clone(),
+                    }),
                 },
                 context: Context {
                     neighbourhood: area(&context.neighbourhood),
@@ -161,10 +178,11 @@ impl Feature {
                 source: Source {
                     dataset: common.source.dataset.clone(),
                 },
-                confidence,
+                confidence: None,
                 address_lines: common.address_lines.clone(),
-                matched,
-                distance_m,
+                matched: None,
+                distance_m: None,
+                highlights: Vec::new(),
             },
         }
     }
@@ -173,26 +191,21 @@ impl Feature {
 impl From<&api::ForwardFeature> for Feature {
     fn from(feature: &api::ForwardFeature) -> Self {
         let properties = &feature.properties;
-        Self::of(
-            &properties.common,
-            feature.geometry.coordinates,
-            properties.confidence,
-            properties.matched,
-            properties.distance_m,
-        )
+        let mut own = Self::of(&properties.common, feature.geometry.coordinates);
+        own.properties.confidence = properties.confidence;
+        own.properties.matched = properties.matched;
+        own.properties.distance_m = properties.distance_m;
+        own.properties.highlights.clone_from(&properties.highlights);
+        own
     }
 }
 
 impl From<&api::ReverseFeature> for Feature {
     fn from(feature: &api::ReverseFeature) -> Self {
         let properties = &feature.properties;
-        Self::of(
-            &properties.common,
-            feature.geometry.coordinates,
-            None,
-            None,
-            properties.distance_m,
-        )
+        let mut own = Self::of(&properties.common, feature.geometry.coordinates);
+        own.properties.distance_m = properties.distance_m;
+        own
     }
 }
 
@@ -248,10 +261,13 @@ pub(super) struct ResponseAddress {
     pub(super) country: Option<CountryField>,
 }
 
-#[derive(Debug, Serialize)]
+/// Precisely's `AdminField`. Autocomplete writes a county and a
+/// neighbourhood as an empty one.
+#[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AdminField {
-    pub(super) long_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) long_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) short_name: Option<String>,
 }
@@ -334,6 +350,8 @@ pub(super) struct AddressMatch {
 pub(super) struct MatchDescription {
     pub(super) label: &'static str,
     pub(super) match_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) matched_substring: Option<String>,
 }
 
 /// og's coordinates are WGS 84 longitude and latitude.
@@ -413,7 +431,7 @@ impl Feature {
     /// the asked point in the custom fields Precisely writes it to. An area
     /// holds the point, so it has none.
     pub(super) fn reverse_candidate(&self) -> Candidate {
-        let mut candidate = self.candidate(Product::Geocode);
+        let mut candidate = self.unasked_candidate();
         if let Some(distance_m) = self.properties.distance_m {
             candidate
                 .custom_fields
@@ -425,13 +443,48 @@ impl Feature {
         candidate
     }
 
+    /// A candidate found with no address asked, by a point or a key.
+    /// Precisely scores how well a result matches the address asked, and
+    /// writes 0 when none was.
+    pub(super) fn unasked_candidate(&self) -> Candidate {
+        let mut candidate = self.candidate(Product::Geocode);
+        candidate.score = Some(0);
+        candidate
+    }
+
     /// Metres from the point a reverse geocode, or an autocomplete with
     /// `originXY`, measured from.
     pub(super) const fn distance_m(&self) -> Option<f64> {
         self.properties.distance_m
     }
 
+    /// A geocode, verify, lookup or reverse candidate, in the postal form.
     pub(super) fn candidate(&self, product: Product) -> Candidate {
+        self.build(product, Style::Postal)
+    }
+
+    /// An autocomplete prediction's candidate. Autocomplete writes the
+    /// address in its own case and without the country, names the state by
+    /// its code and leaves the county and neighbourhood empty, and says how
+    /// the typed text matched each part.
+    pub(super) fn prediction(&self) -> Candidate {
+        let mut candidate = self.build(Product::Geocode, Style::Display);
+        let postal = self.us_address(&candidate.address).is_some();
+        let address = &mut candidate.address;
+        if postal {
+            address.admin2 = Some(AdminField::default());
+            address.neighborhood = Some(AdminField::default());
+            if let Some(admin1) = address.admin1.as_mut()
+                && let Some(code) = admin1.short_name.clone()
+            {
+                admin1.long_name = Some(code);
+            }
+        }
+        candidate.explanation.address_match.description = self.typed(&candidate.address);
+        candidate
+    }
+
+    fn build(&self, product: Product, style: Style) -> Candidate {
         let properties = &self.properties;
         let address = &properties.address;
         let context = &properties.context;
@@ -439,12 +492,6 @@ impl Feature {
         let accuracy = properties.accuracy.as_str();
         let is_street_line = matches!(layer, "address" | "interpolation" | "street");
         let area = |area: &Option<Area>| area.as_ref().map(|area| area.name.clone());
-        let admin = |name: Option<String>| {
-            name.map(|long_name| AdminField {
-                long_name,
-                short_name: None,
-            })
-        };
         let (postal_code, postal_code_ext) = match address.postcode.as_deref() {
             Some(postcode) => match zip_plus_four(postcode) {
                 Some((zip, plus_four)) => (Some(zip.to_string()), Some(plus_four.to_string())),
@@ -466,9 +513,9 @@ impl Feature {
         ) {
             (Some(long_name), stated) => Some(AdminField {
                 short_name: region_code.or(stated).filter(|short| *short != long_name),
-                long_name,
+                long_name: Some(long_name),
             }),
-            (None, stated) => admin(stated),
+            (None, stated) => AdminField::named(stated),
         };
         let code = self.country_code().map(str::to_string);
         let country_name = self
@@ -505,6 +552,20 @@ impl Feature {
         } else {
             (None, None)
         };
+        let admin2 = area(&context.district)
+            .or_else(|| area(&context.subregion))
+            .or_else(|| own("district"));
+        let city = town(
+            address.locality.as_deref(),
+            context.locality.as_ref().map(|area| area.name.as_str()),
+            &[
+                admin2.as_deref(),
+                region.map(|region| region.name),
+                address.region.as_deref(),
+            ],
+        )
+        .map(str::to_string)
+        .or_else(|| own("locality"));
         let judged = properties.matched.unwrap_or_default();
         let kind = address.unit.as_deref().and_then(unit_type);
         let mut candidate = Candidate {
@@ -530,23 +591,10 @@ impl Feature {
                 },
                 unit_type: kind,
                 place_name: (layer == "poi").then(|| properties.name.clone()),
-                neighborhood: admin(neighborhood),
-                suburb: admin(suburb),
-                // The record's own locality is the one its address is
-                // written with; the containing area may name the wider
-                // municipality.
-                city: admin(
-                    address
-                        .locality
-                        .clone()
-                        .or_else(|| area(&context.locality))
-                        .or_else(|| own("locality")),
-                ),
-                admin2: admin(
-                    area(&context.district)
-                        .or_else(|| area(&context.subregion))
-                        .or_else(|| own("district")),
-                ),
+                neighborhood: AdminField::named(neighborhood),
+                suburb: AdminField::named(suburb),
+                city: AdminField::named(city),
+                admin2: AdminField::named(admin2),
                 admin1,
                 postal_code,
                 postal_code_ext,
@@ -575,47 +623,11 @@ impl Feature {
                 encode_parts(&properties.id, Some(properties.layer), &properties.label),
             )]),
         };
-        // A point may have a street-only display label even though its
-        // recorded components identify the municipality and state.
-        if is_street_line
-            && candidate.address.formatted_location_address.is_none()
-            && candidate
-                .address
-                .country
-                .as_ref()
-                .and_then(|country| country.iso_alpha2_code.as_deref())
-                == Some("US")
-            && let (Some(city), Some(region), Some(street)) = (
-                candidate.address.city.as_ref(),
-                candidate.address.admin1.as_ref(),
-                candidate.address.formatted_street_address.as_deref(),
-            )
-        {
-            let state = region.short_name.as_deref().unwrap_or(&region.long_name);
-            let postal = properties.address.postcode.as_deref();
-            let state_and_postal = [Some(state), postal]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" ");
-            let location = format!("{}, {state_and_postal}", city.long_name);
-            let country = candidate
-                .address
-                .country
-                .as_ref()
-                .and_then(|country| country.name.as_deref());
-            let city_state = format!("{} {state_and_postal}", city.long_name);
-            candidate.address.formatted_address = Some(
-                [Some(street), Some(&city_state), country]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
-            candidate.address.formatted_location_address = Some(location);
+        if let Some(us) = self.us_address(&candidate.address) {
+            us.write(&mut candidate, style);
         }
         let holds = Holds::of(&candidate.address);
-        candidate.explanation.address_match.description = describe(judged, &holds);
+        candidate.explanation.address_match.description = describe(judged);
         if product == Product::Verify {
             // Verify standardizes an address and does not place it.
             candidate.location = None;
@@ -630,7 +642,165 @@ impl Feature {
         }
         candidate
     }
+
+    /// The candidate's address in the US postal form, for a US house on a
+    /// street whose town and state og knows. Every Precisely example of a
+    /// US address is written so; og writes no other country's address in a
+    /// form Precisely has not shown.
+    fn us_address(&self, address: &ResponseAddress) -> Option<UsAddress> {
+        let country = address.country.as_ref()?.iso_alpha2_code.as_deref();
+        if country != Some("US") {
+            return None;
+        }
+        let parts = self.properties.address.street_parts.as_ref();
+        let street = self.properties.address.street.as_deref()?;
+        let admin1 = address.admin1.as_ref()?;
+        Some(UsAddress::of(&usps::Parts {
+            number: address.address_number.as_deref()?,
+            prefix: parts.and_then(|parts| parts.prefix.as_deref()),
+            name: parts.map_or(street, |parts| parts.name.as_str()),
+            kind: parts.and_then(|parts| parts.kind.as_deref()),
+            suffix: parts.and_then(|parts| parts.suffix.as_deref()),
+            unit_type: address.unit_type.as_deref(),
+            unit: address.unit.as_deref(),
+            city: address.city.as_ref()?.long_name.as_deref()?,
+            state: admin1
+                .short_name
+                .as_deref()
+                .or(admin1.long_name.as_deref())
+                .filter(|code| code.len() == 2)?,
+            zip: address.postal_code.as_deref(),
+            zip4: address.postal_code_ext.as_deref(),
+        }))
+    }
+
+    /// How the typed text matched each part, from the parts of the label
+    /// it marked. Precisely names what matched in capitals. Empty when og
+    /// marked nothing.
+    fn typed(&self, address: &ResponseAddress) -> Vec<MatchDescription> {
+        let label = self.properties.label.chars().collect::<Vec<_>>();
+        let marked = self
+            .properties
+            .highlights
+            .iter()
+            .filter(|mark| mark.start < mark.end && mark.end <= label.len())
+            .map(|mark| label[mark.start..mark.end].iter().collect::<String>())
+            .collect::<Vec<_>>();
+        if marked.is_empty() {
+            return Vec::new();
+        }
+        let key = |text: &str| text.to_lowercase();
+        let judge = |part: Option<&str>| -> (&'static str, Option<String>) {
+            let Some(part) = part else {
+                return ("NONE", None);
+            };
+            let words = part.split_whitespace().map(key).collect::<Vec<_>>();
+            let hits = marked
+                .iter()
+                .filter(|text| words.contains(&key(text)))
+                .map(|text| text.to_uppercase())
+                .collect::<Vec<_>>();
+            match hits.len() {
+                0 => ("NONE", None),
+                n if n == words.len() => ("EXACT", Some(hits.join(" "))),
+                _ => ("PARTIAL", Some(hits.join(" "))),
+            }
+        };
+        let street = self.properties.address.street.as_deref();
+        let city = address
+            .city
+            .as_ref()
+            .and_then(|city| city.long_name.as_deref());
+        LABELS
+            .into_iter()
+            .filter(|label| *label != "unitMatch")
+            .map(|label| {
+                let (match_type, matched_substring) = match label {
+                    "placeName" => judge(address.place_name.as_deref()),
+                    "addressNumber" => judge(address.address_number.as_deref()),
+                    "street" => judge(street),
+                    "city" => judge(city),
+                    "postalCode" => judge(address.postal_code.as_deref()),
+                    _ => ("NONE", None),
+                };
+                MatchDescription {
+                    label,
+                    match_type,
+                    matched_substring,
+                }
+            })
+            .collect()
+    }
 }
+
+impl UsAddress {
+    /// Writes the address into a candidate in `style`.
+    fn write(&self, candidate: &mut Candidate, style: Style) {
+        let address = &mut candidate.address;
+        let street_line = self.street_line(style);
+        let last_line = self.last_line(style);
+        let country = match style {
+            Style::Postal => address
+                .country
+                .as_ref()
+                .and_then(|country| country.name.clone()),
+            Style::Display => None,
+        };
+        let lines = [Some(street_line.clone()), Some(last_line), country]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        address.formatted_address = Some(lines.join(", "));
+        address.formatted_street_address = Some(street_line);
+        address.formatted_location_address = Some(self.location_line(style));
+        address.street = Some(self.street(style));
+        address.unit_type = address.unit_type.as_deref().map(usps::designator);
+        let city = self.city(style);
+        address.city = Some(AdminField::both(city));
+        if style == Style::Postal
+            && let Some(admin2) = address.admin2.as_mut()
+            && let Some(name) = admin2.long_name.as_deref()
+        {
+            *admin2 = AdminField::both(name.to_uppercase());
+        }
+        candidate.address_lines = lines;
+    }
+}
+
+impl AdminField {
+    fn named(name: Option<String>) -> Option<Self> {
+        name.map(|long_name| Self {
+            long_name: Some(long_name),
+            short_name: None,
+        })
+    }
+
+    /// A name Precisely writes as both the long and the short name.
+    fn both(name: String) -> Self {
+        Self {
+            short_name: Some(name.clone()),
+            long_name: Some(name),
+        }
+    }
+}
+
+/// The parts a `MatchDescription` names, in the order Precisely lists them.
+/// Autocomplete lists them without `unitMatch`.
+const LABELS: [&str; 13] = [
+    "placeName",
+    "addressNumber",
+    "admin1",
+    "admin2",
+    "city",
+    "neighborhood",
+    "suburb",
+    "street",
+    "postalCode",
+    "streetType",
+    "postalCodeExt",
+    "streetDirectional",
+    "unitMatch",
+];
 
 impl Holds {
     /// What a result's address holds, for the parts og can fill.
@@ -649,35 +819,37 @@ impl Holds {
     }
 }
 
-/// How each part matched, as Precisely's `MatchDescription` names it. Only
-/// og's own `matched` is `EXACT`; a part the request left out that the
-/// result fills is `ADDED`. Empty when og judged no part, as of a record
-/// looked up by its key.
-fn describe(judged: QueryMatch, holds: &Holds) -> Vec<MatchDescription> {
+/// How each part matched, as Precisely's `MatchDescription` names it, for
+/// every part it lists. A part og did not judge, or the query left out, is
+/// `NONE`. og judges the street whole, not its type and direction apart.
+/// Empty when og judged no part, as of a record looked up by its key.
+fn describe(judged: QueryMatch) -> Vec<MatchDescription> {
     if judged.is_empty() {
         return Vec::new();
     }
-    [
-        ("addressNumber", judged.housenumber, holds.housenumber),
-        ("street", judged.street, holds.street),
-        ("unitMatch", judged.unit, holds.unit),
-        ("city", judged.locality, holds.city),
-        ("admin1", judged.region, holds.region),
-        ("postalCode", judged.postcode, holds.postcode),
-        ("country", judged.country, holds.country),
-    ]
-    .into_iter()
-    .map(|(label, judged, holds)| MatchDescription {
-        label,
-        match_type: match judged {
-            Some(PartMatch::Matched) => "EXACT",
-            Some(PartMatch::Partial) => "PARTIAL",
-            Some(PartMatch::Unmatched) => "NONE",
-            None if holds => "ADDED",
-            None => "NONE",
-        },
-    })
-    .collect()
+    LABELS
+        .into_iter()
+        .map(|label| {
+            let part = match label {
+                "addressNumber" => judged.housenumber,
+                "admin1" => judged.region,
+                "city" => judged.locality,
+                "street" => judged.street,
+                "postalCode" => judged.postcode,
+                "unitMatch" => judged.unit,
+                _ => None,
+            };
+            MatchDescription {
+                label,
+                match_type: match part {
+                    Some(PartMatch::Matched) => "EXACT",
+                    Some(PartMatch::Partial) => "PARTIAL",
+                    Some(PartMatch::Unmatched) | None => "NONE",
+                },
+                matched_substring: None,
+            }
+        })
+        .collect()
 }
 
 /// The keys a reverse geocode result's distance from the asked point is
@@ -810,7 +982,7 @@ impl Candidate {
         let name = |field: &Option<AdminField>| {
             field
                 .as_ref()
-                .map(|field| field.long_name.clone())
+                .and_then(|field| field.long_name.clone())
                 .unwrap_or_default()
         };
         let country = address.country.as_ref();
@@ -922,6 +1094,106 @@ mod tests {
             serde_json::json!({"longName": "Washington County"})
         );
         assert_eq!(county.get("city"), None);
+    }
+
+    /// og's answer for 350 Jordan Avenue as the Lycoming County source
+    /// writes it, `district` standing in for the town.
+    fn jordan() -> Feature {
+        serde_json::from_value(serde_json::json!({
+            "geometry": {"coordinates": [-76.9251736, 41.2480338]},
+            "properties": {
+                "id": "openaddresses:us/pa/lycoming:row:21956", "layer": "address",
+                "accuracy": "rooftop", "name": "350 JORDAN AVENUE",
+                "label": "350 JORDAN AVENUE, Lycoming County, PA, 17754",
+                "source": {"dataset": "openaddresses:us/pa/lycoming"},
+                "address": {
+                    "housenumber": "350", "street": "JORDAN AVENUE",
+                    "locality": "Lycoming County", "region": "PA", "postcode": "17754",
+                    "street_parts": {"name": "JORDAN", "type": "AVENUE"},
+                },
+                "context": {
+                    "locality": {"name": "Montoursville"},
+                    "subregion": {"name": "Lycoming County"},
+                    "region": {"name": "Pennsylvania", "code": "US-PA"},
+                    "country": {"name": "United States", "code": "US"},
+                },
+                "highlights": [{"start": 0, "end": 3}, {"start": 4, "end": 10}],
+            },
+        }))
+        .expect("an og feature")
+    }
+
+    #[test]
+    fn a_us_address_is_written_in_the_postal_form_in_its_town() {
+        let candidate = serde_json::to_value(jordan().candidate(Product::Geocode)).expect("JSON");
+        let address = &candidate["address"];
+        assert_eq!(
+            address["formattedAddress"],
+            "350 JORDAN AVE, MONTOURSVILLE PA 17754, United States"
+        );
+        assert_eq!(address["formattedStreetAddress"], "350 JORDAN AVE");
+        assert_eq!(
+            address["formattedLocationAddress"],
+            "MONTOURSVILLE, PA  17754"
+        );
+        assert_eq!(address["street"], "JORDAN");
+        assert_eq!(
+            address["city"],
+            serde_json::json!({"longName": "MONTOURSVILLE", "shortName": "MONTOURSVILLE"})
+        );
+        assert_eq!(
+            address["admin2"],
+            serde_json::json!({"longName": "LYCOMING COUNTY", "shortName": "LYCOMING COUNTY"})
+        );
+        assert_eq!(
+            address["admin1"],
+            serde_json::json!({"longName": "Pennsylvania", "shortName": "PA"})
+        );
+        assert_eq!(
+            candidate["addressLines"],
+            serde_json::json!(["350 JORDAN AVE", "MONTOURSVILLE PA 17754", "United States"])
+        );
+    }
+
+    #[test]
+    fn a_us_prediction_is_written_as_autocomplete_writes_it() {
+        let candidate = serde_json::to_value(jordan().prediction()).expect("JSON");
+        let address = &candidate["address"];
+        assert_eq!(
+            address["formattedAddress"],
+            "350 Jordan Ave, Montoursville PA 17754"
+        );
+        assert_eq!(
+            address["formattedLocationAddress"],
+            "Montoursville, PA 17754"
+        );
+        assert_eq!(address["street"], "Jordan Ave");
+        assert_eq!(
+            address["admin1"],
+            serde_json::json!({"longName": "PA", "shortName": "PA"})
+        );
+        assert_eq!(address["admin2"], serde_json::json!({}));
+        assert_eq!(address["neighborhood"], serde_json::json!({}));
+        assert_eq!(
+            candidate["addressLines"],
+            serde_json::json!(["350 Jordan Ave", "Montoursville PA 17754"])
+        );
+        let described = candidate["explanation"]["addressMatch"]["description"]
+            .as_array()
+            .expect("description")
+            .iter()
+            .filter(|part| part["matchType"] != "NONE")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            described,
+            [
+                serde_json::json!({"label": "addressNumber", "matchType": "EXACT",
+                                   "matchedSubstring": "350"}),
+                serde_json::json!({"label": "street", "matchType": "PARTIAL",
+                                   "matchedSubstring": "JORDAN"}),
+            ]
+        );
     }
 
     #[test]

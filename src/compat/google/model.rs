@@ -266,7 +266,7 @@ impl GeocodeResult {
             place: format!("places/{place_id}"),
             place_id,
             location: LatLng::of(coordinates),
-            granularity: granularity(common.accuracy),
+            granularity: granularity(common),
             formatted_address,
             postal_address,
             address_components: address_components(common, language),
@@ -347,9 +347,13 @@ impl Entrance {
     }
 }
 
-pub(super) const fn granularity(accuracy: Accuracy) -> &'static str {
-    match accuracy {
+/// Google's `granularity` for what og's point stands for. An address mapped
+/// as an outline stands at the outline's centre, the house itself, which
+/// is Google's street-address precision.
+pub(super) fn granularity(common: &Common) -> &'static str {
+    match common.accuracy {
         Accuracy::Rooftop => "ROOFTOP",
+        Accuracy::Centroid if common.layer == Layer::Address => "ROOFTOP",
         Accuracy::Interpolated => "RANGE_INTERPOLATED",
         // og's street point is a point on the street's own geometry, its
         // nearest equivalent of Google's centre of a feature.
@@ -377,15 +381,32 @@ fn formatted_address(common: &Common) -> Option<String> {
 
 fn address_fields(common: &Common) -> (Option<PostalAddress>, Option<String>) {
     let mut postal = postal_address(common);
-    let formatted =
-        if common.layer == Layer::Address && compat::country_code(&common.context) == Some("US") {
-            postal
-                .as_mut()
-                .and_then(|postal| formatted_us_address(common, postal))
-        } else {
-            None
-        };
+    let formatted = if matches!(common.layer, Layer::Address | Layer::Poi) && is_us(common) {
+        postal
+            .as_mut()
+            .and_then(|postal| formatted_us_address(common, postal))
+    } else {
+        None
+    };
     (postal, formatted.or_else(|| formatted_address(common)))
+}
+
+fn is_us(common: &Common) -> bool {
+    compat::country_code(&common.context) == Some("US")
+}
+
+/// A US street as Google writes it on a house's address line and in a
+/// route's short text: `Amphitheatre Pkwy`, `W El Camino Real`. Its long
+/// text keeps the words.
+fn us_street(common: &Common) -> Option<String> {
+    let street = common.address.street.as_deref()?;
+    let parts = common.address.street_parts.as_ref();
+    Some(compat::usps::display_street(
+        parts.map_or(street, |parts| parts.name.as_str()),
+        parts.and_then(|parts| parts.prefix.as_deref()),
+        parts.and_then(|parts| parts.kind.as_deref()),
+        parts.and_then(|parts| parts.suffix.as_deref()),
+    ))
 }
 
 fn formatted_us_address(common: &Common, postal: &mut PostalAddress) -> Option<String> {
@@ -403,6 +424,7 @@ fn formatted_us_address(common: &Common, postal: &mut PostalAddress) -> Option<S
         .map(str::to_owned);
     let state = state_code?;
     postal.administrative_area = Some(state.clone());
+    common.address.housenumber.as_deref()?;
     let street = postal.address_lines.first()?;
     let locality = postal.locality.as_deref()?;
     let zip = postal.postal_code.as_deref()?;
@@ -416,12 +438,16 @@ fn formatted_us_address(common: &Common, postal: &mut PostalAddress) -> Option<S
 }
 
 /// The house number and street (or `addr:place`) as one line, joined as og
-/// joins them in an address's own name.
+/// joins them in an address's own name. A US street is abbreviated.
 fn street_line(common: &Common) -> Option<String> {
     let address = &common.address;
+    let street = is_us(common)
+        .then(|| us_street(common))
+        .flatten()
+        .or_else(|| address.street.clone());
     let parts = [
         address.housenumber.as_deref(),
-        address.street.as_deref().or(address.place.as_deref()),
+        street.as_deref().or(address.place.as_deref()),
     ]
     .into_iter()
     .flatten()
@@ -439,7 +465,16 @@ fn postal_address(common: &Common) -> Option<PostalAddress> {
         region_code: compat::country_code(context).map(str::to_string),
         postal_code: address.postcode.clone(),
         administrative_area: address.region.clone().or_else(|| area(&context.region)),
-        locality: address.locality.clone().or_else(|| area(&context.locality)),
+        locality: compat::town(
+            address.locality.as_deref(),
+            context.locality.as_ref().map(|area| area.name.as_str()),
+            &[
+                context.subregion.as_ref().map(|area| area.name.as_str()),
+                context.district.as_ref().map(|area| area.name.as_str()),
+                context.region.as_ref().map(|area| area.name.as_str()),
+            ],
+        )
+        .map(str::to_string),
         // `areas` is outermost first, as an envelope lists them.
         sublocality: if address.areas.is_empty() {
             area(&context.sublocality)
@@ -486,7 +521,15 @@ fn address_components(common: &Common, language: &Language) -> Vec<AddressCompon
     };
     push(address.unit.as_deref(), &["subpremise"]);
     push(address.housenumber.as_deref(), &["street_number"]);
-    push(address.street.as_deref(), &["route"]);
+    if let Some(street) = address.street.as_deref().filter(|text| !text.is_empty()) {
+        components.push(AddressComponent {
+            short_text: is_us(common)
+                .then(|| us_street(common))
+                .flatten()
+                .unwrap_or_else(|| street.to_string()),
+            ..component(street, &["route"])
+        });
+    }
     let named = [
         (&context.neighbourhood, &["neighborhood", "political"][..]),
         (&context.sublocality, &["sublocality", "political"][..]),

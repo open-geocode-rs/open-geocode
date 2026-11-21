@@ -299,9 +299,14 @@ impl DistanceUnit {
 /// Precisely answers one candidate unless asked for more.
 const DEFAULT_MAX_RESULTS: i64 = 1;
 
+/// How far a reverse geocode looks when the request states no `distance`,
+/// in metres. Precisely documents 5 m.
+const DEFAULT_DISTANCE_M: f64 = 5.0;
+
 impl Preferences {
     /// The search radius in metres, when the request states one. Precisely
-    /// measures in metres unless told otherwise.
+    /// measures in metres unless told otherwise, and searches
+    /// [`DEFAULT_DISTANCE_M`] when told nothing.
     fn distance_m(&self) -> Result<Option<f64>, VendorError> {
         let Some(distance) = &self.distance else {
             return Ok(None);

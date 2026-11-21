@@ -104,7 +104,7 @@ fn prediction(feature: &Feature, kind: Kind) -> Prediction {
     let candidate = feature.candidate(Product::Geocode);
     let address = candidate.address;
     let own = |name: &str| AdminField {
-        long_name: name.to_string(),
+        long_name: Some(name.to_string()),
         short_name: None,
     };
     Prediction {

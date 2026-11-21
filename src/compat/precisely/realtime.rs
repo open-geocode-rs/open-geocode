@@ -393,12 +393,16 @@ pub(super) async fn reverse(
     let id = request_id(&request);
     let body = read_json::<ReverseRequest>(&state, request, "INVALID_REQUEST").await?;
     let max = body.preferences.max_results()?;
-    let radius_m = body.preferences.distance_m()?;
+    let radius_m = body
+        .preferences
+        .distance_m()?
+        .unwrap_or(super::DEFAULT_DISTANCE_M);
     let mut outcomes = Vec::new();
     for location in checked(body.locations)? {
         let args = Args::new()
             .maybe("lon", location.longitude.map(|lon| lon.to_string()))
-            .maybe("lat", location.latitude.map(|lat| lat.to_string()));
+            .maybe("lat", location.latitude.map(|lat| lat.to_string()))
+            .set("radius", crate::compat::radius(radius_m));
         let wanted = given(location.country.as_deref()).map(country_code);
         outcomes.push(match native::reverse(&state, args).await {
             Ok(collection) => {
@@ -409,11 +413,9 @@ pub(super) async fn reverse(
                     .iter()
                     .map(Feature::from)
                     .filter(|feature| {
-                        radius_m.is_none_or(|radius| {
-                            feature
-                                .distance_m()
-                                .is_none_or(|distance| distance <= radius)
-                        })
+                        feature
+                            .distance_m()
+                            .is_none_or(|distance| distance <= radius_m)
                     })
                     .filter(|feature| {
                         wanted.as_deref().is_none_or(|wanted| {
@@ -506,7 +508,7 @@ async fn lookup_key(state: &AppState, value: &str, country: Option<&str>) -> Out
         Ok(Some(hit)) => {
             let feature = Feature::from(&hit);
             if feature.country_code() == Some(code.as_str()) {
-                Outcome::found(None, &[feature], 1, Product::Geocode)
+                Outcome::answered(None, vec![feature.unasked_candidate()])
             } else {
                 empty()
             }
@@ -593,13 +595,26 @@ async fn complete(
         .collect::<Vec<_>>();
     let predictions = features
         .iter()
-        .map(|feature| Prediction {
-            prediction: feature.label().to_string(),
-            distance: feature.distance_m().map(|value| Metres {
-                value,
-                distance_unit: "METER",
-            }),
-            candidate: feature.candidate(Product::Geocode),
+        .map(|feature| {
+            let candidate = feature.prediction();
+            Prediction {
+                prediction: candidate
+                    .address
+                    .formatted_address
+                    .clone()
+                    .unwrap_or_else(|| feature.label().to_string()),
+                // With no `originXY` there is nothing to measure from, and
+                // Precisely writes 0.
+                distance: match focus {
+                    Some(_) => feature.distance_m(),
+                    None => Some(0.0),
+                }
+                .map(|value| Metres {
+                    value,
+                    distance_unit: "METER",
+                }),
+                candidate,
+            }
         })
         .collect::<Vec<_>>();
     Ok(Json(AutocompleteResponse {

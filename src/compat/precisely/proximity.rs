@@ -148,7 +148,8 @@ pub(super) async fn proximity_search(
     let args = Args::new()
         .set("lon", lon.to_string())
         .set("lat", lat.to_string())
-        .set("layer", "address");
+        .set("layer", "address")
+        .maybe("radius", radius.map(crate::compat::radius));
     let collection = native::reverse(&state, args)
         .await
         .map_err(|problem| Failure::of(&problem, Some(country)).into_error(problem))?;
@@ -179,7 +180,7 @@ pub(super) async fn proximity_search(
                 return None;
             }
             let name = |field: &Option<result::AdminField>| {
-                field.as_ref().map(|field| field.long_name.clone())
+                field.as_ref().and_then(|field| field.long_name.clone())
             };
             let metadata = [
                 (
@@ -194,11 +195,11 @@ pub(super) async fn proximity_search(
                 ("ADMIN2", name(&address.admin2)),
                 (
                     "ADMIN1",
-                    address.admin1.as_ref().map(|admin1| {
+                    address.admin1.as_ref().and_then(|admin1| {
                         admin1
                             .short_name
                             .clone()
-                            .unwrap_or_else(|| admin1.long_name.clone())
+                            .or_else(|| admin1.long_name.clone())
                     }),
                 ),
                 ("POSTALCODE", address.postal_code.clone()),
