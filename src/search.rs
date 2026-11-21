@@ -2913,12 +2913,19 @@ impl TextSearcher {
                         if spot.docs.len() < NEIGHBOUR_DOCUMENTS {
                             spot.docs.push(item.doc);
                         }
+                        if item.order == spot.head.order
+                            && item.base == spot.head.base
+                            && spot.tied.len() < NEIGHBOUR_DOCUMENTS
+                        {
+                            spot.tied.push(item.doc);
+                        }
                         if item.address && spot.points.len() < SPOT_POINTS {
                             spot.points.push(item.point);
                         }
                     }
                     None if room => spots.push(Spot {
                         docs: vec![item.doc],
+                        tied: vec![item.doc],
                         points: match item.address {
                             true => vec![item.point],
                             false => Vec::new(),
@@ -3058,7 +3065,8 @@ impl TextSearcher {
             let hit = match form {
                 FORM_STREET => self.street_answer(&searcher, spot, &street_ranking, &mut keep)?,
                 _ => {
-                    let Some(address) = self.doc_address(spot.head.doc) else {
+                    let doc = self.best_tied_document(&searcher, plan, &spot.tied)?;
+                    let Some(address) = self.doc_address(doc) else {
                         continue;
                     };
                     let ranking = match spot.head.base {
@@ -3823,6 +3831,69 @@ impl TextSearcher {
     }
 
     /// The document of id `doc` across the index, as the structured index numbers it.
+    /// Of `tied`, documents the structured order ranks alike, the one whose
+    /// street holds the most words of `plan`'s subject, the first of those
+    /// when several do. A key drops the words that only describe a street
+    /// ("b" and "xi" of "Mobilheimplatz B XI"), so the streets of one key
+    /// differ only in them, and the query names which.
+    fn best_tied_document(
+        &self,
+        searcher: &Searcher,
+        plan: &QueryPlan,
+        tied: &[DocId],
+    ) -> Result<DocId> {
+        let Some(&first) = tied.first() else {
+            return Err(Error::Inconsistent("a spot with no document".into()));
+        };
+        if tied.len() < 2 {
+            return Ok(first);
+        }
+        let records = self.pack.records();
+        let mut best = (0, first);
+        for &doc in tied {
+            let Some(address) = self.doc_address(doc) else {
+                continue;
+            };
+            let (record_id, _) = self.document_records(searcher, address)?;
+            // The street an address is on, or the place it is numbered in
+            // ("Kropfsdorf 8"); a street's own name.
+            let street = match records.record(record_id)? {
+                Record::Address(record) => record.address.street.or(record.address.place),
+                Record::Poi(PoiRecord {
+                    address: Some(address),
+                    ..
+                }) => address.street.or(address.place),
+                Record::Street(record) => Some(record.name),
+                _ => None,
+            };
+            // Each word in every form it is written in ("rd" and "road").
+            let mut words = HashSet::new();
+            for word in street
+                .as_deref()
+                .and_then(search_key)
+                .iter()
+                .flat_map(|key| key.split_whitespace())
+            {
+                words.extend(lattice::forms_both_ways(word));
+                words.insert(word.to_string());
+            }
+            let held = plan
+                .subject
+                .iter()
+                .filter(|word| {
+                    words.contains(&word.text)
+                        || lattice::other_forms(&word.text)
+                            .iter()
+                            .any(|form| words.contains(form))
+                })
+                .count();
+            if held > best.0 {
+                best = (held, doc);
+            }
+        }
+        Ok(best.1)
+    }
+
     fn doc_address(&self, doc: DocId) -> Option<DocAddress> {
         let ord = self.segments.iter().position(|(_, _, end)| doc < *end)?;
         Some(DocAddress::new(ord as u32, doc - self.segments[ord].1))
@@ -7951,6 +8022,10 @@ struct Keyed {
 struct Spot {
     head: Keyed,
     docs: Vec<DocId>,
+    /// The documents the order cannot tell from the head, the head first,
+    /// at most [`NEIGHBOUR_DOCUMENTS`] (see
+    /// [`TextSearcher::best_tied_document`]).
+    tied: Vec<DocId>,
     /// Address points, at most [`SPOT_POINTS`].
     points: Vec<[f64; 2]>,
 }
@@ -15652,6 +15727,57 @@ mod tests {
         let query = "10 Queen Street Toronto K1P 5G4";
         let found = ids(&structured, query);
         assert_eq!(found, ids(&plain, query));
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// Streets whose names differ only in words a key drops as describing
+    /// a street ("B" and "XI" of "Mobilheimplatz B XI") tie in the
+    /// structured order: the one whose street holds the query's words
+    /// answers, not the first document.
+    #[test]
+    fn of_streets_a_key_cannot_tell_apart_the_one_the_query_names_answers() {
+        let temp_dir = temp_pack_path("search-tied-streets");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (id, street, lon) in [
+            ("osm:node:1", "Mobilheimplatz B V", 16.91620),
+            ("osm:node:2", "Mobilheimplatz B XI", 16.91640),
+            ("osm:node:3", "Mobilheimplatz C XI", 16.91660),
+        ] {
+            let record = located(
+                address_record(
+                    id,
+                    "",
+                    "19",
+                    street,
+                    Some("Sankt Andrä am Zicksee"),
+                    Some("7161"),
+                ),
+                [lon, 47.789],
+            );
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
+        assert!(searcher.structured.is_some());
+        let top = searcher
+            .search(&TextSearchOptions {
+                query: "Mobilheimplatz B XI 19, Sankt Andrä am Zicksee".to_string(),
+                limit: 1,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            })
+            .expect("search")
+            .into_iter()
+            .map(|hit| hit.record.id)
+            .collect::<Vec<_>>();
+        assert!(
+            LAST_STRUCTURED.with(Cell::get).answered,
+            "answered by the structured stage"
+        );
+        assert_eq!(top, vec!["osm:node:2".to_string()]);
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
