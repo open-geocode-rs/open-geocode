@@ -1,5 +1,5 @@
-//! How far a town mapped only as a point reaches: as far as the addresses
-//! that name it, and at least half way to the nearest other town point.
+//! How far a town mapped only as a point reaches, as far as the addresses
+//! that name it and at least half way to the nearest other town point.
 
 use std::{
     cmp::Ordering,
@@ -77,7 +77,7 @@ type Peer = GeomWithData<[f64; 2], usize>;
 /// Sets the reach of each town point in `dots`, in whole metres, whose names, as
 /// [`dictionary_key`] spells them, are `names`. A town reaches as far as
 /// the farthest address that names it and lies nearer to it than to any
-/// other town point of its kind or a bigger one: an address past the half
+/// other town point of its kind or a bigger one. An address past the half
 /// way line to such a town is that town's, or names a town of this name by
 /// mistake. Every town reaches at least half way to the nearest other town
 /// point, so a town no address names still holds the houses nearest it.
@@ -215,7 +215,7 @@ fn nearer_than(
 }
 
 /// The most degrees, in plain lon and lat, a point within `metres` of a
-/// point at `lat` can lie away: a degree of longitude is shortest at the
+/// point at `lat` can lie away. A degree of longitude is shortest at the
 /// pole-ward edge of the circle.
 fn degrees_within(lat: f64, metres: f64) -> f64 {
     let lat_span = metres / METRES_PER_DEGREE;
@@ -270,7 +270,7 @@ mod tests {
     fn a_town_reaches_its_farthest_address() {
         let mut dots = vec![dot(1, [0.0, 0.0], 16), dot(2, [0.0, 0.2], 20)];
         let names = keys(&dots);
-        // Past the hamlet's half way line: a smaller town cuts no city short.
+        // Past the hamlet's half way line, as a smaller town cuts no city short.
         let votes = [vote("Town 1", [0.0, 0.15]), vote("Town 1", [0.0, -0.05])];
         measure_reach(&mut dots, &names, votes.into_iter()).unwrap();
         assert!(

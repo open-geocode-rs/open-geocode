@@ -56,7 +56,7 @@ impl Named {
     }
 
     /// Whether `locality` is a town the query names, either perhaps with
-    /// the word of its type: a query for "Narva linn" names the houses that
+    /// the word of its type. A query for "Narva linn" names the houses that
     /// state "Narva".
     fn town_is(&self, locality: Option<&str>) -> bool {
         locality

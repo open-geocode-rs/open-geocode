@@ -96,7 +96,7 @@ pub(crate) struct BoundaryIndex {
     dots: RTree<TownDot>,
 }
 
-/// A town mapped only as a point: a city, town, village or hamlet node that
+/// A town mapped only as a point, a city, town, village or hamlet node that
 /// merged into no boundary.
 #[derive(Debug, Clone)]
 pub(crate) struct TownDot {
@@ -129,8 +129,8 @@ impl TownDot {
     }
 }
 
-/// How important a settlement is, as the town a record lies in: the kind,
-/// by its [`place_rank`], and how well known it is.
+/// How important a settlement is as the town a record lies in, by its kind
+/// ([`place_rank`]) and how well known it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Settlement {
     pub(crate) rank: u8,
@@ -196,8 +196,8 @@ struct AcceptedBoundary {
     shape: ShapeRef,
     area: f64,
     interior_point: Option<[f64; 2]>,
-    /// The settlement it is, when it is one: by its own `place` tag, a town
-    /// node merged into it, or a town point of its name inside it.
+    /// The settlement it is, when its own `place` tag, a town node merged
+    /// into it or a town point of its name inside it makes it one.
     town: Option<Settlement>,
 }
 
@@ -879,9 +879,9 @@ impl BoundaryIndex {
         }
     }
 
-    /// Learns the towns the boundaries alone do not say: the areas a town
-    /// point of their name lies in, with that point's rank, and the town
-    /// points that lie in no area of their name.
+    /// Learns the towns the boundaries alone do not say. These are the areas
+    /// a town point of their name lies in, with that point's rank, and the
+    /// town points that lie in no area of their name.
     pub(crate) fn add_towns(
         &mut self,
         named: impl IntoIterator<Item = (RecordId, Settlement)>,
@@ -1039,7 +1039,7 @@ impl BoundaryIndex {
     /// `locality`. The settlement areas around the point no smaller than the
     /// area the tiers put in `locality` compete, and so do the town points
     /// whose reach holds it, in its country, where the tiers put no boundary
-    /// in `locality`: a commune that holds a hamlet's point stays the town.
+    /// in `locality`, so a commune that holds a hamlet's point stays the town.
     /// A town point is the town of no other town point. The best area and
     /// the best point are found apart (see [`Candidate`]), then the one the
     /// source names wins, else the more important, else the area.
@@ -1056,9 +1056,7 @@ impl BoundaryIndex {
                 .is_some_and(|locality| same_text(locality, name))
         };
         let tiered = best[PlaceLayer::Locality as usize];
-        // A town smaller than the area the tiers put in `locality` is a part
-        // of it: the village a merged municipality grew from stays below the
-        // municipality, which is the town its addresses name.
+        // Merged municipality stays the town over the village it grew from.
         let areas = covered
             .iter()
             .filter(|boundary| tiered.is_none_or(|tiered| boundary.area >= tiered.area))
@@ -1070,9 +1068,7 @@ impl BoundaryIndex {
                     size: boundary.area,
                 })
             });
-        // A town point is a town of its own, in no other town point: search
-        // reads a settlement whose context names a town as one bounded by
-        // it, and Te Awamutu is no part of Hamilton.
+        // Town points are towns themselves, never inside another (Te Awamutu, Hamilton).
         let is_dot = |dot: &TownDot| {
             dot.point == [lon, lat] && source_context.place.is_some_and(|place| place == dot.name)
         };
@@ -1120,8 +1116,8 @@ impl BoundaryIndex {
             })
     }
 
-    /// Whether `inner` lies inside `outer`: `outer` covers a point inside
-    /// `inner`, and `inner` is the smaller and not drawn over the same
+    /// Whether `inner` lies inside `outer`, as `outer` covers a point inside
+    /// `inner` and `inner` is the smaller and not drawn over the same
     /// ground. Two areas each covering the other's inner point, the smaller
     /// more than half the size of the larger, are drawn over the same
     /// ground, such as a borough and its county, and lie inside neither. The
@@ -1148,8 +1144,8 @@ impl BoundaryIndex {
     /// the areas whose tier agrees with their size keep their tiers. The town
     /// takes `locality`. An area the tiers put on the wrong side of the town
     /// moves to a free tier on its own side, nearer the town the fewer of the
-    /// other moving areas lie between: a Moscow district inside the city
-    /// below it, the county around a village above it. Areas wanting one
+    /// other moving areas lie between. A Moscow district inside the city
+    /// moves below it, the county around a village above it. Areas wanting one
     /// tier keep one, by [`compare_side_by_side`]; the others stay in the
     /// chain the Pack stores.
     fn around_town<'a>(
@@ -1268,7 +1264,7 @@ impl Candidate<'_> {
     /// Of two areas, or two town points, the more important kind, then the
     /// smaller area or the point whose reach the point lies furthest inside:
     /// a village drawn inside a city is part of the city. How well known
-    /// each is says nothing here: a house by one village's point is in that
+    /// each is says nothing here. A house by one village's point is in that
     /// village, whatever the next village is called in other languages.
     fn cmp_alike(left: &Self, right: &Self) -> Ordering {
         right
@@ -1279,8 +1275,8 @@ impl Candidate<'_> {
             .then(left.town.record_id().cmp(&right.town.record_id()))
     }
 
-    /// The best area against the best point: the more important, then the
-    /// area. A borough that is a city by its own tags yields to the city
+    /// The best area against the best point, the more important first, then
+    /// the area. A borough that is a city by its own tags yields to the city
     /// point inside it, which is better known.
     fn cmp_across(left: &Self, right: &Self) -> Ordering {
         right
@@ -1351,7 +1347,7 @@ impl Town<'_> {
         matches!(self, Self::Dot(_))
     }
 
-    /// Whether `unit` lies inside the town: by area against an area, and by
+    /// Whether `unit` lies inside the town, by area against an area and by
     /// [`place_rank`] against a point, which has none.
     fn is_inside(&self, unit: &AcceptedBoundary) -> Option<bool> {
         match self {

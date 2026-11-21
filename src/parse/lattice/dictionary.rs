@@ -1422,7 +1422,7 @@ pub(super) fn is_admin_type(key: &str) -> bool {
 }
 
 /// Whether two names of an area, as dictionary keys, are one name, one of
-/// them perhaps with the word of its type: "narva linn" and "narva".
+/// them perhaps with the word of its type, such as "narva linn" and "narva".
 pub(crate) fn same_admin_name(left: &str, right: &str) -> bool {
     left == right
         || admin_aliases(left).iter().any(|alias| alias == right)

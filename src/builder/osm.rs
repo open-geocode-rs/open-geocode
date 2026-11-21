@@ -449,8 +449,8 @@ struct Contexts {
     region_groups: HashMap<RecordId, Vec<RecordId>>,
 }
 
-/// How far each town point reaches: measured from the towns the addresses
-/// name, or as a checkpoint saved it.
+/// How far each town point reaches, measured from the towns the addresses
+/// name or as a checkpoint saved it.
 enum TownReach {
     Votes(ExternalSorter<TownVote>),
     Measured(HashMap<RecordId, u32>),
@@ -473,17 +473,7 @@ impl Contexts {
         let area_tags = boundaries.area_tags(&boundary_ids);
         let region_groups = boundaries.region_groups(&boundary_ids);
         let mut index = boundaries.into_index(&boundary_ids, &country_ids);
-        // The settlement points that are no boundary's own. An admin area is
-        // a settlement too when a point lies in it that its own name is one
-        // of the names of, at whatever tier the area sits, as a town's
-        // boundary holds the town's point; a ward or a local board holds none
-        // of its name. The area's other names stay out: one of them may be a
-        // translation that names the town, as a region around a city is
-        // called by the city's name in some languages. So does its name
-        // without the word for its type, which a district shares with the
-        // town it is run from ("okres Žilina", "Timaru District"). A town point in no
-        // area of its name is a town of its own, which the points around it
-        // may lie in.
+        // Only the own name counts; other names may translate a town, a district shares its seat's.
         let mut points = Vec::new();
         for (record_id, item) in ordered.reader()?.enumerate() {
             let item = item?;
@@ -512,9 +502,7 @@ impl Contexts {
                 })
             })
             .collect::<Vec<_>>();
-        // An area named like a settlement in it is that settlement only when
-        // it holds no other town as big: Bayern holds a hamlet of its name
-        // and every city of the state, Berlin holds no other city.
+        // A bigger town inside means no town, as Bayern holds hamlet Bayern and every Bavarian city.
         let held = holders.iter().flatten().copied().collect::<HashSet<_>>();
         let towns_in = points
             .par_iter()
@@ -2247,7 +2235,7 @@ fn context_sorter(
 
 const TOWN_VOTES: &str = "town-votes";
 
-/// The town-vote sorter gets a quarter of a share: a vote is a part of an
+/// The town-vote sorter gets a quarter of a share, as a vote is a part of an
 /// address, and only addresses that name a town cast one.
 fn town_vote_share(budget: usize) -> usize {
     (budget / 4).max(1)
@@ -5885,8 +5873,7 @@ mod tests {
         let (king, south, bay) = (id("osm:node:1"), id("osm:node:2010"), id("osm:way:602"));
         let (ward, ward_relation) = (id("osm:way:605"), id("osm:relation:902"));
         let context = pack.boundary_context(king).unwrap().expect("context");
-        // A `place=city` area around the point is its town, and the admin
-        // area the tiers put in `locality` lies inside it.
+        // The place=city area is the town; the tiered locality lies inside it.
         assert_eq!(context.admin_context.locality_record_id(), Some(metro));
         assert_eq!(
             context.admin_context.get(PlaceLayer::SubLocality),
@@ -5911,8 +5898,7 @@ mod tests {
         for (record, list) in lists {
             assert_eq!(pack.enclosing_areas(record).unwrap(), list, "{record}");
         }
-        // Metro is King's town, so the parser knows it as a place, and a place
-        // outside every area keeps its own.
+        // Metro is King's town, so the parser knows it; a place outside every area keeps its own.
         let dictionaries = Dictionaries::open(pack.container()).expect("dictionaries");
         assert_eq!(dictionaries.areas("metro"), [metro as u32]);
         assert_eq!(dictionaries.areas("lonely"), [id("osm:node:2011") as u32]);
@@ -6059,8 +6045,7 @@ mod tests {
             -0.137,
             &[("place", "city"), ("name", "City of Westminster")],
         );
-        // The City of London is a city by the admin level table, which ranks
-        // its level 6 at `locality` and London's boroughs below it.
+        // Admin level table ranks the City of London's level 6 at locality.
         map.relation(
             51800,
             [51.51, -0.11, 51.52, -0.08],
@@ -6142,8 +6127,7 @@ mod tests {
         map.area([48.06, 11.36, 48.25, 11.72], &admin("6", "München"));
         map.area([48.13, 11.57, 48.15, 11.6], &admin("9", "Altstadt-Lehel"));
         map.point(48.137, 11.575, &[("place", "city"), ("name", "München")]);
-        // An area whose name is the city's only with a type word is not the
-        // city, though it is smaller and holds the city's point.
+        // Type-word name only, so not the city though smaller and holding its point.
         map.area(
             [48.1365, 11.574, 48.1372, 11.5752],
             &admin("11", "Stadt München"),
@@ -6178,8 +6162,8 @@ mod tests {
     }
 
     /// A borough and its county are drawn over the same ground inside the
-    /// city. Both move below it and want one tier: the finer level takes it,
-    /// and the county stays in the list of areas the house lies in.
+    /// city. Both move below it and want one tier, which the finer level
+    /// takes, and the county stays in the list of areas the house lies in.
     #[test]
     fn a_borough_and_its_county_inside_a_city_keep_the_borough() {
         let mut map = Map::new();
@@ -6293,7 +6277,7 @@ mod tests {
     }
 
     /// A city whose tiers already name it keeps its context, and a commune
-    /// holding a hamlet's point stays the town: a point counts only where
+    /// holding a hamlet's point stays the town, as a point counts only where
     /// the tiers name no town.
     #[test]
     fn a_town_the_tiers_name_keeps_its_context() {
@@ -6332,7 +6316,7 @@ mod tests {
     }
 
     /// A district named for a town only by the town's local nickname holds
-    /// no town: the town stays a point of its own, inside the district.
+    /// no town. The town stays a point of its own, inside the district.
     #[test]
     fn a_district_named_like_a_town_nickname_is_no_town() {
         let mut map = Map::new();
@@ -6409,8 +6393,8 @@ mod tests {
         }
     }
 
-    /// A state named like a hamlet in it is no town: it holds bigger towns
-    /// too.
+    /// A state named like a hamlet in it is no town, as it holds bigger
+    /// towns too.
     #[test]
     fn a_state_named_like_a_hamlet_in_it_is_no_town() {
         let mut map = Map::new();
