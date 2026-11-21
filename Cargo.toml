@@ -125,7 +125,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 rayon = "1.12"
 # Per-country postcode patterns in the parser.
 regex = "1.12"
-rstar = "0.12"
+rstar = "0.13"
 # Hashes the integer keys of hot maps (a training gradient's feature ids)
 # without SipHash's cost; nothing here hashes input an attacker controls.
 # Already in the tree through Tantivy.
