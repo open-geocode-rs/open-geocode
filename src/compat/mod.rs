@@ -254,6 +254,64 @@ impl Args {
     }
 }
 
+/// Names each area named in several languages at once, as OSM writes a
+/// country of several (`Schweiz/Suisse/Svizzera/Svizra`), in the language of
+/// the place, as a vendor names it when no language is asked. That language
+/// is the one the nearest area named once is named in: Conthey is Conthey in
+/// French and Gundis in German, so a house in it is French-speaking and its
+/// country is Suisse. An area whose parts name it in no such language keeps
+/// its name.
+pub(crate) fn name_joined_areas(pack: &crate::pack::Reader, context: &mut crate::api::Context) {
+    let mut areas = [
+        &mut context.neighbourhood,
+        &mut context.sublocality,
+        &mut context.locality,
+        &mut context.subdistrict,
+        &mut context.district,
+        &mut context.subregion,
+        &mut context.region,
+        &mut context.country,
+    ];
+    let joined = |name: &str| name.contains('/');
+    let Some(languages) = areas
+        .iter()
+        .flat_map(|area| area.as_ref())
+        .find_map(|area| {
+            if joined(&area.name) {
+                return None;
+            }
+            let names = pack.names_by_language(area.record_id);
+            let speaking = names
+                .iter()
+                .filter(|(_, name)| *name == area.name)
+                .map(|(code, _)| code.clone())
+                .collect::<Vec<_>>();
+            (!speaking.is_empty() && speaking.len() < names.len()).then_some(speaking)
+        })
+    else {
+        return;
+    };
+    for area in areas.iter_mut().flat_map(|area| area.as_mut()) {
+        if !joined(&area.name) {
+            continue;
+        }
+        let parts = area.name.split('/').map(str::trim).collect::<Vec<_>>();
+        // The first part in the place's language, where it speaks several.
+        let names = pack.names_by_language(area.record_id);
+        let local = parts
+            .iter()
+            .find(|part| {
+                names
+                    .iter()
+                    .any(|(code, name)| languages.contains(code) && name == *part)
+            })
+            .map(|part| (*part).to_string());
+        if let Some(local) = local {
+            area.name = local;
+        }
+    }
+}
+
 /// An area's name without the word for its kind, as an address writes it:
 /// `Suffolk` of `Suffolk County`, `Oder-Spree` of `Landkreis Oder-Spree`.
 /// The kind words are og's parser's, from libpostal's lists in every
@@ -336,6 +394,22 @@ pub(crate) mod native {
     // answers that can hold a house keep one copy of it
     // (see [`house::one_per_house`]).
 
+    /// The answer with each area named in several languages at once named
+    /// in the place's own, when no language was asked
+    /// ([`name_joined_areas`]).
+    fn local_forward(
+        state: &AppState,
+        asked: bool,
+        mut found: ForwardCollection,
+    ) -> ForwardCollection {
+        if !asked {
+            for feature in &mut found.features {
+                name_joined_areas(state.pack(), &mut feature.properties.common.context);
+            }
+        }
+        found
+    }
+
     /// Runs a lookup and keeps one copy of each house in its answer. Where
     /// the caller asked for a number of answers and copies leave fewer, og
     /// is asked for more, up to `most`, the route's own limit, so the answer
@@ -390,6 +464,7 @@ pub(crate) mod native {
         state: &AppState,
         args: Args,
     ) -> Result<ForwardCollection, Problem> {
+        let args_lang = args.get("lang").is_some();
         one_per_house(
             args,
             crate::http::bounds::MAX_SEARCH_LIMIT,
@@ -401,18 +476,21 @@ pub(crate) mod native {
             },
         )
         .await
+        .map(|found| local_forward(state, args_lang, found))
     }
 
     pub(crate) async fn places(state: &AppState, args: Args) -> Result<ForwardCollection, Problem> {
+        let args_lang = args.get("lang").is_some();
         runtime::places(State(state.clone()), args.query())
             .await
-            .map(|json| json.0)
+            .map(|json| local_forward(state, args_lang, json.0))
     }
 
     pub(crate) async fn autocomplete(
         state: &AppState,
         args: Args,
     ) -> Result<ForwardCollection, Problem> {
+        let args_lang = args.get("lang").is_some();
         one_per_house(
             args,
             crate::search::MAX_AUTOCOMPLETE_LIMIT,
@@ -424,6 +502,7 @@ pub(crate) mod native {
             },
         )
         .await
+        .map(|found| local_forward(state, args_lang, found))
     }
 
     /// Free text answered with addresses, areas and places together, as a
@@ -495,6 +574,7 @@ pub(crate) mod native {
         state: &AppState,
         args: Args,
     ) -> Result<ReverseCollection, Problem> {
+        let args_lang = args.get("lang").is_some();
         one_per_house(
             args,
             crate::http::bounds::MAX_SEARCH_LIMIT,
@@ -506,6 +586,14 @@ pub(crate) mod native {
             },
         )
         .await
+        .map(|mut found| {
+            if !args_lang {
+                for feature in &mut found.features {
+                    name_joined_areas(state.pack(), &mut feature.properties.common.context);
+                }
+            }
+            found
+        })
     }
 
     /// The places og holds within `radius_m` of `point`, the most prominent
@@ -910,6 +998,48 @@ mod tests {
                 &boston
             ),
             ["240 Washington St", "Boston, MA 02108", "United States"]
+        );
+    }
+
+    /// With no language asked, a country OSM names in several languages at
+    /// once is named in the language of the place, on every vendor.
+    #[tokio::test]
+    async fn a_country_named_in_several_languages_takes_the_places_own() {
+        use crate::runtime::router_tests::{state_for, temp_path, write_stated_names_pack};
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let pack = temp_path("vendor-joined-names");
+        write_stated_names_pack(&pack);
+        let router = runtime::build_router(state_for(&pack, true), None, None);
+        let get = |uri: &str| {
+            let router = router.clone();
+            let request = axum::http::Request::get(uri)
+                .body(Body::empty())
+                .expect("request");
+            async move {
+                let reply = router.oneshot(request).await.expect("reply");
+                let bytes = axum::body::to_bytes(reply.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                serde_json::from_slice::<Value>(&bytes).expect("json")
+            }
+        };
+        let q = "q=67%20Route%20de%20la%20T%C3%A9l%C3%A9cabine";
+        let here = get(&format!("/compat/here/v1/geocode?{q}")).await;
+        assert_eq!(
+            here["items"][0]["address"]["countryName"], "Suisse",
+            "{here}"
+        );
+        let mapbox = get(&format!("/compat/mapbox/search/geocode/v6/forward?{q}")).await;
+        assert_eq!(
+            mapbox["features"][0]["properties"]["context"]["country"]["name"], "Suisse",
+            "{mapbox}"
+        );
+        // Asked in a language, the country is named in it, as before.
+        let german = get(&format!("/compat/here/v1/geocode?{q}&lang=de")).await;
+        assert_eq!(
+            german["items"][0]["address"]["countryName"], "Schweiz",
+            "{german}"
         );
     }
 

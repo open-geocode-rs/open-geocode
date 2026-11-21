@@ -3320,12 +3320,17 @@ pub(crate) mod router_tests {
         let munich = area(PlaceLayer::Locality, "München", 4);
         let russia = area(PlaceLayer::Country, "Россия", 5);
         let moscow = area(PlaceLayer::Locality, "Москва", 6);
+        // A country OSM names in its four languages at once, and a district
+        // named in French, Gundis in German.
+        let switzerland = area(PlaceLayer::Country, "Schweiz/Suisse/Svizzera/Svizra", 7);
+        let conthey = area(PlaceLayer::District, "Conthey", 8);
         let code = |code: &str| CountryCode::parse(code).expect("code");
         writer.set_country_codes(
             [
                 (austria, code("AT")),
                 (germany, code("DE")),
                 (russia, code("RU")),
+                (switzerland, code("CH")),
             ]
             .into_iter()
             .collect(),
@@ -3390,6 +3395,24 @@ pub(crate) mod router_tests {
                         ("fr", "Moscou"),
                         ("de", "Moskau"),
                         ("ru", "Москва"),
+                    ]),
+                ),
+                (
+                    switzerland,
+                    names([
+                        ("de", "Schweiz"),
+                        ("fr", "Suisse"),
+                        ("it", "Svizzera"),
+                        ("rm", "Svizra"),
+                    ]),
+                ),
+                (
+                    conthey,
+                    names([
+                        ("de", "Gundis"),
+                        ("fr", "Conthey"),
+                        ("it", "Conthey"),
+                        ("rm", "Gundis"),
                     ]),
                 ),
             ]
@@ -3457,6 +3480,21 @@ pub(crate) mod router_tests {
                 within(&[
                     (PlaceLayer::Country, russia),
                     (PlaceLayer::Locality, moscow),
+                ]),
+            ),
+            (
+                house(
+                    15,
+                    14.0,
+                    "67",
+                    "Route de la Télécabine",
+                    "Nendaz",
+                    "1997",
+                    None,
+                ),
+                within(&[
+                    (PlaceLayer::Country, switzerland),
+                    (PlaceLayer::District, conthey),
                 ]),
             ),
             (

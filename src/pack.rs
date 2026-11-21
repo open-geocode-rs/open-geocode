@@ -1429,6 +1429,13 @@ impl Reader {
 
     /// Every name an area record has in a language of its own, as
     /// [`Self::language_name`] reads them one at a time.
+    /// A record's names by language, as `(code, name)`.
+    pub fn names_by_language(&self, record_id: RecordId) -> &[(String, String)] {
+        self.language_names
+            .get(&record_id)
+            .map_or(&[][..], Vec::as_slice)
+    }
+
     pub fn language_names(&self, record_id: RecordId) -> impl Iterator<Item = &str> {
         self.language_names
             .get(&record_id)
