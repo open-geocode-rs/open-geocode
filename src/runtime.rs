@@ -915,7 +915,31 @@ fn places_place(request: &PlacesRequest) -> String {
 fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardCollection> {
     let (catalogue, ids) = match request {
         PlacesRequest::Text(options) => {
-            let hits = state.places.search(&options)?;
+            let named = state.places.search(&options)?;
+            // A query that only names a kind of place means the nearest
+            // ones, as autocomplete reads it.
+            let as_typed = TextAutocompleteOptions {
+                query: options.query.clone(),
+                limit: options.limit,
+                layer: None,
+                countries: options.countries.clone(),
+                focus: options.focus,
+                bbox: options.bbox,
+            };
+            let limit = crate::search::effective_limit(options.limit);
+            // A place named as typed is what a search for its name asks for.
+            let typed = search_key(&options.query);
+            let named_as_typed = named
+                .first()
+                .is_some_and(|hit| search_key(&hit.record.name) == typed);
+            let mut hits = match named_as_typed {
+                true => named,
+                false => nearest_of_category(state, &as_typed, limit, named)?,
+            };
+            // A search's results carry no highlights, a suggestion's do.
+            for hit in &mut hits {
+                hit.highlights = Default::default();
+            }
             let focus = options.focus;
             let mut collection = api::forward_collection(&state.pack, options.query, hits)?;
             api::measure_from(&mut collection, focus);
@@ -1109,7 +1133,8 @@ pub(crate) async fn autocomplete(
             Some(_) => worker.searcher.autocomplete(&options)?,
             None => {
                 let named = suggest(&worker.searcher, &worker.places, &options)?;
-                nearest_of_category(&worker, &options, named)?
+                let limit = effective_autocomplete_limit(options.limit);
+                nearest_of_category(&worker, &options, limit, named)?
             }
         };
         let mut collection = api::forward_collection(&worker.pack, query, hits)?;
@@ -1190,6 +1215,7 @@ pub(crate) async fn of_categories(
 fn nearest_of_category(
     state: &AppState,
     options: &TextAutocompleteOptions,
+    limit: usize,
     named: Vec<TextSearchHit>,
 ) -> Result<Vec<TextSearchHit>> {
     // Through a typo the kind is never the whole query's own name.
@@ -1235,7 +1261,6 @@ fn nearest_of_category(
     let (Some(focus), categories) = (focus, request.categories) else {
         return Ok(named);
     };
-    let limit = effective_autocomplete_limit(options.limit);
     let mut hits = pois_of_categories(
         state,
         &categories,
@@ -4351,6 +4376,12 @@ pub(crate) mod router_tests {
             ("/geocode?q=10%20King%20Street%20West", (house, None)),
             (
                 "/places?q=Lantern%20Cafe",
+                (serde_json::json!("Lantern Cafe, Toronto"), None),
+            ),
+            // A search for a kind of place, as autocomplete reads it, finds
+            // the nearest place of that kind whatever its name.
+            (
+                "/places?q=coffeehouse&focus=-79.4,43.0",
                 (serde_json::json!("Lantern Cafe, Toronto"), None),
             ),
             (

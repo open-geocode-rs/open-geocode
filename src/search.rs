@@ -10068,7 +10068,7 @@ fn ord_range(start: Bound<u64>, end: Bound<u64>) -> Range<u64> {
     start..end
 }
 
-fn effective_limit(limit: usize) -> usize {
+pub(crate) fn effective_limit(limit: usize) -> usize {
     if limit == 0 {
         DEFAULT_SEARCH_LIMIT
     } else {
