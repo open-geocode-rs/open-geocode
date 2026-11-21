@@ -21,7 +21,7 @@ use crate::{
         SourceProvenance, place_rank, point_geometry,
     },
     util::{
-        geo::{METRES_PER_DEGREE, point_lon_lat},
+        geo::{EARTH_RADIUS_M, point_lon_lat},
         text::normalize_for_compare,
     },
 };
@@ -155,15 +155,25 @@ impl Settlement {
     }
 }
 
+/// How much the town envelope outgrows its reach, so rounding never drops a point at the edge.
+const ENVELOPE_SLACK: f64 = 1.000_001;
+
 /// A town point is found by the points its reach holds.
 impl RTreeObject for TownDot {
     type Envelope = AABB<[f64; 2]>;
 
     fn envelope(&self) -> Self::Envelope {
         let [lon, lat] = self.point;
-        let degrees = self.reach_m / METRES_PER_DEGREE;
-        let wide = degrees / (lat.abs() + degrees).min(89.9).to_radians().cos();
-        AABB::from_corners([lon - wide, lat - degrees], [lon + wide, lat + degrees])
+        // The spherical cap of the reach, as `haversine_m` measures, widened a hair for rounding.
+        let angle = self.reach_m / EARTH_RADIUS_M * ENVELOPE_SLACK;
+        let tall = angle.to_degrees();
+        let (south, north) = ((lat - tall).max(-90.0), (lat + tall).min(90.0));
+        // A cap that holds a pole spans every longitude.
+        if lat.abs() + tall >= 90.0 {
+            return AABB::from_corners([-180.0, south], [180.0, north]);
+        }
+        let wide = (angle.sin() / lat.to_radians().cos()).asin().to_degrees();
+        AABB::from_corners([lon - wide, south], [lon + wide, north])
     }
 }
 
@@ -906,10 +916,8 @@ impl BoundaryIndex {
             .into_iter()
             .map(|mut dot| {
                 let [lon, lat] = dot.point;
-                dot.country = self
-                    .covering(lon, lat, &SourceContext::default())
-                    .tuple
-                    .country_record_id();
+                let covered = self.covered(lon, lat);
+                dot.country = country_of(&best_of_each_tier(&covered, &SourceContext::default()).0);
                 dot
             })
             .collect();
@@ -926,6 +934,17 @@ impl BoundaryIndex {
             .collect::<Vec<_>>();
         reach.sort_unstable();
         reach
+    }
+
+    /// The settlement areas, by record id, with their rank and inner point.
+    pub(crate) fn settlement_areas(&self) -> impl Iterator<Item = (RecordId, u8, [f64; 2])> + '_ {
+        self.boundaries.iter().filter_map(|boundary| {
+            Some((
+                boundary.record_id,
+                boundary.town?.rank,
+                boundary.interior_point?,
+            ))
+        })
     }
 
     /// The areas under the country at a point.
@@ -982,7 +1001,10 @@ impl BoundaryIndex {
         source_context: &SourceContext<'_>,
         own: Option<OwnArea>,
     ) -> RecordContext {
-        if self.boundaries.is_empty() || !lon.is_finite() || !lat.is_finite() {
+        if (self.boundaries.is_empty() && self.dots.size() == 0)
+            || !lon.is_finite()
+            || !lat.is_finite()
+        {
             return RecordContext::default();
         }
 
@@ -1020,8 +1042,7 @@ impl BoundaryIndex {
         };
         let mut derived_country = None;
         if tuple.country_record_id().is_none()
-            && let Some(country) = best[PlaceLayer::Region as usize]
-                .and_then(|region| region.inferred_country_record_id)
+            && let Some(country) = inferred_country(&best)
         {
             tuple.set(PlaceLayer::Country, country);
             derived_country = Some(country);
@@ -1104,9 +1125,14 @@ impl BoundaryIndex {
         lat: f64,
         best: &Best<'_>,
     ) -> impl Iterator<Item = (&'a TownDot, f64)> {
-        let country = best[PlaceLayer::Country as usize].map(|country| country.record_id);
-        self.dots
-            .locate_in_envelope_intersecting(&AABB::from_point([lon, lat]))
+        let country = country_of(best);
+        // An envelope past the antimeridian holds the point a full turn over.
+        [lon, lon + 360.0, lon - 360.0]
+            .into_iter()
+            .flat_map(move |turned| {
+                self.dots
+                    .locate_in_envelope_intersecting(&AABB::from_point([turned, lat]))
+            })
             .filter(move |dot| dot.country == country)
             .filter_map(move |dot| {
                 let distance =
@@ -1449,6 +1475,18 @@ pub(crate) fn required_boundary_way_ids(relations: &[BoundaryRelationStub]) -> H
         .iter()
         .flat_map(|relation| relation.members.iter().map(|member| member.way_id))
         .collect()
+}
+
+/// The country a region names when no boundary is the country.
+fn inferred_country(best: &Best<'_>) -> Option<RecordId> {
+    best[PlaceLayer::Region as usize].and_then(|region| region.inferred_country_record_id)
+}
+
+/// The country boundary of a point, else the one its region names, so a town and the points it names agree.
+fn country_of(best: &Best<'_>) -> Option<RecordId> {
+    best[PlaceLayer::Country as usize]
+        .map(|country| country.record_id)
+        .or_else(|| inferred_country(best))
 }
 
 /// Region boundaries whose ISO 3166-2 code names a country that has no
@@ -2801,6 +2839,54 @@ fn object_type_of(code: u8) -> crate::error::Result<ObjectType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dot_with_reach(point: [f64; 2], reach_m: f64) -> TownDot {
+        let mut dot = TownDot::new(
+            1,
+            point,
+            "Ashby".to_string(),
+            Settlement {
+                rank: 2,
+                prominence: Prominence::default(),
+            },
+        );
+        dot.reach_m = reach_m;
+        dot
+    }
+
+    fn reaches(dot: TownDot, [lon, lat]: [f64; 2]) -> bool {
+        let mut index = test_index(Vec::new());
+        index.add_towns(Vec::new(), vec![dot]);
+        index.dots_reaching(lon, lat, &Default::default()).count() == 1
+    }
+
+    /// A point a hair under the reach, due north, is still a candidate.
+    #[test]
+    fn a_town_reaches_a_point_due_north_at_its_reach() {
+        assert!(reaches(dot_with_reach([0.0, 0.0], 11_120.0), [0.0, 0.1]));
+    }
+
+    /// A degree of longitude shrinks to nothing at the pole.
+    #[test]
+    fn a_town_near_the_pole_reaches_across_it() {
+        assert!(reaches(
+            dot_with_reach([0.0, 89.95], 20_000.0),
+            [170.0, 89.95]
+        ));
+    }
+
+    /// Longitude wraps at the antimeridian.
+    #[test]
+    fn a_town_reaches_across_the_antimeridian() {
+        assert!(reaches(
+            dot_with_reach([179.99, 0.0], 5_000.0),
+            [-179.99, 0.0]
+        ));
+        assert!(reaches(
+            dot_with_reach([-179.99, 0.0], 5_000.0),
+            [179.99, 0.0]
+        ));
+    }
 
     #[test]
     fn exact_polygon_chooses_real_boundary_after_bbox_overlap() {

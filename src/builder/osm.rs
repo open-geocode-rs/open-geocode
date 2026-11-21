@@ -504,7 +504,7 @@ impl Contexts {
             .collect::<Vec<_>>();
         // A bigger town inside means no town, as Bayern holds hamlet Bayern and every Bavarian city.
         let held = holders.iter().flatten().copied().collect::<HashSet<_>>();
-        let towns_in = points
+        let mut towns_in = points
             .par_iter()
             .enumerate()
             .filter_map(|(at, (_, place, [lon, lat]))| {
@@ -531,6 +531,15 @@ impl Contexts {
                 }
                 left
             });
+        // A city merged into its boundary has no point left, so its boundary competes in its place.
+        for (own, rank, [lon, lat]) in index.settlement_areas() {
+            for area in index
+                .areas_at(lon, lat)
+                .filter(|area| *area != own && held.contains(area))
+            {
+                towns_in.entry(area).or_default().push((usize::MAX, rank));
+            }
+        }
         let holders = holders
             .into_iter()
             .zip(&points)
@@ -6116,6 +6125,45 @@ mod tests {
         );
     }
 
+    /// A village point is the town of a house in an extract that holds a
+    /// region but no country boundary, where the country is only inferred.
+    #[test]
+    fn a_village_point_names_a_house_when_the_country_is_inferred() {
+        let mut map = Map::new();
+        map.area(
+            [42.0, -85.0, 49.0, -75.0],
+            &[
+                ("boundary", "administrative"),
+                ("admin_level", "4"),
+                ("name", "Ontario"),
+                ("ISO3166-2", "CA-ON"),
+            ],
+        );
+        map.point(45.0, -80.0, &[("place", "village"), ("name", "Ashby")]);
+        map.point(45.0, -79.9, &[("place", "village"), ("name", "Bourne")]);
+        let farm = house(&mut map, 45.0005, -80.0005);
+        let (_dir, pack) = map.build("town-inferred-country");
+        assert!(
+            tiers(&pack, farm).contains(&(PlaceLayer::Locality, "Ashby".to_string())),
+            "{:?}",
+            tiers(&pack, farm)
+        );
+    }
+
+    /// An extract with no area boundary still has its village points.
+    #[test]
+    fn a_village_point_names_a_house_in_an_extract_with_no_boundary() {
+        let mut map = Map::new();
+        map.point(51.0, -1.0, &[("place", "village"), ("name", "Ashby")]);
+        map.point(51.0, -0.9, &[("place", "village"), ("name", "Bourne")]);
+        let farm = house(&mut map, 51.0005, -0.9995);
+        let (_dir, pack) = map.build("town-no-boundary");
+        assert_eq!(
+            tiers(&pack, farm),
+            named(&[(PlaceLayer::Locality, "Ashby")])
+        );
+    }
+
     /// A city whose boundary sits in a tier above `locality` is the town of
     /// the houses and streets in it, once, and its boroughs lie below it.
     #[test]
@@ -6419,6 +6467,25 @@ mod tests {
                 (PlaceLayer::Locality, "Ruhpolding"),
             ])
         );
+        let context = tiers(&pack, outside);
+        assert!(
+            !context.contains(&(PlaceLayer::Locality, "Bayern".to_string())),
+            "{context:?}"
+        );
+    }
+
+    /// A city drawn as an area counts against the state named like a hamlet
+    /// as a city point does.
+    #[test]
+    fn a_state_named_like_a_hamlet_in_it_is_no_town_with_the_city_an_area() {
+        let mut map = Map::new();
+        map.area([47.0, 9.0, 50.0, 13.0], &country("Deutschland", "DE"));
+        map.area([47.5, 10.0, 49.5, 12.9], &admin("4", "Bayern"));
+        map.area([48.0, 11.4, 48.3, 11.7], &admin("8", "München"));
+        map.point(47.794, 12.534, &[("place", "hamlet"), ("name", "Bayern")]);
+        map.point(48.137, 11.575, &[("place", "city"), ("name", "München")]);
+        let outside = house(&mut map, 48.5, 11.0);
+        let (_dir, pack) = map.build("town-state-hamlet-city-area");
         let context = tiers(&pack, outside);
         assert!(
             !context.contains(&(PlaceLayer::Locality, "Bayern".to_string())),
