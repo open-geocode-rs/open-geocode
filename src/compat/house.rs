@@ -8,7 +8,7 @@
 use crate::{
     api::{Accuracy, Address, Common, ForwardFeature, ReverseFeature},
     builder::osm::DISPUTED_HOUSE_RADIUS_M,
-    record::Layer,
+    record::{Building, Layer},
     spatial_index::haversine_m,
     text_index::compact_postcode,
     util::fold::search_key,
@@ -18,11 +18,17 @@ use crate::{
 pub(crate) trait Answer {
     /// The house it is, when it is one.
     fn house(&self) -> Option<House>;
+    /// The building it is drawn as.
+    fn building(&mut self) -> &mut Option<Building>;
 }
 
 impl Answer for ForwardFeature {
     fn house(&self) -> Option<House> {
         House::of(&self.properties.common, self.geometry.coordinates)
+    }
+
+    fn building(&mut self) -> &mut Option<Building> {
+        &mut self.properties.common.building
     }
 }
 
@@ -30,11 +36,25 @@ impl Answer for ReverseFeature {
     fn house(&self) -> Option<House> {
         House::of(&self.properties.common, self.geometry.coordinates)
     }
+
+    fn building(&mut self) -> &mut Option<Building> {
+        &mut self.properties.common.building
+    }
+}
+
+/// The copy kept for a house takes the building another copy of it is drawn
+/// as, when it is drawn as none. A point at a building's door and the
+/// building's outline are one house, and the outline names the building.
+fn take_building(kept: &mut Option<Building>, other: &mut Option<Building>) {
+    if kept.is_none() {
+        *kept = other.take();
+    }
 }
 
 /// Keeps one answer per house, in the place of its best-ranked copy. Of the
 /// copies, the most precise point wins, and of equally precise ones the one
-/// that states most of its address, then the best-ranked.
+/// that states most of its address, then the best-ranked. It keeps the
+/// building any copy is drawn as ([`take_building`]).
 pub(crate) fn one_per_house<A: Answer>(answers: &mut Vec<A>) {
     let mut kept: Vec<(A, Option<House>)> = Vec::with_capacity(answers.len());
     for answer in std::mem::take(answers) {
@@ -43,6 +63,7 @@ pub(crate) fn one_per_house<A: Answer>(answers: &mut Vec<A>) {
             kept.iter()
                 .position(|(_, held)| held.as_ref().is_some_and(|held| held.is_same(house)))
         });
+        let mut answer = answer;
         match copy {
             Some(at) => {
                 let held = kept[at].1.as_ref();
@@ -51,7 +72,10 @@ pub(crate) fn one_per_house<A: Answer>(answers: &mut Vec<A>) {
                     .zip(held)
                     .is_some_and(|(house, held)| house.outranks(held))
                 {
-                    kept[at] = (answer, house);
+                    let (mut dropped, _) = std::mem::replace(&mut kept[at], (answer, house));
+                    take_building(kept[at].0.building(), dropped.building());
+                } else {
+                    take_building(kept[at].0.building(), answer.building());
                 }
             }
             None => kept.push((answer, house)),
@@ -143,11 +167,16 @@ mod tests {
         address: Address,
         accuracy: Accuracy,
         point: [f64; 2],
+        building: Option<Building>,
     }
 
     impl Answer for Copy {
         fn house(&self) -> Option<House> {
             House::new(&self.address, self.accuracy, self.point)
+        }
+
+        fn building(&mut self) -> &mut Option<Building> {
+            &mut self.building
         }
     }
 
@@ -167,6 +196,7 @@ mod tests {
             },
             accuracy,
             point: [16.39 + east / metres_per_degree, 48.218],
+            building: None,
         }
     }
 
@@ -208,6 +238,32 @@ mod tests {
             },
         );
         assert_eq!(kept(vec![outline, other, point, bare]), ["point", "other"]);
+    }
+
+    /// The point kept for a house names the building its outline copy is
+    /// drawn as, whichever came first.
+    #[test]
+    fn the_copy_kept_takes_the_building_another_copy_is_drawn_as() {
+        let named = || {
+            Some(Building {
+                name: Some("Google Building 41".to_string()),
+            })
+        };
+        for outline_first in [true, false] {
+            let mut outline = copy("outline", Accuracy::Centroid, 0.0, town("Wien", None));
+            outline.building = named();
+            let point = copy("point", Accuracy::Rooftop, 20.0, town("Wien", None));
+            let mut copies = if outline_first {
+                vec![outline, point]
+            } else {
+                vec![point, outline]
+            };
+            one_per_house(&mut copies);
+            let [kept] = copies.as_mut_slice() else {
+                panic!("one copy");
+            };
+            assert_eq!((kept.id, kept.building.clone()), ("point", named()));
+        }
     }
 
     #[test]
