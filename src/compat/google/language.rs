@@ -4,15 +4,14 @@ use axum::http::HeaderMap;
 
 use super::invalid;
 use crate::{
-    api::Languages,
-    compat::{VendorError, header},
+    api::{Context, Languages},
+    compat::{self, VendorError, header},
     pack::{Reader, RecordId},
 };
 
 /// The language asked, and the Pack that tells which names og holds in it.
 /// og names a record it has no name for in that language by its local name,
-/// whose language og does not know, so a field saying which language a name
-/// is in is set only for a name og holds in the language asked.
+/// which is in the language its place speaks ([`compat::place_language`]).
 pub(super) struct Language<'a> {
     pack: &'a Reader,
     code: Option<String>,
@@ -42,10 +41,21 @@ impl<'a> Language<'a> {
         self.code.as_deref()
     }
 
-    /// The language og names `record_id` in, as og holds it: `de` when
-    /// `de-CH` was asked and og has only a `de` name. `None` when og names it
-    /// by its local name.
-    pub(super) fn of(&self, record_id: Option<RecordId>) -> Option<String> {
+    /// The language og names `record_id` in. It is the language asked, as
+    /// og holds it (`de` when `de-CH` was asked and og has only a `de`
+    /// name), else the language of the local name, the one `place`
+    /// speaks. `None` when neither is known.
+    pub(super) fn of(&self, record_id: Option<RecordId>, place: &Context) -> Option<String> {
+        self.held(record_id)
+            .or_else(|| compat::place_language(self.pack, place))
+    }
+
+    /// The language local names are written in where `place` is.
+    pub(super) fn local(&self, place: &Context) -> Option<String> {
+        compat::place_language(self.pack, place)
+    }
+
+    fn held(&self, record_id: Option<RecordId>) -> Option<String> {
         let (held, _) = self
             .pack
             .language_name_as(record_id?, self.code.as_deref()?)?;

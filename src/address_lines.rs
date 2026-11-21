@@ -286,6 +286,7 @@ mod tests {
             record_id: 0,
             local_name: None,
             wikidata: None,
+            plate_code: None,
         })
     }
 

@@ -709,6 +709,10 @@ pub struct ContextArea {
     /// The area's Wikidata item, for the vendors that write one.
     #[serde(skip)]
     pub wikidata: Option<u32>,
+    /// The code on the area's vehicle plates (`SIM`), for the vendors that
+    /// write one.
+    #[serde(skip)]
+    pub plate_code: Option<String>,
 }
 
 impl Point {
@@ -860,6 +864,7 @@ impl<'a> Contexts<'a> {
                     record_id,
                     local_name: None,
                     wikidata: self.pack.records().wikidata(record_id)?,
+                    plate_code: self.pack.plate_code(record_id).map(str::to_string),
                 })
             })
             .transpose()?;

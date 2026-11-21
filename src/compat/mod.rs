@@ -263,6 +263,9 @@ impl Args {
 /// country is Suisse. An area whose parts name it in no such language keeps
 /// its name.
 pub(crate) fn name_joined_areas(pack: &crate::pack::Reader, context: &mut crate::api::Context) {
+    let Some(languages) = place_languages(pack, context) else {
+        return;
+    };
     let mut areas = [
         &mut context.neighbourhood,
         &mut context.sublocality,
@@ -274,24 +277,6 @@ pub(crate) fn name_joined_areas(pack: &crate::pack::Reader, context: &mut crate:
         &mut context.country,
     ];
     let joined = |name: &str| name.contains('/');
-    let Some(languages) = areas
-        .iter()
-        .flat_map(|area| area.as_ref())
-        .find_map(|area| {
-            if joined(&area.name) {
-                return None;
-            }
-            let names = pack.names_by_language(area.record_id);
-            let speaking = names
-                .iter()
-                .filter(|(_, name)| *name == area.name)
-                .map(|(code, _)| code.clone())
-                .collect::<Vec<_>>();
-            (!speaking.is_empty() && speaking.len() < names.len()).then_some(speaking)
-        })
-    else {
-        return;
-    };
     for area in areas.iter_mut().flat_map(|area| area.as_mut()) {
         if !joined(&area.name) {
             continue;
@@ -308,9 +293,85 @@ pub(crate) fn name_joined_areas(pack: &crate::pack::Reader, context: &mut crate:
             })
             .map(|part| (*part).to_string());
         if let Some(local) = local {
-            area.name = local;
+            // The joined name stays its local name, so it tells no language
+            // the part was picked by ([`place_language`]).
+            let joined = std::mem::replace(&mut area.name, local);
+            area.local_name.get_or_insert(joined);
         }
     }
+}
+
+/// The languages an area's name is written in, those that name it so:
+/// Conthey is Conthey in French and Italian and Gundis in German, so it
+/// speaks French or Italian. None for a name joined from several
+/// languages, or one no language names it by.
+fn speaking(pack: &crate::pack::Reader, area: &crate::api::ContextArea) -> Option<Vec<String>> {
+    // An area renamed in the language asked is read by its local name.
+    let local = area.local_name.as_deref().unwrap_or(&area.name);
+    if local.contains('/') {
+        return None;
+    }
+    let names = pack.names_by_language(area.record_id);
+    let speaking = names
+        .iter()
+        .filter(|(_, name)| name == local)
+        .map(|(code, _)| code.clone())
+        .collect::<Vec<_>>();
+    (!speaking.is_empty()).then_some(speaking)
+}
+
+/// The languages a place speaks, which its local names are written in.
+/// They are the languages its nearest area is named in ([`speaking`]),
+/// narrowed by each area farther out while that leaves more than one. None
+/// when no area tells a language.
+fn place_languages(
+    pack: &crate::pack::Reader,
+    context: &crate::api::Context,
+) -> Option<Vec<String>> {
+    let mut languages: Option<Vec<String>> = None;
+    for area in context.areas() {
+        let Some(spoken) = speaking(pack, area) else {
+            continue;
+        };
+        languages = Some(match languages {
+            None => spoken,
+            Some(held) => {
+                let narrowed = held
+                    .iter()
+                    .filter(|code| spoken.contains(code))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if narrowed.is_empty() { held } else { narrowed }
+            }
+        });
+        if languages.as_ref().is_some_and(|held| held.len() == 1) {
+            break;
+        }
+    }
+    languages
+}
+
+/// The one language a place speaks ([`place_languages`]). Where its areas'
+/// names leave several, it is the one of them the nearest boundary stating
+/// a default language names (`default_language`): a country and a state
+/// named alike in English and Jamaican Patois, in a country whose default
+/// is English, speak English. None when its areas' names tell none, since
+/// a default alone is no sign of the place's own (Switzerland's is Latin).
+pub(crate) fn place_language(
+    pack: &crate::pack::Reader,
+    context: &crate::api::Context,
+) -> Option<String> {
+    let languages = place_languages(pack, context)?;
+    if let [one] = languages.as_slice() {
+        return Some(one.clone());
+    }
+    context
+        .areas()
+        .map(|area| pack.default_languages(area.record_id).collect::<Vec<_>>())
+        .find(|defaults| !defaults.is_empty())?
+        .into_iter()
+        .find(|code| languages.iter().any(|held| held == code))
+        .map(str::to_string)
 }
 
 /// An area's name without the word for its kind, as an address writes it:
@@ -940,6 +1001,7 @@ mod tests {
             record_id: 0,
             local_name: None,
             wikidata: None,
+            plate_code: None,
         })
     }
 
@@ -1076,6 +1138,219 @@ mod tests {
             german["items"][0]["address"]["countryName"], "Schweiz",
             "{german}"
         );
+    }
+
+    /// A name says the language it is written in. A local name is in the
+    /// language its place speaks, told by its areas' names, and a name og
+    /// holds in the language asked is in that one. A number or a code is in
+    /// none.
+    #[tokio::test]
+    async fn a_local_name_is_in_the_language_its_place_speaks() {
+        use crate::runtime::router_tests::{state_for, temp_path, write_stated_names_pack};
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let pack = temp_path("vendor-local-language");
+        write_stated_names_pack(&pack);
+        let router = runtime::build_router(state_for(&pack, true), None, None);
+        let get = |uri: String| {
+            let router = router.clone();
+            let request = axum::http::Request::get(uri)
+                .body(Body::empty())
+                .expect("request");
+            async move {
+                let reply = router.oneshot(request).await.expect("reply");
+                let bytes = axum::body::to_bytes(reply.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                serde_json::from_slice::<Value>(&bytes).expect("json")
+            }
+        };
+        let q = "addressQuery=1%20Marienplatz";
+        let languages = |answer: &Value| {
+            let result = &answer["results"][0];
+            let mut seen = result["addressComponents"]
+                .as_array()
+                .expect("components")
+                .iter()
+                .map(|component| {
+                    (
+                        component["types"][0].as_str().expect("a type").to_string(),
+                        component["languageCode"].as_str().map(str::to_string),
+                    )
+                })
+                .collect::<Vec<_>>();
+            seen.push((
+                "postalAddress".to_string(),
+                result["postalAddress"]["languageCode"]
+                    .as_str()
+                    .map(str::to_string),
+            ));
+            seen
+        };
+        let local = get(format!("/compat/google/v4/geocode/address?{q}")).await;
+        let of = |seen: &[(String, Option<String>)], kind: &str| {
+            seen.iter()
+                .find(|(found, _)| found == kind)
+                .and_then(|(_, code)| code.clone())
+        };
+        let seen = languages(&local);
+        assert_eq!(of(&seen, "route").as_deref(), Some("de"), "{local}");
+        assert_eq!(of(&seen, "country").as_deref(), Some("de"), "{local}");
+        assert_eq!(of(&seen, "postalAddress").as_deref(), Some("de"), "{local}");
+        assert_eq!(of(&seen, "street_number"), None, "{local}");
+        assert_eq!(of(&seen, "postal_code"), None, "{local}");
+        let english = get(format!(
+            "/compat/google/v4/geocode/address?{q}&languageCode=en"
+        ))
+        .await;
+        let seen = languages(&english);
+        assert_eq!(of(&seen, "country").as_deref(), Some("en"), "{english}");
+        assert_eq!(of(&seen, "route").as_deref(), Some("de"), "{english}");
+        // A place whose areas are named alike in French and Italian, under a
+        // country named in four languages at once, speaks no one language
+        // og can tell, asked in a language or not.
+        let swiss = "addressQuery=67%20Route%20de%20la%20T%C3%A9l%C3%A9cabine";
+        for asked in ["", "&languageCode=de"] {
+            let answer = get(format!("/compat/google/v4/geocode/address?{swiss}{asked}")).await;
+            assert_eq!(of(&languages(&answer), "route"), None, "{answer}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A country and a state named alike in English and Jamaican Patois,
+    /// above a county and town named in no other language, under a country
+    /// whose default language is English, and a county with plate code SIM.
+    fn write_defaults_pack(dir: &std::path::Path) {
+        use crate::{
+            pack::{RecordContext, Writer},
+            record::{
+                AddressComponents, AddressRecord, LocationPrecision, ObjectType, PlaceLayer,
+                PlaceRecord, Record, SourceProvenance, point_geometry,
+            },
+        };
+        let _ = std::fs::remove_dir_all(dir);
+        let mut writer = Writer::create(dir).expect("writer");
+        let mut area = |layer, name: &str, id: i64| {
+            let record = Record::Place(
+                layer,
+                PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: name.to_string(),
+                    place_type: "admin_level:4".to_string(),
+                    geometry: point_geometry(-122.08, 37.42),
+                    source: SourceProvenance::osm(ObjectType::Relation, id),
+                    prominence: Default::default(),
+                    wikidata: None,
+                },
+            );
+            writer.write(&record, None).expect("area")
+        };
+        let country = area(PlaceLayer::Country, "United States", 1);
+        let state = area(PlaceLayer::Region, "California", 2);
+        let county = area(PlaceLayer::District, "Rhein-Hunsrück-Kreis", 3);
+        let town = area(PlaceLayer::Locality, "Mountain View", 4);
+        let named = |names: &[(&str, &str)]| {
+            names
+                .iter()
+                .map(|(code, name)| (code.to_string(), name.to_string()))
+                .collect::<Vec<_>>()
+        };
+        writer.set_language_names(
+            [
+                (
+                    country,
+                    named(&[
+                        ("en", "United States"),
+                        ("jam", "United States"),
+                        ("fr", "États-Unis"),
+                    ]),
+                ),
+                (
+                    state,
+                    named(&[
+                        ("en", "California"),
+                        ("jam", "California"),
+                        ("es", "California"),
+                        ("fr", "Californie"),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        writer.set_default_languages([(country, "en".to_string())].into_iter().collect());
+        writer.set_plate_codes([(county, "SIM".to_string())].into_iter().collect());
+        let context = Some(RecordContext {
+            admin_context: crate::context::AdminContextTuple::from_tiers([
+                (PlaceLayer::Country, country),
+                (PlaceLayer::Region, state),
+                (PlaceLayer::District, county),
+                (PlaceLayer::Locality, town),
+            ]),
+            flags: 0,
+            zone: None,
+        });
+        let house = AddressRecord {
+            access: Vec::new(),
+            disputed: false,
+            street_postcodes: Vec::new(),
+            address: AddressComponents {
+                areas: Vec::new(),
+                number: "1600".to_string(),
+                street: Some("Amphitheatre Parkway".to_string()),
+                place: None,
+                unit: None,
+                locality: None,
+                region: None,
+                postcode: Some("94043".to_string()),
+                country: None,
+            },
+            geometry: point_geometry(-122.084, 37.422),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, 10),
+        };
+        writer.write(&house.into(), context).expect("house");
+        writer.finish().expect("finish");
+    }
+
+    /// Where a place's areas are named alike in several languages, the
+    /// default language its boundary states picks among them, and a
+    /// county's plate code is HERE's county code.
+    #[tokio::test]
+    async fn a_default_language_picks_among_alike_names_and_a_plate_code_is_the_county_code() {
+        use crate::runtime::router_tests::{state_for, temp_path};
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let pack = temp_path("vendor-default-language");
+        write_defaults_pack(&pack);
+        let router = runtime::build_router(state_for(&pack, true), None, None);
+        let get = |uri: &str| {
+            let router = router.clone();
+            let request = axum::http::Request::get(uri)
+                .body(Body::empty())
+                .expect("request");
+            async move {
+                let reply = router.oneshot(request).await.expect("reply");
+                let bytes = axum::body::to_bytes(reply.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                serde_json::from_slice::<Value>(&bytes).expect("json")
+            }
+        };
+        let google =
+            get("/compat/google/v4/geocode/address?addressQuery=1600%20Amphitheatre%20Parkway")
+                .await;
+        let route = google["results"][0]["addressComponents"]
+            .as_array()
+            .expect("components")
+            .iter()
+            .find(|component| component["types"][0] == "route")
+            .cloned()
+            .expect("a route");
+        assert_eq!(route["languageCode"], "en", "{google}");
+        let here = get("/compat/here/v1/geocode?q=1600%20Amphitheatre%20Parkway").await;
+        assert_eq!(here["items"][0]["address"]["countyCode"], "SIM", "{here}");
+        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// Every vendor names a house's town and country as og's answer in the

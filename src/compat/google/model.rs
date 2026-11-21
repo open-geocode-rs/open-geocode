@@ -140,6 +140,8 @@ pub(super) struct PostalAddress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) region_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) language_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) postal_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) administrative_area: Option<String>,
@@ -249,7 +251,7 @@ impl AddressDescriptor {
                     place_id,
                     display_name: LocalizedText {
                         text: found.name.clone(),
-                        language_code: language.of(found.record_id),
+                        language_code: language.of(found.record_id, &found.context),
                     },
                     types: Kind::of(found).types(),
                     spatial_relationship: within.then_some("WITHIN"),
@@ -270,7 +272,7 @@ impl AddressDescriptor {
                     place_id,
                     display_name: LocalizedText {
                         text: area.name.clone(),
-                        language_code: language.of(Some(area.record_id)),
+                        language_code: language.of(Some(area.record_id), context),
                     },
                     containment: "WITHIN",
                 }
@@ -284,13 +286,13 @@ impl Place {
     pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
         let id = encode_id(common);
         let kind = Kind::of(common);
-        let (postal_address, formatted_address) = address_fields(common);
+        let (postal_address, formatted_address) = address_fields(common, language);
         Self {
             name: format!("places/{id}"),
             id,
             display_name: LocalizedText {
                 text: common.name.clone(),
-                language_code: language.of(common.record_id),
+                language_code: language.of(common.record_id, &common.context),
             },
             types: kind.types(),
             primary_type: kind.primary(),
@@ -352,7 +354,7 @@ pub(super) struct GeocodeResult {
 impl GeocodeResult {
     pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
         let place_id = encode_id(common);
-        let (postal_address, formatted_address) = address_fields(common);
+        let (postal_address, formatted_address) = address_fields(common, language);
         Self {
             place: format!("places/{place_id}"),
             place_id,
@@ -394,7 +396,7 @@ impl PlaceView {
     pub(super) fn of(common: &Common, coordinates: [f64; 2], language: &Language) -> Self {
         let place_id = encode_id(common);
         let kind = Kind::of(common);
-        let (postal_address, formatted_address) = address_fields(common);
+        let (postal_address, formatted_address) = address_fields(common, language);
         // A destination's address leads with a POI's name.
         let formatted_address = match common.layer {
             Layer::Poi => formatted_address.map(|address| format!("{}, {address}", common.name)),
@@ -407,7 +409,7 @@ impl PlaceView {
             place_id,
             display_name: LocalizedText {
                 text: common.name.clone(),
-                language_code: language.of(common.record_id),
+                language_code: language.of(common.record_id, &common.context),
             },
             primary_type: kind.primary(),
             types: kind.types(),
@@ -477,8 +479,13 @@ fn formatted_address(common: &Common) -> Option<String> {
 /// The postal address, and the formatted address: a house or a place's
 /// postal lines in its country's form, one line after another, else og's
 /// label. Google writes the United States as `USA` there.
-fn address_fields(common: &Common) -> (Option<PostalAddress>, Option<String>) {
+fn address_fields(common: &Common, language: &Language) -> (Option<PostalAddress>, Option<String>) {
     let mut postal = postal_address(common);
+    if let Some(postal) = postal.as_mut() {
+        // The address names its town in the language its town is named in.
+        let town = common.context.locality.as_ref().map(|town| town.record_id);
+        postal.language_code = language.of(town, &common.context);
+    }
     if is_us(common)
         && let Some(postal) = postal.as_mut()
         && let Some(state) = us_state_code(common, postal)
@@ -548,6 +555,7 @@ fn postal_address(common: &Common) -> Option<PostalAddress> {
     let area = |area: &Option<ContextArea>| area.as_ref().map(|area| area.name.clone());
     let postal = PostalAddress {
         region_code: compat::country_code(context).map(str::to_string),
+        language_code: None,
         postal_code: address.postcode.clone(),
         administrative_area: address.region.clone().or_else(|| area(&context.region)),
         locality: compat::town_of(address, context).map(str::to_string),
@@ -584,10 +592,15 @@ fn address_components(common: &Common, language: &Language) -> Vec<AddressCompon
     ];
     let address = &common.address;
     let context = &common.context;
-    // An area og names in the language asked says so.
+    // A name says which language it is in. A number or a code is in none.
     let area = |area: &ContextArea, types: &[&'static str]| AddressComponent {
-        language_code: language.of(Some(area.record_id)),
+        language_code: language.of(Some(area.record_id), context),
         ..component(&area.name, types)
+    };
+    let local = language.local(context);
+    let named = |text: &str, types: &[&'static str]| AddressComponent {
+        language_code: local.clone(),
+        ..component(text, types)
     };
     let mut components = Vec::new();
     let mut push = |text: Option<&str>, types: &[&'static str]| {
@@ -603,14 +616,14 @@ fn address_components(common: &Common, language: &Language) -> Vec<AddressCompon
                 .then(|| compat::us_street(address))
                 .flatten()
                 .unwrap_or_else(|| street.to_string()),
-            ..component(street, &["route"])
+            ..named(street, &["route"])
         });
     }
-    let named = [
+    let holding = [
         (&context.neighbourhood, &["neighborhood", "political"][..]),
         (&context.sublocality, &["sublocality", "political"][..]),
     ];
-    for (found, types) in named {
+    for (found, types) in holding {
         if let Some(found) = found.as_ref().filter(|found| !found.name.is_empty()) {
             components.push(area(found, types));
         }
@@ -623,7 +636,7 @@ fn address_components(common: &Common, language: &Language) -> Vec<AddressCompon
         Some(locality) => components.push(area(locality, &["locality", "political"])),
         None => {
             if let Some(text) = address.locality.as_deref().filter(|text| !text.is_empty()) {
-                components.push(component(text, &["locality", "political"]));
+                components.push(named(text, &["locality", "political"]));
             }
         }
     }
@@ -649,15 +662,12 @@ fn address_components(common: &Common, language: &Language) -> Vec<AddressCompon
         // component, with its own code.
         None if common.layer == Layer::Region => components.push(AddressComponent {
             short_text: region_short(common.code.as_deref(), &common.name),
-            language_code: language.of(common.record_id),
+            language_code: language.of(common.record_id, context),
             ..component(&common.name, &["administrative_area_level_1", "political"])
         }),
         None => {
             if let Some(text) = address.region.as_deref().filter(|text| !text.is_empty()) {
-                components.push(component(
-                    text,
-                    &["administrative_area_level_1", "political"],
-                ));
+                components.push(named(text, &["administrative_area_level_1", "political"]));
             }
         }
     }
@@ -668,12 +678,12 @@ fn address_components(common: &Common, language: &Language) -> Vec<AddressCompon
         }),
         None if common.layer == Layer::Country => components.push(AddressComponent {
             short_text: common.code.clone().unwrap_or_else(|| common.name.clone()),
-            language_code: language.of(common.record_id),
+            language_code: language.of(common.record_id, context),
             ..component(&common.name, &["country", "political"])
         }),
         None => {
             if let Some(country) = address.country.as_deref().filter(|text| !text.is_empty()) {
-                components.push(component(country, &["country", "political"]));
+                components.push(named(country, &["country", "political"]));
             }
         }
     }

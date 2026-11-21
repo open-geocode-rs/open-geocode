@@ -98,6 +98,7 @@ struct Context {
 struct Area {
     name: String,
     code: Option<String>,
+    plate_code: Option<String>,
 }
 
 impl Area {
@@ -105,7 +106,20 @@ impl Area {
         Self {
             name: area.name.clone(),
             code: area.code.clone(),
+            plate_code: area.plate_code.clone(),
         }
+    }
+
+    /// The area's short code, as HERE writes a county's: the code on its
+    /// vehicle plates (`SIM`), else its code within its country (`HAM` of
+    /// `GB-HAM`).
+    fn short_code(&self) -> Option<String> {
+        self.plate_code.clone().or_else(|| {
+            self.code
+                .as_deref()
+                .and_then(|code| code.split_once('-'))
+                .map(|(_, own)| own.to_string())
+        })
     }
 }
 
@@ -336,6 +350,8 @@ pub(super) struct ItemAddress {
     pub(super) state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) county: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) county_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) city: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -768,6 +784,7 @@ fn address(properties: &Properties) -> ItemAddress {
         county: area(&context.district)
             .or_else(|| own(Layer::District))
             .map(|name| compat::without_kind(&name)),
+        county_code: context.district.as_ref().and_then(Area::short_code),
         city: area(&context.locality)
             .or_else(|| stated.locality.clone())
             .or_else(|| own(Layer::Locality)),
