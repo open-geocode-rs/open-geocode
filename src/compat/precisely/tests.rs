@@ -354,32 +354,28 @@ fn assert_carries(
     let judged = &properties["match"];
     slot("match", judged);
     let description = &result["explanation"]["addressMatch"]["description"];
-    // Autocomplete judges no part; it says which the typed text marked.
-    if judged.is_null() && route != Route::Autocomplete {
-        assert_eq!(description, &Value::Null, "{feature} as {result}");
-    }
-    for (part, label) in [
-        ("housenumber", "addressNumber"),
-        ("street", "street"),
-        ("unit", "unitMatch"),
-        ("locality", "city"),
-        ("region", "admin1"),
-        ("postcode", "postalCode"),
-    ] {
-        let Some(judged) = judged[part].as_str() else {
-            continue;
-        };
-        let described = description
-            .as_array()
-            .and_then(|parts| parts.iter().find(|entry| entry["label"] == label))
-            .unwrap_or_else(|| panic!("{label} is not described in {result}"));
-        let kind = match judged {
-            "matched" => "EXACT",
-            "partial" => "PARTIAL",
-            "unmatched" => "NONE",
-            other => panic!("og judged {part} {other}"),
-        };
-        assert_eq!(described["matchType"], kind, "{part} of {result}");
+    // Found by a point or a key, each part is judged by how it was found:
+    // the street, city and state the record holds `EXACT`, and by a key its
+    // postal parts too.
+    if matches!(route, Route::Reverse | Route::Lookup) {
+        let address = &result["address"];
+        let held = |held: bool| if held { "EXACT" } else { "NONE" };
+        let postal = route == Route::Lookup && !address["postalCode"].is_null();
+        for entry in description.as_array().expect("a description") {
+            let label = entry["label"].as_str().unwrap_or_default();
+            let expected = match label {
+                "street" | "streetType" | "streetDirectional" => {
+                    held(!properties["address"]["street"].is_null())
+                }
+                "city" => held(!address["city"]["longName"].is_null()),
+                "admin1" => held(!address["admin1"].is_null()),
+                "postalCode" | "postalCodeExt" | "unitMatch" => held(postal),
+                _ => "NONE",
+            };
+            assert_eq!(entry["matchType"], expected, "{label} in {result}");
+        }
+    } else {
+        assert_judged(route, feature, result, judged, description);
     }
 
     let distance = &properties["distance_m"];
@@ -966,12 +962,25 @@ async fn reverse_geocode_answers_each_point() {
     .await;
     assert_eq!(reply.status, StatusCode::PARTIAL_CONTENT);
     // A point judges no stated part, so the result scores 0, as Precisely
-    // writes for no address asked, and has no match description.
+    // writes for no address asked. The street segment the point lies on
+    // fixes the street, city and state, and not the number or postcode.
     let mut expected = address_result(&json!(0), &[]);
-    expected["explanation"]["addressMatch"]
-        .as_object_mut()
-        .expect("addressMatch")
-        .remove("description");
+    let exact = [
+        "admin1",
+        "city",
+        "street",
+        "streetType",
+        "streetDirectional",
+    ];
+    expected["explanation"]["addressMatch"]["description"] = json!(
+        [
+            "placeName", "addressNumber", "admin1", "admin2", "city", "neighborhood", "suburb",
+            "street", "postalCode", "streetType", "postalCodeExt", "streetDirectional", "unitMatch",
+        ]
+        .iter()
+        .map(|label| json!({"label": label, "matchType": if exact.contains(label) { "EXACT" } else { "NONE" }}))
+        .collect::<Vec<_>>()
+    );
     // The house stands on the asked point.
     expected["customFields"]["REVERSE_GEOCODE_DISTANCE"] = json!("0");
     expected["customFields"]["REVERSE_GEOCODE_DISTANCE_UNIT"] = json!("METERS");
@@ -2211,4 +2220,41 @@ async fn files_list_in_the_order_they_were_uploaded() {
         .map(|file| file["fileId"].as_str().expect("fileId").to_string())
         .collect::<Vec<_>>();
     assert_eq!(listed, ids);
+}
+
+/// How a result found by a query describes the parts og judged.
+fn assert_judged(
+    route: Route,
+    feature: &Value,
+    result: &Value,
+    judged: &Value,
+    description: &Value,
+) {
+    // Autocomplete judges no part; it says which the typed text marked.
+    if judged.is_null() && route != Route::Autocomplete {
+        assert_eq!(description, &Value::Null, "{feature} as {result}");
+    }
+    for (part, label) in [
+        ("housenumber", "addressNumber"),
+        ("street", "street"),
+        ("unit", "unitMatch"),
+        ("locality", "city"),
+        ("region", "admin1"),
+        ("postcode", "postalCode"),
+    ] {
+        let Some(judged) = judged[part].as_str() else {
+            continue;
+        };
+        let described = description
+            .as_array()
+            .and_then(|parts| parts.iter().find(|entry| entry["label"] == label))
+            .unwrap_or_else(|| panic!("{label} is not described in {result}"));
+        let kind = match judged {
+            "matched" => "EXACT",
+            "partial" => "PARTIAL",
+            "unmatched" => "NONE",
+            other => panic!("og judged {part} {other}"),
+        };
+        assert_eq!(described["matchType"], kind, "{part} of {result}");
+    }
 }

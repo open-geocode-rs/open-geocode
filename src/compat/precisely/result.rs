@@ -431,7 +431,7 @@ impl Feature {
     /// the asked point in the custom fields Precisely writes it to. An area
     /// holds the point, so it has none.
     pub(super) fn reverse_candidate(&self) -> Candidate {
-        let mut candidate = self.unasked_candidate();
+        let mut candidate = self.unasked_candidate(FoundBy::Point);
         if let Some(distance_m) = self.properties.distance_m {
             candidate
                 .custom_fields
@@ -445,10 +445,16 @@ impl Feature {
 
     /// A candidate found with no address asked, by a point or a key.
     /// Precisely scores how well a result matches the address asked, and
-    /// writes 0 when none was.
-    pub(super) fn unasked_candidate(&self) -> Candidate {
+    /// writes 0 when none was. Each part is judged by how the record was
+    /// found ([`judged_unasked`]).
+    pub(super) fn unasked_candidate(&self, found_by: FoundBy) -> Candidate {
         let mut candidate = self.candidate(Product::Geocode);
         candidate.score = Some(0);
+        candidate.explanation.address_match.description = judged_unasked(
+            &candidate.address,
+            self.properties.address.street.is_some(),
+            found_by,
+        );
         candidate
     }
 
@@ -823,6 +829,53 @@ impl Holds {
 /// every part it lists. A part og did not judge, or the query left out, is
 /// `NONE`. og judges the street whole, not its type and direction apart.
 /// Empty when og judged no part, as of a record looked up by its key.
+/// How a record was found when no address was asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FoundBy {
+    /// Reverse geocoding: the street segment the point lies on.
+    Point,
+    /// Lookup: the whole record its key names.
+    Key,
+}
+
+/// Each part judged with no address asked. Found by a point, the record is
+/// the street segment the point lies on, so the street (its name, type and
+/// direction as one), the city and the state are `EXACT` where the record
+/// holds them, and the house number, postcode and unit, which a point does
+/// not fix, are `NONE`. Found by its key, the postal parts of the record
+/// are read with it and are `EXACT` too where it holds a postcode. A part
+/// the record lacks is `NONE`.
+fn judged_unasked(
+    address: &ResponseAddress,
+    street: bool,
+    found_by: FoundBy,
+) -> Vec<MatchDescription> {
+    let held = |part: bool| if part { "EXACT" } else { "NONE" };
+    let city = address
+        .city
+        .as_ref()
+        .is_some_and(|city| city.long_name.is_some());
+    let state = address
+        .admin1
+        .as_ref()
+        .is_some_and(|admin1| admin1.long_name.is_some() || admin1.short_name.is_some());
+    let postal = found_by == FoundBy::Key && address.postal_code.is_some();
+    LABELS
+        .into_iter()
+        .map(|label| MatchDescription {
+            label,
+            match_type: match label {
+                "street" | "streetType" | "streetDirectional" => held(street),
+                "city" => held(city),
+                "admin1" => held(state),
+                "postalCode" | "postalCodeExt" | "unitMatch" => held(postal),
+                _ => "NONE",
+            },
+            matched_substring: None,
+        })
+        .collect()
+}
+
 fn describe(judged: QueryMatch) -> Vec<MatchDescription> {
     if judged.is_empty() {
         return Vec::new();

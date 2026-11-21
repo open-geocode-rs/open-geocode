@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Failure, Preferences, country_code, error, given, read_json,
-    result::{Candidate, Feature, Product},
+    result::{Candidate, Feature, FoundBy, Product},
 };
 use crate::{
     compat::{Args, VendorError, decode_id, native},
@@ -514,7 +514,7 @@ async fn lookup_key(state: &AppState, value: &str, country: Option<&str>) -> Out
         Ok(Some(hit)) => {
             let feature = Feature::from(&hit);
             if feature.country_code() == Some(code.as_str()) {
-                Outcome::answered(None, vec![feature.unasked_candidate()])
+                Outcome::answered(None, vec![feature.unasked_candidate(FoundBy::Key)])
             } else {
                 empty()
             }
