@@ -10265,9 +10265,20 @@ fn mix(
         let (named, others): (Vec<_>, Vec<_>) = places
             .into_iter()
             .partition(|hit| name_starts_as(&hit.record.name, &tokens, typos));
-        mixed.extend(named);
-        mixed.extend(addresses);
-        mixed.extend(others);
+        let mut rest = named;
+        rest.extend(addresses);
+        rest.extend(others);
+        // Typed in part, what lies within the caller's reach comes before
+        // what lies beyond it, each in its order: "rest" by a Baltimore
+        // restaurant is the restaurant, not a rest area a state away.
+        if near_first {
+            let (near, far): (Vec<_>, Vec<_>) = rest
+                .into_iter()
+                .partition(|hit| usize::from(hit.signals.focus_band) < BIAS_BANDS);
+            rest = near;
+            rest.extend(far);
+        }
+        mixed.extend(rest);
     }
     mixed.truncate(limit);
     mixed
@@ -12788,6 +12799,52 @@ mod tests {
             "a house number asks for an address"
         );
         assert_eq!(mix_suggestions("queen", addresses(), places(), 2).len(), 2);
+    }
+
+    /// Typed in part with a focus, what lies within the caller's reach comes
+    /// before what lies beyond it, each in its order.
+    #[test]
+    fn a_part_typed_near_the_caller_answers_what_is_near_first() {
+        let hit = |id: &str, layer: &str, name: &str, focus_band: u8| TextSearchHit {
+            named_place: false,
+            record_id: 0,
+            score: 1.0,
+            record: Summary {
+                id: id.to_string(),
+                layer: layer.to_string(),
+                name: name.to_string(),
+                label: name.to_string(),
+                ..street_summary()
+            },
+            fallback: false,
+            features: Features::default(),
+            confidence: None,
+            signals: Signals {
+                focus_band,
+                ..Signals::default()
+            },
+            matched: QueryMatch::default(),
+            highlights: Vec::new(),
+        };
+        let addresses = vec![hit("osm:way:1", "street", "Rest Area", 9)];
+        let places = vec![
+            hit("osm:node:2", "poi", "Restaurante Tio Pepe", 2),
+            hit("osm:node:3", "poi", "Samos Restaurant", 2),
+            hit("osm:node:4", "poi", "Far Restaurant", 9),
+        ];
+        let ids = mix("rest", addresses.clone(), places.clone(), 0, true, false)
+            .into_iter()
+            .map(|hit| hit.record.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["osm:node:2", "osm:node:3", "osm:way:1", "osm:node:4"]);
+        let unfocused = mix("rest", addresses, places, 0, false, false)
+            .into_iter()
+            .map(|hit| hit.record.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unfocused,
+            ["osm:node:2", "osm:way:1", "osm:node:3", "osm:node:4"]
+        );
     }
 
     fn street_summary() -> Summary {
