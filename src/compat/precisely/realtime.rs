@@ -558,37 +558,42 @@ pub(super) async fn autocomplete(
     request: Request,
 ) -> Result<Json<AutocompleteResponse>, VendorError> {
     let body = read_json::<AutocompleteRequest>(&state, request, "INVALID_REQUEST").await?;
-    complete(&state, body).await
+    complete(&state, body, None).await
 }
 
-/// `/v2/express-autocomplete`, v1's request with `filterBias` added. og's
-/// autocomplete has no field filter or bias, so one sent is refused rather
-/// than answered as if it held.
+/// `/v2/express-autocomplete`, v1's request with `filterBias` added, which
+/// filters or biases the results by city and postcode.
 pub(super) async fn express_autocomplete_v2(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Json<AutocompleteResponse>, VendorError> {
-    let body = read_json::<AutocompleteRequest>(&state, request, "INVALID_REQUEST").await?;
-    if body.preferences.filter_bias.is_some() {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "INVALID_REQUEST",
-            "filterBias is not supported by this server (DIS-LI-1018)",
-        ));
+    let mut body = read_json::<AutocompleteRequest>(&state, request, "INVALID_REQUEST").await?;
+    let filter_bias = body.preferences.filter_bias.take();
+    if let Some(filter_bias) = &filter_bias {
+        filter_bias.check()?;
     }
-    complete(&state, body).await
+    complete(&state, body, filter_bias.as_ref()).await
 }
 
 async fn complete(
     state: &AppState,
     body: AutocompleteRequest,
+    filter_bias: Option<&super::FilterBias>,
 ) -> Result<Json<AutocompleteResponse>, VendorError> {
     let max = body.preferences.max_results()?;
     let focus = body.preferences.origin()?;
     let address = body.address;
     let args = Args::new()
         .set("q", address.text())
-        .set("limit", max.to_string())
+        // A filter or bias picks from all og can suggest.
+        .set(
+            "limit",
+            match filter_bias {
+                Some(_) => crate::search::MAX_AUTOCOMPLETE_LIMIT.max(max),
+                None => max,
+            }
+            .to_string(),
+        )
         .maybe("country", address.country().map(country_code))
         .maybe("focus", focus.map(|[lon, lat]| format!("{lon},{lat}")))
         .maybe("lang", body.preferences.lang());
@@ -600,7 +605,7 @@ async fn complete(
         .iter()
         .map(Feature::from)
         .collect::<Vec<_>>();
-    let predictions = features
+    let mut predictions = features
         .iter()
         .map(|feature| {
             let candidate = feature.prediction();
@@ -624,6 +629,28 @@ async fn complete(
             }
         })
         .collect::<Vec<_>>();
+    if let Some(filter_bias) = filter_bias {
+        let fields = |prediction: &Prediction| {
+            let address = &prediction.candidate.address;
+            (
+                address
+                    .city
+                    .as_ref()
+                    .and_then(|city| city.long_name.clone()),
+                address.postal_code.clone(),
+            )
+        };
+        predictions.retain(|prediction| {
+            let (city, postcode) = fields(prediction);
+            filter_bias.keeps(city.as_deref(), postcode.as_deref())
+        });
+        // A stable sort keeps og's order within each.
+        predictions.sort_by_key(|prediction| {
+            let (city, postcode) = fields(prediction);
+            !filter_bias.favours(city.as_deref(), postcode.as_deref())
+        });
+        predictions.truncate(max);
+    }
     Ok(Json(AutocompleteResponse {
         response: Predictions {
             status: if predictions.is_empty() {

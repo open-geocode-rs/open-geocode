@@ -262,11 +262,99 @@ struct Preferences {
     /// for none.
     #[serde(rename = "originXY", default)]
     origin_xy: Vec<f64>,
-    /// Read only to tell it was sent (see
-    /// [`realtime::express_autocomplete_v2`]).
-    filter_bias: Option<serde::de::IgnoredAny>,
+    /// v2 autocomplete's filter or bias by city and postcode.
+    filter_bias: Option<FilterBias>,
     /// The language to answer in, as a locale (`th`, `en_US`) or its parts.
     client_locale: Option<Locale>,
+}
+
+/// v2 autocomplete's `filterBias`. A `filter` keeps only the results whose
+/// fields match `include` and drops those matching `exclude`. A `bias` puts
+/// the results matching `include` first and keeps the others.
+#[derive(Debug, Deserialize)]
+pub(super) struct FilterBias {
+    #[serde(rename = "type")]
+    kind: BiasKind,
+    fields: BiasFields,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BiasKind {
+    Bias,
+    Filter,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BiasFields {
+    #[serde(default)]
+    include: std::collections::BTreeMap<String, BiasValue>,
+    #[serde(default)]
+    exclude: std::collections::BTreeMap<String, BiasValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BiasValue {
+    value: String,
+}
+
+impl FilterBias {
+    /// Refuses what Precisely documents as an invalid request: `exclude`
+    /// with a bias, `poiCategory` in an address search, and a field it does
+    /// not filter by.
+    pub(super) fn check(&self) -> Result<(), VendorError> {
+        let invalid =
+            |message: String| Err(error(StatusCode::BAD_REQUEST, "INVALID_REQUEST", &message));
+        if self.kind == BiasKind::Bias && !self.fields.exclude.is_empty() {
+            return invalid("filterBias of type bias takes no exclude".to_string());
+        }
+        for field in self.fields.include.keys().chain(self.fields.exclude.keys()) {
+            match field.as_str() {
+                "city" | "postalCode" => {}
+                "poiCategory" => {
+                    return invalid("poiCategory filters a POI search only".to_string());
+                }
+                other => return invalid(format!("filterBias cannot use the field {other}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a result of this city and postcode matches one of `fields`.
+    fn matches(
+        fields: &std::collections::BTreeMap<String, BiasValue>,
+        city: Option<&str>,
+        postcode: Option<&str>,
+    ) -> bool {
+        fields.iter().any(|(field, wanted)| {
+            let wanted = wanted.value.trim();
+            match field.as_str() {
+                "city" => city.is_some_and(|city| city.eq_ignore_ascii_case(wanted)),
+                // A postcode matches by its start, so `121` holds `12180`.
+                "postalCode" => {
+                    !wanted.is_empty() && postcode.is_some_and(|code| code.starts_with(wanted))
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// Whether a result is kept.
+    pub(super) fn keeps(&self, city: Option<&str>, postcode: Option<&str>) -> bool {
+        match self.kind {
+            BiasKind::Bias => true,
+            BiasKind::Filter => {
+                (self.fields.include.is_empty()
+                    || Self::matches(&self.fields.include, city, postcode))
+                    && !Self::matches(&self.fields.exclude, city, postcode)
+            }
+        }
+    }
+
+    /// Whether a result goes before those that do not match.
+    pub(super) fn favours(&self, city: Option<&str>, postcode: Option<&str>) -> bool {
+        self.kind == BiasKind::Bias && Self::matches(&self.fields.include, city, postcode)
+    }
 }
 
 /// Precisely's `Locale`, sent as a locale string or as an object of its

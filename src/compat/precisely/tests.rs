@@ -2134,34 +2134,65 @@ async fn a_bulk_verify_job_writes_verify_output() {
 }
 
 #[tokio::test]
-async fn express_autocomplete_v2_refuses_a_filter_it_cannot_honour() {
+async fn express_autocomplete_v2_filters_and_biases_by_city_and_postcode() {
     let fixture = Fixture::new("filter-bias");
     let router = fixture.router();
     let address = json!({"addressLines": ["Queen Bak"], "country": "CAN"});
-    let plain = post(
-        &router,
-        "/v2/express-autocomplete",
-        &json!({"address": address}),
-    )
-    .await;
-    assert_eq!(plain.status, StatusCode::OK);
-    assert_eq!(plain.json()["response"]["status"], "OK");
-    let filtered = post(
-        &router,
-        "/v2/express-autocomplete",
-        &json!({"preferences": {"filterBias": {"type": "filter",
-                    "fields": {"include": {"city": {"value": "Toronto"}}}}},
-                "address": address}),
-    )
-    .await;
-    assert_eq!(filtered.status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        filtered.json(),
-        errors(
-            "INVALID_REQUEST",
-            "filterBias is not supported by this server (DIS-LI-1018)"
-        )
+    let ask = |filter_bias: Value| {
+        let router = router.clone();
+        let address = address.clone();
+        async move {
+            post(
+                &router,
+                "/v2/express-autocomplete",
+                &json!({"preferences": {"filterBias": filter_bias}, "address": address}),
+            )
+            .await
+        }
+    };
+    let cities = |reply: &Value| {
+        reply["response"]["predictions"]
+            .as_array()
+            .map(|predictions| {
+                predictions
+                    .iter()
+                    .map(|p| p["address"]["city"]["longName"].clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let kept =
+        ask(json!({"type": "filter", "fields": {"include": {"city": {"value": "toronto"}}}})).await;
+    assert_eq!(kept.status, StatusCode::OK);
+    let found = cities(&kept.json());
+    assert!(
+        !found.is_empty() && found.iter().all(|city| city == "Toronto"),
+        "{}",
+        kept.json()
     );
+    let by_postcode =
+        ask(json!({"type": "filter", "fields": {"include": {"postalCode": {"value": "M5"}}}}))
+            .await;
+    assert_eq!(cities(&by_postcode.json()), found, "{}", by_postcode.json());
+    let dropped =
+        ask(json!({"type": "filter", "fields": {"exclude": {"city": {"value": "Toronto"}}}})).await;
+    assert_eq!(
+        dropped.json()["response"]["status"],
+        "ZERO_RESULTS",
+        "{}",
+        dropped.json()
+    );
+    let biased =
+        ask(json!({"type": "bias", "fields": {"include": {"city": {"value": "Elsewhere"}}}})).await;
+    assert_eq!(cities(&biased.json()), found, "a bias drops nothing");
+    for refused in [
+        json!({"type": "bias", "fields": {"exclude": {"city": {"value": "Toronto"}}}}),
+        json!({"type": "filter", "fields": {"include": {"poiCategory": {"value": "5800"}}}}),
+    ] {
+        let reply = ask(refused.clone()).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(reply.json()["errors"][0]["status"], "INVALID_REQUEST");
+    }
 }
 
 /// Files asked for within one second list in the order they were asked for.
