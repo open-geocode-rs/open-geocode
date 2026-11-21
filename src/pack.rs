@@ -1427,6 +1427,16 @@ impl Reader {
             .map(|(_, name)| name)
     }
 
+    /// Every name an area record has in a language of its own, as
+    /// [`Self::language_name`] reads them one at a time.
+    pub fn language_names(&self, record_id: RecordId) -> impl Iterator<Item = &str> {
+        self.language_names
+            .get(&record_id)
+            .into_iter()
+            .flatten()
+            .map(|(_, name)| name.as_str())
+    }
+
     /// [`Self::language_name`], with the code the name is held under. That is
     /// `de` when `de-CH` reads its base language.
     pub fn language_name_as(&self, record_id: RecordId, language: &str) -> Option<(&str, &str)> {

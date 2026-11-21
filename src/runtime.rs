@@ -1835,7 +1835,7 @@ fn reverse_answer(state: &AppState, request: ReverseRequest) -> Result<ReverseCo
 }
 
 #[cfg(test)]
-mod router_tests {
+pub(crate) mod router_tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -1853,7 +1853,7 @@ mod router_tests {
         point_geometry,
     };
 
-    fn temp_path(name: &str) -> PathBuf {
+    pub(crate) fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("open-geocode-http-{name}-{}", std::process::id()))
     }
 
@@ -1893,7 +1893,7 @@ mod router_tests {
         writer.finish().expect("finish");
     }
 
-    fn state_for(pack_dir: &Path, ready: bool) -> AppState {
+    pub(crate) fn state_for(pack_dir: &Path, ready: bool) -> AppState {
         state_with(pack_dir, ready, Limits::DEFAULT)
     }
 
@@ -3261,6 +3261,333 @@ mod router_tests {
 
         let _ = std::fs::remove_dir_all(&pack);
         let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+    }
+
+    /// Houses whose source states their town or country in another language
+    /// than their areas' local names: Vienna in Wien, Munich in München,
+    /// Moscow in Москва, and `AT` for Austria. Each area has names in English,
+    /// French, German and Russian. A last house states a town no area of its
+    /// context names.
+    pub(crate) fn write_stated_names_pack(dir: &Path) {
+        use crate::context::{AdminContextTuple, RecordContext};
+        use crate::parse::lattice::CountryCode;
+        use crate::record::{PlaceLayer, PlaceRecord, Record};
+        let _ = std::fs::remove_dir_all(dir);
+        let mut writer = Writer::create(dir).expect("writer");
+        let mut area = |layer, name: &str, id: i64| {
+            let record = Record::Place(
+                layer,
+                PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: name.to_string(),
+                    place_type: "admin_level:4".to_string(),
+                    geometry: point_geometry(0.0, 0.0),
+                    source: SourceProvenance::osm(ObjectType::Relation, id),
+                    prominence: Default::default(),
+                    wikidata: None,
+                },
+            );
+            writer.write(&record, None).expect("area")
+        };
+        let austria = area(PlaceLayer::Country, "Österreich", 1);
+        let wien = area(PlaceLayer::Region, "Wien", 2);
+        let germany = area(PlaceLayer::Country, "Deutschland", 3);
+        let munich = area(PlaceLayer::Locality, "München", 4);
+        let russia = area(PlaceLayer::Country, "Россия", 5);
+        let moscow = area(PlaceLayer::Locality, "Москва", 6);
+        let code = |code: &str| CountryCode::parse(code).expect("code");
+        writer.set_country_codes(
+            [
+                (austria, code("AT")),
+                (germany, code("DE")),
+                (russia, code("RU")),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let names = |names: [(&str, &str); 4]| {
+            names
+                .iter()
+                .map(|(code, name)| (code.to_string(), name.to_string()))
+                .collect::<Vec<_>>()
+        };
+        writer.set_language_names(
+            [
+                (
+                    austria,
+                    names([
+                        ("en", "Austria"),
+                        ("fr", "Autriche"),
+                        ("de", "Österreich"),
+                        ("ru", "Австрия"),
+                    ]),
+                ),
+                (
+                    wien,
+                    names([
+                        ("en", "Vienna"),
+                        ("fr", "Vienne"),
+                        ("de", "Wien"),
+                        ("ru", "Вена"),
+                    ]),
+                ),
+                (
+                    germany,
+                    names([
+                        ("en", "Germany"),
+                        ("fr", "Allemagne"),
+                        ("de", "Deutschland"),
+                        ("ru", "Германия"),
+                    ]),
+                ),
+                (
+                    munich,
+                    names([
+                        ("en", "Munich"),
+                        ("fr", "Munich"),
+                        ("de", "München"),
+                        ("ru", "Мюнхен"),
+                    ]),
+                ),
+                (
+                    russia,
+                    names([
+                        ("en", "Russia"),
+                        ("fr", "Russie"),
+                        ("de", "Russland"),
+                        ("ru", "Россия"),
+                    ]),
+                ),
+                (
+                    moscow,
+                    names([
+                        ("en", "Moscow"),
+                        ("fr", "Moscou"),
+                        ("de", "Moskau"),
+                        ("ru", "Москва"),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let within = |tiers: &[(PlaceLayer, crate::pack::RecordId)]| {
+            Some(RecordContext {
+                admin_context: AdminContextTuple::from_tiers(tiers.iter().copied()),
+                flags: 0,
+                zone: None,
+            })
+        };
+        let house = |id: i64,
+                     lon: f64,
+                     number: &str,
+                     street: &str,
+                     town: &str,
+                     postcode: &str,
+                     country: Option<&str>|
+         -> Record {
+            AddressRecord {
+                access: Vec::new(),
+                disputed: false,
+                street_postcodes: Vec::new(),
+                address: AddressComponents {
+                    areas: Vec::new(),
+                    number: number.to_string(),
+                    street: Some(street.to_string()),
+                    place: None,
+                    unit: None,
+                    locality: Some(town.to_string()),
+                    region: None,
+                    postcode: Some(postcode.to_string()),
+                    country: country.map(str::to_string),
+                },
+                geometry: point_geometry(lon, 10.0),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, id),
+            }
+            .into()
+        };
+        for (record, context) in [
+            (
+                house(11, 10.0, "42", "Heinestraße", "Vienna", "1020", Some("AT")),
+                within(&[(PlaceLayer::Country, austria), (PlaceLayer::Region, wien)]),
+            ),
+            (
+                house(12, 11.0, "1", "Marienplatz", "Munich", "80331", None),
+                within(&[
+                    (PlaceLayer::Country, germany),
+                    (PlaceLayer::Locality, munich),
+                ]),
+            ),
+            (
+                house(
+                    13,
+                    12.0,
+                    "43",
+                    "Измайловский бульвар",
+                    "Moscow",
+                    "105043",
+                    None,
+                ),
+                within(&[
+                    (PlaceLayer::Country, russia),
+                    (PlaceLayer::Locality, moscow),
+                ]),
+            ),
+            (
+                house(14, 13.0, "5", "Hauptstraße", "Schwabing", "80801", None),
+                within(&[
+                    (PlaceLayer::Country, germany),
+                    (PlaceLayer::Locality, munich),
+                ]),
+            ),
+        ] {
+            writer.write(&record, context).expect("write");
+        }
+        writer.finish().expect("finish");
+    }
+
+    /// A town or country the source states in another language is written as
+    /// the area it names, in the language asked or else its local name, so
+    /// no answer names one place in two languages. The street stays as the
+    /// source writes it, and a town naming no area of the context stays too.
+    #[tokio::test]
+    async fn a_stated_place_is_named_as_its_area_in_every_language() {
+        let pack = temp_path("stated-names");
+        write_stated_names_pack(&pack);
+        let router = build_router(state_for(&pack, true), None, None);
+        let named = |answer: &serde_json::Value| {
+            let properties = &answer["features"][0]["properties"];
+            (
+                properties["label"].clone(),
+                properties["address"]["locality"].clone(),
+                properties["address_lines"].clone(),
+            )
+        };
+        let expect = |label: &str, town: &str, lines: &[&str]| {
+            (
+                serde_json::json!(label),
+                serde_json::json!(town),
+                serde_json::json!(lines),
+            )
+        };
+        for (route, lon, lang, expected) in [
+            (
+                "/geocode?q=42%20Heinestra%C3%9Fe",
+                10.0,
+                "",
+                expect(
+                    "42 Heinestraße, Wien, 1020, AT",
+                    "Wien",
+                    &["Heinestraße 42", "1020 Wien", "Österreich"],
+                ),
+            ),
+            (
+                "/geocode?q=42%20Heinestra%C3%9Fe",
+                10.0,
+                "en",
+                expect(
+                    "42 Heinestraße, Vienna, 1020, AT",
+                    "Vienna",
+                    &["Heinestraße 42", "1020 Vienna", "Austria"],
+                ),
+            ),
+            (
+                "/geocode?q=42%20Heinestra%C3%9Fe",
+                10.0,
+                "fr",
+                expect(
+                    "42 Heinestraße, Vienne, 1020, AT",
+                    "Vienne",
+                    &["Heinestraße 42", "1020 Vienne", "Autriche"],
+                ),
+            ),
+            (
+                "/geocode?q=42%20Heinestra%C3%9Fe",
+                10.0,
+                "ru",
+                expect(
+                    "42 Heinestraße, Вена, 1020, AT",
+                    "Вена",
+                    &["Heinestraße 42", "1020 Вена", "Австрия"],
+                ),
+            ),
+            (
+                "/geocode?q=1%20Marienplatz",
+                11.0,
+                "",
+                expect(
+                    "1 Marienplatz, München, 80331",
+                    "München",
+                    &["Marienplatz 1", "80331 München", "Deutschland"],
+                ),
+            ),
+            (
+                "/geocode?q=1%20Marienplatz",
+                11.0,
+                "fr",
+                expect(
+                    "1 Marienplatz, Munich, 80331",
+                    "Munich",
+                    &["Marienplatz 1", "80331 Munich", "Allemagne"],
+                ),
+            ),
+            (
+                "/geocode?q=1%20Marienplatz",
+                11.0,
+                "ru",
+                expect(
+                    "1 Marienplatz, Мюнхен, 80331",
+                    "Мюнхен",
+                    &["Marienplatz 1", "80331 Мюнхен", "Германия"],
+                ),
+            ),
+            (
+                "/geocode?q=43%20%D0%98%D0%B7%D0%BC%D0%B0%D0%B9%D0%BB%D0%BE%D0%B2%D1%81%D0%BA%D0%B8%D0%B9%20%D0%B1%D1%83%D0%BB%D1%8C%D0%B2%D0%B0%D1%80",
+                12.0,
+                "",
+                expect(
+                    "43 Измайловский бульвар, Москва, 105043",
+                    "Москва",
+                    &["Измайловский бульвар, 43", "Москва", "Россия", "105043"],
+                ),
+            ),
+            (
+                "/geocode?q=43%20%D0%98%D0%B7%D0%BC%D0%B0%D0%B9%D0%BB%D0%BE%D0%B2%D1%81%D0%BA%D0%B8%D0%B9%20%D0%B1%D1%83%D0%BB%D1%8C%D0%B2%D0%B0%D1%80",
+                12.0,
+                "de",
+                expect(
+                    "43 Измайловский бульвар, Moskau, 105043",
+                    "Moskau",
+                    &["Измайловский бульвар, 43", "Moskau", "Russland", "105043"],
+                ),
+            ),
+            (
+                "/geocode?q=5%20Hauptstra%C3%9Fe",
+                13.0,
+                "en",
+                expect(
+                    "5 Hauptstraße, Schwabing, 80801",
+                    "Schwabing",
+                    &["Hauptstraße 5", "80801 Schwabing", "Germany"],
+                ),
+            ),
+        ] {
+            let lang = if lang.is_empty() {
+                String::new()
+            } else {
+                format!("&lang={lang}")
+            };
+            for uri in [
+                format!("{route}{lang}"),
+                format!("/reverse?lon={lon}&lat=10.0{lang}"),
+            ] {
+                let reply = send(router.clone(), request("GET", &uri)).await;
+                assert_eq!(reply.status, StatusCode::OK, "{uri}");
+                assert_eq!(named(&reply.json()), expected, "{uri}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// Toronto in Ontario in Canada and Berlin in Germany, with houses and

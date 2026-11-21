@@ -563,6 +563,95 @@ pub(crate) fn town<'a>(
 mod tests {
     use super::*;
 
+    /// Every vendor names a house's town and country as og's answer in the
+    /// language asked does, never the source's spelling beside translated
+    /// areas.
+    #[tokio::test]
+    async fn every_vendor_names_a_stated_town_in_the_language_asked() {
+        use crate::runtime::router_tests::{state_for, temp_path, write_stated_names_pack};
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let pack = temp_path("vendor-stated-names");
+        write_stated_names_pack(&pack);
+        let router = runtime::build_router(state_for(&pack, true), None, None);
+        let call = |request: axum::http::Request<Body>| {
+            let router = router.clone();
+            async move {
+                let reply = router.oneshot(request).await.expect("reply");
+                let bytes = axum::body::to_bytes(reply.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                serde_json::from_slice::<Value>(&bytes).expect("json")
+            }
+        };
+        let get = |uri: String| {
+            call(
+                axum::http::Request::get(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+        };
+        for (lang, town, country) in [
+            ("fr", "Vienne", "Autriche"),
+            ("ru", "Вена", "Австрия"),
+            ("de", "Wien", "Österreich"),
+        ] {
+            let q = "q=42%20Heinestra%C3%9Fe";
+            let google = get(format!(
+                "/compat/google/v4/geocode/address?addressQuery=42%20Heinestra%C3%9Fe&languageCode={lang}"
+            ))
+            .await;
+            let result = &google["results"][0];
+            assert_eq!(result["postalAddress"]["locality"], town, "{google}");
+            assert_eq!(
+                result["formattedAddress"],
+                format!("42 Heinestraße, {town}, 1020, AT"),
+                "{google}"
+            );
+            let here = get(format!("/compat/here/v1/geocode?{q}&lang={lang}")).await;
+            let address = &here["items"][0]["address"];
+            assert_eq!(address["city"], town, "{here}");
+            assert_eq!(address["countryName"], country, "{here}");
+            assert_eq!(
+                address["label"],
+                format!("Heinestraße 42, 1020 {town}, {country}"),
+                "{here}"
+            );
+            let mapbox = get(format!(
+                "/compat/mapbox/search/geocode/v6/forward?{q}&language={lang}"
+            ))
+            .await;
+            let properties = &mapbox["features"][0]["properties"];
+            assert_eq!(
+                properties["context"]["country"]["name"], country,
+                "{mapbox}"
+            );
+            assert!(
+                properties["full_address"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(town) && !text.contains("Vienna")),
+                "{mapbox}"
+            );
+            let precisely = call(
+                axum::http::Request::post("/compat/precisely/v1/geocode")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "preferences": {"maxResults": 1, "clientLocale": lang},
+                            "addresses": [{"addressLines": ["42 Heinestraße"], "country": "AT"}],
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await;
+            let address = &precisely["responses"][0]["results"][0]["address"];
+            assert_eq!(address["city"]["longName"], town, "{precisely}");
+            assert_eq!(address["country"]["name"], country, "{precisely}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
     #[test]
     fn a_county_written_as_the_town_gives_way_to_the_town_holding_the_record() {
         let county = Some("Lycoming County");

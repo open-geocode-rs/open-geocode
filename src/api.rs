@@ -657,6 +657,23 @@ impl Context {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+
+    /// Its areas, smallest first.
+    pub fn areas(&self) -> impl Iterator<Item = &ContextArea> {
+        [
+            &self.neighbourhood,
+            &self.sublocality,
+            &self.locality,
+            &self.subdistrict,
+            &self.district,
+            &self.subregion,
+            &self.region,
+            &self.country,
+            &self.place,
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
@@ -743,6 +760,8 @@ impl ReverseFeature {
 pub struct Contexts<'a> {
     pack: &'a Reader,
     areas: HashMap<RecordId, Option<ContextArea>>,
+    /// Every name of each area, as search compares them.
+    keys: HashMap<RecordId, Vec<String>>,
 }
 
 impl<'a> Contexts<'a> {
@@ -750,6 +769,7 @@ impl<'a> Contexts<'a> {
         Self {
             pack,
             areas: HashMap::new(),
+            keys: HashMap::new(),
         }
     }
 
@@ -771,6 +791,36 @@ impl<'a> Contexts<'a> {
             country: self.area(tuple.get(PlaceLayer::Country))?,
             place: self.area(tuple.get(PlaceLayer::Place))?,
         })
+    }
+
+    /// Whether `stated` is area `record_id`'s ISO code or the short code
+    /// after its country's (`CA` of `US-CA`). A code is written one way in
+    /// every language, so it stays as the source writes it.
+    fn is_code(&self, record_id: RecordId, stated: &str) -> bool {
+        self.code(record_id).is_some_and(|code| {
+            code.eq_ignore_ascii_case(stated)
+                || code
+                    .split_once('-')
+                    .is_some_and(|(_, short)| short.eq_ignore_ascii_case(stated))
+        })
+    }
+
+    /// Whether `stated` is a name of area `record_id`, in any language.
+    fn names_area(&mut self, record_id: RecordId, stated: &str) -> Result<bool> {
+        let Some(stated) = crate::util::fold::search_key(stated) else {
+            return Ok(false);
+        };
+        if !self.keys.contains_key(&record_id) {
+            let names = self.pack.records().names(record_id)?;
+            let keys = names
+                .iter()
+                .map(String::as_str)
+                .chain(self.pack.language_names(record_id))
+                .filter_map(crate::util::fold::search_key)
+                .collect();
+            self.keys.insert(record_id, keys);
+        }
+        Ok(self.keys[&record_id].contains(&stated))
     }
 
     /// An area's ISO code: a country's own, else its subdivision code.
@@ -966,6 +1016,26 @@ fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) ->
             &mut area.translations,
         );
     }
+    // A part the source states that names an area was written as the area
+    // (see [`name_stated_parts`]), so it is renamed with it.
+    let address = &mut common.address;
+    for part in [
+        &mut address.locality,
+        &mut address.region,
+        &mut address.country,
+        &mut address.place,
+    ]
+    .into_iter()
+    .flatten()
+    .chain(&mut address.areas)
+    {
+        if let Some(area) = context
+            .areas()
+            .find(|area| area.local_name.as_deref() == Some(part.as_str()))
+        {
+            part.clone_from(&area.name);
+        }
+    }
     // The lines name areas, which just changed language.
     common.address_lines =
         crate::address_lines::address_lines(common.layer, &common.address, &common.context);
@@ -1090,14 +1160,20 @@ pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<Fo
         .point
         .ok_or_else(|| Error::Inconsistent(format!("search hit {} has no point", hit.record.id)))?;
     let accuracy = Accuracy::of(point.precision, &hit.record.source);
+    let mut common = common(contexts, hit.record_id, hit.record, accuracy)?;
+    let mut highlights = hit.highlights;
+    let moved = name_stated_parts(contexts, &mut common)?;
+    if !moved.is_empty() {
+        move_highlights(&mut highlights, &moved);
+    }
     let properties = ForwardProperties {
-        common: common(contexts, hit.record_id, hit.record, accuracy)?,
+        common,
         score: hit.score,
         confidence: hit.confidence,
         fallback: hit.fallback,
         distance_m: None,
         matched: (!hit.matched.is_empty()).then_some(hit.matched),
-        highlights: hit.highlights,
+        highlights,
     };
     Ok(ForwardFeature::new(point.lon, point.lat, properties))
 }
@@ -1168,8 +1244,10 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
             summary.layer.clone_from(layer);
         }
         summary.label.clone_from(&result.label);
+        let mut common = common(&mut contexts, record_id, summary, accuracy)?;
+        name_stated_parts(&mut contexts, &mut common)?;
         let properties = ReverseProperties {
-            common: common(&mut contexts, record_id, summary, accuracy)?,
+            common,
             distance_m: result.distance_m,
         };
         features.push(ReverseFeature::new(lon, lat, properties));
@@ -1290,6 +1368,52 @@ fn common(
         record_id: Some(record_id),
         local_name: None,
     })
+}
+
+/// Writes each place the source states, its town, region, country or a
+/// named part of a town, as the area of the result's context it names, so
+/// one answer never names a place two ways: an address tagged `Vienna` in
+/// Wien says `Wien`, and with `lang` says what the area does. A code (`CA`,
+/// `AT`) is the same in every language and stays. The label
+/// follows, and how its parts moved is returned (see [`relabel`]), none when
+/// nothing was renamed. A part that names no area of the context stays as
+/// the source wrote it.
+fn name_stated_parts(contexts: &mut Contexts, common: &mut Common) -> Result<Vec<Moved>> {
+    let areas = common
+        .context
+        .areas()
+        .map(|area| (area.record_id, area.name.clone()))
+        .collect::<Vec<_>>();
+    let mut renamed = Vec::new();
+    let address = &mut common.address;
+    let parts = [
+        &mut address.locality,
+        &mut address.region,
+        &mut address.country,
+        &mut address.place,
+    ]
+    .into_iter()
+    .flatten()
+    .chain(&mut address.areas);
+    for part in parts {
+        for (record_id, name) in &areas {
+            if part == name || contexts.is_code(*record_id, part) {
+                break;
+            }
+            if contexts.names_area(*record_id, part)? {
+                renamed.push((std::mem::replace(part, name.clone()), name.clone()));
+                break;
+            }
+        }
+    }
+    if renamed.is_empty() {
+        return Ok(Vec::new());
+    }
+    common.address_lines =
+        crate::address_lines::address_lines(common.layer, &common.address, &common.context);
+    let (label, moved) = relabel(&common.label, &renamed);
+    common.label = label;
+    Ok(moved)
 }
 
 /// The result columns of one forward feature, by name, in the order

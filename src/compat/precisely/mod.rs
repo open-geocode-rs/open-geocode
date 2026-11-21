@@ -251,8 +251,7 @@ fn given(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-/// `preferences`, the fields og can honour. The rest, and their types, are
-/// not read, since `clientLocale` comes as a string or an object.
+/// `preferences`, the fields og can honour. The rest are not read.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Preferences {
@@ -266,6 +265,45 @@ struct Preferences {
     /// Read only to tell it was sent (see
     /// [`realtime::express_autocomplete_v2`]).
     filter_bias: Option<serde::de::IgnoredAny>,
+    /// The language to answer in, as a locale (`th`, `en_US`) or its parts.
+    client_locale: Option<Locale>,
+}
+
+/// Precisely's `Locale`, sent as a locale string or as an object of its
+/// parts. Any other shape is left unread, as before og read it.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Locale {
+    Text(String),
+    Parts {
+        language: Option<String>,
+        script: Option<String>,
+        country: Option<String>,
+    },
+    Other(serde::de::IgnoredAny),
+}
+
+impl Locale {
+    /// og's `lang` for it, when it names a language og can read: `en_US` is
+    /// `en-US`.
+    fn lang(&self) -> Option<String> {
+        let lang = match self {
+            Self::Text(text) => text.trim().replace('_', "-"),
+            Self::Parts {
+                language,
+                script,
+                country,
+            } => [language, script, country]
+                .into_iter()
+                .flatten()
+                .map(|part| part.trim())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("-"),
+            Self::Other(_) => return None,
+        };
+        crate::api::Languages::parse(&lang).is_ok().then_some(lang)
+    }
 }
 
 /// Precisely's `Distance`.
@@ -304,6 +342,11 @@ const DEFAULT_MAX_RESULTS: i64 = 1;
 const DEFAULT_DISTANCE_M: f64 = 5.0;
 
 impl Preferences {
+    /// og's `lang` for `clientLocale`.
+    fn lang(&self) -> Option<String> {
+        self.client_locale.as_ref().and_then(Locale::lang)
+    }
+
     /// The search radius in metres, when the request states one. Precisely
     /// measures in metres unless told otherwise, and searches
     /// [`DEFAULT_DISTANCE_M`] when told nothing.

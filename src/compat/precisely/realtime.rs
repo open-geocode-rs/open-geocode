@@ -364,7 +364,12 @@ async fn addresses(
     for address in checked(body.addresses)? {
         let address_id = address.address_id.clone();
         outcomes.push(
-            match native::geocode(&state, args(address.geocode_params(max))).await {
+            match native::geocode(
+                &state,
+                args(address.geocode_params(max)).maybe("lang", body.preferences.lang()),
+            )
+            .await
+            {
                 Ok(collection) => {
                     Outcome::of_features(address_id, &collection.features, max, product)
                 }
@@ -402,7 +407,8 @@ pub(super) async fn reverse(
         let args = Args::new()
             .maybe("lon", location.longitude.map(|lon| lon.to_string()))
             .maybe("lat", location.latitude.map(|lat| lat.to_string()))
-            .set("radius", crate::compat::radius(radius_m));
+            .set("radius", crate::compat::radius(radius_m))
+            .maybe("lang", body.preferences.lang());
         let wanted = given(location.country.as_deref()).map(country_code);
         outcomes.push(match native::reverse(&state, args).await {
             Ok(collection) => {
@@ -584,7 +590,8 @@ async fn complete(
         .set("q", address.text())
         .set("limit", max.to_string())
         .maybe("country", address.country().map(country_code))
-        .maybe("focus", focus.map(|[lon, lat]| format!("{lon},{lat}")));
+        .maybe("focus", focus.map(|[lon, lat]| format!("{lon},{lat}")))
+        .maybe("lang", body.preferences.lang());
     let collection = native::autocomplete(state, args)
         .await
         .map_err(|problem| Failure::of(&problem, address.country()).into_error(problem))?;
