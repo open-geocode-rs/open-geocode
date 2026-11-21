@@ -1012,18 +1012,22 @@ mod tests {
 
     /// The section a build of `input` writes, read back from scratch.
     fn build_bytes(input: &Path, languages: &[String], dir: &Path) -> Result<Vec<u8>> {
-        build_bytes_with(input, languages, dir, 1 << 20, &Budget::unlimited())
+        build_bytes_with(input, languages, dir, 1 << 20, &Budget::unlimited()).map(|built| built.0)
     }
 
     /// As [`build_bytes`], with the sorters' share and the pool set, so a
     /// test can make every buffer spill and every node store map a file.
+    /// Also returns what the sorters wrote to scratch.
     fn build_bytes_with(
         input: &Path,
         languages: &[String],
         dir: &Path,
         budget: usize,
         memory: &Arc<Budget>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(
+        Vec<u8>,
+        std::collections::BTreeMap<String, crate::extsort::Traffic>,
+    )> {
         let scratch = Scratch::create(dir.join("scratch"))?;
         let progress = Progress::new(
             Arc::new(Quiet),
@@ -1036,7 +1040,7 @@ mod tests {
             progress: &progress,
         };
         let section = build_section(&[input.to_path_buf()], languages, &env)?;
-        Ok(std::fs::read(section.path())?)
+        Ok((std::fs::read(section.path())?, scratch.traffic()))
     }
 
     fn built(
@@ -1389,13 +1393,19 @@ mod tests {
         let section = |budget: usize, memory: Arc<Budget>| {
             let (input, dir) = scratch_input("spill");
             write_pbf(&input, &examples());
-            let bytes = build_bytes_with(&input, &owned(&["es", "fr"]), &dir, budget, &memory)
+            let built = build_bytes_with(&input, &owned(&["es", "fr"]), &dir, budget, &memory)
                 .expect("section");
             std::fs::remove_dir_all(dir).expect("cleanup");
-            bytes
+            built
         };
-        let roomy = section(1 << 20, Budget::unlimited());
-        let starved = section(1, Budget::new(0));
+        let (roomy, _) = section(1 << 20, Budget::unlimited());
+        let (starved, traffic) = section(1, Budget::new(0));
+        for label in ["translation-ids", "translation-streets"] {
+            assert!(
+                traffic.get(label).is_some_and(|owner| owner.runs > 1),
+                "{label} must have spilled more than one run: {traffic:?}"
+            );
+        }
         assert_eq!(roomy, starved);
     }
 
