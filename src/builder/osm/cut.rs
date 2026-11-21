@@ -10,7 +10,8 @@
 use std::{fs, path::Path};
 
 use geo::{
-    BooleanOps, Contains, Coord, Intersects, LineString, MultiPolygon, Point, Polygon, Rect,
+    Area, BoundingRect, Contains, Coord, InteriorPoint, Intersects, LineString, MultiPolygon,
+    Point, Polygon, Rect,
 };
 
 use crate::error::{Error, Result};
@@ -120,7 +121,10 @@ impl Cut {
     /// is a way the extract holds, as the ways left out lie outside it. So
     /// each open chain is closed by any path outside the cut, here to the
     /// nearest point of the cut's outline and along it, and the rings are
-    /// filled even-odd and clipped to the cut. Where that path runs differs
+    /// clipped to the cut's box and read even-odd, as a boundary's shape is.
+    /// The other side is the cut's outline with them. A cut that is not a
+    /// box leaves the rings as they run between it and its box, where the
+    /// extract holds nothing to place. Where that path runs differs
     /// from the ways left out only by how often it goes round the cut, which
     /// flips every point inside alike; the anchor says which side is the
     /// area.
@@ -162,18 +166,20 @@ impl Cut {
             contour.extend(walk(&outlines[from.ring], from, to));
             contours.push(contour);
         }
-        let subject = MultiPolygon::new(
-            contours
-                .into_iter()
-                .filter(|contour| contour.len() >= 3)
-                .map(|contour| Polygon::new(LineString::new(contour), Vec::new()))
-                .collect(),
-        );
-        let mut inside = subject.intersection(&self.shape);
-        if !inside.contains(&anchor) && !open.is_empty() {
-            inside = self.shape.difference(&inside);
+        let bounds = self.shape.bounding_rect()?;
+        let mut rings = contours
+            .iter()
+            .map(|contour| clip_to(contour, &bounds))
+            .filter(|ring| ring.len() >= 3)
+            .collect::<Vec<_>>();
+        if !even_odd(&rings, anchor.0) && !open.is_empty() {
+            rings.extend(outlines);
         }
-        (inside.contains(&anchor) && !inside.0.is_empty()).then_some(inside)
+        if !even_odd(&rings, anchor.0) {
+            return None;
+        }
+        let area = nested(&rings);
+        (!area.0.is_empty()).then_some(area)
     }
 
     /// Every ring of the cut's outline, each as its points in order, closed.
@@ -261,6 +267,121 @@ fn walk(outline: &[Coord<f64>], from: OnOutline, to: OnOutline) -> Vec<Coord<f64
     }
     points.push(to.point);
     points
+}
+
+/// A side of a box: the coordinate it bounds, where, and whether the inside
+/// lies above it.
+type Side = (fn(Coord<f64>) -> f64, f64, bool);
+
+/// The part of `ring` inside `bounds`, as one ring: each edge cut where it
+/// crosses a side of the box. A box is convex, so clipping every ring of an
+/// even-odd shape alone leaves its parity inside the box as it was.
+fn clip_to(ring: &[Coord<f64>], bounds: &Rect<f64>) -> Vec<Coord<f64>> {
+    let (min, max) = (bounds.min(), bounds.max());
+    let sides: [Side; 4] = [
+        (|point| point.x, min.x, true),
+        (|point| point.x, max.x, false),
+        (|point| point.y, min.y, true),
+        (|point| point.y, max.y, false),
+    ];
+    let mut points = ring.to_vec();
+    for (along, edge, above) in sides {
+        let inside = |point: Coord<f64>| match above {
+            true => along(point) >= edge,
+            false => along(point) <= edge,
+        };
+        let crossing = |from: Coord<f64>, to: Coord<f64>| {
+            let (a, b) = (along(from), along(to));
+            from + (to - from) * ((edge - a) / (b - a))
+        };
+        let mut kept = Vec::with_capacity(points.len());
+        for (index, &point) in points.iter().enumerate() {
+            let previous = points[(index + points.len() - 1) % points.len()];
+            match (inside(previous), inside(point)) {
+                (true, true) => kept.push(point),
+                (true, false) => kept.push(crossing(previous, point)),
+                (false, true) => {
+                    kept.push(crossing(previous, point));
+                    kept.push(point);
+                }
+                (false, false) => {}
+            }
+        }
+        points = kept;
+        if points.is_empty() {
+            break;
+        }
+    }
+    points
+}
+
+/// Whether `point` lies inside `rings` by the even-odd rule, the rule a
+/// boundary's shape is read by (see [`super::containment::encode_shape`]).
+fn even_odd(rings: &[Vec<Coord<f64>>], point: Coord<f64>) -> bool {
+    let mut inside = false;
+    for ring in rings {
+        for (index, &to) in ring.iter().enumerate() {
+            let from = ring[(index + ring.len() - 1) % ring.len()];
+            if (from.y > point.y) != (to.y > point.y)
+                && point.x < from.x + (point.y - from.y) / (to.y - from.y) * (to.x - from.x)
+            {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// `rings` read by the even-odd rule as polygons: a ring inside an odd
+/// number of the others is a hole of the smallest of them.
+fn nested(rings: &[Vec<Coord<f64>>]) -> MultiPolygon<f64> {
+    let polygons = rings
+        .iter()
+        .map(|ring| Polygon::new(LineString::new(ring.clone()), Vec::new()))
+        .collect::<Vec<_>>();
+    let areas = polygons
+        .iter()
+        .map(|polygon| polygon.unsigned_area())
+        .collect::<Vec<_>>();
+    // A point inside each ring, off its outline, to count the larger rings it
+    // lies in: a ring sharing part of the cut's outline holds none of it.
+    let probe = |index: usize| polygons[index].interior_point().map(|point| point.0);
+    let holders = |index: usize| {
+        probe(index).map_or_else(Vec::new, |point| {
+            (0..rings.len())
+                .filter(|&other| {
+                    other != index
+                        && areas[other] > areas[index]
+                        && even_odd(&rings[other..=other], point)
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let depths = (0..rings.len()).map(holders).collect::<Vec<_>>();
+    let mut outers = Vec::new();
+    let mut holes = Vec::<(usize, LineString<f64>)>::new();
+    for (index, held_by) in depths.iter().enumerate() {
+        let ring = LineString::new(rings[index].clone());
+        match held_by.len() % 2 {
+            0 => outers.push((index, Polygon::new(ring, Vec::new()))),
+            _ => {
+                let Some(&smallest) = held_by.iter().min_by(|a, b| {
+                    polygons[**a]
+                        .unsigned_area()
+                        .total_cmp(&polygons[**b].unsigned_area())
+                }) else {
+                    continue;
+                };
+                holes.push((smallest, ring));
+            }
+        }
+    }
+    for (holder, ring) in holes {
+        if let Some((_, polygon)) = outers.iter_mut().find(|(index, _)| *index == holder) {
+            polygon.interiors_push(ring);
+        }
+    }
+    MultiPolygon::new(outers.into_iter().map(|(_, polygon)| polygon).collect())
 }
 
 #[cfg(test)]
