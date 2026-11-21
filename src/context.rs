@@ -84,14 +84,14 @@ impl TierSet {
         self.iter().next()
     }
 
-    fn from_bits(bits: u16) -> Option<Self> {
+    pub(crate) fn from_bits(bits: u16) -> Option<Self> {
         let known = PlaceLayer::ALL
             .into_iter()
             .fold(0, |known, tier| known | Self::of(tier).0);
         (bits & !known == 0).then_some(Self(bits))
     }
 
-    fn bits(self) -> u16 {
+    pub(crate) fn bits(self) -> u16 {
         self.0
     }
 }
