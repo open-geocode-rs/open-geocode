@@ -477,13 +477,17 @@ async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compa
     };
     match plan.lookup {
         Lookup::Geocode(args) => {
-            let found = native::geocode(state, args).await.map_err(failed)?;
+            let found = super::forward_geocode(state, args, types)
+                .await
+                .map_err(failed)?;
             translated(Collection::forward(&found, types, naming))
         }
         Lookup::Id { named, lang, text } => {
             let found = match native::lookup(state, &named, lang.as_deref()).await {
                 Ok(Some(collection)) => collection,
-                Ok(None) => native::geocode(state, text).await.map_err(failed)?,
+                Ok(None) => super::forward_geocode(state, text, types)
+                    .await
+                    .map_err(failed)?,
                 Err(problem) => return Err(failed(problem)),
             };
             translated(Collection::forward(&found, types, naming))
@@ -493,7 +497,9 @@ async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compa
             complete,
             limit,
         } => {
-            let found = native::geocode(state, geocode).await.map_err(failed)?;
+            let found = super::forward_geocode(state, geocode, types)
+                .await
+                .map_err(failed)?;
             if reads_whole(&found) {
                 return translated(Collection::forward(&found, types, naming));
             }
@@ -627,20 +633,18 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
     let types = params.types(Api::Geocoding)?;
     let languages = languages(params)?;
     let lang = (!languages.is_empty()).then(|| languages.join(","));
-    let layer = types.as_ref().and_then(Types::og_layer);
     let wanted = limit(params, MAX_FORWARD_LIMIT)?;
     let (focus, bbox) = (params.focus(Api::Geocoding)?, params.bbox(Api::Geocoding)?);
-    let limited = |q: &str, limit: usize, layer: Option<&str>| {
+    let limited = |q: &str, limit: usize| {
         Args::new()
             .set("q", q)
             .set("limit", limit.to_string())
             .maybe("country", params.get("country"))
             .maybe("focus", focus.clone())
             .maybe("bbox", bbox.clone())
-            .maybe("layer", layer)
             .maybe("lang", lang.clone())
     };
-    let text = |q: &str| limited(q, wanted.unwrap_or(DEFAULT_LIMIT), layer);
+    let text = |q: &str| limited(q, wanted.unwrap_or(DEFAULT_LIMIT));
     if let Some(q) = params.get("q") {
         let lookup = match decode_id(q) {
             Some(named) => Lookup::Id {
@@ -652,7 +656,7 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
                 geocode: text(q),
                 // POIs are dropped from what the text completes to, so as
                 // many are asked for as Geocoding may answer.
-                complete: limited(q, MAX_FORWARD_LIMIT, None),
+                complete: limited(q, MAX_FORWARD_LIMIT),
                 limit: wanted.unwrap_or(DEFAULT_LIMIT),
             },
             None => Lookup::Geocode(text(q)),
@@ -685,7 +689,6 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
                 .maybe("region", params.get("region"))
                 .maybe("postcode", params.get("postcode"))
                 .maybe("country", code)
-                .maybe("layer", layer)
                 .maybe("lang", lang.clone()),
         ),
         // og's address fields need a street. Areas alone are a search for
@@ -710,7 +713,6 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
                 .maybe("country", code)
                 .maybe("focus", params.focus(Api::Geocoding)?)
                 .maybe("bbox", params.bbox(Api::Geocoding)?)
-                .maybe("layer", layer)
                 .maybe("lang", lang.clone());
             Lookup::Geocode(args)
         }

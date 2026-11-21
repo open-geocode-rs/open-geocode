@@ -25,7 +25,7 @@ use serde_json::json;
 
 use crate::{
     api::{
-        Accuracy, Attribution, Common, ForwardCollection, ForwardFeature, QueryMatch,
+        Accuracy, Attribution, Common, ForwardCollection, ForwardFeature, PartMatch, QueryMatch,
         ReverseCollection, ReverseFeature,
     },
     compat::{Args, VendorError, encode_area_id, encode_id, native, retry_after},
@@ -50,6 +50,46 @@ async fn complete(
         return native::autocomplete(state, args.set("layer", "interpolation")).await;
     }
     Ok(found)
+}
+
+/// An address filter keeps both mapped points and numbered interpolation.
+async fn forward_geocode(
+    state: &AppState,
+    args: Args,
+    types: Option<&Types>,
+) -> Result<ForwardCollection, Problem> {
+    let layer = types.and_then(Types::og_layer);
+    if layer != Some("address") {
+        return native::geocode(state, args.maybe("layer", layer)).await;
+    }
+    let found = native::geocode(state, args.clone().set("layer", "address")).await?;
+    let matches_address = |feature: &ForwardFeature| {
+        feature.properties.matched.as_ref().is_some_and(|matched| {
+            matched.street == Some(PartMatch::Matched)
+                && matches!(
+                    matched.housenumber,
+                    Some(PartMatch::Matched | PartMatch::Partial)
+                )
+                && [
+                    matched.unit,
+                    matched.locality,
+                    matched.region,
+                    matched.postcode,
+                    matched.country,
+                ]
+                .into_iter()
+                .all(|part| part != Some(PartMatch::Unmatched))
+        })
+    };
+    if found.features.first().is_some_and(matches_address) {
+        return Ok(found);
+    }
+    let mut ranges = native::geocode(state, args.set("layer", "interpolation")).await?;
+    ranges.features.retain(matches_address);
+    if ranges.features.is_empty() {
+        return Ok(found);
+    }
+    Ok(ranges)
 }
 
 pub(crate) fn router() -> Router<AppState> {

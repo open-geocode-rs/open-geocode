@@ -455,7 +455,7 @@ pub(super) async fn forward(
     } else {
         match layer {
             Some("poi") => native::places(&state, args).await,
-            Some(layer) => native::geocode(&state, args.set("layer", layer)).await,
+            Some(_) => super::forward_geocode(&state, args, types.as_ref()).await,
             // A town the text names comes first, as og's search answers it.
             None => native::search(&state, args).await,
         }

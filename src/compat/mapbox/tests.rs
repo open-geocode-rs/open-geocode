@@ -1007,6 +1007,32 @@ async fn geocoding_errors_are_mapbox_errors() {
 }
 
 #[tokio::test]
+async fn forward_address_filters_include_mapped_house_number_ranges() {
+    let pack = write_pack();
+    let router = router(&pack);
+    for route in [
+        "/compat/mapbox/search/geocode/v6/forward?autocomplete=false",
+        "/compat/mapbox/search/geocode/v6/forward?autocomplete=true",
+        "/compat/mapbox/search/searchbox/v1/forward?auto_complete=false",
+        "/compat/mapbox/search/searchbox/v1/forward?auto_complete=true",
+    ] {
+        let uri = format!("{route}&q=50%20Queen%20Street%2C%20Toronto&types=address&limit=1");
+        let (status, body) = get(&router, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let features = body["features"].as_array().expect("features");
+        assert_eq!(features.len(), 1, "{uri}: {body}");
+        assert_eq!(
+            features[0]["properties"]["name"], "50 Queen Street",
+            "{uri}"
+        );
+        assert_eq!(
+            features[0]["properties"]["feature_type"], "address",
+            "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn search_box_suggest_then_retrieve() {
     let pack = write_pack();
     let router = router(&pack);
