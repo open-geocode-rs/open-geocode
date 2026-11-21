@@ -906,7 +906,7 @@ impl TextSearcher {
         if let Some(normalized) = autocomplete_country_alias(options) {
             return self.autocomplete(&normalized);
         }
-        self.autocomplete_address(options)
+        self.autocomplete_address(options, false)
     }
 
     // An incomplete address must not trigger a geocoding retry on each keystroke.
@@ -914,6 +914,7 @@ impl TextSearcher {
     fn autocomplete_address(
         &self,
         options: &TextAutocompleteOptions,
+        focus_only: bool,
     ) -> Result<Vec<TextSearchHit>> {
         let layers = match options.layer.as_deref() {
             None => &[Layer::Address, Layer::Interpolation][..],
@@ -951,15 +952,37 @@ impl TextSearcher {
                 .filter(|part| part.label == Label::Locality)
                 .flat_map(|part| &part.words),
         )?;
-        if placed.is_empty() {
+        let nearby = if placed.is_empty() {
+            // With no written locality, only a complete street reading and
+            // a caller's focus can scope a retry for a mapped range.
+            if !plan.context.is_empty()
+                || !plan.unplaced.is_empty()
+                || !plan
+                    .subject
+                    .iter()
+                    .any(|word| self.describes_street(&word.text))
+            {
+                return Ok(Vec::new());
+            }
+            let Some(focus) = options.focus else {
+                return Ok(Vec::new());
+            };
+            Some(focus)
+        } else if focus_only {
             return Ok(Vec::new());
-        }
+        } else {
+            None
+        };
+        let bbox = options.bbox.or_else(|| nearby.map(bias_bounds));
 
         let query_words = QueryWords::new(&query);
         let session = Session::new(self.budget);
         for layer in layers {
+            if nearby.is_some() && *layer != Layer::Interpolation {
+                continue;
+            }
             crate::stop::check()?;
-            let filters = Filters::new(Some(layer.as_str()), &options.countries, options.bbox);
+            let filters = Filters::new(Some(layer.as_str()), &options.countries, bbox);
             let (mut hits, _) = self.search_plan(
                 plan,
                 &placed,
@@ -970,12 +993,16 @@ impl TextSearcher {
                 1,
                 &session,
                 &mut |_, _, _, hit| {
-                    Ok(hit.record.address.housenumber.as_deref() == Some(number.text.as_str()))
+                    Ok(
+                        hit.record.address.housenumber.as_deref() == Some(number.text.as_str())
+                            && nearby.is_none_or(|focus| within_bias(hit, focus)),
+                    )
                 },
             )?;
             hits.retain(|hit| {
                 hit.matched.street == Some(PartMatch::Matched)
-                    && (hit.matched.locality == Some(PartMatch::Matched)
+                    && (nearby.is_some()
+                        || hit.matched.locality == Some(PartMatch::Matched)
                         || (*layer == Layer::Interpolation
                             && hit.matched.locality == Some(PartMatch::Partial)))
             });
@@ -7524,6 +7551,34 @@ const BIAS_BANDS: usize = 6;
 /// The reach of [`BIAS_BANDS`].
 pub(crate) const BIAS_RADIUS_M: f64 = FOCUS_BANDS_M[BIAS_BANDS - 1];
 
+// A conservative index filter. The distance check uses the interpolated
+// point, including when the enclosing box would cross the antimeridian.
+fn bias_bounds([lon, lat]: [f64; 2]) -> BoundingBox {
+    const METRES_PER_DEGREE: f64 = 110_000.0;
+    let lat_span = BIAS_RADIUS_M / METRES_PER_DEGREE;
+    let min_lat = (lat - lat_span).max(-90.0);
+    let max_lat = (lat + lat_span).min(90.0);
+    let cos = min_lat.abs().max(max_lat.abs()).to_radians().cos();
+    let lon_span = lat_span / cos;
+    let (min_lon, max_lon) = if lon - lon_span >= -180.0 && lon + lon_span <= 180.0 {
+        (lon - lon_span, lon + lon_span)
+    } else {
+        (-180.0, 180.0)
+    };
+    BoundingBox {
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+    }
+}
+
+fn within_bias(hit: &TextSearchHit, [lon, lat]: [f64; 2]) -> bool {
+    hit.record
+        .point
+        .is_some_and(|point| haversine_m(lon, lat, point.lon, point.lat) <= BIAS_RADIUS_M)
+}
+
 /// [`Prominence::rank`] of a place known beyond its own language: read on
 /// Wikipedia, or linked to Wikidata and named in another language. New York
 /// is; Pike County, Arkansas, and Albert, Somme, are not.
@@ -9816,25 +9871,20 @@ fn effective_limit(limit: usize) -> usize {
     }
 }
 
-/// Fallback only when neither searcher has an in-order match, so a query
-/// that answered before keeps its answer and speed.
+/// Mix the in-order matches first. Check for a numbered address or nearby
+/// typing correction when the matches are empty or all far from the caller.
 pub fn suggest(
     addresses: &TextSearcher,
     places: &TextSearcher,
     options: &TextAutocompleteOptions,
 ) -> Result<Vec<TextSearchHit>> {
-    let near = |hit: &TextSearchHit, [lon, lat]: [f64; 2]| {
-        hit.record
-            .point
-            .is_some_and(|point| haversine_m(lon, lat, point.lon, point.lat) <= BIAS_RADIUS_M)
-    };
     // Near first, before the mix cuts to the limit and far hits fill it.
     let tier = |completion, only_near: bool| -> Result<Vec<TextSearchHit>> {
         let mut addresses = addresses.autocomplete_as(options, completion)?;
         let mut places = places.autocomplete_as(options, completion)?;
         if let (true, Some(focus)) = (only_near, options.focus) {
-            addresses.retain(|hit| near(hit, focus));
-            places.retain(|hit| near(hit, focus));
+            addresses.retain(|hit| within_bias(hit, focus));
+            places.retain(|hit| within_bias(hit, focus));
         }
         Ok(mix(
             &options.query,
@@ -9850,13 +9900,26 @@ pub fn suggest(
         if mixed.is_empty() {
             continue;
         }
-        // Nothing near as typed: a typo of a name nearby ("starbuks" in
-        // Seattle) before the far place spelt that way.
         if let Some(focus) = options.focus
-            && completion != Completion::Typos
-            && last_word_may_be_a_typo(&options.query)
-            && !mixed.iter().any(|hit| near(hit, focus))
+            && !mixed.iter().any(|hit| within_bias(hit, focus))
         {
+            if let Some(local) = addresses
+                .autocomplete_address(options, true)?
+                .into_iter()
+                .find(|hit| within_bias(hit, focus))
+            {
+                let mut hits = vec![local];
+                hits.extend(
+                    mixed
+                        .into_iter()
+                        .take(effective_autocomplete_limit(options.limit) - 1),
+                );
+                return Ok(hits);
+            }
+            // Try a nearby typo before a far literal match.
+            if completion == Completion::Typos || !last_word_may_be_a_typo(&options.query) {
+                return Ok(mixed);
+            }
             let mut typos = tier(Completion::Typos, true)?;
             if !typos.is_empty() {
                 for hit in mixed {
@@ -9873,7 +9936,7 @@ pub fn suggest(
     if let Some(normalized) = autocomplete_country_alias(options) {
         return suggest(addresses, places, &normalized);
     }
-    addresses.autocomplete_address(options)
+    addresses.autocomplete_address(options, false)
 }
 
 // Address context indexes alpha-2 codes. Retry only an explicit suffix on
@@ -14968,24 +15031,37 @@ mod tests {
                 None,
             )
             .expect("locality evidence");
+        let mut distant = address_record(
+            "osm:node:50",
+            "",
+            "50",
+            "Queen Street West",
+            Some("Ottawa"),
+            None,
+        );
+        distant.geometry = point_geometry(-75.7, 45.4);
+        writer
+            .write(&distant.into(), None)
+            .expect("distant address");
         writer.finish().expect("finish");
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
-        let ask = |query: &str, layer: Option<Layer>| {
+        let places = searcher.places();
+        let ask = |query: &str, layer: Option<Layer>, focus| {
             suggest(
                 &searcher,
-                &searcher.places(),
+                &places,
                 &TextAutocompleteOptions {
                     query: query.to_string(),
                     limit: 5,
                     layer: layer.map(|layer| layer.as_str().to_string()),
                     countries: Vec::new(),
-                    focus: None,
+                    focus,
                     bbox: None,
                 },
             )
             .expect("suggestions")
         };
-        let hits = ask("50 Queen St W Toronto", None);
+        let hits = ask("50 Queen St W Toronto", None, None);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].record.id, "osm:way:20:interp:2-98");
         assert_eq!(
@@ -14997,9 +15073,20 @@ mod tests {
             "50 Queen St E Toronto",
             "50 Queen St W Vancouver",
         ] {
-            assert!(ask(query, None).is_empty(), "{query}");
+            assert!(ask(query, None, None).is_empty(), "{query}");
         }
-        assert!(ask("50 Queen St W Toronto", Some(Layer::Address)).is_empty());
+        assert!(ask("50 Queen St W Toronto", Some(Layer::Address), None).is_empty());
+        let bare = "50 Queen St W";
+        assert_eq!(ask(bare, None, None)[0].record.id, "osm:node:50");
+        assert_eq!(
+            ask(bare, None, Some([-79.0, 43.0]))[0].record.id,
+            "osm:way:20:interp:2-98",
+        );
+        assert_eq!(
+            ask(bare, None, Some([-75.7, 45.4]))[0].record.id,
+            "osm:node:50",
+        );
+        assert!(ask("50 Queen St W Vancouver", None, Some([-79.0, 43.0])).is_empty());
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
