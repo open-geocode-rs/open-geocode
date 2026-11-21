@@ -12,7 +12,7 @@
 
 use std::{
     fs::{self, File},
-    io::{self, BufRead, BufReader, BufWriter, Read, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -1642,24 +1642,32 @@ fn carried(id: &str) -> Option<Carried<'_>> {
     })
 }
 
-/// Every og line of every run of the job, in run order, each passed to
-/// `each` with what its id carries.
-fn each_line(
+/// Every og line of every run of the job, in the order the runs wrote them,
+/// each passed to `each` with what its id carries and where it starts in its
+/// run's results.
+fn each_line_as_written(
     state: &AppState,
     meta: &Meta,
-    mut each: impl FnMut(&Carried<'_>, OgLine) -> io::Result<()>,
+    mut each: impl FnMut(&Carried<'_>, OgLine, Written) -> io::Result<()>,
 ) -> io::Result<()> {
-    for run in &meta.runs {
+    for (run_index, run) in meta.runs.iter().enumerate() {
         let Some(job) = state.jobs().get(run) else {
             continue;
         };
         let mut lines = BufReader::new(job.open_results()?);
         let mut line = String::new();
+        let mut offset = 0u64;
         loop {
             line.clear();
-            if lines.read_line(&mut line)? == 0 {
+            let read = lines.read_line(&mut line)?;
+            if read == 0 {
                 break;
             }
+            let at = Written {
+                run: run_index,
+                offset,
+            };
+            offset += read as u64;
             let Ok(parsed) = serde_json::from_str::<OgLine>(&line) else {
                 continue;
             };
@@ -1669,8 +1677,64 @@ fn each_line(
             let Some(carried) = carried(&id) else {
                 continue;
             };
-            each(&carried, parsed)?;
+            each(&carried, parsed, at)?;
         }
+    }
+    Ok(())
+}
+
+/// Where a run wrote an og line.
+#[derive(Clone, Copy)]
+struct Written {
+    run: usize,
+    offset: u64,
+}
+
+/// Every og line of the job, in the order of the records it answers, each
+/// passed to `each` with what its id carries. Runs answer records as they
+/// finish, so a first pass notes where each record's line is, at most one
+/// place per record, and a second reads them in record order.
+fn each_line(
+    state: &AppState,
+    meta: &Meta,
+    mut each: impl FnMut(&Carried<'_>, OgLine) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut at: Vec<Option<Written>> = vec![None; meta.items];
+    each_line_as_written(state, meta, |carried, _, written| {
+        if let Some(slot) = at.get_mut(carried.ordinal) {
+            slot.get_or_insert(written);
+        }
+        Ok(())
+    })?;
+    let mut runs = meta
+        .runs
+        .iter()
+        .map(|run| {
+            state
+                .jobs()
+                .get(run)
+                .map(|job| job.open_results().map(BufReader::new))
+                .transpose()
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut line = String::new();
+    for written in at.into_iter().flatten() {
+        let Some(Some(reader)) = runs.get_mut(written.run) else {
+            continue;
+        };
+        reader.seek(SeekFrom::Start(written.offset))?;
+        line.clear();
+        reader.read_line(&mut line)?;
+        let Ok(parsed) = serde_json::from_str::<OgLine>(&line) else {
+            continue;
+        };
+        let Some(id) = parsed.id.clone() else {
+            continue;
+        };
+        let Some(carried) = carried(&id) else {
+            continue;
+        };
+        each(&carried, parsed)?;
     }
     Ok(())
 }
@@ -1678,7 +1742,7 @@ fn each_line(
 /// A bit per item, set for the ones a run has answered.
 fn answered(state: &AppState, meta: &Meta) -> io::Result<Vec<u64>> {
     let mut answered = vec![0u64; meta.items.div_ceil(64)];
-    each_line(state, meta, |carried, _| {
+    each_line_as_written(state, meta, |carried, _, _| {
         if let Some(word) = answered.get_mut(carried.ordinal / 64) {
             *word |= 1 << (carried.ordinal % 64);
         }
@@ -2556,6 +2620,41 @@ mod tests {
         let meta = load(&state, &id).expect("meta");
         assert_eq!(meta.items, 3);
         assert_eq!(answered(&state, &meta).expect("answered"), [0b111]);
+    }
+
+    #[tokio::test]
+    async fn results_follow_the_records_whatever_order_they_finished_in() {
+        use super::super::tests::{finished_job, get, pack};
+
+        let pack = pack("batch-order");
+        let state = pack.state(crate::limits::Limits::DEFAULT);
+        let router = crate::runtime::build_router(state.clone(), None, None);
+        let id = finished_job(&router, "recId|q\n1|10 King Street\n2|Queen\n3|zzzz\n").await;
+        let meta = load(&state, &id).expect("meta");
+        // The run finished its records third, first, second.
+        for run in &meta.runs {
+            let job = state.jobs().get(run).expect("run");
+            let path = job.results_path();
+            let written = fs::read_to_string(path).expect("results");
+            let mut lines = written.lines().collect::<Vec<_>>();
+            let row =
+                |line: &&str| serde_json::from_str::<Value>(line).expect("line")["row"].as_u64();
+            lines.sort_by_key(|line| match row(line) {
+                Some(2) => 0,
+                Some(0) => 1,
+                _ => 2,
+            });
+            let finished = lines.iter().map(|line| format!("{line}\n"));
+            fs::write(path, finished.collect::<String>()).expect("rewrite");
+        }
+        let results = get(&router, &format!("/compat/here/v7/batch/jobs/{id}/results")).await;
+        let rec_ids = results
+            .text()
+            .lines()
+            .skip(1)
+            .map(|line| line.split('|').next().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(rec_ids, ["1", "2", "3"], "{}", results.text());
     }
 
     #[test]

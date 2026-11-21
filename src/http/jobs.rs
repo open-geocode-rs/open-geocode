@@ -229,6 +229,12 @@ impl Job {
         File::open(&self.results)
     }
 
+    /// Where the results are written.
+    #[cfg(test)]
+    pub(crate) fn results_path(&self) -> &std::path::Path {
+        &self.results
+    }
+
     fn save(&self) {
         let status = self.snapshot();
         // A status that fails to save leaves the job served from memory;
