@@ -805,7 +805,8 @@ fn unsorted(earlier: i64, later: i64) -> Error {
 
 /// Read the node blocks of `input` and keep in `slots`, which has room for
 /// every id `set` marks, the coordinates of the nodes `set` marks, and the
-/// address tags of those of them `tag_ids` (sorted) names.
+/// address tags of those of them `tag_ids` (sorted) names. The pass is
+/// measured under `stage`.
 pub(crate) fn load(
     input: &Path,
     node_blobs: &[u64],
@@ -813,6 +814,7 @@ pub(crate) fn load(
     tag_ids: &[i64],
     mut slots: Slots,
     progress: &Progress,
+    stage: BuildStage,
 ) -> Result<(Locations, LoadStats)> {
     let needed = set.len();
     let mut tags = Vec::new();
@@ -823,7 +825,7 @@ pub(crate) fn load(
     let read_bytes = for_each_block(
         input,
         progress,
-        BuildStage::NodeJoin,
+        stage,
         Some(node_blobs),
         |_, block| Ok(find(&block, &set, tag_ids)),
         |found| {

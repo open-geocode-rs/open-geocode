@@ -45,6 +45,20 @@ impl Language {
     }
 }
 
+/// The context levels an address field can name. A field looks only at its
+/// own levels, finest first, so a province that shares a neighbourhood's
+/// name never wins `areas`. `Any` is a label's text, which no field owns: it
+/// reads the locality first, as `address.locality` does, so a label and the
+/// field it repeats agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Level {
+    Place,
+    Areas,
+    Locality,
+    Region,
+    Any,
+}
+
 /// Every lookup one answer needs, bound to its point and its own id.
 /// Pure closures let the translation rules be tested without building a Pack.
 pub(crate) struct Lookups<'a, S, A, I> {
@@ -54,7 +68,8 @@ pub(crate) struct Lookups<'a, S, A, I> {
     pub own_name: Option<String>,
     /// Street name of an address, found by proximity to its point.
     pub street: S,
-    /// Name of an answer field found in the answer's context, by area id.
+    /// Translation of a name an answer field shows, taken from the context
+    /// area of that [`Level`] that carries the name.
     pub area: A,
     pub by_id: I,
 }
@@ -62,14 +77,14 @@ pub(crate) struct Lookups<'a, S, A, I> {
 impl<'a, S, A, I> Lookups<'a, S, A, I>
 where
     S: for<'b> Fn(&'b str) -> Option<String>,
-    A: for<'b> Fn(&'b str) -> Option<String>,
+    A: for<'b> Fn(&'b str, Level) -> Option<String>,
 {
     fn of(&self, name: &str) -> Option<String> {
         self.own
             .filter(|_| self.own_name.as_deref() == Some(name))
             .map(str::to_string)
             .or_else(|| (self.street)(name))
-            .or_else(|| (self.area)(name))
+            .or_else(|| (self.area)(name, Level::Any))
     }
 }
 
@@ -106,21 +121,32 @@ fn contexts(by_id: impl Fn(ObjectType, i64) -> Option<String>, context: &mut Con
 
 /// An address states text, not an object id. The answer's own context areas
 /// are the authority: a village `Aldaia` with no `name:es` stays as it is,
-/// while `València` takes the name of the locality area of that id.
+/// while `València` takes the name of the locality area of that id. Each
+/// field looks at its own levels first, so a province named like the
+/// neighbourhood does not lend its name to `areas`.
 fn address<S, A, I>(lookups: &Lookups<'_, S, A, I>, address: &mut Address)
 where
     S: for<'b> Fn(&'b str) -> Option<String>,
-    A: for<'b> Fn(&'b str) -> Option<String>,
+    A: for<'b> Fn(&'b str, Level) -> Option<String>,
 {
     field(&lookups.street, &mut address.street);
-    field(&lookups.area, &mut address.place);
+    field(
+        |name| (lookups.area)(name, Level::Place),
+        &mut address.place,
+    );
     for value in &mut address.areas {
-        if let Some(translated) = (lookups.area)(value) {
+        if let Some(translated) = (lookups.area)(value, Level::Areas) {
             value.clone_from(&translated);
         }
     }
-    field(&lookups.area, &mut address.locality);
-    field(&lookups.area, &mut address.region);
+    field(
+        |name| (lookups.area)(name, Level::Locality),
+        &mut address.locality,
+    );
+    field(
+        |name| (lookups.area)(name, Level::Region),
+        &mut address.region,
+    );
 }
 
 /// Names a label may show, in one order, so replacement does not depend on
@@ -133,7 +159,7 @@ fn label_names<S, A, I>(
 ) -> Vec<String>
 where
     S: for<'b> Fn(&'b str) -> Option<String>,
-    A: for<'b> Fn(&'b str) -> Option<String>,
+    A: for<'b> Fn(&'b str, Level) -> Option<String>,
 {
     let mut names: Vec<String> = Vec::new();
     let own = include_name.then_some(common.name.as_str());
@@ -177,20 +203,63 @@ fn context_names(context: &Context) -> Vec<String> {
 
 /// Replace the names a label shows, keeping the layout its writer chose.
 /// Reverse writes the label itself, so there is no record to rebuild it from.
-fn replace<S, A, I>(label: &str, lookups: &Lookups<'_, S, A, I>, names: &[String]) -> String
+/// One pass over the original label picks the matches, so text a translation
+/// inserts is never translated again; `protected` text, such as a POI's own
+/// name, is never rewritten.
+fn replace<S, A, I>(
+    label: &str,
+    lookups: &Lookups<'_, S, A, I>,
+    names: &[String],
+    protected: &[String],
+) -> String
 where
     S: for<'b> Fn(&'b str) -> Option<String>,
-    A: for<'b> Fn(&'b str) -> Option<String>,
+    A: for<'b> Fn(&'b str, Level) -> Option<String>,
 {
-    let mut replaced = label.to_string();
-    for name in names {
-        if let Some(translated) = lookups.of(name)
-            && translated.as_str() != name
-        {
-            replaced = replaced.replace(name, &translated);
+    let mut protected_mask = vec![false; label.len()];
+    for name in protected {
+        let mut from = 0;
+        while let Some(at) = label[from..].find(name) {
+            let start = from + at;
+            let end = start + name.len();
+            for slot in &mut protected_mask[start..end] {
+                *slot = true;
+            }
+            from = start + name.len().max(1);
         }
     }
-    replaced
+    let mut sorted = names.to_vec();
+    sorted.sort_unstable_by(|left, right| right.len().cmp(&left.len()).then(left.cmp(right)));
+    let mut result = String::new();
+    let mut index = 0;
+    let bytes = label.as_bytes();
+    while index < bytes.len() {
+        if protected_mask[index] {
+            let ch = label[index..].chars().next().expect("char");
+            result.push(ch);
+            index += ch.len_utf8();
+            continue;
+        }
+        let mut matched = false;
+        for name in &sorted {
+            if label[index..].starts_with(name)
+                && !protected_mask[index..index + name.len()].iter().any(|b| *b)
+                && let Some(translated) = lookups.of(name)
+            {
+                result.push_str(&translated);
+                index += name.len();
+                matched = true;
+                break;
+            }
+        }
+        if matched {
+            continue;
+        }
+        let ch = label[index..].chars().next().expect("char");
+        result.push(ch);
+        index += ch.len_utf8();
+    }
+    result
 }
 
 /// Apply a language to one result's address parts, its context and its own
@@ -199,7 +268,7 @@ where
 pub(crate) fn apply<S, A, I>(lookups: &Lookups<'_, S, A, I>, common: &mut Common)
 where
     S: for<'b> Fn(&'b str) -> Option<String>,
-    A: for<'b> Fn(&'b str) -> Option<String>,
+    A: for<'b> Fn(&'b str, Level) -> Option<String>,
     I: Fn(ObjectType, i64) -> Option<String>,
 {
     let layer = common.layer;
@@ -209,7 +278,7 @@ where
 
     // An address's name is its number and its subject; a street, place or
     // area's name is the thing itself. A POI's own name stays as it is.
-    if common.address.housenumber.is_some() {
+    if common.address.housenumber.is_some() && layer != crate::record::Layer::Poi {
         common.name = crate::labels::address_name(&to_components(&common.address));
     } else if layer != crate::record::Layer::Poi
         && let Some(translated) = lookups.own
@@ -221,7 +290,12 @@ where
     } else if let Some(before) = &before {
         let own_name = layer != crate::record::Layer::Poi;
         let names = label_names(lookups, before, own_name);
-        common.label = replace(&before.label, lookups, &names);
+        let protected = if layer == crate::record::Layer::Poi {
+            vec![before.name.clone()]
+        } else {
+            Vec::new()
+        };
+        common.label = replace(&before.label, lookups, &names, &protected);
     }
 }
 
@@ -230,19 +304,27 @@ where
 pub(crate) fn apply_reverse<S, A, I>(lookups: &Lookups<'_, S, A, I>, common: &mut Common)
 where
     S: for<'b> Fn(&'b str) -> Option<String>,
-    A: for<'b> Fn(&'b str) -> Option<String>,
+    A: for<'b> Fn(&'b str, Level) -> Option<String>,
     I: Fn(ObjectType, i64) -> Option<String>,
 {
+    let layer = common.layer;
     let original = common.clone();
     address(lookups, &mut common.address);
     contexts(&lookups.by_id, &mut common.context);
-    if common.address.housenumber.is_some() {
+    if common.address.housenumber.is_some() && layer != crate::record::Layer::Poi {
         common.name = crate::labels::address_name(&to_components(&common.address));
-    } else if let Some(translated) = lookups.own {
+    } else if layer != crate::record::Layer::Poi
+        && let Some(translated) = lookups.own
+    {
         common.name = translated.to_string();
     }
     let names = label_names(lookups, &original, true);
-    common.label = replace(&original.label, lookups, &names);
+    let protected = if layer == crate::record::Layer::Poi {
+        vec![original.name.clone()]
+    } else {
+        Vec::new()
+    };
+    common.label = replace(&original.label, lookups, &names, &protected);
 }
 
 fn to_components(address: &Address) -> crate::record::AddressComponents {
@@ -269,8 +351,9 @@ impl Language {
                 && common.layer != crate::record::Layer::Poi)
                 .then(|| common.name.clone()),
             street: |name: &str| self.street(name, lon, lat).map(str::to_string),
-            area: |name: &str| {
-                area_named(&areas, name).and_then(|area| self.of(&area.id).map(str::to_string))
+            area: |name: &str, level: Level| {
+                area_named(&areas, name, level)
+                    .and_then(|area| self.of(&area.id).map(str::to_string))
             },
             by_id: |kind, id| self.by_id(kind, id).map(str::to_string),
         };
@@ -284,8 +367,9 @@ impl Language {
             own,
             own_name: (!common.address.housenumber.is_some()).then(|| common.name.clone()),
             street: |name: &str| self.street(name, lon, lat).map(str::to_string),
-            area: |name: &str| {
-                area_named(&areas, name).and_then(|area| self.of(&area.id).map(str::to_string))
+            area: |name: &str, level: Level| {
+                area_named(&areas, name, level)
+                    .and_then(|area| self.of(&area.id).map(str::to_string))
             },
             by_id: |kind, id| self.by_id(kind, id).map(str::to_string),
         };
@@ -293,21 +377,49 @@ impl Language {
     }
 }
 
-fn area_named<'a>(context: &'a Context, name: &str) -> Option<&'a ContextArea> {
-    [
-        &context.neighbourhood,
-        &context.sublocality,
-        &context.locality,
-        &context.subdistrict,
-        &context.district,
-        &context.subregion,
-        &context.region,
-        &context.country,
-        &context.place,
-    ]
-    .into_iter()
-    .flatten()
-    .find(|area| area.name == name)
+/// The first context area that carries `name`, looking at the levels `level`
+/// names in order, finest first. `Any` is a label's text, which no field
+/// owns.
+fn area_named<'a>(context: &'a Context, name: &str, level: Level) -> Option<&'a ContextArea> {
+    let levels: &[&Option<ContextArea>] = match level {
+        Level::Place => &[
+            &context.place,
+            &context.neighbourhood,
+            &context.sublocality,
+            &context.locality,
+        ],
+        Level::Areas => &[
+            &context.neighbourhood,
+            &context.sublocality,
+            &context.subdistrict,
+            &context.district,
+            &context.locality,
+        ],
+        Level::Locality => &[
+            &context.locality,
+            &context.sublocality,
+            &context.subdistrict,
+            &context.district,
+            &context.neighbourhood,
+        ],
+        Level::Region => &[&context.region, &context.subregion, &context.country],
+        Level::Any => &[
+            &context.locality,
+            &context.neighbourhood,
+            &context.sublocality,
+            &context.subdistrict,
+            &context.district,
+            &context.subregion,
+            &context.region,
+            &context.country,
+            &context.place,
+        ],
+    };
+    levels
+        .iter()
+        .copied()
+        .flatten()
+        .find(|area| area.name == name)
 }
 
 #[cfg(test)]
@@ -328,7 +440,7 @@ mod tests {
     type TestLookups<'a> = Lookups<
         'a,
         Box<dyn for<'b> Fn(&'b str) -> Option<String> + 'a>,
-        Box<dyn for<'b> Fn(&'b str) -> Option<String> + 'a>,
+        Box<dyn for<'b> Fn(&'b str, Level) -> Option<String> + 'a>,
         Box<dyn Fn(ObjectType, i64) -> Option<String> + 'a>,
     >;
 
@@ -350,7 +462,7 @@ mod tests {
                         None
                     }
                 }),
-                area: Box::new(|_: &str| None),
+                area: Box::new(|_: &str, _: Level| None),
                 by_id: Box::new(|kind, id| self.by_id.get(&(kind, id)).cloned()),
             }
         }
@@ -433,7 +545,7 @@ mod tests {
             own: None,
             own_name: None,
             street: |_: &str| None,
-            area: |name: &str| {
+            area: |name: &str, _: Level| {
                 areas
                     .get(name)
                     .and_then(|id| ids::parse(id).ok().flatten())
@@ -453,7 +565,7 @@ mod tests {
             own: None,
             own_name: None,
             street: Box::new(|_: &str| None),
-            area: Box::new(|_: &str| None),
+            area: Box::new(|_: &str, _: Level| None),
             by_id: Box::new(|kind, id| tables.by_id.get(&(kind, id)).cloned()),
         };
         apply(&no_area_lookups, &mut no_area);
@@ -548,7 +660,7 @@ mod tests {
             own: None,
             own_name: None,
             street: |_: &str| None,
-            area: |name: &str| {
+            area: |name: &str, _: Level| {
                 areas
                     .get(name)
                     .and_then(|id| ids::parse(id).ok().flatten())
@@ -558,5 +670,192 @@ mod tests {
         };
         apply_reverse(&lookups, &mut result);
         assert_eq!(result.label, "26 Carrer Major, Valencia, 46004, Spain");
+    }
+
+    #[test]
+    fn text_inserted_by_one_replacement_is_not_replaced_again() {
+        // Carrer del Port -> Calle del Port; locality Port -> Puerto.
+        // The result must be "Calle del Port, Puerto", not "Calle del Puerto, Puerto".
+        let mut tables = empty_tables();
+        tables
+            .streets
+            .insert("Carrer del Port".into(), "Calle del Port".into());
+        let mut result = common();
+        result.address.street = Some("Carrer del Port".into());
+        result.address.locality = Some("Port".into());
+        result.address.region = None;
+        result.label = "Carrer del Port, Port, 46001, Spain".into();
+        let lookups = Lookups {
+            own: None,
+            own_name: None,
+            street: Box::new(move |name: &str| {
+                if name == "Carrer del Port" {
+                    Some("Calle del Port".into())
+                } else {
+                    None
+                }
+            }),
+            area: Box::new(|name: &str, _: Level| {
+                if name == "Port" {
+                    Some("Puerto".into())
+                } else {
+                    None
+                }
+            }),
+            by_id: Box::new(|_, _| None),
+        };
+        apply_reverse(&lookups, &mut result);
+        assert_eq!(
+            result.label, "Calle del Port, Puerto, 46001, Spain",
+            "the street's translated name must not be re-translated by the locality"
+        );
+    }
+
+    #[test]
+    fn a_pois_own_name_is_not_replaced_by_its_address() {
+        // A POI named "Museu del Barri" with house number 26: its name must stay.
+        let mut result = common();
+        result.layer = Layer::Poi;
+        result.name = "Museu del Barri".into();
+        result.label = "Museu del Barri, Carrer Major, València".into();
+        result.address.housenumber = Some("26".into());
+        result.address.street = Some("Carrer Major".into());
+        let lookups = Lookups {
+            own: None,
+            own_name: None,
+            street: Box::new(|_: &str| None),
+            area: Box::new(|_: &str, _: Level| None),
+            by_id: Box::new(|_, _| None),
+        };
+        apply(&lookups, &mut result);
+        assert_eq!(
+            result.name, "Museu del Barri",
+            "a POI keeps its own name even when it has a house number"
+        );
+    }
+
+    #[test]
+    fn a_pois_name_inside_its_label_is_protected_from_replacement() {
+        // POI label "València Museum, València" where locality València -> Valencia.
+        // The POI name must stay "València Museum" while the locality changes.
+        let mut result = common();
+        result.layer = Layer::Poi;
+        result.name = "València Museum".into();
+        result.label = "València Museum, València".into();
+        result.address.locality = Some("València".into());
+        result.context.locality = Some(ContextArea {
+            id: "osm:node:42".to_string(),
+            name: "València".to_string(),
+        });
+        let lookups = Lookups {
+            own: None,
+            own_name: None,
+            street: Box::new(|_: &str| None),
+            area: Box::new(|name: &str, _: Level| {
+                if name == "València" {
+                    Some("Valencia".into())
+                } else {
+                    None
+                }
+            }),
+            by_id: Box::new(|_, _| None),
+        };
+        apply(&lookups, &mut result);
+        assert_eq!(
+            result.label, "València Museum, Valencia",
+            "the POI name must not be rewritten by the locality replacement"
+        );
+    }
+
+    /// Lookups that resolve areas as a request does: through the answer's
+    /// own context, by level, to the area's id. No closure decides the answer.
+    fn context_lookups<'a>(context: &'a Context, tables: &'a Tables) -> TestLookups<'a> {
+        Lookups {
+            own: None,
+            own_name: None,
+            street: Box::new(|_: &str| None),
+            area: Box::new(move |name: &str, level: Level| {
+                area_named(context, name, level)
+                    .and_then(|area| ids::parse(&area.id).ok().flatten())
+                    .and_then(|(kind, id)| tables.by_id.get(&(kind, id)).cloned())
+            }),
+            by_id: Box::new(|kind, id| tables.by_id.get(&(kind, id)).cloned()),
+        }
+    }
+
+    fn context_area(id: &str, name: &str) -> ContextArea {
+        ContextArea {
+            id: id.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_field_takes_the_translation_of_the_area_at_its_own_level() {
+        // One name on three levels, each translated differently. Looking
+        // finest first gives `locality` the neighbourhood's name; looking
+        // broadest first gives `areas` the province's.
+        let mut tables = empty_tables();
+        tables
+            .by_id
+            .insert((ObjectType::Node, 10), "Barrio San Juan".into());
+        tables
+            .by_id
+            .insert((ObjectType::Node, 42), "San Juan".into());
+        tables
+            .by_id
+            .insert((ObjectType::Relation, 7), "Provincia San Juan".into());
+        let mut result = common();
+        result.context.neighbourhood = Some(context_area("osm:node:10", "Sant Joan"));
+        result.context.locality = Some(context_area("osm:node:42", "Sant Joan"));
+        result.context.region = Some(context_area("osm:relation:7", "Sant Joan"));
+        result.address.locality = Some("Sant Joan".into());
+        result.address.areas = vec!["Sant Joan".into()];
+        result.address.region = Some("Sant Joan".into());
+        let context = result.context.clone();
+        apply(&context_lookups(&context, &tables), &mut result);
+        assert_eq!(result.address.locality.as_deref(), Some("San Juan"));
+        assert_eq!(result.address.areas, ["Barrio San Juan"]);
+        assert_eq!(result.address.region.as_deref(), Some("Provincia San Juan"));
+    }
+
+    #[test]
+    fn a_province_named_like_the_locality_does_not_lend_its_name() {
+        let mut tables = empty_tables();
+        tables
+            .by_id
+            .insert((ObjectType::Relation, 7), "Provincia de Valencia".into());
+        tables
+            .by_id
+            .insert((ObjectType::Node, 42), "Valencia".into());
+        let mut result = common();
+        result.context.region = Some(context_area("osm:relation:7", "València"));
+        result.context.locality = Some(context_area("osm:node:42", "València"));
+        result.address.locality = Some("València".into());
+        let context = result.context.clone();
+        apply(&context_lookups(&context, &tables), &mut result);
+        assert_eq!(result.address.locality.as_deref(), Some("Valencia"));
+    }
+
+    #[test]
+    fn a_label_and_the_field_it_repeats_take_the_same_translation() {
+        let mut tables = empty_tables();
+        tables
+            .by_id
+            .insert((ObjectType::Node, 10), "Barrio San Juan".into());
+        tables
+            .by_id
+            .insert((ObjectType::Node, 42), "San Juan".into());
+        let mut result = common();
+        result.context.neighbourhood = Some(context_area("osm:node:10", "Sant Joan"));
+        result.context.locality = Some(context_area("osm:node:42", "Sant Joan"));
+        result.address.street = None;
+        result.address.region = None;
+        result.address.locality = Some("Sant Joan".into());
+        result.label = "Sant Joan, 46001, Spain".into();
+        let context = result.context.clone();
+        apply_reverse(&context_lookups(&context, &tables), &mut result);
+        assert_eq!(result.address.locality.as_deref(), Some("San Juan"));
+        assert_eq!(result.label, "San Juan, 46001, Spain");
     }
 }

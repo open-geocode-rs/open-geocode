@@ -157,8 +157,9 @@ enum PackCommand {
 
         /// Languages whose OSM `name:<lang>` the Pack keeps for streets,
         /// places and areas, comma-separated, such as `es,ca`. A request's
-        /// `lang` answers in one of them. Each adds a name table to the Pack
-        /// and one pass over the inputs; none keeps it as it was.
+        /// `lang` answers in one of them. One shared scan covers all selected
+        /// languages; a second pass runs only when street coordinates are
+        /// needed. None keeps the Pack as it was.
         #[arg(long = "lang", value_delimiter = ',')]
         languages: Vec<String>,
 

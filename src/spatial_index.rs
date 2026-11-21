@@ -1108,7 +1108,9 @@ fn local_xy_m(lon: f64, lat: f64, origin_lon: f64, origin_lat: f64) -> (f64, f64
     let y = (lat - origin_lat).to_radians() * EARTH_RADIUS_M;
     (x, y)
 }
-
+pub(crate) fn point_segment_distance_m(lon: f64, lat: f64, start: [f64; 2], end: [f64; 2]) -> f64 {
+    project_to_segment_m(lon, lat, start, end).distance_m
+}
 pub(crate) fn haversine_m(a_lon: f64, a_lat: f64, b_lon: f64, b_lat: f64) -> f64 {
     let d_lat = (b_lat - a_lat).to_radians();
     let d_lon = (b_lon - a_lon).to_radians();

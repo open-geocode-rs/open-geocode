@@ -56,8 +56,8 @@ mod emit;
 mod emitted;
 mod geometry;
 mod interpolation;
-mod locations;
-mod pbf;
+pub(crate) mod locations;
+pub(crate) mod pbf;
 mod place;
 mod poi;
 mod postcode;
@@ -1078,6 +1078,7 @@ impl<'a> Run<'a> {
             &tag_ids,
             slots,
             &self.progress,
+            BuildStage::NodeJoin,
         )?;
         input.locations = Some(locations);
         // Their saved copies go at the next checkpoint: the store holds
@@ -1997,15 +1998,31 @@ impl<'a> Run<'a> {
         let structured = Instant::now();
         crate::structured::add_to(&mut sealed)?;
         crate::ids::add_to(&mut sealed)?;
-        crate::translations::add_to(&mut sealed, &self.options.inputs, &self.options.languages)?;
-        stats.bytes = sealed.bytes();
         self.progress.finish(BuildStage::StructuredIndex);
+        let structured_index_ms = structured.elapsed().as_millis();
+        let names = crate::translations::add_to(
+            &mut sealed,
+            &self.options.inputs,
+            &self.options.languages,
+            &crate::translations::Env {
+                scratch: &self.scratch,
+                memory: &self.memory,
+                budget: self.budget,
+                progress: &self.progress,
+            },
+        )?;
+        stats.bytes = sealed.bytes();
+        if let Some(bytes) = names {
+            stats
+                .sections
+                .insert(crate::translations::SECTION.to_string(), bytes);
+        }
         let mut report = self.report();
         report.checkpoints = self.checkpoints.clone();
         self.progress.check()?;
         report.parser_training = training;
         report.phases.parser_training_ms = parser_training_ms;
-        report.phases.structured_index_ms = structured.elapsed().as_millis();
+        report.phases.structured_index_ms = structured_index_ms;
         for (name, sorted) in &self.sorted {
             report.scratch.sorters.insert(name.clone(), sorted.clone());
         }

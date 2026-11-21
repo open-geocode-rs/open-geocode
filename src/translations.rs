@@ -17,7 +17,9 @@
 //! ```text
 //! names/lang  languages varint | per language, ascending by tag:
 //!               tag varint-length text | 3 offsets u64 | 3 lengths u64;
-//!               offsets count from the first block
+//!               each block's offsets and lengths are three interleaved
+//!               (offset, length) pairs, every value a varint; offsets count
+//!               from the first block
 //! ids         entries u64 | 2 * entries + 1 offsets u32 | heap,
 //!             texts alternating key "node|way|relation:id" and name
 //! street text entries u64 | 2 * entries + 1 offsets u32 | heap, texts
@@ -27,35 +29,49 @@
 //!             as street text
 //! ```
 
-use std::{collections::HashMap, fs::File, io::BufReader, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::{self, BufWriter, Write},
+    iter::Peekable,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use osmpbf::{Element, ElementReader};
-use rustc_hash::FxHashSet;
+use osmpbf::Element;
 
 use crate::{
-    builder::osm::{
-        street,
-        tags::{OsmTags, is_language_tag, without_pasted_tags},
+    builder::{
+        osm::{
+            locations::{self, NodeSet, Slots},
+            pbf::for_each_block,
+            street,
+            tags::{OsmTags, is_language_tag, without_pasted_tags},
+        },
+        progress::{BuildStage, Progress},
     },
     container::{Bytes, Container},
     error::{Error, Result},
+    extsort::{ExternalSorter, Scratch, ScratchFile, Sorted, Spill, Spool, SpoolReader},
+    memory::Budget,
     pack::SealedPack,
     record::ObjectType,
     spatial_index::haversine_m,
     util::{
-        codec::{get_str, get_u64, put_str, put_u64, read_u32_le, read_u64_le},
+        codec::{
+            get_i64, get_str, get_string, get_u32, get_u64, put_i64, put_str, put_u64, read_u32_le,
+            read_u64_le,
+        },
         text::collapse_whitespace,
     },
 };
 
 pub const SECTION: &str = "names/lang";
 const VERSION: u32 = 2;
-const READ_BUFFER_BYTES: usize = 4 << 20;
+const IO_BUFFER_BYTES: usize = 1 << 20;
 const MAX_VERTICES: usize = 8;
 
-// A house numbered on a street usually sits within a few dozen metres of its
-// way. 1.5 km spans long residential ways and the gap between two samples of
-// an avenue without borrowing a same-named street in the next town.
+// A house usually sits within 1.5 km of its way.
 const MAX_STREET_DISTANCE_M: f64 = 1500.0;
 
 /// `value` as the tag a Pack and a request name a language by, `zh_Hans` as
@@ -133,74 +149,180 @@ fn key(object_type: ObjectType, object_id: i64) -> String {
     format!("{kind}:{object_id}")
 }
 
-#[derive(Default)]
-struct Found {
-    by_id: Vec<Vec<(String, String)>>,
-    streets: Vec<Vec<(String, String, Vec<i64>)>>,
-    wanted_nodes: FxHashSet<i64>,
+/// A translated name, keyed by the OSM object it belongs to.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct IdRow {
+    language: u32,
+    key: String,
+    value: String,
 }
 
-impl Found {
-    fn new(languages: usize) -> Self {
-        Self {
-            by_id: vec![Vec::new(); languages],
-            streets: vec![Vec::new(); languages],
-            wanted_nodes: FxHashSet::default(),
+impl Spill for IdRow {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, u64::from(self.language));
+        put_str(out, &self.key);
+        put_str(out, &self.value);
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        Ok(Self {
+            language: get_u32(input)?,
+            key: get_string(input)?,
+            value: get_string(input)?,
+        })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.key.len() + self.value.len()
+    }
+}
+
+/// A street way as the scan saw it: its sampled nodes are ids, not yet
+/// coordinates.
+#[derive(Debug)]
+struct PendingStreet {
+    language: u32,
+    name: String,
+    translated: String,
+    refs: Vec<i64>,
+}
+
+impl Spill for PendingStreet {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, u64::from(self.language));
+        put_str(out, &self.name);
+        put_str(out, &self.translated);
+        put_u64(out, self.refs.len() as u64);
+        for id in &self.refs {
+            put_i64(out, *id);
         }
     }
 
-    fn merge(mut self, other: Self) -> Self {
-        for (into, from) in self.by_id.iter_mut().zip(other.by_id) {
-            into.extend(from);
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let language = get_u32(input)?;
+        let name = get_string(input)?;
+        let translated = get_string(input)?;
+        let count = usize::try_from(get_u64(input)?)?;
+        let mut refs = Vec::with_capacity(count.min(MAX_VERTICES));
+        for _ in 0..count {
+            refs.push(get_i64(input)?);
         }
-        for (into, from) in self.streets.iter_mut().zip(other.streets) {
-            into.extend(from);
-        }
-        self.wanted_nodes.extend(other.wanted_nodes);
-        self
+        Ok(Self {
+            language,
+            name,
+            translated,
+            refs,
+        })
     }
 
-    fn sort(&mut self) {
-        for language in &mut self.by_id {
-            language.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-            language.dedup_by(|a, b| a.0 == b.0);
-        }
-        for language in &mut self.streets {
-            language.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.name.len() + self.translated.len() + self.refs.len() * 8
+    }
+}
+
+/// A street way with the coordinates of its sampled nodes. `translated` is
+/// empty when the way has no other name in the language: the row still
+/// competes on distance, so a nearer way with no translation is not skipped
+/// for a farther one that has it.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct StreetRow {
+    language: u32,
+    name: String,
+    translated: String,
+    vertices: Vec<[i32; 2]>,
+}
+
+impl Spill for StreetRow {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, u64::from(self.language));
+        put_str(out, &self.name);
+        put_str(out, &self.translated);
+        put_u64(out, self.vertices.len() as u64);
+        for [lon, lat] in &self.vertices {
+            put_i64(out, i64::from(*lon));
+            put_i64(out, i64::from(*lat));
         }
     }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let language = get_u32(input)?;
+        let name = get_string(input)?;
+        let translated = get_string(input)?;
+        let count = usize::try_from(get_u64(input)?)?;
+        let mut vertices = Vec::with_capacity(count.min(MAX_VERTICES));
+        for _ in 0..count {
+            vertices.push([
+                i32::try_from(get_i64(input)?)?,
+                i32::try_from(get_i64(input)?)?,
+            ]);
+        }
+        Ok(Self {
+            language,
+            name,
+            translated,
+            vertices,
+        })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.name.len()
+            + self.translated.len()
+            + self.vertices.len() * 8
+    }
+}
+
+/// What one PBF block holds that the section keeps.
+#[derive(Default)]
+struct BlockNames {
+    offset: u64,
+    has_nodes: bool,
+    ids: Vec<IdRow>,
+    streets: Vec<PendingStreet>,
 }
 
 /// One element's names, and the node ids needed to place a translated street.
 /// A place or boundary has its own source id; a street also answers to its
 /// vertices so an address whose way is not in the extract still gets its name.
-fn count_element(element: Element<'_>, languages: &[String], found: &mut Found) {
-    let refs = if let Element::Way(ref way) = element {
-        Some(way.refs().collect::<Vec<_>>())
-    } else {
-        None
-    };
-    let (object_type, object_id, tags) = match element {
-        Element::Node(node) => (ObjectType::Node, node.id(), node.tags().collect::<Vec<_>>()),
-        Element::DenseNode(node) => (ObjectType::Node, node.id(), node.tags().collect::<Vec<_>>()),
-        Element::Way(way) => (ObjectType::Way, way.id(), way.tags().collect::<Vec<_>>()),
+fn count_element(element: Element<'_>, languages: &[String], out: &mut BlockNames) {
+    let (object_type, object_id, tags, refs) = match element {
+        Element::Node(node) => (
+            ObjectType::Node,
+            node.id(),
+            node.tags().collect::<Vec<_>>(),
+            None,
+        ),
+        Element::DenseNode(node) => (
+            ObjectType::Node,
+            node.id(),
+            node.tags().collect::<Vec<_>>(),
+            None,
+        ),
+        Element::Way(way) => (
+            ObjectType::Way,
+            way.id(),
+            way.tags().collect::<Vec<_>>(),
+            Some(way.refs().collect::<Vec<_>>()),
+        ),
         Element::Relation(relation) => (
             ObjectType::Relation,
             relation.id(),
             relation.tags().collect::<Vec<_>>(),
+            None,
         ),
     };
-    let tags = tags
-        .iter()
-        .map(|(key, value)| (*key, *value))
-        .collect::<Vec<_>>();
+    // Nearly every element lacks a name or a kind this section keeps; skip
+    // those before an owned tag map is built for each.
+    let has = |wanted: &[&str]| tags.iter().any(|(key, _)| wanted.contains(key));
+    if !has(&["name"]) || !has(&["highway", "place", "boundary", "admin_level"]) {
+        return;
+    }
     let map = tags
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let name = match map.cleaned("name") {
-        Some(name) => name,
-        None => return,
+    let Some(name) = map.cleaned("name") else {
+        return;
     };
     let street = object_type == ObjectType::Way && street::is_street(&map);
     let named = street
@@ -211,21 +333,37 @@ fn count_element(element: Element<'_>, languages: &[String], found: &mut Found) 
         return;
     }
     let translations = translation(tags.iter().copied(), &name, languages);
-    if translations.is_empty() {
+    let id = key(object_type, object_id);
+    for (index, translated) in &translations {
+        out.ids.push(IdRow {
+            language: *index as u32,
+            key: id.clone(),
+            value: translated.clone(),
+        });
+    }
+    if !street {
         return;
     }
-    let id = key(object_type, object_id);
-    for (index, translated) in translations {
-        found.by_id[index].push((id.clone(), translated.clone()));
-        if street {
-            let refs = refs.as_deref().unwrap_or(&[]);
-            found.wanted_nodes.extend(refs.iter().copied());
-            let sampled = samples(refs.len())
-                .into_iter()
-                .map(|at| refs[at])
-                .collect::<Vec<_>>();
-            found.streets[index].push((name.clone(), translated, sampled));
-        }
+    let refs = refs.as_deref().unwrap_or(&[]);
+    let sampled = samples(refs.len())
+        .into_iter()
+        .map(|at| refs[at])
+        .collect::<Vec<_>>();
+    // Every language keeps a row, an empty translation too: a way named like
+    // a translated one must still win on proximity and keep its local name,
+    // rather than borrow the other way's. Rows nothing translates are dropped
+    // later, once every input has shown which names are translated.
+    let mut translated = vec![String::new(); languages.len()];
+    for (index, value) in translations {
+        translated[index] = value;
+    }
+    for (index, value) in translated.into_iter().enumerate() {
+        out.streets.push(PendingStreet {
+            language: index as u32,
+            name: name.clone(),
+            translated: value,
+            refs: sampled.clone(),
+        });
     }
 }
 
@@ -241,174 +379,367 @@ fn samples(len: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Hexagonal-ish quantisation to 1e-7 degrees, the records' coordinate scale.
-fn coordinate(decimicro: i32) -> i32 {
-    decimicro
-}
-
-thread_local! {
-    static NODE_COORDS: std::cell::RefCell<HashMap<i64, [i32; 2]>> =
-        std::cell::RefCell::new(HashMap::new());
-}
-
-#[derive(Default)]
-struct Pass1 {
-    found: Found,
-}
-
-impl Pass1 {
-    fn merge(mut self, other: Self) -> Self {
-        self.found = self.found.merge(other.found);
-        self
-    }
-}
 fn too_big(language: &str) -> Error {
     Error::OutOfResources(format!(
         "the {language} names are more than 4 GiB of text; keep fewer languages"
     ))
 }
 
-fn encode(languages: &[String], found: &Found) -> Result<Vec<u8>> {
-    let mut directory = Vec::new();
-    put_u64(&mut directory, languages.len() as u64);
-    let mut blocks = Vec::new();
-    for (index, language) in languages.iter().enumerate() {
-        let ids_start = blocks.len();
-        let mut heap = Vec::new();
-        let mut offsets = Vec::with_capacity(found.by_id[index].len() * 2 + 1);
-        offsets.push(0u32);
-        for (key, value) in &found.by_id[index] {
-            heap.extend_from_slice(key.as_bytes());
-            offsets.push(u32::try_from(heap.len()).map_err(|_| too_big(language))?);
-            heap.extend_from_slice(value.as_bytes());
-            offsets.push(u32::try_from(heap.len()).map_err(|_| too_big(language))?);
-        }
-        blocks.extend_from_slice(&(found.by_id[index].len() as u64).to_le_bytes());
-        for offset in offsets {
-            blocks.extend_from_slice(&offset.to_le_bytes());
-        }
-        blocks.extend_from_slice(&heap);
-        let ids_len = blocks.len() - ids_start;
-
-        let text_start = blocks.len();
-        let mut text_heap = Vec::new();
-        let mut text_offsets = Vec::with_capacity(found.streets[index].len() * 2 + 1);
-        text_offsets.push(0u32);
-        let mut vertex_heap = Vec::new();
-        let mut vertex_offsets = Vec::with_capacity(found.streets[index].len() + 1);
-        vertex_offsets.push(0u32);
-        for (name, translated, refs) in &found.streets[index] {
-            let vertices = refs
-                .iter()
-                .filter_map(|node| NODE_COORDS.with(|coords| coords.borrow().get(node).copied()))
-                .collect::<Vec<_>>();
-            let vertices = &vertices;
-            text_heap.extend_from_slice(name.as_bytes());
-            text_offsets.push(u32::try_from(text_heap.len()).map_err(|_| too_big(language))?);
-            text_heap.extend_from_slice(translated.as_bytes());
-            text_offsets.push(u32::try_from(text_heap.len()).map_err(|_| too_big(language))?);
-            for [lon, lat] in vertices {
-                vertex_heap.extend_from_slice(&lon.to_le_bytes());
-                vertex_heap.extend_from_slice(&lat.to_le_bytes());
-            }
-            vertex_offsets.push(u32::try_from(vertex_heap.len()).map_err(|_| too_big(language))?);
-        }
-        blocks.extend_from_slice(&(found.streets[index].len() as u64).to_le_bytes());
-        for offset in text_offsets {
-            blocks.extend_from_slice(&offset.to_le_bytes());
-        }
-        blocks.extend_from_slice(&text_heap);
-        let text_len = blocks.len() - text_start;
-
-        let verts_start = blocks.len();
-        blocks.extend_from_slice(&(found.streets[index].len() as u64).to_le_bytes());
-        for offset in vertex_offsets {
-            blocks.extend_from_slice(&offset.to_le_bytes());
-        }
-        blocks.extend_from_slice(&vertex_heap);
-        let verts_len = blocks.len() - verts_start;
-
-        put_str(&mut directory, language);
-        for (at, len) in [
-            (ids_start, ids_len),
-            (text_start, text_len),
-            (verts_start, verts_len),
-        ] {
-            put_u64(&mut directory, at as u64);
-            put_u64(&mut directory, len as u64);
-        }
-    }
-    directory.extend_from_slice(&blocks);
-    Ok(directory)
+/// What a build lends the section: the pool its sorters spill under, the
+/// scratch they spill to, and where its progress goes.
+pub(crate) struct Env<'a> {
+    pub scratch: &'a Arc<Scratch>,
+    pub memory: &'a Arc<Budget>,
+    pub budget: usize,
+    pub progress: &'a Progress,
 }
 
-/// Read the names of `inputs` in `languages`. Nodes precede ways in a sorted
-/// extract, but a tile cut can put a way before its nodes, so the node ids the
-/// translated way needs are collected first and the nodes are read in a second
-/// pass: memory stays proportional to translated streets, not to all nodes.
-fn build_bytes(inputs: &[PathBuf], languages: &[String]) -> Result<Vec<u8>> {
-    let languages = parse_languages(languages)?;
-    let mut found = Found::new(languages.len());
-    for input in inputs {
-        let file = File::open(input).map_err(|source| Error::IoPath {
-            action: "failed to open",
-            path: input.clone(),
-            source,
-        })?;
-        let reader = ElementReader::new(BufReader::with_capacity(READ_BUFFER_BYTES, file));
-        let pass = reader.par_map_reduce(
-            |element| {
-                let mut found = Found::new(languages.len());
-                count_element(element, &languages, &mut found);
-                Pass1 { found }
-            },
-            || Pass1 {
-                found: Found::new(languages.len()),
-            },
-            Pass1::merge,
-        )?;
-        found = found.merge(pass.found);
+fn scratch_file(scratch: &Arc<Scratch>, label: &str) -> Result<ScratchFile> {
+    let path = scratch.new_file(label);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(Error::Decode("scratch file name is not UTF-8"))?;
+    ScratchFile::create(scratch, label, name)
+}
+
+fn buffered(file: ScratchFile) -> BufWriter<ScratchFile> {
+    BufWriter::with_capacity(IO_BUFFER_BYTES, file)
+}
+
+fn unbuffered(writer: BufWriter<ScratchFile>) -> Result<ScratchFile> {
+    writer
+        .into_inner()
+        .map_err(|error| Error::Io(error.into_error()))
+}
+
+fn append(into: &mut impl Write, file: &ScratchFile) -> Result<()> {
+    let mut source = File::open(file.path()).map_err(|source| Error::IoPath {
+        action: "failed to open",
+        path: file.path().to_path_buf(),
+        source,
+    })?;
+    io::copy(&mut source, into)?;
+    Ok(())
+}
+
+/// One table of one language, written as it is read: its offsets and its
+/// heap go to files of their own, and [`TableWriter::finish`] lays them
+/// after the entry count the section's layout asks for first.
+struct TableWriter {
+    language: String,
+    offsets: BufWriter<ScratchFile>,
+    heap: BufWriter<ScratchFile>,
+    heap_bytes: u64,
+    cuts: u64,
+    entries: u64,
+}
+
+impl TableWriter {
+    fn new(scratch: &Arc<Scratch>, language: &str) -> Result<Self> {
+        let mut offsets = buffered(scratch_file(scratch, "translation-offsets")?);
+        offsets.write_all(&0u32.to_le_bytes())?;
+        Ok(Self {
+            language: language.to_string(),
+            offsets,
+            heap: buffered(scratch_file(scratch, "translation-heap")?),
+            heap_bytes: 0,
+            cuts: 0,
+            entries: 0,
+        })
     }
-    if found.wanted_nodes.is_empty() {
-        found.sort();
-        return encode(&languages, &found);
+
+    /// Add `bytes` to the heap and end a text there.
+    fn cut(&mut self, bytes: &[u8]) -> Result<()> {
+        self.heap.write_all(bytes)?;
+        self.heap_bytes += bytes.len() as u64;
+        let at = u32::try_from(self.heap_bytes).map_err(|_| too_big(&self.language))?;
+        self.offsets.write_all(&at.to_le_bytes())?;
+        self.cuts += 1;
+        Ok(())
     }
-    let wanted = std::sync::Arc::new(std::mem::take(&mut found.wanted_nodes));
-    for input in inputs {
-        let file = File::open(input).map_err(|source| Error::IoPath {
-            action: "failed to open",
-            path: input.clone(),
-            source,
-        })?;
-        let reader = ElementReader::new(BufReader::with_capacity(READ_BUFFER_BYTES, file));
-        reader.for_each(|element| {
-            let (node, lon, lat) = match element {
-                Element::Node(node) => (node.id(), node.decimicro_lon(), node.decimicro_lat()),
-                Element::DenseNode(node) => (node.id(), node.decimicro_lon(), node.decimicro_lat()),
-                _ => return,
-            };
-            if wanted.contains(&node) {
-                NODE_COORDS.with(|coords| {
-                    coords
-                        .borrow_mut()
-                        .insert(node, [coordinate(lon), coordinate(lat)]);
-                });
+
+    fn entry(&mut self) {
+        self.entries += 1;
+    }
+
+    /// Append the table to `blocks`; its length in bytes.
+    fn finish(self, blocks: &mut impl Write) -> Result<u64> {
+        let offsets = unbuffered(self.offsets)?;
+        let heap = unbuffered(self.heap)?;
+        blocks.write_all(&self.entries.to_le_bytes())?;
+        append(blocks, &offsets)?;
+        append(blocks, &heap)?;
+        Ok(8 + (self.cuts + 1) * 4 + self.heap_bytes)
+    }
+}
+
+/// Hand `each` the rows of `language` that come next in `rows`, sorted by
+/// language first.
+fn lane<T: Spill + Ord>(
+    rows: &mut Peekable<Sorted<T>>,
+    language: u32,
+    of: impl Fn(&T) -> u32,
+    mut each: impl FnMut(T) -> Result<()>,
+) -> Result<()> {
+    loop {
+        match rows.peek() {
+            Some(Ok(row)) if of(row) == language => {}
+            Some(Err(_)) => {
+                return match rows.next() {
+                    Some(Err(error)) => Err(error),
+                    _ => unreachable!("peeked an error"),
+                };
             }
+            _ => return Ok(()),
+        }
+        each(rows.next().expect("peeked")?)?;
+    }
+}
+
+/// Write the section from the sorted rows, one language after another.
+fn write_section(
+    languages: &[String],
+    ids: Sorted<IdRow>,
+    streets: Sorted<StreetRow>,
+    scratch: &Arc<Scratch>,
+) -> Result<ScratchFile> {
+    let mut ids = ids.peekable();
+    let mut streets = streets.peekable();
+    let mut blocks = buffered(scratch_file(scratch, "translation-blocks")?);
+    let mut position = 0u64;
+    let mut directory = Vec::new();
+    put_u64(&mut directory, languages.len() as u64);
+    for (index, language) in languages.iter().enumerate() {
+        let index = index as u32;
+        let mut placed = [(0u64, 0u64); 3];
+
+        let mut names = TableWriter::new(scratch, language)?;
+        let mut last: Option<String> = None;
+        lane(
+            &mut ids,
+            index,
+            |row| row.language,
+            |row| {
+                // One object can arrive twice, from inputs that overlap.
+                if last.as_deref() == Some(row.key.as_str()) {
+                    return Ok(());
+                }
+                names.cut(row.key.as_bytes())?;
+                names.cut(row.value.as_bytes())?;
+                names.entry();
+                last = Some(row.key);
+                Ok(())
+            },
+        )?;
+        let len = names.finish(&mut blocks)?;
+        placed[0] = (position, len);
+        position += len;
+
+        let mut text = TableWriter::new(scratch, language)?;
+        let mut vertices = TableWriter::new(scratch, language)?;
+        let mut bytes = Vec::new();
+        lane(
+            &mut streets,
+            index,
+            |row| row.language,
+            |row| {
+                text.cut(row.name.as_bytes())?;
+                text.cut(row.translated.as_bytes())?;
+                text.entry();
+                bytes.clear();
+                for [lon, lat] in &row.vertices {
+                    bytes.extend_from_slice(&lon.to_le_bytes());
+                    bytes.extend_from_slice(&lat.to_le_bytes());
+                }
+                vertices.cut(&bytes)?;
+                vertices.entry();
+                Ok(())
+            },
+        )?;
+        let len = text.finish(&mut blocks)?;
+        placed[1] = (position, len);
+        position += len;
+        let len = vertices.finish(&mut blocks)?;
+        placed[2] = (position, len);
+        position += len;
+
+        put_str(&mut directory, language);
+        for (at, len) in placed {
+            put_u64(&mut directory, at);
+            put_u64(&mut directory, len);
+        }
+    }
+    let blocks = unbuffered(blocks)?;
+    let mut section = buffered(scratch_file(scratch, "translations")?);
+    section.write_all(&directory)?;
+    append(&mut section, &blocks)?;
+    drop(blocks);
+    unbuffered(section)
+}
+
+/// One input after its names pass: the blocks that hold nodes, and every
+/// named street way, its nodes still ids. Nodes precede ways in a sorted
+/// extract but a tile cut can put a way before its nodes, so the node ids are
+/// collected first and the node blocks read in a second pass, through the
+/// store the build's own node pass uses: it holds the coordinates in the
+/// pool or maps them from scratch.
+struct Scanned<'a> {
+    input: &'a Path,
+    node_blobs: Vec<u64>,
+    pending: SpoolReader<PendingStreet>,
+}
+
+/// Read one input's names into the sorters. Streets wait in a spool: which of
+/// them matter is known only once every input has been read.
+fn scan_input<'a>(
+    input: &'a Path,
+    languages: &[String],
+    env: &Env<'_>,
+    ids: &mut ExternalSorter<IdRow>,
+    translated_names: &mut [HashSet<String>],
+) -> Result<Scanned<'a>> {
+    let mut node_blobs = Vec::new();
+    let mut pending = Spool::<PendingStreet>::create(env.scratch, "translation-pending")?;
+    for_each_block(
+        input,
+        env.progress,
+        BuildStage::Translations,
+        None,
+        |offset, block| {
+            let mut names = BlockNames {
+                offset,
+                ..BlockNames::default()
+            };
+            for element in block.elements() {
+                names.has_nodes |= matches!(element, Element::Node(_) | Element::DenseNode(_));
+                count_element(element, languages, &mut names);
+            }
+            Ok(names)
+        },
+        |names| {
+            if names.has_nodes {
+                node_blobs.push(names.offset);
+            }
+            for row in names.ids {
+                ids.push(row)?;
+            }
+            for street in names.streets {
+                if !street.translated.is_empty() {
+                    translated_names[street.language as usize].insert(street.name.clone());
+                }
+                pending.write(&street)?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(Scanned {
+        input,
+        node_blobs,
+        pending: pending.into_reader()?,
+    })
+}
+
+/// Place the streets of one input that can change an answer: those with a
+/// translation, and those sharing a name with a translated street of the same
+/// language, which must keep their local name when they are nearer. Any other
+/// street can never change the answer, so it stores no vertices.
+fn place_input(
+    scanned: Scanned<'_>,
+    env: &Env<'_>,
+    translated_names: &[HashSet<String>],
+    streets: &mut ExternalSorter<StreetRow>,
+) -> Result<()> {
+    let nodes = NodeSet::new(env.memory);
+    let mut kept = Spool::<PendingStreet>::create(env.scratch, "translation-kept")?;
+    for street in scanned.pending {
+        let street = street?;
+        if street.translated.is_empty()
+            && !translated_names[street.language as usize].contains(&street.name)
+        {
+            continue;
+        }
+        nodes.mark(&street.refs)?;
+        kept.write(&street)?;
+    }
+    if kept.written() == 0 {
+        env.progress.start(BuildStage::TranslationNodes, Some(0))?;
+        env.progress.finish(BuildStage::TranslationNodes);
+        return Ok(());
+    }
+    let slots = Slots::new(nodes.len(), true, env.memory, env.scratch)?;
+    let (locations, _) = locations::load(
+        scanned.input,
+        &scanned.node_blobs,
+        nodes,
+        &[],
+        slots,
+        env.progress,
+        BuildStage::TranslationNodes,
+    )?;
+    for street in kept.into_reader()? {
+        let street = street?;
+        let vertices = street
+            .refs
+            .iter()
+            .filter_map(|id| locations.get(*id))
+            .map(|at| [at.lon_e7, at.lat_e7])
+            .collect();
+        streets.push(StreetRow {
+            language: street.language,
+            name: street.name,
+            translated: street.translated,
+            vertices,
         })?;
     }
-    found.sort();
-    encode(&languages, &found)
+    Ok(())
+}
+
+/// Read the names of `inputs` in `languages` into a section file.
+fn build_section(inputs: &[PathBuf], languages: &[String], env: &Env<'_>) -> Result<ScratchFile> {
+    let languages = parse_languages(languages)?;
+    let share = (env.budget / 4).max(1);
+    let mut ids = ExternalSorter::<IdRow>::new(env.scratch, "translation-ids", env.memory, share);
+    let mut streets =
+        ExternalSorter::<StreetRow>::new(env.scratch, "translation-streets", env.memory, share);
+    let mut translated_names = vec![HashSet::new(); languages.len()];
+    let mut scanned = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        scanned.push(scan_input(
+            input,
+            &languages,
+            env,
+            &mut ids,
+            &mut translated_names,
+        )?);
+    }
+    for input in scanned {
+        place_input(input, env, &translated_names, &mut streets)?;
+    }
+    write_section(&languages, ids.finish()?, streets.finish()?, env.scratch)
 }
 
 /// Read the `name:<language>` names of `inputs` for `languages` and add them
-/// to the sealed Pack. Does nothing without languages: the pass over the
-/// inputs is the cost, and only a build that asked for it pays it.
-pub fn add_to(sealed: &mut SealedPack, inputs: &[PathBuf], languages: &[String]) -> Result<()> {
+/// to the sealed Pack, returning the section's size. Without languages the
+/// stage runs empty and nothing is added: the passes over the inputs are the
+/// cost, and only a build that asked for them pays it.
+pub(crate) fn add_to(
+    sealed: &mut SealedPack,
+    inputs: &[PathBuf],
+    languages: &[String],
+    env: &Env<'_>,
+) -> Result<Option<u64>> {
     if languages.is_empty() {
-        return Ok(());
+        for stage in [BuildStage::Translations, BuildStage::TranslationNodes] {
+            env.progress.start(stage, Some(0))?;
+            env.progress.finish(stage);
+        }
+        return Ok(None);
     }
-    let bytes = build_bytes(inputs, languages)?;
-    sealed.add_section(SECTION, VERSION, &bytes)
+    let section = build_section(inputs, languages, env)?;
+    let bytes = section.bytes();
+    sealed.add_section_files(&[(SECTION, VERSION, section.path().to_path_buf())])?;
+    Ok(Some(bytes))
 }
 
 #[derive(Debug)]
@@ -482,12 +813,15 @@ impl Translations {
                 let block = bytes.get(start..end).ok_or_else(truncated)?;
                 let entries = usize::try_from(read_u64_le(block, 0).ok_or_else(truncated)?)?;
                 counts[table] = entries;
-                let texts = if table == 2 {
-                    entries + 1
+                let offsets_count = if table == 2 {
+                    entries.checked_add(1).ok_or_else(truncated)?
                 } else {
-                    entries * 2 + 1
+                    entries
+                        .checked_mul(2)
+                        .and_then(|doubled| doubled.checked_add(1))
+                        .ok_or_else(truncated)?
                 };
-                let table_bytes = texts.checked_mul(4).ok_or_else(truncated)?;
+                let table_bytes = offsets_count.checked_mul(4).ok_or_else(truncated)?;
                 let at = table_bytes
                     .checked_add(8)
                     .filter(|at| *at <= block.len())
@@ -500,13 +834,8 @@ impl Translations {
                             .map_err(|_| Error::Decode("the name translations are not UTF-8"))?,
                     )
                 };
-                let count = if table == 2 {
-                    entries + 1
-                } else {
-                    entries * 2 + 1
-                };
                 let mut previous = 0;
-                for index in 0..count {
+                for index in 0..offsets_count {
                     let cut = read_u32_le(block, 8 + index * 4).ok_or_else(truncated)?;
                     let cut = usize::try_from(cut)?;
                     if cut < previous || text.is_some_and(|text| !text.is_char_boundary(cut)) {
@@ -519,6 +848,9 @@ impl Translations {
                 }
                 offsets[table] = start + 8;
                 heap[table] = start + at;
+            }
+            if counts[1] != counts[2] {
+                return Err(Error::Decode("the name translations are out of order"));
             }
             tables.push(Table {
                 language,
@@ -571,12 +903,8 @@ impl Translations {
     pub fn street_near(&self, language: &str, name: &str, lon: f64, lat: f64) -> Option<&str> {
         let table = self.table(language)?;
         let bytes: &[u8] = &self.bytes;
-        // Lower bound: the first entry whose text is not less than `name`.
-        // The earlier search stopped on the first equal entry it found, at
-        // `middle`, and then scanned from `low`, so entries below `name` in
-        // `[low, middle)` made the first `text != name` break the loop and
-        // return nothing. A small table happened to land on the match; a
-        // large one did not, which is why only the full build failed.
+        // Lower bound of `name` among sorted street rows.
+
         let count = count(table, 1);
         let mut low = 0;
         let mut high = count;
@@ -589,31 +917,59 @@ impl Translations {
                 high = middle;
             }
         }
-        let mut found: Option<(&str, f64)> = None;
+
+        let mut found: Option<(Option<&str>, f64)> = None;
         for index in low..count {
             let text = table.text(bytes, 1, index * 2)?;
             if text != name.as_bytes() {
                 break;
             }
-            let translated = std::str::from_utf8(table.text(bytes, 1, index * 2 + 1)?).ok()?;
+            let translated_raw = std::str::from_utf8(table.text(bytes, 1, index * 2 + 1)?).ok()?;
+            let translated = if translated_raw.is_empty() {
+                None
+            } else {
+                Some(translated_raw)
+            };
             let Some(vertices) = table.text(bytes, 2, index) else {
                 continue;
             };
-            for vertex in vertices.as_chunks::<8>().0 {
-                let x = i32::from_le_bytes(vertex[..4].try_into().expect("vertex"));
-                let y = i32::from_le_bytes(vertex[4..].try_into().expect("vertex"));
-                let distance = haversine_m(lon, lat, f64::from(x) / 1e7, f64::from(y) / 1e7);
-                if distance > MAX_STREET_DISTANCE_M {
-                    continue;
-                }
-                // Nearest vertex wins; equal distance takes the smaller text
-                // so the answer cannot depend on the order of a build.
-                if found.is_none_or(|(held, best)| (distance, translated) < (best, held)) {
-                    found = Some((translated, distance));
+            let coords: Vec<(f64, f64)> = vertices
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| {
+                    (
+                        f64::from(i32::from_le_bytes(chunk[0..4].try_into().unwrap())) / 1e7,
+                        f64::from(i32::from_le_bytes(chunk[4..8].try_into().unwrap())) / 1e7,
+                    )
+                })
+                .collect();
+            let mut distance = f64::INFINITY;
+            if coords.len() == 1 {
+                distance = haversine_m(lon, lat, coords[0].0, coords[0].1);
+            } else {
+                for pair in coords.windows(2) {
+                    let d = crate::spatial_index::point_segment_distance_m(
+                        lon,
+                        lat,
+                        [pair[0].0, pair[0].1],
+                        [pair[1].0, pair[1].1],
+                    );
+                    if d < distance {
+                        distance = d;
+                    }
                 }
             }
+            if distance > MAX_STREET_DISTANCE_M {
+                continue;
+            }
+            if found.is_none_or(|(held, best)| {
+                (distance, translated.unwrap_or("")) < (best, held.unwrap_or(""))
+            }) {
+                found = Some((translated, distance));
+            }
         }
-        found.map(|(translated, _)| translated)
+        found.and_then(|(translated, _)| translated)
     }
 
     fn table(&self, language: &str) -> Option<&Table> {
@@ -648,13 +1004,51 @@ mod tests {
         values.iter().map(|value| (*value).to_string()).collect()
     }
 
+    struct Quiet;
+
+    impl crate::builder::BuildObserver for Quiet {
+        fn started(&self, _: BuildStage, _: Option<u64>) {}
+        fn advanced(&self, _: u64) {}
+        fn finished(&self, _: BuildStage) {}
+        fn warned(&self, _: &str) {}
+    }
+
+    /// The section a build of `input` writes, read back from scratch.
+    fn build_bytes(input: &Path, languages: &[String], dir: &Path) -> Result<Vec<u8>> {
+        build_bytes_with(input, languages, dir, 1 << 20, &Budget::unlimited())
+    }
+
+    /// As [`build_bytes`], with the sorters' share and the pool set, so a
+    /// test can make every buffer spill and every node store map a file.
+    fn build_bytes_with(
+        input: &Path,
+        languages: &[String],
+        dir: &Path,
+        budget: usize,
+        memory: &Arc<Budget>,
+    ) -> Result<Vec<u8>> {
+        let scratch = Scratch::create(dir.join("scratch"))?;
+        let progress = Progress::new(
+            Arc::new(Quiet),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let env = Env {
+            scratch: &scratch,
+            memory,
+            budget,
+            progress: &progress,
+        };
+        let section = build_section(&[input.to_path_buf()], languages, &env)?;
+        Ok(std::fs::read(section.path())?)
+    }
+
     fn built(
         blocks: &[Vec<crate::builder::osm::test_pbf::TestElement>],
         languages: &[&str],
     ) -> Translations {
         let (input, dir) = scratch_input("roundtrip");
         write_pbf(&input, blocks);
-        let bytes = build_bytes(&[input], &owned(languages)).expect("section");
+        let bytes = build_bytes(&input, &owned(languages), &dir).expect("section");
         std::fs::remove_dir_all(dir).expect("cleanup");
         Translations::parse(Bytes::new(bytes)).expect("parsed")
     }
@@ -757,7 +1151,11 @@ mod tests {
                 way(
                     8,
                     &[99, 98],
-                    &[("highway", "residential"), ("name", "Missing node")],
+                    &[
+                        ("highway", "residential"),
+                        ("name", "Missing node"),
+                        ("name:es", "Nodo ausente"),
+                    ],
                 ),
             ],
         ]
@@ -906,12 +1304,102 @@ mod tests {
     #[test]
     fn a_street_whose_node_is_missing_from_the_extract_does_not_panic() {
         let translations = built(&examples(), &["es"]);
-        assert!(
-            translations
-                .street_near("es", "Missing node", -0.44, 39.56)
-                .is_none()
+        assert_eq!(
+            translations.street_near("es", "Missing node", -0.44, 39.56),
+            Some("Nodo ausente")
         );
-        assert_eq!(translations.by_id("es", ObjectType::Way, 8), None);
+        assert_eq!(
+            translations.by_id("es", ObjectType::Way, 8),
+            Some("Nodo ausente")
+        );
+    }
+
+    #[test]
+    fn the_nearest_way_wins_even_when_it_has_no_translation() {
+        // Way A has no name:es. Way B, about 800 m from the query and inside
+        // the 1.5 km limit, has one. A query on A must not borrow B's.
+        let block = vec![
+            node(1, 39.47, -0.37, &[]),
+            node(2, 39.4701, -0.37, &[]),
+            node(3, 39.4772, -0.37, &[]),
+            node(4, 39.4773, -0.37, &[]),
+            way(
+                1,
+                &[1, 2],
+                &[("highway", "residential"), ("name", "Carrer Major")],
+            ),
+            street(2, &[3, 4], "Carrer Major", "Calle Mayor"),
+        ];
+        let translations = built(&[block], &["es"]);
+        assert_eq!(
+            translations.street_near("es", "Carrer Major", -0.37, 39.47005),
+            None,
+            "the nearest way has no name:es; it must not borrow a farther translation"
+        );
+    }
+
+    #[test]
+    fn a_way_translated_in_one_language_still_blocks_the_others() {
+        let block = vec![
+            node(1, 39.47, -0.37, &[]),
+            node(2, 39.4701, -0.37, &[]),
+            node(3, 39.4772, -0.37, &[]),
+            node(4, 39.4773, -0.37, &[]),
+            // Nearest: es only.
+            street(1, &[1, 2], "Carrer Major", "Calle Mayor"),
+            // Farther: ca only.
+            way(
+                2,
+                &[3, 4],
+                &[
+                    ("highway", "residential"),
+                    ("name", "Carrer Major"),
+                    ("name:ca", "Carrer Gran"),
+                ],
+            ),
+        ];
+        let translations = built(&[block], &["es", "ca"]);
+        assert_eq!(
+            translations.street_near("es", "Carrer Major", -0.37, 39.47005),
+            Some("Calle Mayor")
+        );
+        assert_eq!(
+            translations.street_near("ca", "Carrer Major", -0.37, 39.47005),
+            None,
+            "the nearest way has no name:ca; it must not borrow the farther one's"
+        );
+    }
+
+    #[test]
+    fn proximity_is_measured_to_the_way_not_only_its_vertices() {
+        // A straight 4 km way: both endpoints are 2 km from the midpoint,
+        // beyond the 1.5 km limit.
+        let block = vec![
+            node(1, 39.47, -0.37, &[]),
+            node(2, 39.506, -0.37, &[]),
+            street(1, &[1, 2], "Carrer Major", "Calle Mayor"),
+        ];
+        let translations = built(&[block], &["es"]);
+        assert_eq!(
+            translations.street_near("es", "Carrer Major", -0.37, 39.488),
+            Some("Calle Mayor"),
+            "the midpoint lies on the way even though every vertex is far"
+        );
+    }
+
+    #[test]
+    fn a_build_that_spills_writes_the_same_section_as_one_in_memory() {
+        let section = |budget: usize, memory: Arc<Budget>| {
+            let (input, dir) = scratch_input("spill");
+            write_pbf(&input, &examples());
+            let bytes = build_bytes_with(&input, &owned(&["es", "fr"]), &dir, budget, &memory)
+                .expect("section");
+            std::fs::remove_dir_all(dir).expect("cleanup");
+            bytes
+        };
+        let roomy = section(1 << 20, Budget::unlimited());
+        let starved = section(1, Budget::new(0));
+        assert_eq!(roomy, starved);
     }
 
     #[test]
@@ -931,7 +1419,7 @@ mod tests {
                 &[("place", "town"), ("name", "Aaa"), ("name:es", "Bbb")],
             )]],
         );
-        let bytes = build_bytes(&[input], &owned(&["es"])).expect("section");
+        let bytes = build_bytes(&input, &owned(&["es"]), &dir).expect("section");
         std::fs::remove_dir_all(dir).expect("cleanup");
         assert!(Translations::parse(Bytes::new(bytes.clone())).is_ok());
         for cut in 0..bytes.len() {
