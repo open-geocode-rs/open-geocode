@@ -460,9 +460,15 @@ impl Feature {
     /// Judges the street's type and direction apart from its name, as
     /// Precisely describes them: each is `EXACT` where the asked street and
     /// the record agree on it, neither stating one included, and `NONE`
-    /// where they differ or the street did not match. og reads both streets
-    /// with its own street split.
+    /// where they differ or the street did not match. The record's part
+    /// agrees when any asked word is a form of it, wherever it stands, so a
+    /// unit read into the asked street (`District Ave Ste`) leaves its type
+    /// standing.
     pub(super) fn judge_street_parts(&self, candidate: &mut Candidate, asked: Option<&str>) {
+        use crate::{
+            parse::lattice::other_forms,
+            road::{StreetParts, direction_of},
+        };
         let description = &mut candidate.explanation.address_match.description;
         let street_matched = description
             .iter()
@@ -476,32 +482,35 @@ impl Feature {
             .street
             .as_deref()
             .unwrap_or_default();
-        let (asked, held) = (
-            crate::road::StreetParts::of(asked).unwrap_or_default(),
-            crate::road::StreetParts::of(held).unwrap_or_default(),
-        );
         let key = |word: &str| {
             crate::util::fold::search_key(word.trim_end_matches('.')).unwrap_or_default()
         };
-        let same_kind = |left: Option<&str>, right: Option<&str>| match (left, right) {
-            (None, None) => true,
-            (Some(left), Some(right)) => {
-                let (left, right) = (key(left), key(right));
-                left == right
-                    || crate::parse::lattice::other_forms(&left).contains(&right)
-                    || crate::parse::lattice::other_forms(&right).contains(&left)
-            }
-            _ => false,
-        };
-        let direction = |parts: &crate::road::StreetParts<'_>| {
+        let words = asked.split_whitespace().map(key).collect::<Vec<_>>();
+        let (asked, held) = (
+            StreetParts::of(asked).unwrap_or_default(),
+            StreetParts::of(held).unwrap_or_default(),
+        );
+        let direction = |parts: &StreetParts<'_>| {
             parts
                 .prefix
                 .or(parts.suffix)
-                .and_then(|word| crate::road::direction_of(&key(word)))
+                .and_then(|word| direction_of(&key(word)))
+        };
+        let kind_agrees = match held.kind.map(key) {
+            Some(kind) => words.iter().any(|word| {
+                *word == kind
+                    || other_forms(word).contains(&kind)
+                    || other_forms(&kind).contains(word)
+            }),
+            None => asked.kind.is_none(),
+        };
+        let direction_agrees = match direction(&held) {
+            Some(stated) => words.iter().any(|word| direction_of(word) == Some(stated)),
+            None => direction(&asked).is_none(),
         };
         let judged = [
-            ("streetType", same_kind(asked.kind, held.kind)),
-            ("streetDirectional", direction(&asked) == direction(&held)),
+            ("streetType", kind_agrees),
+            ("streetDirectional", direction_agrees),
         ];
         for entry in description.iter_mut() {
             if let Some((_, agrees)) = judged.iter().find(|(label, _)| *label == entry.label) {
@@ -1452,6 +1461,40 @@ mod tests {
                                    "matchedSubstring": "JORDAN"}),
             ]
         );
+    }
+
+    /// The record's type agrees with any asked word that is a form of it,
+    /// so a unit the parser read into the street leaves the type standing.
+    #[test]
+    fn a_streets_type_agrees_wherever_the_asked_street_writes_it() {
+        let judged = |asked: &str| {
+            let feature = jordan();
+            let mut candidate = feature.candidate(Product::Geocode);
+            candidate.explanation.address_match.description = LABELS
+                .into_iter()
+                .map(|label| MatchDescription {
+                    label,
+                    match_type: if label == "street" { "EXACT" } else { "NONE" },
+                    matched_substring: None,
+                })
+                .collect();
+            feature.judge_street_parts(&mut candidate, Some(asked));
+            let of = |label: &str| {
+                candidate
+                    .explanation
+                    .address_match
+                    .description
+                    .iter()
+                    .find(|entry| entry.label == label)
+                    .map(|entry| entry.match_type)
+            };
+            (of("streetType"), of("streetDirectional"))
+        };
+        assert_eq!(judged("jordan ave ste"), (Some("EXACT"), Some("EXACT")));
+        assert_eq!(judged("Jordan Avenue"), (Some("EXACT"), Some("EXACT")));
+        assert_eq!(judged("jordan rd"), (Some("NONE"), Some("EXACT")));
+        assert_eq!(judged("jordan"), (Some("NONE"), Some("EXACT")));
+        assert_eq!(judged("n jordan ave"), (Some("EXACT"), Some("NONE")));
     }
 
     /// A postal answer restates its parts in the postal form, as the
