@@ -26,6 +26,12 @@ use crate::format;
 const CHUNK_BYTES: usize = 1 << 20;
 /// How long a download may receive nothing before it is given up as stalled.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the index body may take to arrive once its headers are in.
+const INDEX_BODY_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(60)
+};
 /// How often a download waiting for data looks at its cancel flag.
 const POLL: Duration = Duration::from_millis(200);
 /// Geofabrik's list of every extract it serves and where each one is now.
@@ -149,11 +155,19 @@ struct Urls {
 
 impl Index {
     pub(crate) fn fetch(url: &str) -> Result<Self> {
-        retrying(|| agent().get(url).call())
-            .with_context(|| format!("failed to reach {url}"))?
-            .body_mut()
-            .read_json()
-            .with_context(|| format!("failed to read {url}"))
+        // Only the index gets a body limit, extract downloads keep their idle timeout.
+        retrying(|| {
+            agent()
+                .get(url)
+                .config()
+                .timeout_recv_body(Some(INDEX_BODY_TIMEOUT))
+                .build()
+                .call()
+        })
+        .with_context(|| format!("failed to reach {url}"))?
+        .body_mut()
+        .read_json()
+        .with_context(|| format!("failed to read {url}"))
     }
 
     /// The download link of the extract the index calls `id`.
@@ -468,6 +482,8 @@ mod tests {
         Status(u16),
         /// Each answer once, in order, and the last one from then on.
         Sequence(Vec<Answer>),
+        /// A 200 whose headers promise more body than is ever sent, then silence.
+        Stall(Vec<u8>),
     }
 
     impl Answer {
@@ -534,6 +550,17 @@ mod tests {
                             ),
                             Vec::new(),
                         ),
+                        Some(Answer::Stall(sent)) => {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                sent.len() + 1000
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(&sent);
+                            let _ = stream.flush();
+                            thread::sleep(Duration::from_secs(10));
+                            continue;
+                        }
                         Some(Answer::Sequence(_)) | None => (
                             "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n".to_string(),
                             Vec::new(),
@@ -890,6 +917,18 @@ mod tests {
         assert_eq!(build_download(&server, "monaco").unwrap(), b"monaco 261109");
         assert_eq!(server.requests("/index-v1-nogeom.json"), 3);
         assert_eq!(server.requests("/europe/monaco-261109.osm.pbf.md5"), 3);
+    }
+
+    #[test]
+    fn an_index_that_stalls_after_its_headers_is_given_up_on() {
+        let server = Server::start();
+        server.route("/index.json", Answer::Stall(br#"{"features": ["#.to_vec()));
+        let started = Instant::now();
+
+        let error = Index::fetch(&server.url("/index.json")).unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(5), "{error:#}");
+        assert!(format!("{error:#}").contains("timeout"), "{error:#}");
     }
 
     #[test]

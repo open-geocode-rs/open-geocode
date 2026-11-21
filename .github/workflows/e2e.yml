@@ -79,14 +79,14 @@ jobs:
           path: ${{ runner.temp }}/serve.log
           if-no-files-found: ignore
 
-      # A red run is og's fault or Geofabrik's. This says which in the log.
-      - name: Say who failed
+      # The index answering says nothing about the extract or its .md5, so no side is blamed.
+      - name: Check the Geofabrik index
         if: failure()
         run: |
           if curl -fsS --max-time 30 --output /dev/null "$GEOFABRIK_INDEX"; then
-            echo "::error::Geofabrik answers its index, so og failed."
+            echo "::notice::Geofabrik answers its index. This alone does not say which side failed."
           else
-            echo "::error::Geofabrik did not answer its index, so Geofabrik failed."
+            echo "::notice::Geofabrik did not answer its index."
           fi
 
       - name: Report end to end issues
