@@ -228,6 +228,19 @@ impl Args {
         Self(self.0.clone())
     }
 
+    /// These parameters with `name` set to `value` in place of what it was.
+    fn with(&self, name: &'static str, value: String) -> Self {
+        let mut args = Self(
+            self.0
+                .iter()
+                .filter(|(key, _)| *key != name)
+                .cloned()
+                .collect(),
+        );
+        args.0.push((name, value));
+        args
+    }
+
     fn query<T: serde::de::DeserializeOwned>(
         &self,
     ) -> Result<Query<T>, axum::extract::rejection::QueryRejection> {
@@ -247,15 +260,54 @@ pub(crate) mod native {
     // answers that can hold a house keep one copy of it
     // (see [`house::one_per_house`]).
 
+    /// Runs a lookup and keeps one copy of each house in its answer. Where
+    /// the caller asked for a number of answers and copies leave fewer, og
+    /// is asked for more, up to its own most, so the answer holds as many
+    /// houses as og has.
+    async fn one_per_house<C, A, Fut>(
+        args: Args,
+        features: fn(&mut C) -> &mut Vec<A>,
+        run: impl Fn(Args) -> Fut,
+    ) -> Result<C, Problem>
+    where
+        A: house::Answer,
+        Fut: std::future::Future<Output = Result<C, Problem>>,
+    {
+        let asked = args
+            .get("limit")
+            .and_then(|limit| limit.parse::<usize>().ok());
+        let mut ask = asked.unwrap_or(0);
+        loop {
+            let mut found = run(args.with("limit", ask.to_string())).await?;
+            let answers = features(&mut found);
+            let held = answers.len();
+            house::one_per_house(answers);
+            let Some(asked) = asked else {
+                return Ok(found);
+            };
+            let more = (ask * 2).min(crate::http::bounds::MAX_SEARCH_LIMIT);
+            if answers.len() >= asked || held < ask || more <= ask {
+                answers.truncate(asked);
+                return Ok(found);
+            }
+            ask = more;
+        }
+    }
+
     pub(crate) async fn geocode(
         state: &AppState,
         args: Args,
     ) -> Result<ForwardCollection, Problem> {
-        let mut found = runtime::geocode(State(state.clone()), args.query())
-            .await?
-            .0;
-        house::one_per_house(&mut found.features);
-        Ok(found)
+        one_per_house(
+            args,
+            |found: &mut ForwardCollection| &mut found.features,
+            |args| async move {
+                Ok(runtime::geocode(State(state.clone()), args.query())
+                    .await?
+                    .0)
+            },
+        )
+        .await
     }
 
     pub(crate) async fn places(state: &AppState, args: Args) -> Result<ForwardCollection, Problem> {
@@ -268,11 +320,16 @@ pub(crate) mod native {
         state: &AppState,
         args: Args,
     ) -> Result<ForwardCollection, Problem> {
-        let mut found = runtime::autocomplete(State(state.clone()), args.query())
-            .await?
-            .0;
-        house::one_per_house(&mut found.features);
-        Ok(found)
+        one_per_house(
+            args,
+            |found: &mut ForwardCollection| &mut found.features,
+            |args| async move {
+                Ok(runtime::autocomplete(State(state.clone()), args.query())
+                    .await?
+                    .0)
+            },
+        )
+        .await
     }
 
     /// Free text answered with addresses, areas and places together, as a
@@ -344,11 +401,16 @@ pub(crate) mod native {
         state: &AppState,
         args: Args,
     ) -> Result<ReverseCollection, Problem> {
-        let mut found = runtime::reverse(State(state.clone()), args.query())
-            .await?
-            .0;
-        house::one_per_house(&mut found.features);
-        Ok(found)
+        one_per_house(
+            args,
+            |found: &mut ReverseCollection| &mut found.features,
+            |args| async move {
+                Ok(runtime::reverse(State(state.clone()), args.query())
+                    .await?
+                    .0)
+            },
+        )
+        .await
     }
 
     /// The places of `categories`, as the catalog writes each one.

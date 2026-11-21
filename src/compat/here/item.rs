@@ -117,6 +117,12 @@ struct Extra {
 }
 
 impl Feature {
+    /// How far the result lies from a reverse geocode's point, none for an
+    /// area holding the point.
+    pub(super) fn distance_m(&self) -> f64 {
+        self.properties.distance_m.unwrap_or(0.0)
+    }
+
     fn of(coordinates: [f64; 2], common: &api::Common, extra: Extra) -> Self {
         let address = &common.address;
         let context = &common.context;

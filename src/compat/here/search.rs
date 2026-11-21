@@ -358,8 +358,9 @@ pub(super) struct Reverse {
     pub(super) center: LatLng,
     /// `in=circle`'s radius, a hard filter on the distance.
     pub(super) radius_m: Option<f64>,
-    /// og's `layer` when HERE's `types` or `bearing` asks for one kind only.
-    pub(super) layer: Option<&'static str>,
+    /// og's layers when HERE's `types` or `bearing` asks for kinds og keeps
+    /// apart. Empty for an answer of any kind.
+    pub(super) layers: &'static [&'static str],
     pub(super) types: Option<Vec<String>>,
     pub(super) limit: usize,
     /// og's `lang`, from HERE's `lang`.
@@ -399,21 +400,23 @@ impl Reverse {
         }
         // og has no heading to match, but HERE's bearing answers streets
         // only, and that og can do.
-        let layer = match (bearing, types.as_deref()) {
-            (Some(_), _) => Some("street"),
+        let layers: &'static [&'static str] = match (bearing, types.as_deref()) {
+            (Some(_), _) => &["street"],
             (None, Some([kind])) => match kind.as_str() {
-                "street" => Some("street"),
-                "houseNumber" => Some("address"),
-                "place" => Some("poi"),
-                "city" => Some("locality"),
-                _ => None,
+                "street" => &["street"],
+                "houseNumber" => &["address"],
+                // HERE's address results are houses and streets.
+                "address" => &["address", "street"],
+                "place" => &["poi"],
+                "city" => &["locality"],
+                _ => &[],
             },
-            _ => None,
+            _ => &[],
         };
         Ok(Self {
             center,
             radius_m,
-            layer,
+            layers,
             types: if bearing.is_some() {
                 Some(vec!["street".to_string()])
             } else {
@@ -424,7 +427,9 @@ impl Reverse {
         })
     }
 
-    pub(super) fn og_fields(&self) -> Vec<(&'static str, String)> {
+    /// og's reverse parameters, for the nearest of `layer` or, with none,
+    /// for the point's answer.
+    pub(super) fn og_fields(&self, layer: Option<&str>) -> Vec<(&'static str, String)> {
         let mut fields = vec![
             ("lon", self.center.lng.to_string()),
             ("lat", self.center.lat.to_string()),
@@ -436,7 +441,7 @@ impl Reverse {
                 ),
             ),
         ];
-        if let Some(layer) = self.layer {
+        if let Some(layer) = layer {
             fields.push(("layer", layer.to_string()));
             // og answers the nearest of one kind as many times as asked.
             fields.push(("limit", self.limit.to_string()));
@@ -508,12 +513,26 @@ pub(super) async fn revgeocode(
     respond(&request_id, answer.await.map(|items| Items { items }))
 }
 
+/// The answer of each og layer HERE's types ask for, nearest first.
 async fn reverse_lookup(state: &AppState, request: &Reverse) -> Result<Vec<Item>, Gs7Error> {
-    let collection = native::reverse(state, args(request.og_fields()))
-        .await
-        .map_err(Gs7Error::of)?;
+    let mut features = Vec::new();
+    if request.layers.is_empty() {
+        let collection = native::reverse(state, args(request.og_fields(None)))
+            .await
+            .map_err(Gs7Error::of)?;
+        features = reverse_features(&collection);
+    }
+    for layer in request.layers {
+        let collection = native::reverse(state, args(request.og_fields(Some(layer))))
+            .await
+            .map_err(Gs7Error::of)?;
+        features.extend(reverse_features(&collection));
+    }
+    if request.layers.len() > 1 {
+        features.sort_by(|left, right| left.distance_m().total_cmp(&right.distance_m()));
+    }
     Ok(reverse_items(
-        &reverse_features(&collection),
+        &features,
         request.radius_m,
         request.types.as_deref(),
         request.limit,

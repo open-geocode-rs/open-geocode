@@ -2130,6 +2130,25 @@ async fn a_us_address_is_written_as_google_writes_it_in_its_town() {
 
 /// A house og holds twice, as its point and its building's outline, is one
 /// result for every vendor, at its point.
+/// Asked for the nearest two houses, a vendor answers two houses, though og
+/// holds the nearest one twice.
+#[tokio::test]
+async fn a_house_held_twice_leaves_room_for_the_next_house() {
+    let fixture = us_fixture();
+    let here = get(
+        &fixture.router,
+        "/compat/here/v1/revgeocode?at=37.4218,-122.0852&types=address&limit=2",
+    )
+    .await;
+    let numbers = here.body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["address"]["houseNumber"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(numbers, [json!("1600"), json!("1601")], "{}", here.body);
+}
+
 #[tokio::test]
 async fn a_house_held_twice_is_answered_once() {
     let fixture = us_fixture();
