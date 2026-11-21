@@ -1264,7 +1264,14 @@ impl<'a> Run<'a> {
         {
             self.progress.check()?;
             let points = self.label_points(&labels)?;
-            builder.add_cut_relations(&cut, &points, member_line)?;
+            let vertices = |stub: &boundary::BoundaryRelationStub| {
+                stub.members
+                    .iter()
+                    .filter_map(|member| find(member.way_id))
+                    .map(|(_, _, count)| count as usize)
+                    .sum::<usize>()
+            };
+            builder.add_cut_relations(&cut, &points, member_line, batch_vertices, vertices)?;
         }
         self.progress.check()?;
         let mut places = Emitted::default();
@@ -1298,8 +1305,8 @@ impl<'a> Run<'a> {
     }
 
     /// The polygon the inputs were cut to: the one the options name, else
-    /// the box around the bounds every input's header states. None when an
-    /// input states none.
+    /// the box around the bounds each input's header states, one part for
+    /// each input. None when an input states none.
     fn extract_cut(&self) -> Result<Option<Cut>> {
         if let Some(path) = &self.options.cut {
             return Ok(Some(Cut::read_poly(path)?));
@@ -1313,10 +1320,7 @@ impl<'a> Run<'a> {
         else {
             return Ok(None);
         };
-        Ok(bounds
-            .into_iter()
-            .reduce(|[a, b, c, d], [e, f, g, h]| [a.min(e), b.min(f), c.max(g), d.max(h)])
-            .map(Cut::of_bounds))
+        Ok(Some(Cut::of_bounds(bounds)))
     }
 
     /// The point of each place node of `nodes` among the place records.

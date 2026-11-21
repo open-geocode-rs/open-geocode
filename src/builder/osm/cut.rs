@@ -18,29 +18,37 @@ use crate::error::{Error, Result};
 
 use super::boundary::Vertex;
 
-/// The polygon an extract was cut to.
+/// The polygon an extract was cut to, as its separate parts: one box for
+/// each input of a build, or each outer ring of a `.poly` file with its
+/// holes. An area is closed inside the part its `label` lies in: the space
+/// between two parts holds nothing of either.
 #[derive(Debug, Clone)]
 pub(crate) struct Cut {
-    shape: MultiPolygon<f64>,
+    parts: Vec<Polygon<f64>>,
 }
 
 impl Cut {
-    /// The bounds an extract's header states, `[min_lon, min_lat, max_lon,
+    /// The bounds each input's header states, `[min_lon, min_lat, max_lon,
     /// max_lat]`: the box around its polygon, which holds every way the cut
     /// left out of it only where the polygon fills its box.
-    pub(crate) fn of_bounds([min_lon, min_lat, max_lon, max_lat]: [f64; 4]) -> Self {
-        let rect = Rect::new(
-            Coord {
-                x: min_lon,
-                y: min_lat,
-            },
-            Coord {
-                x: max_lon,
-                y: max_lat,
-            },
-        );
+    pub(crate) fn of_bounds(bounds: impl IntoIterator<Item = [f64; 4]>) -> Self {
         Self {
-            shape: MultiPolygon::new(vec![rect.to_polygon()]),
+            parts: bounds
+                .into_iter()
+                .map(|[min_lon, min_lat, max_lon, max_lat]| {
+                    Rect::new(
+                        Coord {
+                            x: min_lon,
+                            y: min_lat,
+                        },
+                        Coord {
+                            x: max_lon,
+                            y: max_lat,
+                        },
+                    )
+                    .to_polygon()
+                })
+                .collect(),
         }
     }
 
@@ -107,9 +115,7 @@ impl Cut {
                 outer.interiors_push(hole);
             }
         }
-        Ok(Self {
-            shape: MultiPolygon::new(outers),
-        })
+        Ok(Self { parts: outers })
     }
 
     /// The part of an area inside the cut, from what the extract holds of
@@ -139,66 +145,135 @@ impl Cut {
         open: &[Vec<Vertex>],
         anchor: [f64; 2],
     ) -> Option<MultiPolygon<f64>> {
-        let anchor = Point::new(anchor[0], anchor[1]);
-        if !self.shape.contains(&anchor) {
-            return None;
-        }
-        let outlines = self.outlines();
-        let mut contours = Vec::with_capacity(rings.len() + open.len());
-        contours.extend(
-            rings
-                .iter()
-                .map(|ring| ring.iter().map(coord).collect::<Vec<_>>()),
-        );
-        for chain in open {
-            let (first, last) = (coord(chain.first()?), coord(chain.last()?));
-            if self.shape.intersects(&Point::from(first))
-                || self.shape.intersects(&Point::from(last))
-            {
-                return None;
-            }
-            let from = nearest_on(&outlines, last)?;
-            let to = nearest_on(&outlines, first)?;
-            if from.ring != to.ring {
-                return None;
-            }
-            let mut contour = chain.iter().map(coord).collect::<Vec<_>>();
-            contour.extend(walk(&outlines[from.ring], from, to));
-            contours.push(contour);
-        }
-        let bounds = self.shape.bounding_rect()?;
-        let mut rings = contours
+        let point = Point::new(anchor[0], anchor[1]);
+        self.parts
             .iter()
-            .map(|contour| clip_to(contour, &bounds))
-            .filter(|ring| ring.len() >= 3)
-            .collect::<Vec<_>>();
-        if !even_odd(&rings, anchor.0) && !open.is_empty() {
-            rings.extend(outlines);
-        }
-        if !even_odd(&rings, anchor.0) {
-            return None;
-        }
-        let area = nested(&rings);
-        (!area.0.is_empty()).then_some(area)
+            .filter(|part| part.contains(&point))
+            .find_map(|part| close_in(part, rings, open, point.0))
     }
+}
 
-    /// Every ring of the cut's outline, each as its points in order, closed.
-    fn outlines(&self) -> Vec<Vec<Coord<f64>>> {
-        self.shape
-            .iter()
-            .flat_map(|polygon| std::iter::once(polygon.exterior()).chain(polygon.interiors()))
-            .map(|ring| {
-                let mut points = ring.0.clone();
-                if points.first() != points.last()
-                    && let Some(first) = points.first().copied()
-                {
-                    points.push(first);
-                }
-                points
-            })
-            .filter(|points| points.len() >= 4)
-            .collect()
+/// [`Cut::close`] inside one part of the cut.
+fn close_in(
+    part: &Polygon<f64>,
+    rings: &[Vec<Vertex>],
+    open: &[Vec<Vertex>],
+    anchor: Coord<f64>,
+) -> Option<MultiPolygon<f64>> {
+    let outlines = outlines(part);
+    let mut contours = rings
+        .iter()
+        .map(|ring| ring.iter().map(coord).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let mut ends = Vec::with_capacity(open.len());
+    for chain in open {
+        let (first, last) = (coord(chain.first()?), coord(chain.last()?));
+        if part.intersects(&Point::from(first)) || part.intersects(&Point::from(last)) {
+            return None;
+        }
+        let (from, to) = (nearest_on(&outlines, first)?, nearest_on(&outlines, last)?);
+        if from.ring != to.ring {
+            return None;
+        }
+        ends.push((from, to));
     }
+    contours.extend(closures(&outlines, open, &ends));
+    let bounds = part.bounding_rect()?;
+    let mut clipped = contours
+        .iter()
+        .map(|contour| clip_to(contour, &bounds))
+        .filter(|ring| ring.len() >= 3)
+        .collect::<Vec<_>>();
+    if !even_odd(&clipped, anchor) {
+        clipped.extend(outlines);
+    }
+    if !even_odd(&clipped, anchor) {
+        return None;
+    }
+    let area = nested(&clipped);
+    (!area.0.is_empty()).then_some(area)
+}
+
+/// The open chains closed into rings along the outline they meet: from
+/// each chain's last end forward along its ring to the next end of any
+/// chain there, then along that chain, until the ring of chains closes.
+/// Each stretch of outline between two ends serves at most one ring, so the
+/// rings never overlap, however the chains lie.
+fn closures(
+    outlines: &[Vec<Coord<f64>>],
+    open: &[Vec<Vertex>],
+    ends: &[(OnOutline, OnOutline)],
+) -> Vec<Vec<Coord<f64>>> {
+    // Every end on the outline, in order along its ring: the chain, and
+    // whether it is the chain's first end.
+    let mut order = ends
+        .iter()
+        .enumerate()
+        .flat_map(|(chain, (from, to))| [(*from, chain, true), (*to, chain, false)])
+        .collect::<Vec<_>>();
+    order.sort_by(|(a, ..), (b, ..)| {
+        (a.ring, a.segment)
+            .cmp(&(b.ring, b.segment))
+            .then(a.along.total_cmp(&b.along))
+    });
+    let next = |at: OnOutline| {
+        order
+            .iter()
+            .filter(|(on, ..)| on.ring == at.ring)
+            .find(|(on, ..)| (on.segment, on.along) > (at.segment, at.along))
+            .or_else(|| order.iter().find(|(on, ..)| on.ring == at.ring))
+            .copied()
+    };
+    let mut used = vec![false; open.len()];
+    let mut contours = Vec::new();
+    for start in 0..open.len() {
+        if used[start] {
+            continue;
+        }
+        let mut contour = Vec::new();
+        let (mut chain, mut forward) = (start, true);
+        loop {
+            used[chain] = true;
+            let points = open[chain].iter().map(coord);
+            let leave = match forward {
+                true => {
+                    contour.extend(points);
+                    ends[chain].1
+                }
+                false => {
+                    contour.extend(points.rev());
+                    ends[chain].0
+                }
+            };
+            let Some((arrive, then, first)) = next(leave) else {
+                break;
+            };
+            contour.extend(walk(&outlines[leave.ring], leave, arrive));
+            if used[then] {
+                break;
+            }
+            (chain, forward) = (then, first);
+        }
+        contours.push(contour);
+    }
+    contours
+}
+
+/// Every ring of `part`'s outline, each as its points in order, closed.
+fn outlines(part: &Polygon<f64>) -> Vec<Vec<Coord<f64>>> {
+    std::iter::once(part.exterior())
+        .chain(part.interiors())
+        .map(|ring| {
+            let mut points = ring.0.clone();
+            if points.first() != points.last()
+                && let Some(first) = points.first().copied()
+            {
+                points.push(first);
+            }
+            points
+        })
+        .filter(|points| points.len() >= 4)
+        .collect()
 }
 
 fn coord(vertex: &Vertex) -> Coord<f64> {
@@ -399,7 +474,7 @@ mod tests {
     /// A unit cut; an area's outline runs in through its top edge, down,
     /// and out through its bottom edge, the area lying to the west.
     fn west_of_a_line() -> (Cut, Vec<Vertex>) {
-        let cut = Cut::of_bounds([0.0, 0.0, 10.0, 10.0]);
+        let cut = Cut::of_bounds([[0.0, 0.0, 10.0, 10.0]]);
         let chain = line(&[(6.0, 12.0), (6.0, 5.0), (4.0, 3.0), (6.0, -2.0)], 1);
         (cut, chain)
     }
@@ -422,7 +497,7 @@ mod tests {
 
     #[test]
     fn an_outline_that_ends_inside_the_cut_is_not_closed() {
-        let cut = Cut::of_bounds([0.0, 0.0, 10.0, 10.0]);
+        let cut = Cut::of_bounds([[0.0, 0.0, 10.0, 10.0]]);
         let chain = line(&[(6.0, 12.0), (6.0, 5.0)], 1);
         assert!(cut.close(&[], &[chain], [1.0, 5.0]).is_none());
     }
@@ -439,8 +514,8 @@ mod tests {
             "illinois\n1\n  0 0\n  10 0\n  10 10\n  0 10\n  0 0\nEND\n!2\n  4 4\n  6 4\n  6 6\n  4 6\nEND\nEND\n",
         )
         .expect("poly");
-        assert!(cut.shape.contains(&Point::new(1.0, 1.0)));
-        assert!(!cut.shape.contains(&Point::new(5.0, 5.0)));
+        assert!(cut.parts[0].contains(&Point::new(1.0, 1.0)));
+        assert!(!cut.parts[0].contains(&Point::new(5.0, 5.0)));
         assert!(Cut::parse_poly("illinois\n1\n  0 x\nEND\nEND\n").is_err());
         assert!(Cut::parse_poly("illinois\nEND\n").is_err());
     }
@@ -459,5 +534,86 @@ mod tests {
         assert!(inside.contains(&Point::new(8.0, 1.0)));
         assert!(!inside.contains(&Point::new(3.0, 3.0)));
         assert!(!inside.contains(&Point::new(3.0, 8.0)));
+    }
+
+    /// A `.poly` cut of two separate parts: an outline the cut broke in one
+    /// says nothing of the other, which no part of the area reaches.
+    #[test]
+    fn a_part_of_the_cut_the_outline_never_reaches_stays_out() {
+        let cut = Cut::parse_poly(
+            "two\n1\n  0 0\n  10 0\n  10 10\n  0 10\nEND\n2\n  20 0\n  30 0\n  30 10\n  20 10\nEND\nEND\n",
+        )
+        .expect("poly");
+        let chain = line(&[(5.0, 12.0), (5.0, 5.0), (5.0, -2.0)], 1);
+        let west = cut.close(&[], &[chain], [2.0, 5.0]).expect("west");
+        assert!(west.contains(&Point::new(2.0, 5.0)));
+        assert!(!west.contains(&Point::new(8.0, 5.0)));
+        assert!(!west.contains(&Point::new(25.0, 5.0)));
+    }
+
+    /// An area all of whose outer ways the cut left out, the cut lying
+    /// inside it, keeps its inner ring: it is the cut less that ring.
+    #[test]
+    fn an_area_round_the_whole_cut_keeps_its_inner_ring() {
+        let cut = Cut::of_bounds([[0.0, 0.0, 10.0, 10.0]]);
+        let inner = line(
+            &[(4.0, 4.0), (6.0, 4.0), (6.0, 6.0), (4.0, 6.0), (4.0, 4.0)],
+            1,
+        );
+        let area = cut.close(&[inner], &[], [2.0, 2.0]).expect("area");
+        assert!(area.contains(&Point::new(2.0, 2.0)));
+        assert!(area.contains(&Point::new(8.0, 8.0)));
+        assert!(!area.contains(&Point::new(5.0, 5.0)));
+    }
+
+    /// Three outlines the cut broke, whose closures along the cut overlap:
+    /// the strips between them alternate in and out.
+    #[test]
+    fn outlines_whose_closures_overlap_keep_their_parity() {
+        let cut = Cut::of_bounds([[0.0, 0.0, 10.0, 10.0]]);
+        let down = |x: f64, id| line(&[(x, 12.0), (x, 5.0), (x, -2.0)], id);
+        let up = |x: f64, id| line(&[(x, -2.0), (x, 5.0), (x, 12.0)], id);
+        let area = cut
+            .close(&[], &[down(3.0, 1), up(8.0, 4), down(9.0, 7)], [1.0, 5.0])
+            .expect("area");
+        assert!(area.contains(&Point::new(1.0, 5.0)));
+        assert!(!area.contains(&Point::new(5.0, 5.0)));
+        assert!(area.contains(&Point::new(8.5, 5.0)));
+        assert!(!area.contains(&Point::new(9.5, 5.0)));
+    }
+
+    /// A `.poly` cut with a hole: the area stops at the hole the extract
+    /// was cut around only as far as its box (see [`Cut::close`]).
+    #[test]
+    fn a_hole_of_the_cut_is_held_only_by_the_box() {
+        let cut = Cut::parse_poly(
+            "holed\n1\n  0 0\n  10 0\n  10 10\n  0 10\nEND\n!2\n  4 4\n  6 4\n  6 6\n  4 6\nEND\nEND\n",
+        )
+        .expect("poly");
+        let chain = line(&[(3.0, 12.0), (3.0, 5.0), (3.0, -2.0)], 1);
+        let east = cut.close(&[], &[chain], [8.0, 5.0]).expect("east");
+        assert!(east.contains(&Point::new(8.0, 5.0)));
+        assert!(!east.contains(&Point::new(1.0, 5.0)));
+        assert!(
+            east.contains(&Point::new(5.0, 5.0)),
+            "the hole, where the extract holds nothing"
+        );
+    }
+
+    /// A build of two extracts far apart: an outline the first one's cut
+    /// broke closes inside that one's box, never across the gap between
+    /// them, which holds nothing of either. One box round both would hold
+    /// the outline's ends and leave the area out.
+    #[test]
+    fn an_outline_closes_inside_the_box_of_its_own_extract() {
+        let (_, chain) = west_of_a_line();
+        let two = Cut::of_bounds([[0.0, 0.0, 10.0, 10.0], [20.0, 20.0, 30.0, 30.0]]);
+        let west = two
+            .close(&[], std::slice::from_ref(&chain), [1.0, 5.0])
+            .expect("west");
+        assert!(west.contains(&Point::new(2.0, 8.0)));
+        assert!(!west.contains(&Point::new(25.0, 25.0)));
+        let one = Cut::of_bounds([[0.0, 0.0, 30.0, 30.0]]);
+        assert!(one.close(&[], &[chain], [1.0, 5.0]).is_none());
     }
 }

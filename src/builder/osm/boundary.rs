@@ -295,26 +295,42 @@ impl BoundaryBuilder {
     /// The part inside `cut` of each area the input left some of the ways
     /// of out, whose `label` node lies in `labels`, a point by node id (see
     /// [`boundary_from_cut_relation`]). The rest stay left out.
+    /// They are built a batch at a time, each batch's vertices `batch_vertices`
+    /// at most as `vertices` counts a relation's, and written before the
+    /// next, as [`Self::add_relations`] is fed.
     pub(crate) fn add_cut_relations(
         &mut self,
         cut: &Cut,
         labels: &HashMap<i64, [f64; 2]>,
         member_line: impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>> + Sync,
+        batch_vertices: usize,
+        vertices: impl Fn(&BoundaryRelationStub) -> usize,
     ) -> crate::error::Result<()> {
         let stubs = std::mem::take(&mut self.cut);
-        let drafts = stubs
-            .par_iter()
-            .map(|stub| {
-                let Some(anchor) = stub.label.and_then(|label| labels.get(&label)) else {
-                    return Ok(None);
-                };
-                Ok(
-                    boundary_from_cut_relation(stub, &member_line, cut, *anchor)?
-                        .map(|built| Draft::of_relation(stub, built)),
-                )
-            })
-            .collect::<crate::error::Result<Vec<_>>>()?;
-        self.write(drafts.into_iter().flatten().collect())
+        let mut start = 0;
+        let mut held = 0;
+        for (at, stub) in stubs.iter().enumerate() {
+            held += vertices(stub);
+            if held < batch_vertices && at + 1 < stubs.len() {
+                continue;
+            }
+            let drafts = stubs[start..=at]
+                .par_iter()
+                .map(|stub| {
+                    let Some(anchor) = stub.label.and_then(|label| labels.get(&label)) else {
+                        return Ok(None);
+                    };
+                    Ok(
+                        boundary_from_cut_relation(stub, &member_line, cut, *anchor)?
+                            .map(|built| Draft::of_relation(stub, built)),
+                    )
+                })
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            self.write(drafts.into_iter().flatten().collect())?;
+            start = at + 1;
+            held = 0;
+        }
+        Ok(())
     }
 
     fn write(&mut self, drafts: Vec<Draft>) -> crate::error::Result<()> {
