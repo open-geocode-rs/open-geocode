@@ -759,38 +759,15 @@ fn page(items: Vec<Item>, offset: Option<usize>, limit: usize, query_terms: bool
 }
 
 /// How many results og is asked for. That is a page past `offset`, and one
-/// more to tell whether another page follows.
+/// more to tell whether another page follows, up to the most og gives to one
+/// query. A page past those is cut short or empty, as HERE answers a page
+/// past the results it has.
 fn fetch(offset: Option<usize>, limit: usize, max: usize) -> usize {
     match offset {
         Some(offset) => offset + limit + 1,
         None => limit,
     }
     .min(max)
-}
-
-/// A page past `offset` that og can answer: og gives at most `max` results
-/// to one query, so a page reaching past them is refused, not cut short.
-fn within(
-    offset: Option<usize>,
-    limit: usize,
-    max: usize,
-    params: &Params,
-) -> Result<(), Gs7Error> {
-    let end = offset.unwrap_or(0) + limit;
-    if end <= max {
-        return Ok(());
-    }
-    let (param, value) = match offset {
-        Some(offset) => ("offset", offset.to_string()),
-        None => ("limit", params.get("limit").unwrap_or_default().to_string()),
-    };
-    Err(Gs7Error::illegal(
-        param,
-        &value,
-        format!(
-            "This server answers at most {max} results to one query, so 'offset' plus 'limit' must be at most {max}"
-        ),
-    ))
 }
 
 /// `route`, a polyline to search along, sent in the query string. og
@@ -841,7 +818,6 @@ pub(super) async fn autosuggest(
         let near = Near::read(&params, true)?;
         let limit = params.limit(20, 100)?;
         let offset = params.int("offset", 0, 99)?;
-        within(offset, limit, MAX_AUTOCOMPLETE_LIMIT, &params)?;
         if q.trim().is_empty() {
             return Ok(page(Vec::new(), offset, limit, true));
         }
@@ -931,7 +907,6 @@ pub(super) async fn discover(
         let near = Near::read(&params, true)?;
         let limit = params.limit(20, 100)?;
         let offset = params.int("offset", 0, 99)?;
-        within(offset, limit, MAX_SEARCH_LIMIT, &params)?;
         if q.trim().is_empty() {
             return Ok(page(Vec::new(), offset, limit, false));
         }
@@ -982,24 +957,16 @@ pub(super) async fn browse(
         let area = params.get("in").map(Area::parse).transpose()?;
         let limit = params.limit(20, 100)?;
         let offset = params.int("offset", 0, 99)?;
-        within(offset, limit, MAX_SEARCH_LIMIT, &params)?;
         let filter = Filter::parse(params.get("categories"))?;
         let name = params.get("name").and_then(search_key);
-        // og's places carry no HERE chain or food type. Leaving one out
-        // keeps every place; asking for one cannot be honoured, and an empty
-        // answer would read as none there.
-        for list in ["chains", "foodTypes"] {
-            if let Some(value) = params.get(list)
-                && !Listed::parse(Some(value)).included.is_empty()
-            {
-                return Err(Gs7Error::illegal(
-                    list,
-                    value,
-                    format!(
-                        "This server holds no '{list}' for places; filter by 'categories' or 'name'"
-                    ),
-                ));
-            }
+        // og's places carry no HERE chain or food type, so a list that keeps
+        // only places of some keeps none og holds. One that only excludes
+        // keeps them all.
+        let keeps_unheld = ["chains", "foodTypes"]
+            .iter()
+            .any(|list| !Listed::parse(params.get(list)).included.is_empty());
+        if keeps_unheld {
+            return Ok(page(Vec::new(), offset, limit, false));
         }
         let categories = filter.og_categories();
         if categories.is_empty() {

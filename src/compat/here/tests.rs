@@ -852,28 +852,14 @@ async fn autosuggest_autocomplete_and_discover() {
     let reply = get(&router, "/compat/here/v1/autosuggest?q=+&at=43,-79").await;
     assert_eq!(reply.json(), json!({"items": [], "queryTerms": []}));
 
-    // A page past what og answers, and a route to search along, are refused.
-    for (uri, param) in [
-        (
-            "/compat/here/v1/autosuggest?q=Queen&at=43,-79&limit=21",
-            "limit",
-        ),
-        (
-            "/compat/here/v1/autosuggest?q=Queen&at=43,-79&limit=10&offset=15",
-            "offset",
-        ),
-        (
-            "/compat/here/v1/discover?q=Queen&at=43,-79&limit=51",
-            "limit",
-        ),
+    // A page reaching past what og answers is cut short, not refused.
+    for uri in [
+        "/compat/here/v1/autosuggest?q=Queen&at=43,-79&limit=21",
+        "/compat/here/v1/autosuggest?q=Queen&at=43,-79&limit=10&offset=15",
+        "/compat/here/v1/discover?q=Queen&at=43,-79&limit=51",
     ] {
         let reply = get(&router, uri).await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
-        assert_eq!(
-            reply.json()["title"],
-            format!("Illegal input for parameter '{param}'"),
-            "{uri}"
-        );
+        assert_eq!(reply.status, StatusCode::OK, "{uri}");
     }
     for path in ["discover", "autosuggest"] {
         let uri = format!("/compat/here/v1/{path}?q=Queen&at=43,-79");
@@ -962,14 +948,24 @@ async fn browse_answers_the_places_around_a_point_by_kind_and_name() {
         assert_eq!(reply.status, StatusCode::OK, "{query}");
         assert_eq!(reply.json(), json!({"items": []}), "{query}");
     }
-    // What og cannot honour is refused, never answered as nothing there: a
-    // chain or food type asked for, a page past og's 50 results, a route.
-    for (query, param) in [
-        ("at=43,-79&chains=1566", "chains"),
-        ("at=43,-79&foodTypes=800-067", "foodTypes"),
-        ("at=43,-79&limit=100", "limit"),
-        ("at=43,-79&limit=20&offset=40", "offset"),
+    // og's places carry no chain or food type, so asking for one keeps none,
+    // and a page past og's 50 results is cut short.
+    for query in [
+        "at=43,-79&chains=1566",
+        "at=43,-79&foodTypes=800-067",
+        "at=43,-79&limit=20&offset=40",
     ] {
+        let reply = get(&router, &format!("{base}?{query}")).await;
+        assert_eq!(reply.status, StatusCode::OK, "{query}");
+        assert!(
+            reply.json()["items"].as_array().is_some_and(Vec::is_empty),
+            "{query}"
+        );
+    }
+    let reply = get(&router, &format!("{base}?at=43,-79&limit=100")).await;
+    assert_eq!(reply.json(), found);
+    // A route og cannot search along is refused.
+    for (query, param) in [("at=43,-79&route=BFoz5xJ67i1B1B7PzIhaxL7Y", "route")] {
         let reply = get(&router, &format!("{base}?{query}")).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{query}");
         assert_eq!(
