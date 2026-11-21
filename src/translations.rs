@@ -16,10 +16,9 @@
 //!
 //! ```text
 //! names/lang  languages varint | per language, ascending by tag:
-//!               tag varint-length text | 3 offsets u64 | 3 lengths u64;
-//!               each block's offsets and lengths are three interleaved
-//!               (offset, length) pairs, every value a varint; offsets count
-//!               from the first block
+//!               tag varint-length text | ids (offset, length) |
+//!               street text (offset, length) | street verts (offset, length),
+//!               every value a varint; offsets count from the first block
 //! ids         entries u64 | 2 * entries + 1 offsets u32 | heap,
 //!             texts alternating key "node|way|relation:id" and name
 //! street text entries u64 | 2 * entries + 1 offsets u32 | heap, texts
