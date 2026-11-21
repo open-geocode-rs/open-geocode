@@ -265,6 +265,7 @@ mod tests {
 
     fn pending(id: i64, number: &str, street: &str, lat: f64) -> PendingAddress {
         let record = AddressRecord {
+            building: None,
             access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),

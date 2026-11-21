@@ -2817,6 +2817,7 @@ mod tests {
 
     fn address(street: Option<&str>, areas: &[&str]) -> Record {
         Record::Address(crate::record::AddressRecord {
+            building: None,
             access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),

@@ -1888,6 +1888,7 @@ pub(crate) mod router_tests {
         writer
             .write(
                 &AddressRecord {
+                    building: None,
                     access: Vec::new(),
                     disputed: false,
                     street_postcodes: Vec::new(),
@@ -2687,6 +2688,7 @@ pub(crate) mod router_tests {
             .into(),
             poi(2, ObjectType::Node, "Lantern Cafe", -79.1, None).into(),
             AddressRecord {
+                building: None,
                 access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
@@ -2862,6 +2864,7 @@ pub(crate) mod router_tests {
         };
         let house = |id: i64, street: &str, lon: f64| -> Record {
             AddressRecord {
+                building: None,
                 access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
@@ -3161,6 +3164,7 @@ pub(crate) mod router_tests {
         };
         let house = |id: i64, street: &str, lon: f64, access| -> Record {
             AddressRecord {
+                building: None,
                 access,
                 disputed: false,
                 street_postcodes: Vec::new(),
@@ -3491,6 +3495,7 @@ pub(crate) mod router_tests {
                      country: Option<&str>|
          -> Record {
             AddressRecord {
+                building: None,
                 access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
@@ -3745,6 +3750,7 @@ pub(crate) mod router_tests {
         };
         let house = |id: i64, address: AddressComponents, lon: f64| -> Record {
             AddressRecord {
+                building: None,
                 access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
@@ -4084,6 +4090,7 @@ pub(crate) mod router_tests {
             country: None,
         };
         let house = AddressRecord {
+            building: None,
             access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
@@ -4108,6 +4115,7 @@ pub(crate) mod router_tests {
         };
         // A house whose street the source writes abbreviated.
         let abbreviated = AddressRecord {
+            building: None,
             address: AddressComponents {
                 number: "12".to_string(),
                 street: Some("Queen St W".to_string()),
@@ -4134,6 +4142,7 @@ pub(crate) mod router_tests {
         // Three houses about 8 m apart along one street.
         for (id, number, lon) in [(1, "10", -79.0), (2, "12", -79.0001), (3, "14", -79.0002)] {
             let house = AddressRecord {
+                building: None,
                 access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),

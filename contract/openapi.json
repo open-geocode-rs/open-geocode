@@ -145,6 +145,17 @@
         ],
         "type": "object"
       },
+      "Building": {
+        "description": "The building an address is drawn as, when its source maps it as one.",
+        "properties": {
+          "name": {
+            "description": "Its name, as its `name` tag writes it.",
+            "example": "Google Building 41",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "Common": {
         "description": "Properties shared by forward and reverse results.",
         "properties": {
@@ -198,6 +209,10 @@
           "brand": {
             "$ref": "#/components/schemas/Brand",
             "description": "The chain a place belongs to, when its name may not say: \"Tankstation\nZanoli\" is an Esso. Present only on places."
+          },
+          "building": {
+            "$ref": "#/components/schemas/Building",
+            "description": "The building an address's source draws it as, and its name when it\nhas one. Absent on an address mapped as a point on no building, and\non every other result."
           },
           "category": {
             "description": "POI category, such as `amenity:cafe`. Present only on POIs.",

@@ -630,6 +630,7 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
     // house only a POI states.
     if let Some(address) = &address {
         let record = AddressRecord {
+            building: super::address::building_of(tags),
             disputed: false,
             street_postcodes: Vec::new(),
             address: address.clone(),

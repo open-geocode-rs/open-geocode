@@ -395,6 +395,7 @@ mod tests {
                     },
                 ),
                 _ => AddressRecord {
+                    building: None,
                     access: Vec::new(),
                     disputed: false,
                     street_postcodes: Vec::new(),

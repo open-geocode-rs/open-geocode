@@ -64,6 +64,11 @@ struct Properties {
     distance_m: Option<f64>,
     #[serde(default)]
     highlights: Vec<Highlight>,
+    /// The building the address's source draws it as.
+    building: Option<crate::record::Building>,
+    /// The kind of entrance the result's own point is, when it is one of
+    /// its entrances (`main`).
+    door: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -183,6 +188,15 @@ impl Feature {
                 matched: None,
                 distance_m: None,
                 highlights: Vec::new(),
+                building: common.building.clone(),
+                door: common
+                    .access
+                    .iter()
+                    .find(|access| {
+                        (access.lon - coordinates[0]).abs() < 1e-7
+                            && (access.lat - coordinates[1]).abs() < 1e-7
+                    })
+                    .map(|access| access.kind.clone()),
             },
         }
     }
@@ -313,6 +327,8 @@ pub(super) struct LocationExplanation {
     pub(super) kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) designation: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) description: Option<&'static str>,
     pub(super) additional_metadata: BTreeMap<&'static str, String>,
 }
 
@@ -761,6 +777,7 @@ impl Feature {
                 explanation: LocationExplanation {
                     kind: location_type(layer, accuracy),
                     designation: (properties.accuracy == Accuracy::Centroid).then_some("CENTROID"),
+                    description: location_description(properties),
                     additional_metadata: BTreeMap::from([(
                         "SOURCE",
                         properties.source.dataset.clone(),
@@ -1178,6 +1195,24 @@ fn location_type(layer: &str, accuracy: &str) -> Option<&'static str> {
         ("country", _) => "COUNTRY",
         _ => return None,
     })
+}
+
+/// Precisely's `LocationDescription`, what an address's point stands on. A
+/// point that is one of the address's own entrances is a door, the front
+/// one for OSM's main entrance and the back one for its service entrance.
+/// Any other point of an address its source draws as a building is the
+/// building.
+fn location_description(properties: &Properties) -> Option<&'static str> {
+    if properties.layer != Layer::Address {
+        return None;
+    }
+    match (properties.door.as_deref(), &properties.building) {
+        (Some("main"), _) => Some("FRONT_DOOR"),
+        (Some("service"), _) => Some("BACK_DOOR"),
+        (Some(_), _) => Some("ENTRANCE"),
+        (None, Some(_)) => Some("BUILDING"),
+        (None, None) => None,
+    }
 }
 
 /// Precisely's `MatchType`, what kind of thing matched. An area, og's

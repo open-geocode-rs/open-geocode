@@ -12,8 +12,8 @@ use crate::{
     extsort::Spill,
     parse::lattice::CountryCode,
     record::{
-        AddressComponents, AddressRecord, Brand, Contact, DerivedSourceProvenance, Entrance,
-        InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
+        AddressComponents, AddressRecord, Brand, Building, Contact, DerivedSourceProvenance,
+        Entrance, InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
         LocationPrecision, ObjectType, PlaceRecord, PoiDetails, PoiRecord, PostcodeRecord,
         Prominence, Record, RoadClass, SourceProvenance, StreetRecord, point_geometry,
     },
@@ -200,6 +200,8 @@ pub(crate) struct PendingAddress {
     /// The entrances its source maps. A boxed slice, as few have any and
     /// every pending address is as wide as this makes it.
     pub access: Box<[Entrance]>,
+    /// The building its source draws it as, boxed for the same reason.
+    pub building: Option<Box<Building>>,
 }
 
 /// The components a street order key holds, borrowed from it.
@@ -283,6 +285,12 @@ impl<'a> Fields<'a> {
 /// Bit of a pending address's kind byte. When set, its entrances follow
 /// its point.
 const PENDING_ACCESS: u8 = 8;
+/// Bit of a pending address's kind byte. When set, its source draws it as
+/// a building.
+const PENDING_BUILDING: u8 = 16;
+/// Bit of a pending address's kind byte. When set, its building's name
+/// follows its entrances.
+const PENDING_BUILDING_NAME: u8 = 32;
 
 impl PendingAddress {
     pub(super) fn new(record: &AddressRecord, seq: u64, dataset: u32) -> Result<Self> {
@@ -301,6 +309,7 @@ impl PendingAddress {
             source,
             seq,
             record.access.clone().into(),
+            record.building.clone().map(Box::new),
         ))
     }
 
@@ -311,6 +320,7 @@ impl PendingAddress {
         source: Source,
         seq: u64,
         access: Box<[Entrance]>,
+        building: Option<Box<Building>>,
     ) -> Self {
         let [lon, lat] = point;
         let mut order = Vec::new();
@@ -357,6 +367,7 @@ impl PendingAddress {
             precision,
             source,
             access,
+            building,
         }
     }
 
@@ -376,6 +387,7 @@ impl PendingAddress {
             self.source,
             self.seq,
             self.access.clone(),
+            self.building.clone(),
         )
     }
 
@@ -396,6 +408,7 @@ impl PendingAddress {
             location_precision: self.precision,
             disputed: false,
             access: self.access.to_vec(),
+            building: self.building.as_deref().cloned(),
             source: datasets.provenance(self.source)?,
             geometry: point_geometry(self.point[0], self.point[1]),
         })
@@ -494,7 +507,12 @@ impl PendingAddress {
         } else {
             PENDING_ACCESS
         };
-        out.push(kind | precision | access);
+        let building = match self.building.as_deref() {
+            None => 0,
+            Some(Building { name: None }) => PENDING_BUILDING,
+            Some(Building { name: Some(_) }) => PENDING_BUILDING | PENDING_BUILDING_NAME,
+        };
+        out.push(kind | precision | access | building);
         put_i64(out, self.source.object_id);
         if self.source.object_type == ObjectType::Row {
             put_u64(out, u64::from(self.source.dataset));
@@ -502,6 +520,13 @@ impl PendingAddress {
         encode_compact_point(out, self.point);
         if !self.access.is_empty() {
             put_entrances(out, &self.access);
+        }
+        if let Some(name) = self
+            .building
+            .as_deref()
+            .and_then(|building| building.name.as_deref())
+        {
+            put_str(out, name);
         }
     }
 
@@ -560,6 +585,13 @@ impl PendingAddress {
                 Box::default()
             } else {
                 get_entrances(input)?.into()
+            },
+            building: match (kind & PENDING_BUILDING, kind & PENDING_BUILDING_NAME) {
+                (0, _) => None,
+                (_, 0) => Some(Box::default()),
+                _ => Some(Box::new(Building {
+                    name: Some(get_string(input)?),
+                })),
             },
         })
     }
@@ -1946,6 +1978,7 @@ mod tests {
                 let lat = 34.0 + (street_id / 1000) as f64 * 0.001 + (random % 1000) as f64 * 1e-7;
                 let parse = |value: f64| format!("{value:.7}").parse::<f64>().expect("number");
                 AddressRecord {
+                    building: None,
                     access: Vec::new(),
                     disputed: false,
                     street_postcodes: Vec::new(),
@@ -1985,6 +2018,7 @@ mod tests {
         source: SourceProvenance,
     ) -> AddressRecord {
         AddressRecord {
+            building: None,
             access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),

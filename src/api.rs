@@ -263,6 +263,11 @@ pub struct Common {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schema(example = json!(["pizza", "italian"]))]
     pub cuisine: Vec<String>,
+    /// The building an address's source draws it as, and its name when it
+    /// has one. Absent on an address mapped as a point on no building, and
+    /// on every other result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub building: Option<crate::record::Building>,
     /// For an address that states no postcode, the one postcode the other
     /// addresses of its street state, when they all state the same one. It
     /// is where the address most likely lies, and `address.postcode` stays
@@ -1384,6 +1389,7 @@ fn common(
         timezone: summary.timezone,
         cuisine: summary.cuisine,
         street_postcode: summary.street_postcode,
+        building: summary.building,
         access: summary.access,
         address_lines: crate::address_lines::address_lines(layer, &address, &context),
         address,
@@ -1630,6 +1636,7 @@ mod tests {
         writer
             .write(
                 &AddressRecord {
+                    building: None,
                     access: Vec::new(),
                     disputed: false,
                     street_postcodes: Vec::new(),

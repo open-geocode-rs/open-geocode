@@ -1233,6 +1233,7 @@ mod tests {
 
     fn address(lon: f64, lat: f64, object_id: i64) -> Record {
         Record::Address(AddressRecord {
+            building: None,
             access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),

@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::{
     builder::report::CandidateIssue,
     record::{
-        AddressComponents, AddressRecord, Entrance, LocationPrecision, ObjectType, Record,
-        SourceProvenance, point_geometry,
+        AddressComponents, AddressRecord, Building, Entrance, LocationPrecision, ObjectType,
+        Record, SourceProvenance, point_geometry,
     },
     util::text::collapse_whitespace,
 };
@@ -46,6 +46,7 @@ pub(crate) fn address_record_from_candidate(
     candidate: &AddressCandidate,
 ) -> std::result::Result<AddressRecord, CandidateIssue> {
     Ok(AddressRecord {
+        building: building_of(&candidate.tags),
         disputed: false,
         street_postcodes: Vec::new(),
         access: candidate.entrances.clone(),
@@ -126,13 +127,34 @@ pub(crate) fn collect_clean_tags<'a>(
     .collect()
 }
 
+/// An object's `addr:*` tags, and, when it states an address and is a
+/// building, its `building` and `name` tags, which say the building the
+/// address is drawn as.
 pub(crate) fn collect_addr_tags_from_map(
     tags: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
-    tags.iter()
+    let mut kept = tags
+        .iter()
         .filter(|(key, _)| key.starts_with("addr:"))
         .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
+        .collect::<BTreeMap<_, _>>();
+    if !kept.is_empty() && building_of(tags).is_some() {
+        for key in ["building", "name"] {
+            if let Some(value) = tags.get(key) {
+                kept.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    kept
+}
+
+/// The building an object's tags draw it as: a `building` tag other than
+/// `no`, named by its `name` tag.
+pub(crate) fn building_of(tags: &BTreeMap<String, String>) -> Option<Building> {
+    tags.cleaned("building").filter(|value| value != "no")?;
+    Some(Building {
+        name: tags.cleaned("name"),
+    })
 }
 
 pub(crate) fn validate_address_tags(
@@ -144,6 +166,49 @@ pub(crate) fn validate_address_tags(
 #[cfg(test)]
 mod tests {
     use geojson::GeometryValue;
+
+    #[test]
+    fn an_addressed_building_says_it_is_one_and_its_name() {
+        let kept = |pairs: &[(&str, &str)]| {
+            collect_addr_tags_from_map(
+                &pairs
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            )
+        };
+        let building = |pairs: &[(&str, &str)]| building_of(&kept(pairs));
+        let address = [
+            ("addr:housenumber", "1600"),
+            ("addr:street", "Amphitheatre Parkway"),
+        ];
+        let with = |more: &[(&'static str, &'static str)]| {
+            address.iter().chain(more).copied().collect::<Vec<_>>()
+        };
+        assert_eq!(
+            building(&with(&[
+                ("building", "commercial"),
+                ("name", "Google Building 41")
+            ])),
+            Some(Building {
+                name: Some("Google Building 41".into())
+            })
+        );
+        assert_eq!(
+            building(&with(&[("building", "yes")])),
+            Some(Building::default())
+        );
+        assert_eq!(
+            building(&with(&[("building", "no"), ("name", "Shed")])),
+            None
+        );
+        assert_eq!(
+            building(&with(&[("name", "Googleplex"), ("office", "it")])),
+            None
+        );
+        // A named building that states no address is no address.
+        assert!(kept(&[("building", "yes"), ("name", "Hall")]).is_empty());
+    }
 
     use super::*;
 

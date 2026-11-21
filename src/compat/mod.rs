@@ -1279,6 +1279,14 @@ mod tests {
             .collect(),
         );
         writer.set_default_languages([(country, "en".to_string())].into_iter().collect());
+        writer.set_country_codes(
+            [(
+                country,
+                crate::parse::lattice::CountryCode::parse("US").expect("code"),
+            )]
+            .into_iter()
+            .collect(),
+        );
         writer.set_plate_codes([(county, "SIM".to_string())].into_iter().collect());
         let context = Some(RecordContext {
             admin_context: crate::context::AdminContextTuple::from_tiers([
@@ -1291,6 +1299,9 @@ mod tests {
             zone: None,
         });
         let house = AddressRecord {
+            building: Some(crate::record::Building {
+                name: Some("Google Building 41".to_string()),
+            }),
             access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
@@ -1309,7 +1320,27 @@ mod tests {
             location_precision: LocationPrecision::Point,
             source: SourceProvenance::osm(ObjectType::Node, 10),
         };
-        writer.write(&house.into(), context).expect("house");
+        writer
+            .write(&house.clone().into(), context.clone())
+            .expect("house");
+        // A house whose address point is its main entrance.
+        let door = crate::record::Entrance::of_tag(Some("main"), -122.09, 37.43)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let front = AddressRecord {
+            building: None,
+            access: door,
+            address: AddressComponents {
+                number: "7".to_string(),
+                street: Some("Door Street".to_string()),
+                ..house.address.clone()
+            },
+            geometry: point_geometry(-122.09, 37.43),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, 11),
+            ..house
+        };
+        writer.write(&front.into(), context).expect("front door");
         writer.finish().expect("finish");
     }
 
@@ -1350,6 +1381,72 @@ mod tests {
         assert_eq!(route["languageCode"], "en", "{google}");
         let here = get("/compat/here/v1/geocode?q=1600%20Amphitheatre%20Parkway").await;
         assert_eq!(here["items"][0]["address"]["countyCode"], "SIM", "{here}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// An address drawn as a named building names it as Google's premise,
+    /// and Precisely says its point stands on the building, or on a door
+    /// when the point is the address's own main entrance.
+    #[tokio::test]
+    async fn a_building_is_the_premise_and_a_door_is_a_door() {
+        use crate::runtime::router_tests::{state_for, temp_path};
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let pack = temp_path("vendor-premise");
+        write_defaults_pack(&pack);
+        let router = runtime::build_router(state_for(&pack, true), None, None);
+        let call = |request: axum::http::Request<Body>| {
+            let router = router.clone();
+            async move {
+                let reply = router.oneshot(request).await.expect("reply");
+                let bytes = axum::body::to_bytes(reply.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                serde_json::from_slice::<Value>(&bytes).expect("json")
+            }
+        };
+        let get = |uri: &str| {
+            axum::http::Request::get(uri)
+                .body(Body::empty())
+                .expect("request")
+        };
+        let google = call(get(
+            "/compat/google/v4/geocode/address?addressQuery=1600%20Amphitheatre%20Parkway",
+        ))
+        .await;
+        let first = &google["results"][0]["addressComponents"][0];
+        assert_eq!(
+            (
+                &first["longText"],
+                &first["types"][0],
+                &first["languageCode"]
+            ),
+            (
+                &serde_json::json!("Google Building 41"),
+                &serde_json::json!("premise"),
+                &serde_json::json!("en")
+            ),
+            "{google}"
+        );
+        let precisely = |line: &str| {
+            let body =
+                serde_json::json!({"addresses": [{"addressLines": [line], "country": "USA"}]});
+            axum::http::Request::post("/compat/precisely/v1/geocode")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request")
+        };
+        for (line, description) in [
+            ("1600 Amphitheatre Parkway", "BUILDING"),
+            ("7 Door Street", "FRONT_DOOR"),
+        ] {
+            let answer = call(precisely(line)).await;
+            assert_eq!(
+                answer["responses"][0]["results"][0]["location"]["explanation"]["description"],
+                description,
+                "{answer}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&pack);
     }
 

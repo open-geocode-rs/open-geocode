@@ -151,6 +151,7 @@ pub(super) fn pack(name: &str) -> TestPack {
     };
     let address = |address: AddressComponents, lon, id, access| {
         Record::from(AddressRecord {
+            building: None,
             access,
             disputed: false,
             street_postcodes: Vec::new(),

@@ -132,6 +132,7 @@ fn write_pack(dir: &Path) {
     writer
         .write(
             &AddressRecord {
+                building: None,
                 access: vec![
                     Entrance {
                         at: [-790_001_000, 430_001_000],
@@ -2038,6 +2039,7 @@ fn us_fixture() -> Fixture {
     writer
         .write(
             &AddressRecord {
+                building: None,
                 access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
@@ -2055,6 +2057,7 @@ fn us_fixture() -> Fixture {
     writer
         .write(
             &AddressRecord {
+                building: None,
                 access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
@@ -2071,6 +2074,7 @@ fn us_fixture() -> Fixture {
     writer
         .write(
             &AddressRecord {
+                building: None,
                 access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),

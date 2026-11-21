@@ -7479,6 +7479,7 @@ impl TextSearcher {
                 timezone: None,
                 street_postcode: None,
                 access: Vec::new(),
+                building: None,
                 point: Some(Point {
                     lon,
                     lat,
@@ -12866,6 +12867,7 @@ mod tests {
             timezone: None,
             street_postcode: None,
             access: Vec::new(),
+            building: None,
             point: None,
             source: Source {
                 dataset: "osm".to_string(),
@@ -18137,6 +18139,7 @@ mod tests {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(1);
         AddressRecord {
+            building: None,
             access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),

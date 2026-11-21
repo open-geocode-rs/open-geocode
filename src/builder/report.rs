@@ -2029,6 +2029,7 @@ mod tests {
     ) -> AddressRecord {
         let street = street.map(str::to_string);
         AddressRecord {
+            building: None,
             access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),

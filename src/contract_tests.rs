@@ -969,6 +969,7 @@ fn write_pack(dir: &PathBuf) {
     writer
         .write(
             &AddressRecord {
+                building: None,
                 access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
@@ -1163,6 +1164,7 @@ fn write_geneva_pack(dir: &PathBuf) {
     writer
         .write(
             &AddressRecord {
+                building: None,
                 access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),

@@ -17,9 +17,20 @@ pub enum Record {
     Poi(PoiRecord),
 }
 
+/// The building an address is drawn as, when its source maps it as one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct Building {
+    /// Its name, as its `name` tag writes it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[schema(example = "Google Building 41")]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AddressRecord {
     pub address: AddressComponents,
+    /// The building its source draws it as, if it does (see [`Building`]).
+    pub building: Option<Building>,
     /// For an address that states no postcode, the postcodes the other
     /// addresses of its street state: the evidence of where it is. Empty when
     /// it states one, or its street's addresses state none.

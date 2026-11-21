@@ -531,6 +531,7 @@ fn address(
         return Err("bad_coordinates");
     }
     Ok(AddressRecord {
+        building: None,
         access: Vec::new(),
         disputed: false,
         street_postcodes: Vec::new(),

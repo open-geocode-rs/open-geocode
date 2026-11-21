@@ -603,13 +603,26 @@ fn address_components(common: &Common, language: &Language) -> Vec<AddressCompon
         ..component(text, types)
     };
     let mut components = Vec::new();
-    let mut push = |text: Option<&str>, types: &[&'static str]| {
-        if let Some(text) = text.filter(|text| !text.is_empty()) {
-            components.push(component(text, types));
-        }
+    let plain = |text: Option<&str>, types: &[&'static str]| {
+        text.filter(|text| !text.is_empty())
+            .map(|text| component(text, types))
     };
-    push(address.unit.as_deref(), &["subpremise"]);
-    push(address.housenumber.as_deref(), &["street_number"]);
+    // The unit, then the building the address is drawn as, by its name,
+    // then the house number.
+    let premise = common
+        .building
+        .as_ref()
+        .and_then(|building| building.name.as_deref())
+        .map(|name| named(name, &["premise"]));
+    components.extend(
+        [
+            plain(address.unit.as_deref(), &["subpremise"]),
+            premise,
+            plain(address.housenumber.as_deref(), &["street_number"]),
+        ]
+        .into_iter()
+        .flatten(),
+    );
     if let Some(street) = address.street.as_deref().filter(|text| !text.is_empty()) {
         components.push(AddressComponent {
             short_text: is_us(common)

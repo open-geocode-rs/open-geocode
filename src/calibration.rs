@@ -511,6 +511,7 @@ mod tests {
 
     fn row() -> AddressRecord {
         AddressRecord {
+            building: None,
             access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),

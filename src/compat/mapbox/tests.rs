@@ -170,6 +170,7 @@ fn write_pack() -> Pack {
     writer
         .write(
             &AddressRecord {
+                building: None,
                 access: vec![Entrance {
                     at: [-790_001_000, 430_001_000],
                     kind: "main".to_string(),
