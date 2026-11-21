@@ -433,10 +433,26 @@ fn run(
     cancel: &Arc<AtomicBool>,
 ) -> Result<Built> {
     let mut offset = 0;
+    let mut index = None;
     // Each input that needs its extract is downloaded and checked before any
     // of them is built, so a build never starts on a set it cannot finish.
     for input in request.inputs.iter().filter(|input| input.download) {
-        let url = &input.region.osm.url;
+        // Geofabrik's index says where the extract is now. The catalog's own
+        // link is only for what the index does not hold, the planet.
+        let url = match &input.region.osm.id {
+            Some(id) => {
+                if index.is_none() {
+                    index = Some(net::Index::fetch(net::GEOFABRIK_INDEX)?);
+                }
+                index
+                    .as_ref()
+                    .context("the index was not read")?
+                    .link(id)?
+                    .to_string()
+            }
+            None => input.region.osm.url.clone(),
+        };
+        let url = &url;
         let (download_step, check_step) = (offset, offset + 1);
         progress.start(download_step, Some(input.region.osm.bytes));
         let published = net::published(url)?;

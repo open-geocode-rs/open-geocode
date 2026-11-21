@@ -1,0 +1,99 @@
+name: End to end
+
+# The README path on real data, every night. Install og, download a region
+# from the catalog, build its Pack, serve it and ask it. Ashmore and Cartier
+# Islands is 22 KB, and it sits in a nested Geofabrik folder, the layout a
+# moved link breaks. og checks every download against the .md5 Geofabrik
+# publishes beside it, so a wrong file fails here too.
+on:
+  schedule:
+    - cron: "7 9 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/e2e.yml
+      - src/bin/og/net.rs
+      - src/bin/og/job.rs
+      - src/bin/og/regions.rs
+
+permissions:
+  contents: read
+
+env:
+  REGION: australia/ashmore-cartier
+  PACK: australia-ashmore-cartier
+  QUERY: Ashmore and Cartier Islands
+  ADDRESS: 127.0.0.1:8080
+  GEOFABRIK_INDEX: https://download.geofabrik.de/index-v1-nogeom.json
+  REPORTING_ISSUE: ${{ vars.REPORTING_ISSUE }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  e2e:
+    name: End to end
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+
+      - name: Install og
+        run: cargo install --path . --features tui --bin og
+
+      - name: Build a Pack
+        run: |
+          echo "OG_HOME=$RUNNER_TEMP/og" >> "$GITHUB_ENV"
+          OG_HOME="$RUNNER_TEMP/og" og build --region "$REGION"
+
+      - name: Serve it and ask it
+        run: |
+          og serve "$PACK" --bind "$ADDRESS" > "$RUNNER_TEMP/serve.log" 2>&1 &
+          for _ in $(seq 60); do
+            curl -fsS "http://$ADDRESS/readyz" > /dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS --get "http://$ADDRESS/geocode" --data-urlencode "q=$QUERY" | tee "$RUNNER_TEMP/answer.json"
+          python3 -I - "$RUNNER_TEMP/answer.json" <<'EOF'
+          import json, os, sys
+          features = json.load(open(sys.argv[1]))["features"]
+          names = [f["properties"]["name"] for f in features]
+          if not names or names[0] != os.environ["QUERY"]:
+              sys.exit(f"/geocode?q={os.environ['QUERY']} answered {names}")
+          EOF
+
+      - name: Keep the server log
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-logs
+          path: ${{ runner.temp }}/serve.log
+          if-no-files-found: ignore
+
+      # A red run is og's fault or Geofabrik's. This says which in the log.
+      - name: Say who failed
+        if: failure()
+        run: |
+          if curl -fsS --max-time 30 --output /dev/null "$GEOFABRIK_INDEX"; then
+            echo "::error::Geofabrik answers its index, so og failed."
+          else
+            echo "::error::Geofabrik did not answer its index, so Geofabrik failed."
+          fi
+
+      - name: Report end to end issues
+        if: failure() && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment "$REPORTING_ISSUE" \
+                           --body "End to end test of $REGION has problems. Check $RUN_URL" \
+                           --repo "$GITHUB_REPOSITORY"

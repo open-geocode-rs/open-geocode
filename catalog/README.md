@@ -8,7 +8,14 @@ All three are generated from pinned upstream snapshots and never edited by hand.
 python -I catalog/catalog.py generate                                  # rebuild the generated files offline
 python -I catalog/catalog.py check                                     # CI: fails if anything is stale or unresolved
 python -I catalog/catalog.py update geofabrik|openaddresses|overture|id-tagging-schema|id-tagging-schema-words|organicmaps|all  # refresh a pin
+python -I catalog/catalog.py moved                                     # lists Geofabrik links that moved since the pin
 ```
+
+Geofabrik moves extracts without notice.
+`og build` reads Geofabrik's index for the region's current link, so a moved extract does not break a build.
+The catalog keeps each region's id, name and parent, and the index id in `osm.id`.
+The `Catalog sync` workflow runs `moved` every 3 hours and, when a link moved or a region appeared or went away, opens a pull request that runs `update geofabrik`.
+`python3 -I -m unittest discover -s catalog` runs the offline tests of this tool.
 
 Manual decisions (names, ISO codes, parents, groups) live in `curation.toml`, each with a `why`.
 After an update, resolve what it reports there, run `generate`, and commit the snapshot, `sources.lock.json`, `curation.toml` and the generated files together.

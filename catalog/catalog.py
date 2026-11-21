@@ -11,6 +11,9 @@ snapshots and catalog/curation.toml, so two runs give byte-identical output.
     python -I catalog/catalog.py update geofabrik|openaddresses|overture|id-tagging-schema|id-tagging-schema-words|organicmaps|all
     python -I catalog/catalog.py generate
     python -I catalog/catalog.py check
+    python -I catalog/catalog.py moved
+
+`moved` lists the Geofabrik links that moved since the pin.
 
 `generate` and `check` need only the standard library. `update overture`
 needs the packages in catalog/requirements.txt.
@@ -148,6 +151,12 @@ def load_snapshot(name):
 
 # --- Update: Geofabrik --------------------------------------------------
 
+def iso_codes(value):
+    """ISO codes of an index entry as a list. The index's format names a list;
+    since November 2026 the index sends them joined by commas (`HT,DO`)."""
+    return [c.strip() for c in value.split(",")] if isinstance(value, str) else list(value)
+
+
 def update_geofabrik(lock):
     raw = request(GEOFABRIK_INDEX)[1]
     features = [f["properties"] for f in json.loads(raw)["features"]]
@@ -166,9 +175,9 @@ def update_geofabrik(lock):
         pbf = f["urls"]["pbf"]
         entry = dict(id=f["id"], parent=f.get("parent"), name=f["name"], pbf=pbf)
         if f.get("iso3166-1:alpha2"):
-            entry["iso3166_1"] = f["iso3166-1:alpha2"]
+            entry["iso3166_1"] = iso_codes(f["iso3166-1:alpha2"])
         if f.get("iso3166-2"):
-            entry["iso3166_2"] = f["iso3166-2"]
+            entry["iso3166_2"] = iso_codes(f["iso3166-2"])
         entry.update(bytes=sizes[pbf]["bytes"], updated=sizes[pbf]["updated"])
         regions.append(entry)
     planet = sizes[PLANET]
@@ -574,6 +583,19 @@ def above(code, region_codes):
     return any("-" in c and code == ancestry_code(c) for c in region_codes)
 
 
+def region_folder(url):
+    """The folder a Geofabrik extract lives in, `europe/germany` for
+    `europe/germany/germany-latest.osm.pbf`. Region ids and parents are read
+    from it, so a link of any other shape stops the generator rather than
+    renaming regions."""
+    path = url[len(GEOFABRIK_PREFIX):] if url.startswith(GEOFABRIK_PREFIX) else ""
+    folder, _, file = path.rpartition("/")
+    if not folder or file != folder.rpartition("/")[2] + PBF_SUFFIX:
+        raise SystemExit(f"geofabrik: unexpected download url {url}; "
+                         f"want {GEOFABRIK_PREFIX}<folder>/<name>/<name>{PBF_SUFFIX}")
+    return folder
+
+
 def build(geofabrik, openaddresses, overture, curation, lock):
     """The catalog and the list of unresolved findings."""
     unresolved = list(curation.problems)
@@ -582,10 +604,7 @@ def build(geofabrik, openaddresses, overture, curation, lock):
     continents = [c for c in curation.continents if c in tops]
 
     def our_id(r):
-        path = r["pbf"][len(GEOFABRIK_PREFIX):]
-        if not r["pbf"].startswith(GEOFABRIK_PREFIX) or not path.endswith(PBF_SUFFIX):
-            raise SystemExit(f"geofabrik: {r['id']} has an unexpected download url {r['pbf']}")
-        path = path[:-len(PBF_SUFFIX)]
+        path = region_folder(r["pbf"])
         first, _, rest = path.partition("/")
         return rest if rest and first in continents else path
 
@@ -601,14 +620,14 @@ def build(geofabrik, openaddresses, overture, curation, lock):
     iso_set, covers = curation.tables["iso"], curation.tables["covers"]
     kinds, parents = curation.tables["kind"], curation.tables["parent"]
 
-    paths = {r["pbf"][len(GEOFABRIK_PREFIX):-len(PBF_SUFFIX)]: ids[rid] for rid, r in upstream.items()}
+    paths = {region_folder(r["pbf"]): ids[rid] for rid, r in upstream.items()}
     regions = {}
     for rid, r in upstream.items():
         ours = ids[rid]
         parent = ids[r["parent"]] if r["parent"] else None
-        # The download path is the parent of record: the index gives US states
+        # The download folder is the parent of record: the index gives US states
         # north-america as parent although they live under us/.
-        prefix = r["pbf"][len(GEOFABRIK_PREFIX):-len(PBF_SUFFIX)].rpartition("/")[0]
+        prefix = region_folder(r["pbf"]).rpartition("/")[0]
         if prefix in paths and paths[prefix] != parent:
             parent = paths[prefix]
         if ours in parents:
@@ -752,7 +771,7 @@ def build(geofabrik, openaddresses, overture, curation, lock):
     for ours in sorted(regions):
         reg, r = regions[ours], regions[ours]["up"]
         out.append(entry(ours, reg["name"], reg["kind"], reg["parent"], reg["iso"], reg["aliases"],
-                         dict(url=r["pbf"], bytes=r["bytes"], updated=r["updated"])))
+                         dict(id=r["id"], url=r["pbf"], bytes=r["bytes"], updated=r["updated"])))
 
     pins = dict(geofabrik=lock["geofabrik"]["fetched"][:10])
     if openaddresses:
@@ -1095,6 +1114,8 @@ def review(before, after):
         a, b = old[rid], new[rid]
         if a["name"] != b["name"]:
             lines.append(f"renamed {rid}: {a['name']!r} -> {b['name']!r}")
+        if a["osm"]["url"] != b["osm"]["url"]:
+            lines.append(f"moved {rid}: {a['osm']['url']} -> {b['osm']['url']}")
         if a["osm"]["bytes"] and abs(b["osm"]["bytes"] - a["osm"]["bytes"]) / a["osm"]["bytes"] > SIZE_CHANGE:
             lines.append(f"osm size {rid}: {a['osm']['bytes']} -> {b['osm']['bytes']} bytes")
     return lines or ["no region changes"]
@@ -1136,6 +1157,22 @@ def cmd_update(args):
     return 0
 
 
+def moved_links(pinned, live):
+    """Lines for the regions whose link moved, appeared or went away between
+    two ids-to-link maps. Sizes change every day, so only links are compared."""
+    return [f"{rid}: {pinned.get(rid, 'not pinned')} -> {live.get(rid, 'gone')}"
+            for rid in sorted(set(pinned) | set(live)) if pinned.get(rid) != live.get(rid)]
+
+
+def cmd_moved(_):
+    """Regions whose link moved, appeared or went away upstream since the pin."""
+    pinned = {r["id"]: r["pbf"] for r in load_snapshot("geofabrik")["regions"]}
+    live = {f["properties"]["id"]: f["properties"]["urls"]["pbf"] for f in get_json(GEOFABRIK_INDEX)["features"]}
+    for line in moved_links(pinned, live):
+        print(line)
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
@@ -1145,6 +1182,7 @@ def main():
     up.set_defaults(run=cmd_update)
     sub.add_parser("generate", help="build regions.json, licences.json, places.json and categories.json from the pinned snapshots").set_defaults(run=cmd_generate)
     sub.add_parser("check", help="fail if a generated file or a snapshot drifted").set_defaults(run=cmd_check)
+    sub.add_parser("moved", help="list Geofabrik links that moved since the pin").set_defaults(run=cmd_moved)
     a = p.parse_args()
     sys.exit(a.run(a))
 

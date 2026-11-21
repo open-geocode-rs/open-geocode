@@ -41,6 +41,8 @@ struct Entry {
 /// The region's OpenStreetMap extract, as the catalog snapshot saw it.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Osm {
+    /// What Geofabrik's index calls the extract. The planet is not in it.
+    pub id: Option<String>,
     pub url: String,
     pub bytes: u64,
 }
