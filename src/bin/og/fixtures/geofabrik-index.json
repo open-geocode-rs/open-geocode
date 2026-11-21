@@ -1,0 +1,41 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "monaco",
+        "parent": "europe",
+        "name": "Monaco",
+        "iso3166-1:alpha2": ["MC"],
+        "urls": {
+          "pbf": "{base}/europe/monaco-latest.osm.pbf",
+          "bz2": "{base}/europe/monaco-latest.osm.bz2"
+        }
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "haiti-and-domrep",
+        "parent": "central-america",
+        "name": "Haiti and Dominican Republic",
+        "iso3166-1:alpha2": "HT,DO",
+        "urls": {
+          "pbf": "{base}/central-america/haiti-and-domrep-latest.osm.pbf"
+        }
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "ashmore-cartier",
+        "parent": "australia",
+        "name": "Ashmore and Cartier Islands",
+        "urls": {
+          "pbf": "{base}/australia-oceania/australia/ashmore-cartier/ashmore-cartier-latest.osm.pbf"
+        }
+      }
+    }
+  ]
+}

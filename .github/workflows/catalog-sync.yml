@@ -1,0 +1,101 @@
+name: Catalog sync
+
+# Geofabrik's index names the current link of every extract, and og reads it
+# when it builds. When a link moves, or a region is added or removed, this
+# opens a pull request that repins the catalog's region list and names to the
+# index. Sizes change daily, so only a link change starts one.
+#
+# The pull request is pushed and opened with the CATALOG_SYNC_TOKEN secret,
+# not GITHUB_TOKEN. CI does not run on a pull request GITHUB_TOKEN opens, and
+# CI's checks are what let a catalog change merge. The token needs
+# contents and pull requests write on this repository.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/catalog-sync.yml
+  workflow_dispatch:
+  schedule:
+    # Every 3 hours from 1 through 23 with an offset of 45 minutes
+    - cron: "45 1-23/3 * * *"
+
+concurrency:
+  group: catalog-sync
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+env:
+  BRANCH: catalog/geofabrik
+
+jobs:
+  sync:
+    if: startsWith( github.repository, 'open-geocode-rs/' )
+    name: Sync
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Compare Geofabrik's index with the pin
+        id: moved
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I catalog/catalog.py moved > moved.txt
+          changed=false
+          if [ -s moved.txt ]; then
+            changed=true
+            # An open pull request that already holds every live link is current.
+            # A branch whose pull request was closed is not.
+            open_prs="$(gh pr list --head "$BRANCH" --state open --json number --jq length)"
+            if [ "$open_prs" != "0" ] && git fetch --depth=1 origin "$BRANCH" 2>/dev/null; then
+              git checkout FETCH_HEAD -- catalog/upstream/geofabrik.json
+              still_moved="$(python3 -I catalog/catalog.py moved)"
+              if [ -z "$still_moved" ]; then
+                changed=false
+              fi
+              git checkout HEAD -- catalog/upstream/geofabrik.json
+            fi
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Repin the catalog
+        if: steps.moved.outputs.changed == 'true'
+        run: python3 -I catalog/catalog.py update geofabrik > review.txt
+
+      - name: Open or update the pull request
+        if: steps.moved.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CATALOG_SYNC_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$BRANCH"
+          git add catalog
+          git commit -m "chore(catalog): follow the Geofabrik links that moved"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$BRANCH"
+          {
+            echo "$(wc -l < moved.txt) Geofabrik links moved, appeared or went away since the catalog was pinned, so its region list is behind Geofabrik's."
+            echo "This repins \`catalog/upstream/geofabrik.json\` to Geofabrik's index with \`catalog/catalog.py update geofabrik\` and regenerates the catalog."
+            echo
+            echo '```text'
+            head -n 200 review.txt
+            echo '```'
+          } > body.md
+          if [ "$(gh pr view "$BRANCH" --json state --jq .state 2>/dev/null)" = "OPEN" ]; then
+            gh pr edit "$BRANCH" --body-file body.md
+          else
+            gh pr create --base main --head "$BRANCH" \
+              --title "chore(catalog): follow the Geofabrik links that moved" --body-file body.md
+          fi
