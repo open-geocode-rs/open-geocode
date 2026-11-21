@@ -19,7 +19,7 @@ use crate::{
         Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, Prominence, Record,
         SourceProvenance, point_geometry,
     },
-    util::text::normalize_for_compare,
+    util::{geo::point_lon_lat, text::normalize_for_compare},
 };
 
 use super::{
@@ -27,6 +27,7 @@ use super::{
     containment::{ShapeRef, ShapeWriter, Shapes, encode_shape},
     place::place_layer,
     poi::{PoiCandidate, outline},
+    street::is_settlement,
     tags::{OsmTags, alternate_names, item, name_tags, prominence},
 };
 
@@ -49,6 +50,8 @@ const BOUNDARY_TAG_KEYS: [&str; 10] = [
 pub(crate) struct BoundaryRelationStub {
     pub object_id: i64,
     pub members: Vec<BoundaryRelationMember>,
+    /// The node its relation's `label` member references.
+    pub label: Option<i64>,
     pub tags: BTreeMap<String, String>,
 }
 
@@ -156,12 +159,19 @@ struct BuiltBoundary {
     /// rings is left open, such as Russia's mainland, keeps the rings that
     /// closed (Kaliningrad) and covers only them.
     rings_closed: bool,
+    /// A town, city or other settlement node was merged into it.
+    settled: bool,
+    /// Names gained from merged place points. They go on this boundary's own
+    /// record only; as area names of every record inside it they'd bloat the text index.
+    point_names: Vec<String>,
 }
 
 #[derive(Clone)]
 pub(crate) struct BoundaryCandidate {
     source_object_type: ObjectType,
     source_object_id: i64,
+    /// The node its relation's `label` member references.
+    label: Option<i64>,
     boundary: BuiltBoundary,
 }
 
@@ -219,6 +229,7 @@ impl BoundaryBuilder {
                     candidate: BoundaryCandidate {
                         source_object_type: ObjectType::Way,
                         source_object_id: way.object_id,
+                        label: None,
                         boundary,
                     },
                     block,
@@ -244,6 +255,7 @@ impl BoundaryBuilder {
                         candidate: BoundaryCandidate {
                             source_object_type: ObjectType::Relation,
                             source_object_id: stub.object_id,
+                            label: stub.label,
                             boundary,
                         },
                         block,
@@ -315,6 +327,12 @@ impl BoundaryCandidate {
                 .iter()
                 .map(String::capacity)
                 .sum::<usize>()
+            + boundary.point_names.capacity() * std::mem::size_of::<String>()
+            + boundary
+                .point_names
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
             + text(&boundary.place_type)
             + text(&boundary.designation)
             + text(&boundary.inferred_country_code)
@@ -379,7 +397,12 @@ impl BoundarySet {
                     boundary.layer,
                     PlaceRecord {
                         name: boundary.name.clone(),
-                        alt_names: boundary.alt_names.clone(),
+                        alt_names: boundary
+                            .alt_names
+                            .iter()
+                            .chain(&boundary.point_names)
+                            .cloned()
+                            .collect(),
                         place_type: match (boundary.admin_level, &boundary.place_type) {
                             (Some(level), _) => format!("admin_level:{level}"),
                             (None, Some(place)) => place.clone(),
@@ -400,6 +423,76 @@ impl BoundarySet {
             ));
         }
         records
+    }
+
+    /// What can link a place point to a boundary: its `label` node, its
+    /// Wikidata item, or its name, each at the boundary's layer.
+    pub(crate) fn place_links(&mut self) -> PlaceLinks {
+        let mut links = PlaceLinks {
+            labels: HashMap::new(),
+            items: HashMap::new(),
+            names: HashMap::new(),
+            points: vec![None; self.candidates.len()],
+        };
+        for (index, candidate) in self.candidates.iter_mut().enumerate() {
+            let layer = candidate.boundary.layer;
+            if let Some(label) = candidate.label.take() {
+                links.labels.entry((label, layer)).or_insert(index);
+            }
+            if let Some(item) = candidate.boundary.wikidata {
+                links
+                    .items
+                    .entry((item, layer))
+                    .or_insert((index, candidate.boundary.bounds));
+            }
+            links
+                .names
+                .entry((normalize_for_compare(&candidate.boundary.name), layer))
+                .or_default()
+                .push(index);
+        }
+        links
+    }
+
+    /// Merges a place point into its boundary, if it has one.
+    pub(crate) fn merge_place_point(
+        &mut self,
+        links: &mut PlaceLinks,
+        layer: PlaceLayer,
+        place: &PlaceRecord,
+    ) -> bool {
+        let Some((index, link)) = links.find(layer, place, |index, point| {
+            covers_point(&self.shapes, &self.candidates[index].boundary, point)
+        }) else {
+            return false;
+        };
+        let boundary = &mut self.candidates[index].boundary;
+        // The strongest link's point wins, so a `label` node beats a name or Wikidata match.
+        if links.points[index] < Some(link)
+            && let Some(point) = point_lon_lat(&place.geometry)
+        {
+            boundary.representative_point = point;
+            links.points[index] = Some(link);
+        }
+        for name in std::iter::once(&place.name).chain(&place.alt_names) {
+            let folded = name.to_lowercase();
+            let known = std::iter::once(&boundary.name)
+                .chain(&boundary.alt_names)
+                .chain(&boundary.point_names)
+                .any(|known| known.to_lowercase() == folded);
+            if !known {
+                boundary.point_names.push(name.clone());
+            }
+        }
+        boundary.prominence = boundary.prominence.max(place.prominence);
+        boundary.wikidata = boundary.wikidata.or(place.wikidata);
+        boundary.settled |= is_settlement(&place.place_type);
+        true
+    }
+
+    /// Whether a town, city or other settlement node was merged into boundary `index`.
+    pub(crate) fn is_settled(&self, index: usize) -> bool {
+        self.candidates[index].boundary.settled
     }
 
     /// Names of the records admin context tuples can point at, by record id:
@@ -739,6 +832,10 @@ pub(crate) fn relation_member_role(value: &str) -> Option<BoundaryMemberRole> {
     }
 }
 
+pub(crate) fn is_label_role(value: &str) -> bool {
+    normalize_for_compare(value) == "label"
+}
+
 pub(crate) fn required_boundary_way_ids(relations: &[BoundaryRelationStub]) -> HashSet<i64> {
     relations
         .iter()
@@ -948,6 +1045,8 @@ fn built(
             area: geometry.unsigned_area(),
             representative_point,
             rings_closed,
+            settled: false,
+            point_names: Vec::new(),
         },
         block,
     ))
@@ -1754,6 +1853,66 @@ fn source_type_rank(object_type: ObjectType) -> u8 {
     }
 }
 
+/// How a place point names a boundary, weakest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PlaceLink {
+    Name,
+    Item,
+    Label,
+}
+
+/// Lookups from a place point to the boundary it names, all keyed by layer so
+/// that a city node labelling its county stays a separate city.
+pub(crate) struct PlaceLinks {
+    labels: HashMap<(i64, PlaceLayer), usize>,
+    /// The boundary of each item and layer, and its bounds.
+    items: HashMap<(u32, PlaceLayer), (usize, Rect<f64>)>,
+    /// The boundaries of each normalized name and layer.
+    names: HashMap<(String, PlaceLayer), Vec<usize>>,
+    /// The link that set each boundary's point, or `None` while it's still the centroid.
+    points: Vec<Option<PlaceLink>>,
+}
+
+impl PlaceLinks {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.labels.is_empty() && self.items.is_empty() && self.names.is_empty()
+    }
+
+    /// The boundary a place point names, and how. An `admin_centre` member doesn't
+    /// count: a county's centre is a town in its own right.
+    fn find(
+        &self,
+        layer: PlaceLayer,
+        place: &PlaceRecord,
+        covers: impl Fn(usize, [f64; 2]) -> bool,
+    ) -> Option<(usize, PlaceLink)> {
+        let label = (place.source.object_type == ObjectType::Node)
+            .then(|| self.labels.get(&(place.source.object_id, layer)))
+            .flatten();
+        if let Some(index) = label {
+            return Some((*index, PlaceLink::Label));
+        }
+        let point = point_lon_lat(&place.geometry)?;
+        // Within the bounds only, so a mistagged Wikidata item can't pull in a distant point.
+        let item = place
+            .wikidata
+            .and_then(|item| self.items.get(&(item, layer)))
+            .filter(|(_, bounds)| {
+                let (min, max) = (bounds.min(), bounds.max());
+                (min.x..=max.x).contains(&point[0]) && (min.y..=max.y).contains(&point[1])
+            });
+        if let Some((index, _)) = item {
+            return Some((*index, PlaceLink::Item));
+        }
+        // Names repeat, so a name only matches a boundary that contains the point.
+        self.names
+            .get(&(normalize_for_compare(&place.name), layer))?
+            .iter()
+            .find(|&&index| covers(index, point))
+            .map(|&index| (index, PlaceLink::Name))
+    }
+}
+
 /// A part of a [`BoundarySet`] as a checkpoint saves it.
 pub(crate) enum SetItem {
     Candidate(Box<BoundaryCandidate>),
@@ -1854,6 +2013,11 @@ impl crate::extsort::Spill for SetItem {
                 {
                     out.extend_from_slice(&value.to_bits().to_le_bytes());
                 }
+                put_u64(out, boundary.point_names.len() as u64);
+                for name in &boundary.point_names {
+                    put_str(out, name);
+                }
+                out.push(u8::from(boundary.settled));
                 out.push(u8::from(boundary.rings_closed));
             }
             Self::DerivedCountry(code, record) => {
@@ -1917,14 +2081,20 @@ impl crate::extsort::Spill for SetItem {
                     *value = super::checkpoint::get_f64(input)?;
                 }
                 let [min_x, min_y, max_x, max_y, area, lon, lat] = values;
-                let rings_closed = match get_u8(input)? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(Error::Decode("a saved boundary's ring flag is not 0 or 1")),
+                let point_names = (0..get_u64(input)?)
+                    .map(|_| get_string(input))
+                    .collect::<crate::error::Result<Vec<_>>>()?;
+                let flag = |input: &mut &[u8], what| match get_u8(input)? {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    _ => Err(Error::Decode(what)),
                 };
+                let settled = flag(input, "a saved boundary's settled flag is not 0 or 1")?;
+                let rings_closed = flag(input, "a saved boundary's ring flag is not 0 or 1")?;
                 Self::Candidate(Box::new(BoundaryCandidate {
                     source_object_type,
                     source_object_id,
+                    label: None,
                     boundary: BuiltBoundary {
                         layer: boundary_layer,
                         admin_level,
@@ -1942,6 +2112,8 @@ impl crate::extsort::Spill for SetItem {
                         area,
                         representative_point: [lon, lat],
                         rings_closed,
+                        settled,
+                        point_names,
                     },
                 }))
             }
@@ -2125,6 +2297,7 @@ mod tests {
             SetItem::Candidate(Box::new(BoundaryCandidate {
                 source_object_type: ObjectType::Relation,
                 source_object_id: 60189,
+                label: None,
                 boundary,
             }))
             .encode(&mut bytes);
@@ -2138,6 +2311,7 @@ mod tests {
         SetItem::Candidate(Box::new(BoundaryCandidate {
             source_object_type: ObjectType::Relation,
             source_object_id: 60189,
+            label: None,
             boundary: test_boundary(PlaceLayer::Region),
         }))
         .encode(&mut bytes);
@@ -2150,6 +2324,86 @@ mod tests {
                 crate::error::Error::Decode("a saved boundary's ring flag is not 0 or 1")
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn a_saved_boundary_keeps_what_its_merged_points_gave_it() {
+        use crate::extsort::Spill;
+        for settled in [false, true] {
+            let mut boundary = test_boundary(PlaceLayer::Locality);
+            boundary.settled = settled;
+            boundary.point_names = vec!["Emerald City".to_string()];
+            let mut bytes = Vec::new();
+            SetItem::Candidate(Box::new(BoundaryCandidate {
+                source_object_type: ObjectType::Relation,
+                source_object_id: 237_385,
+                label: None,
+                boundary,
+            }))
+            .encode(&mut bytes);
+            let SetItem::Candidate(read) = SetItem::decode(&mut bytes.as_slice()).expect("decode")
+            else {
+                panic!("not a candidate");
+            };
+            assert_eq!(read.boundary.settled, settled);
+            assert_eq!(read.boundary.point_names, ["Emerald City"]);
+        }
+    }
+
+    /// A merged point's names are added to the boundary's record, not to the
+    /// area names of the records inside it.
+    #[test]
+    fn a_merged_points_names_are_the_records_not_the_areas() {
+        let scratch = test_scratch();
+        let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
+        let vertex = |node_id, lon, lat| Vertex { node_id, lat, lon };
+        let ring = vec![
+            vertex(1, 0.0, 0.0),
+            vertex(2, 1.0, 0.0),
+            vertex(3, 1.0, 1.0),
+            vertex(4, 0.0, 1.0),
+            vertex(1, 0.0, 0.0),
+        ];
+        builder
+            .add_relations(
+                &[BoundaryRelationStub {
+                    object_id: 900,
+                    members: vec![BoundaryRelationMember {
+                        way_id: 500,
+                        role: BoundaryMemberRole::Outer,
+                    }],
+                    label: Some(10),
+                    tags: boundary_tags(&BTreeMap::from([
+                        ("boundary".to_string(), "administrative".to_string()),
+                        ("admin_level".to_string(), "8".to_string()),
+                        ("name".to_string(), "Seattle".to_string()),
+                    ])),
+                }],
+                |_| Ok(Some(ring.clone())),
+            )
+            .expect("relations");
+        let mut set = builder.finish().expect("boundaries");
+        let mut links = set.place_links();
+        let point = PlaceRecord {
+            name: "Seattle".to_string(),
+            alt_names: vec!["Emerald City".to_string()],
+            place_type: "city".to_string(),
+            geometry: point_geometry(0.3, 0.2),
+            source: SourceProvenance::osm(ObjectType::Node, 10),
+            prominence: Prominence::default(),
+            wikidata: None,
+        };
+        assert!(set.merge_place_point(&mut links, PlaceLayer::Locality, &point));
+
+        let places = set.place_records(&mut BuilderReport::default());
+        let Record::Place(_, seattle) = &places[0].1 else {
+            panic!("a boundary is a place");
+        };
+        assert_eq!(seattle.alt_names, ["Emerald City"]);
+        assert_eq!(
+            set.context_names(&[7], &HashMap::new()),
+            HashMap::from([(7, vec!["Seattle".to_string()])])
         );
     }
 
@@ -2179,6 +2433,8 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             rings_closed: true,
+            settled: false,
+            point_names: Vec::new(),
         }
     }
 
@@ -2559,6 +2815,7 @@ mod tests {
             candidates.push(BoundaryCandidate {
                 source_object_type: ObjectType::Relation,
                 source_object_id: index as i64 + 1,
+                label: None,
                 boundary: BuiltBoundary {
                     layer: admin_level_layer(level).expect("layer"),
                     admin_level: Some(level),
@@ -2578,6 +2835,8 @@ mod tests {
                     prominence: Default::default(),
                     wikidata: None,
                     rings_closed: true,
+                    settled: false,
+                    point_names: Vec::new(),
                 },
             });
         }
@@ -2692,11 +2951,13 @@ mod tests {
             BoundaryRelationStub {
                 object_id: 100,
                 members: members(&[1, 2]),
+                label: None,
                 tags: tags("Ontario", "CA-ON"),
             },
             BoundaryRelationStub {
                 object_id: 101,
                 members: members(&[1, 3]),
+                label: None,
                 tags: tags("Broken", "CA-QC"),
             },
         ];

@@ -549,6 +549,9 @@ pub struct AcceptedCounts {
     pub poi_categories: BTreeMap<String, u64>,
     #[serde(default)]
     pub places_merged: u64,
+    /// Place points merged into the boundary they name.
+    #[serde(default)]
+    pub place_points_merged: u64,
     /// What the counted presets leave out, to audit curation.
     #[serde(default)]
     pub places_left_out: BTreeMap<String, u64>,

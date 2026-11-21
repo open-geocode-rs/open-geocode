@@ -313,6 +313,13 @@ impl Spill for GeometryItem {
                         BoundaryMemberRole::Inner => 1,
                     });
                 }
+                match relation.label {
+                    Some(label) => {
+                        out.push(1);
+                        put_i64(out, label);
+                    }
+                    None => out.push(0),
+                }
                 put_tags(out, &relation.tags);
             }
             Self::Feature(way_id) => {
@@ -354,9 +361,15 @@ impl Spill for GeometryItem {
                     };
                     members.push(BoundaryRelationMember { way_id, role });
                 }
+                let label = match get_u8(input)? {
+                    0 => None,
+                    1 => Some(get_i64(input)?),
+                    _ => return Err(Error::Decode("a saved relation's label flag is not 0 or 1")),
+                };
                 Self::Relation(BoundaryRelationStub {
                     object_id,
                     members,
+                    label,
                     tags: get_tags(input)?,
                 })
             }
@@ -506,6 +519,19 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_relation_keeps_its_label() {
+        round_trip(&[GeometryItem::Relation(BoundaryRelationStub {
+            object_id: 237_385,
+            members: vec![BoundaryRelationMember {
+                way_id: 500,
+                role: BoundaryMemberRole::Outer,
+            }],
+            label: Some(29_546_940),
+            tags: BTreeMap::from([("name".to_string(), "Seattle".to_string())]),
+        })]);
+    }
+
+    #[test]
     fn saved_geometry_reads_back_bit_for_bit() {
         let vertex = |node_id, lat_e7: i32, lon_e7: i32| Vertex {
             node_id,
@@ -525,6 +551,7 @@ mod tests {
                         role: BoundaryMemberRole::Inner,
                     },
                 ],
+                label: None,
                 tags: BTreeMap::from([("name".to_string(), "Toronto".to_string())]),
             }),
             GeometryItem::Feature(605),

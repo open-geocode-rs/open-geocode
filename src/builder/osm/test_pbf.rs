@@ -18,7 +18,10 @@ pub(crate) enum TestElement {
     },
     Relation {
         id: i64,
+        /// Way members.
         members: Vec<(i64, &'static str)>,
+        /// Node members, written before the ways.
+        nodes: Vec<(i64, &'static str)>,
         tags: Vec<(&'static str, &'static str)>,
     },
 }
@@ -53,6 +56,7 @@ pub(crate) fn relation(
     TestElement::Relation {
         id,
         members: members.to_vec(),
+        nodes: Vec::new(),
         tags: tags.to_vec(),
     }
 }
@@ -109,22 +113,31 @@ fn primitive_block(elements: &[TestElement]) -> Vec<u8> {
                 packed_field(&mut way, 8, &deltas(refs).map(zigzag).collect::<Vec<_>>());
                 ways.push(way);
             }
-            TestElement::Relation { id, members, tags } => {
+            TestElement::Relation {
+                id,
+                members,
+                nodes,
+                tags,
+            } => {
                 let mut relation = Vec::new();
                 varint_field(&mut relation, 1, *id as u64);
                 tag_fields(&mut relation, &mut strings, tags);
-                let roles = members
+                let all = nodes.iter().chain(members).collect::<Vec<_>>();
+                let roles = all
                     .iter()
                     .map(|(_, role)| u64::from(strings.id(role)))
                     .collect::<Vec<_>>();
                 packed_field(&mut relation, 8, &roles);
-                let ids = members.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+                let ids = all.iter().map(|(id, _)| *id).collect::<Vec<_>>();
                 packed_field(
                     &mut relation,
                     9,
                     &deltas(&ids).map(zigzag).collect::<Vec<_>>(),
                 );
-                packed_field(&mut relation, 10, &vec![1; members.len()]);
+                let types = std::iter::repeat_n(0, nodes.len())
+                    .chain(std::iter::repeat_n(1, members.len()))
+                    .collect::<Vec<_>>();
+                packed_field(&mut relation, 10, &types);
                 relations.push(relation);
             }
         }
