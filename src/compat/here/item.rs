@@ -138,9 +138,20 @@ impl Feature {
                 address: Address {
                     housenumber: address.housenumber.clone(),
                     unit: address.unit.clone(),
-                    street: address.street.clone(),
+                    // A US street in the postal abbreviation, as its label
+                    // writes it.
+                    street: match compat::country_code(context) {
+                        Some("US") => compat::us_street(address).or_else(|| address.street.clone()),
+                        _ => address.street.clone(),
+                    },
                     areas: address.areas.clone(),
-                    locality: address.locality.clone(),
+                    // A stated town as a vendor writes it, in the
+                    // locality's spelling.
+                    locality: address
+                        .locality
+                        .as_ref()
+                        .and_then(|_| compat::town_of(address, context))
+                        .map(str::to_string),
                     region: address.region.clone(),
                     postcode: address.postcode.clone(),
                     country: address.country.clone(),

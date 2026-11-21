@@ -185,6 +185,11 @@ impl Style {
 /// `JORDAN` as `Jordan`. A word with any small letter is kept, and so is
 /// one standing for initials or a code (`S`, `NE`, `4B`).
 fn word_case(word: &str) -> String {
+    // An ordinal in capitals, `58TH` as `58th`.
+    let digits = word.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 && ["ST", "ND", "RD", "TH"].contains(&&word[digits..]) {
+        return word.to_lowercase();
+    }
     let letters = word.chars().filter(|c| c.is_alphabetic()).count();
     let shouting = letters > 2 && !word.chars().any(char::is_lowercase);
     if !shouting {
@@ -278,14 +283,24 @@ fn direction(word: &str) -> Option<&'static str> {
 }
 
 /// A street suffix as Publication 28 abbreviates it: `Avenue` as `AVE`.
-/// One already written as its abbreviation stays, and one the table does
-/// not name stays as written.
+/// One already written as its abbreviation stays. Another way of writing
+/// one (`AV`) is read through og's own dictionary of street words, and one
+/// neither names stays as written.
 fn suffix(word: &str) -> String {
     let key = word.trim_end_matches('.').to_uppercase();
-    SUFFIXES
-        .iter()
-        .find(|(full, short)| *full == key || *short == key)
-        .map_or_else(|| key.clone(), |(_, short)| (*short).to_string())
+    let listed = |key: &str| {
+        SUFFIXES
+            .iter()
+            .find(|(full, short)| *full == key || *short == key)
+            .map(|(_, short)| (*short).to_string())
+    };
+    listed(&key)
+        .or_else(|| {
+            crate::parse::lattice::other_forms(&key.to_lowercase())
+                .iter()
+                .find_map(|form| listed(&form.to_uppercase()))
+        })
+        .unwrap_or(key)
 }
 
 /// A unit designator as Publication 28 abbreviates it: `Suite` as `STE`.
@@ -568,6 +583,23 @@ mod tests {
         assert_eq!(
             address.location_line(Style::Postal),
             "BURLINGTON, MA  01803-5231"
+        );
+    }
+
+    #[test]
+    fn a_variant_suffix_and_a_capitalized_ordinal_take_the_postal_forms() {
+        assert_eq!(
+            display_street("BERNARDO", Some("S"), Some("AV"), None),
+            "S Bernardo Ave"
+        );
+        assert_eq!(
+            display_street("58TH", Some("SW"), Some("MNR"), None),
+            "SW 58th Mnr"
+        );
+        assert_eq!(display_street("1ST", None, Some("ST"), None), "1st St");
+        assert_eq!(
+            display_street("Main", None, Some("Street"), None),
+            "Main St"
         );
     }
 

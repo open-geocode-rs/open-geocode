@@ -2165,6 +2165,25 @@ async fn a_us_address_is_written_as_google_writes_it_in_its_town() {
 
 /// A house og holds twice, as its point and its building's outline, is one
 /// result for every vendor, at its point.
+/// HERE writes a US street in the postal abbreviation in its own field, as
+/// its label does.
+#[tokio::test]
+async fn here_writes_a_us_street_in_the_postal_form() {
+    let fixture = us_fixture();
+    let here = get(
+        &fixture.router,
+        "/compat/here/v1/geocode?q=1600%20Amphitheatre%20Parkway,%20Mountain%20View,%20CA",
+    )
+    .await;
+    let address = &here.body["items"][0]["address"];
+    assert_eq!(address["street"], "Amphitheatre Pkwy", "{}", here.body);
+    assert!(
+        address["label"]
+            .as_str()
+            .is_some_and(|label| label.starts_with("1600 Amphitheatre Pkwy"))
+    );
+}
+
 /// Asked for the nearest two houses, a vendor answers two houses, though og
 /// holds the nearest one twice.
 #[tokio::test]
