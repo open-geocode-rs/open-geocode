@@ -351,27 +351,33 @@ fn place_languages(
     languages
 }
 
-/// The one language a place speaks ([`place_languages`]). Where its areas'
-/// names leave several, it is the one of them the nearest boundary stating
-/// a default language names (`default_language`): a country and a state
-/// named alike in English and Jamaican Patois, in a country whose default
-/// is English, speak English. None when its areas' names tell none, since
-/// a default alone is no sign of the place's own (Switzerland's is Latin).
+/// The one language a place speaks. It is the default language the nearest
+/// boundary stating one names (`default_language`), when some area of the
+/// place is named in it by its local name: the United States state English,
+/// and a town named alike only in Occitan still speaks it. A default no area
+/// is named in tells nothing (Switzerland's is Latin), and then the areas'
+/// names alone tell it ([`place_languages`]), when they leave one.
 pub(crate) fn place_language(
     pack: &crate::pack::Reader,
     context: &crate::api::Context,
 ) -> Option<String> {
-    let languages = place_languages(pack, context)?;
-    if let [one] = languages.as_slice() {
-        return Some(one.clone());
-    }
-    context
+    let named_in = |code: &str| {
+        context.areas().any(|area| {
+            speaking(pack, area).is_some_and(|spoken| spoken.iter().any(|held| held == code))
+        })
+    };
+    let defaults = context
         .areas()
         .map(|area| pack.default_languages(area.record_id).collect::<Vec<_>>())
-        .find(|defaults| !defaults.is_empty())?
-        .into_iter()
-        .find(|code| languages.iter().any(|held| held == code))
-        .map(str::to_string)
+        .find(|defaults| !defaults.is_empty())
+        .unwrap_or_default();
+    if let Some(code) = defaults.into_iter().find(|code| named_in(code)) {
+        return Some(code.to_string());
+    }
+    match place_languages(pack, context)?.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
 }
 
 /// An area's name without the word for its kind, as an address writes it:
@@ -1278,6 +1284,9 @@ mod tests {
                         ("fr", "États-Unis"),
                     ]),
                 ),
+                // A minor language copying the town's local name tells
+                // nothing of what the town speaks.
+                (town, named(&[("oc", "Mountain View"), ("zh", "山景城")])),
                 (
                     state,
                     named(&[
