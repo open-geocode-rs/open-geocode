@@ -1047,11 +1047,11 @@ fn lerp(ends: [(u8, u8, u8); 2], t: f64) -> Color {
 // A stage line is laid out as Ollama lays out a layer, with cargo's verb in
 // front: the verb, what it works on, the percent, a bar, then size, speed and
 // time in columns of fixed width, so nothing moves as the numbers change.
-const VERB_WIDTH: usize = 11;
+pub(crate) const VERB_WIDTH: usize = 11;
 const NAME_WIDTH: usize = 16;
-const SIZE_WIDTH: usize = 15;
-const SPEED_WIDTH: usize = 11;
-const TIME_WIDTH: usize = 8;
+pub(crate) const SIZE_WIDTH: usize = 15;
+pub(crate) const SPEED_WIDTH: usize = 11;
+pub(crate) const TIME_WIDTH: usize = 8;
 /// Everything on a line but the bar: the gutter, verb, name, percent and the
 /// caps and gap around the bar, then the three right-hand columns.
 const LINE_FIXED: usize =
@@ -1103,15 +1103,6 @@ fn shimmer(text: &str, millis: u128) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// An amount of a step's work: `752 MB`, `48.2M ways`.
-fn amount(unit: Unit, value: u64) -> String {
-    match unit {
-        Unit::Bytes => format::bytes(value),
-        Unit::Count(_) => format::count(value),
-        Unit::None => String::new(),
-    }
-}
-
 fn finished_line(step: &Step, inner: usize) -> Line<'static> {
     let cells = bar_cells(inner);
     // History lines start at the terminal's edge; the live window sits one
@@ -1135,8 +1126,8 @@ fn finished_line(step: &Step, inner: usize) -> Line<'static> {
         }
         (unit, Some(total)) => {
             let summary = match unit {
-                Unit::Count(name) => format!("{} {name}", amount(unit, total)),
-                _ => amount(unit, total),
+                Unit::Count(name) => format!("{} {name}", unit.amount(total)),
+                _ => unit.amount(total),
             };
             spans.push(plain("100% "));
             spans.extend(bar_spans(cells, 1.0, Some(DONE_BAR)));
@@ -1161,7 +1152,6 @@ fn finished_line(step: &Step, inner: usize) -> Line<'static> {
 /// all measured.
 fn running_line(app: &App, step: &Step, done: u64, inner: usize) -> Line<'static> {
     let cells = bar_cells(inner);
-    let elapsed = step.started.map_or(0.0, |at| at.elapsed().as_secs_f64());
     // The verb and what it works on shimmer as one title.
     let title = format!(
         "{} {}",
@@ -1171,44 +1161,24 @@ fn running_line(app: &App, step: &Step, done: u64, inner: usize) -> Line<'static
     let mut spans = vec![plain(" "), span(spinner(app), ACCENT), plain(" ")];
     spans.extend(shimmer(&title, app.started.elapsed().as_millis()));
     spans.push(plain("  "));
-    match (step.unit, step.total) {
-        (unit, Some(total)) if unit != Unit::None && total > 0 => {
-            let ratio = (done as f64 / total as f64).min(1.0);
-            let rate = done as f64 / elapsed.max(0.001);
-            let speed = if elapsed < 1.0 || done == 0 {
-                String::new()
-            } else {
-                match unit {
-                    Unit::Bytes => format!("{}/s", format::bytes(rate as u64)),
-                    _ => format!("{}/s", format::count(rate as u64)),
-                }
-            };
-            let left = if elapsed < 1.0 || done == 0 {
-                String::new()
-            } else {
-                format::duration(total.saturating_sub(done) as f64 / rate)
-            };
-            spans.push(plain(format!("{:>3}% ", (ratio * 100.0).floor())));
+    let readout = step.readout(done);
+    match readout.ratio {
+        Some(ratio) => {
+            spans.push(plain(format!("{} ", readout.percent())));
             spans.extend(bar_spans(cells, ratio, None));
             spans.push(plain(format!(
                 "  {:>SIZE_WIDTH$}",
-                cut(
-                    &format!("{}/{}", amount(unit, done), amount(unit, total)),
-                    SIZE_WIDTH
-                )
+                cut(&readout.size, SIZE_WIDTH)
             )));
-            spans.push(span(format!("{speed:>SPEED_WIDTH$}"), DIM));
-            spans.push(span(format!("{left:>TIME_WIDTH$}"), DIM));
+            spans.push(span(format!("{:>SPEED_WIDTH$}", readout.speed), DIM));
+            spans.push(span(format!("{:>TIME_WIDTH$}", readout.time), DIM));
         }
-        _ => {
+        None => {
             // No measure, so no percent and no bar: only time passing.
             spans.push(plain("     "));
             spans.push(span(pad("working…", cells + 2), DIM));
             spans.push(plain(" ".repeat(2 + SIZE_WIDTH + SPEED_WIDTH)));
-            spans.push(span(
-                format!("{:>TIME_WIDTH$}", format::duration(elapsed)),
-                DIM,
-            ));
+            spans.push(span(format!("{:>TIME_WIDTH$}", readout.time), DIM));
         }
     }
     Line::from(spans)

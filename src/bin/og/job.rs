@@ -38,6 +38,68 @@ pub(crate) enum Unit {
     None,
 }
 
+impl Unit {
+    /// An amount of a step's work: `752 MB`, `48.2M`.
+    pub(crate) fn amount(self, value: u64) -> String {
+        match self {
+            Self::Bytes => format::bytes(value),
+            Self::Count(_) => format::count(value),
+            Self::None => String::new(),
+        }
+    }
+}
+
+/// How far a running step is, as text: one source for the interface's line
+/// and `og build`'s.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Readout {
+    /// Share of the work done, for a step with a measure.
+    pub ratio: Option<f64>,
+    /// `49.8 GB/95.7 GB`; empty without a measure.
+    pub size: String,
+    /// `48 MB/s`; empty without a measure, or until there is a rate.
+    pub speed: String,
+    /// Time left for a step with a measure, once there is a rate; time
+    /// passed for one without.
+    pub time: String,
+}
+
+impl Readout {
+    fn new(unit: Unit, total: Option<u64>, done: u64, elapsed: f64) -> Self {
+        let Some(total) = total.filter(|&total| unit != Unit::None && total > 0) else {
+            return Self {
+                ratio: None,
+                size: String::new(),
+                speed: String::new(),
+                time: format::duration(elapsed),
+            };
+        };
+        let rate = done as f64 / elapsed.max(0.001);
+        // Under a second in, the rate swings too far to show.
+        let (speed, time) = if elapsed < 1.0 || done == 0 {
+            (String::new(), String::new())
+        } else {
+            (
+                format!("{}/s", unit.amount(rate as u64)),
+                format::duration(total.saturating_sub(done) as f64 / rate),
+            )
+        };
+        Self {
+            ratio: Some((done as f64 / total as f64).min(1.0)),
+            size: format!("{}/{}", unit.amount(done), unit.amount(total)),
+            speed,
+            time,
+        }
+    }
+
+    /// ` 52%`, or nothing without a measure.
+    pub(crate) fn percent(&self) -> String {
+        self.ratio
+            .map(|ratio| format!("{:>3}%", (ratio * 100.0).floor()))
+            .unwrap_or_default()
+    }
+}
+
 /// One line of a running job.
 pub(crate) struct Step {
     /// What it did, once finished: `Scanned`.
@@ -53,6 +115,19 @@ pub(crate) struct Step {
     pub started: Option<Instant>,
     /// Seconds the step took, once finished.
     pub secs: Option<f64>,
+}
+
+impl Step {
+    /// Where the step is with `done` of its work done, now.
+    pub(crate) fn readout(&self, done: u64) -> Readout {
+        let elapsed = self.started.map_or(0.0, |at| at.elapsed().as_secs_f64());
+        Readout::new(self.unit, self.total, done, elapsed)
+    }
+
+    /// Whether the step has started and not finished.
+    pub(crate) fn running(&self) -> bool {
+        self.started.is_some() && self.secs.is_none()
+    }
 }
 
 /// A job's steps and where it is, shared with its thread.
@@ -556,4 +631,43 @@ fn run(
         build_secs,
         costs: report.stage_table(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Readout, Unit};
+
+    #[test]
+    fn readout_of_a_measured_step() {
+        let readout = Readout::new(Unit::Bytes, Some(95_700_000_000), 49_800_000_000, 1_031.0);
+        assert_eq!(readout.ratio, Some(49_800_000_000.0 / 95_700_000_000.0));
+        assert_eq!(readout.percent(), " 52%");
+        assert_eq!(readout.size, "49.8 GB/95.7 GB");
+        assert_eq!(readout.speed, "48 MB/s");
+        assert_eq!(readout.time, "15m50s");
+    }
+
+    #[test]
+    fn readout_shows_no_rate_in_its_first_second() {
+        let readout = Readout::new(Unit::Count("blocks"), Some(2_000), 500, 0.5);
+        assert_eq!(readout.percent(), " 25%");
+        assert_eq!(readout.size, "500/2.0K");
+        assert_eq!((readout.speed.as_str(), readout.time.as_str()), ("", ""));
+        let idle = Readout::new(Unit::Bytes, Some(2_000), 0, 5.0);
+        assert_eq!((idle.speed.as_str(), idle.time.as_str()), ("", ""));
+    }
+
+    #[test]
+    fn readout_without_a_measure_is_time_passed() {
+        let expected = Readout {
+            ratio: None,
+            size: String::new(),
+            speed: String::new(),
+            time: "1m05s".to_string(),
+        };
+        assert_eq!(Readout::new(Unit::None, Some(10), 5, 65.0), expected);
+        assert_eq!(Readout::new(Unit::Bytes, None, 5, 65.0), expected);
+        assert_eq!(Readout::new(Unit::Bytes, Some(0), 0, 65.0), expected);
+        assert_eq!(Readout::new(Unit::None, None, 0, 65.0).percent(), "");
+    }
 }
