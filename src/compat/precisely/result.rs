@@ -209,6 +209,21 @@ impl From<&api::ReverseFeature> for Feature {
     }
 }
 
+impl Candidate {
+    /// Restates the language the request asked for, by its language code
+    /// alone (`en` for `en-US`), as every postal answer's custom fields do.
+    pub(super) fn in_language(mut self, lang: Option<&str>) -> Self {
+        let code = lang
+            .and_then(|lang| lang.split(['-', '_']).next())
+            .map(str::to_ascii_lowercase)
+            .filter(|code| !code.is_empty());
+        if let Some(code) = code {
+            self.custom_fields.insert("LANGUAGE", code);
+        }
+        self
+    }
+}
+
 /// Precisely's `Result`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -359,6 +374,21 @@ const CRS_NAME: &str = "epsg:4326";
 
 /// The compatibility field carrying the og reference for lookup.
 pub(super) const ID_FIELD: &str = "PB_KEY";
+/// The custom field naming the result's point as a geohash.
+const GEOHASH: &str = "GEOHASH";
+/// Characters of the geohash, which names the point to centimetres.
+const GEOHASH_CHARS: usize = 12;
+/// The custom field naming what kind of thing matched the address asked.
+const MATCH_TYPE: &str = "MATCH_TYPE";
+
+/// Which autocomplete a prediction answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Autocomplete {
+    /// `/v1/autocomplete`.
+    V1,
+    /// `/v2/express-autocomplete`.
+    Express,
+}
 
 impl Feature {
     /// The label, as an autocomplete `prediction` shows it.
@@ -485,6 +515,8 @@ impl Feature {
     /// holds the point, so it has none.
     pub(super) fn reverse_candidate(&self) -> Candidate {
         let mut candidate = self.unasked_candidate(FoundBy::Point);
+        // The point is the one asked, so the answer restates no geohash.
+        candidate.custom_fields.remove(GEOHASH);
         if let Some(distance_m) = self.properties.distance_m {
             candidate
                 .custom_fields
@@ -503,6 +535,8 @@ impl Feature {
     pub(super) fn unasked_candidate(&self, found_by: FoundBy) -> Candidate {
         let mut candidate = self.candidate(Product::Geocode);
         candidate.score = Some(0);
+        // No address was asked, so no kind of match is named.
+        candidate.custom_fields.remove(MATCH_TYPE);
         candidate.explanation.address_match.description = judged_unasked(
             &candidate.address,
             self.properties.address.street.is_some(),
@@ -519,18 +553,18 @@ impl Feature {
 
     /// A geocode, verify, lookup or reverse candidate, in the postal form.
     pub(super) fn candidate(&self, product: Product) -> Candidate {
-        self.build(product, Style::Postal)
+        self.build(product, Style::Postal).0
     }
 
     /// An autocomplete prediction's candidate. Autocomplete writes the
     /// address in its own case and without the country, names the state by
     /// its code and leaves the county and neighbourhood empty, and says how
     /// the typed text matched each part.
-    pub(super) fn prediction(&self) -> Candidate {
-        let mut candidate = self.build(Product::Geocode, Style::Display);
-        let postal = self.us_address(&candidate.address).is_some();
+    pub(super) fn prediction(&self, version: Autocomplete) -> Candidate {
+        let (mut candidate, us) = self.build(Product::Geocode, Style::Display);
+        self.restate_typed(&mut candidate, us.as_ref(), version);
         let address = &mut candidate.address;
-        if postal {
+        if us.is_some() {
             address.admin2 = Some(AdminField::default());
             address.neighborhood = Some(AdminField::default());
             if let Some(admin1) = address.admin1.as_mut()
@@ -543,7 +577,61 @@ impl Feature {
         candidate
     }
 
-    fn build(&self, product: Product, style: Style) -> Candidate {
+    /// The parts of a prediction its `customFields` restate, under the keys
+    /// Precisely's examples of each autocomplete write. The first
+    /// autocomplete restates the address on one line and the number and
+    /// street it matched; an address point is its own first number. Express
+    /// restates the address as it formats it and the unit.
+    fn restate_typed(
+        &self,
+        candidate: &mut Candidate,
+        us: Option<&UsAddress>,
+        version: Autocomplete,
+    ) {
+        let address = &candidate.address;
+        let restated = match version {
+            Autocomplete::V1 => {
+                let one_line = us
+                    .map(|us| {
+                        format!(
+                            "{}, {}",
+                            us.street_line(Style::Display),
+                            us.location_line(Style::Display)
+                        )
+                    })
+                    .or_else(|| address.formatted_address.clone());
+                let point = self.properties.layer == Layer::Address
+                    && self.properties.accuracy == Accuracy::Rooftop;
+                vec![
+                    ("FORMATTED_STRING", one_line),
+                    ("MATCHED_FROM_ADDRESSNUMBER", address.address_number.clone()),
+                    (
+                        "MATCHED_FROM_STREETNAME",
+                        self.street_name_and_type(us).map(|(name, _)| name),
+                    ),
+                    (
+                        "ADDRESS_NUMBER_FROM",
+                        address.address_number.clone().filter(|_| point),
+                    ),
+                ]
+            }
+            Autocomplete::Express => vec![
+                ("FORMATTED_STRING", address.formatted_address.clone()),
+                (
+                    "UNIT_INFO",
+                    us.and_then(|us| us.unit(Style::Display))
+                        .or_else(|| self.properties.address.unit.clone()),
+                ),
+            ],
+        };
+        for (key, value) in restated {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                candidate.custom_fields.insert(key, value);
+            }
+        }
+    }
+
+    fn build(&self, product: Product, style: Style) -> (Candidate, Option<UsAddress>) {
         let properties = &self.properties;
         let address = &properties.address;
         let context = &properties.context;
@@ -682,14 +770,19 @@ impl Feature {
                 encode_parts(&properties.id, Some(properties.layer), &properties.label),
             )]),
         };
-        if let Some(us) = self.us_address(&candidate.address) {
+        let us = self.us_address(&candidate.address);
+        if let Some(us) = &us {
             us.write(&mut candidate, style);
+        }
+        if style == Style::Postal {
+            self.restate_postal(&mut candidate, us.as_ref());
         }
         let holds = Holds::of(&candidate.address);
         candidate.explanation.address_match.description = describe(judged);
         if product == Product::Verify {
             // Verify standardizes an address and does not place it.
             candidate.location = None;
+            candidate.custom_fields.remove(GEOHASH);
             if let Some(code) = MatchCode::derive(judged, holds, candidate.score) {
                 candidate
                     .custom_fields
@@ -699,7 +792,66 @@ impl Feature {
                     .insert(EXTENDED_MATCH_CODE, code.extended());
             }
         }
-        candidate
+        (candidate, us)
+    }
+
+    /// The street's own name and its type: the postal form's for a US
+    /// address, og's parts for any other.
+    fn street_name_and_type(&self, us: Option<&UsAddress>) -> Option<(String, Option<String>)> {
+        if let Some(us) = us {
+            return Some((us.street(Style::Postal), us.street_type(Style::Postal)));
+        }
+        let street = self.properties.address.street.as_deref()?;
+        Some(match &self.properties.address.street_parts {
+            Some(parts) => (parts.name.clone(), parts.kind.clone()),
+            None => (street.to_string(), None),
+        })
+    }
+
+    /// The parts of a postal answer its `customFields` restate, under the
+    /// keys every Precisely example of geocode, verify, lookup and reverse
+    /// writes. og keeps one name for a town, so its short, postal and
+    /// preferred names are that one. og splits a street's type off only
+    /// after its name, so the type is always the one after it. og answers
+    /// no intersection.
+    fn restate_postal(&self, candidate: &mut Candidate, us: Option<&UsAddress>) {
+        let address = &candidate.address;
+        let city = address
+            .city
+            .as_ref()
+            .and_then(|city| city.short_name.clone().or_else(|| city.long_name.clone()));
+        let (name, kind) = self.street_name_and_type(us).unzip();
+        let point = candidate
+            .location
+            .as_ref()
+            .map(|location| location.feature.geometry.coordinates);
+        let restated = [
+            ("ADDRLINE_SHORT", address.formatted_street_address.clone()),
+            ("LASTLINE_SHORT", address.formatted_location_address.clone()),
+            ("CITY_SHORT", city.clone()),
+            ("NAME_CITY", city.clone()),
+            ("PREF_CITY", city),
+            ("NAME", name.clone()),
+            ("NAME_SHORT", name),
+            ("TYPE_SHORT", kind.clone().flatten()),
+            ("THOROUGHFARE_TYPE", kind.clone().flatten()),
+            ("POST_THOROUGHFARE_TYPE", kind.flatten()),
+            ("UNIT_TYPE", address.unit_type.clone()),
+            ("INTERSECTION", Some("F".to_string())),
+            (
+                MATCH_TYPE,
+                Some(candidate.explanation.address_match.kind.to_string()),
+            ),
+            (
+                GEOHASH,
+                point.map(|[lon, lat]| crate::util::geo::geohash(lat, lon, GEOHASH_CHARS)),
+            ),
+        ];
+        for (key, value) in restated {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                candidate.custom_fields.insert(key, value);
+            }
+        }
     }
 
     /// The candidate's address in the US postal form, for a US house on a
@@ -1263,7 +1415,7 @@ mod tests {
 
     #[test]
     fn a_us_prediction_is_written_as_autocomplete_writes_it() {
-        let candidate = serde_json::to_value(jordan().prediction()).expect("JSON");
+        let candidate = serde_json::to_value(jordan().prediction(Autocomplete::V1)).expect("JSON");
         let address = &candidate["address"];
         assert_eq!(
             address["formattedAddress"],
@@ -1300,6 +1452,83 @@ mod tests {
                                    "matchedSubstring": "JORDAN"}),
             ]
         );
+    }
+
+    /// A postal answer restates its parts in the postal form, as the
+    /// documented answers for `1700 DISTRICT AVE STE 300` do.
+    #[test]
+    fn a_us_answer_restates_its_parts_in_the_postal_form() {
+        let fields = jordan()
+            .candidate(Product::Geocode)
+            .in_language(Some("en-US"))
+            .custom_fields;
+        let restated = fields
+            .iter()
+            .filter(|(key, _)| **key != ID_FIELD)
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            restated,
+            BTreeMap::from([
+                ("ADDRLINE_SHORT", "350 JORDAN AVE"),
+                ("LASTLINE_SHORT", "MONTOURSVILLE, PA  17754"),
+                ("CITY_SHORT", "MONTOURSVILLE"),
+                ("NAME_CITY", "MONTOURSVILLE"),
+                ("PREF_CITY", "MONTOURSVILLE"),
+                ("NAME", "JORDAN"),
+                ("NAME_SHORT", "JORDAN"),
+                ("TYPE_SHORT", "AVE"),
+                ("THOROUGHFARE_TYPE", "AVE"),
+                ("POST_THOROUGHFARE_TYPE", "AVE"),
+                ("INTERSECTION", "F"),
+                ("MATCH_TYPE", "ADDRESS"),
+                ("GEOHASH", "dr369sbz1wc1"),
+                ("LANGUAGE", "en"),
+            ])
+        );
+        let reverse = jordan().reverse_candidate().custom_fields;
+        assert!(!reverse.contains_key(GEOHASH) && !reverse.contains_key(MATCH_TYPE));
+        let verified = jordan().candidate(Product::Verify).custom_fields;
+        assert!(!verified.contains_key(GEOHASH) && verified.contains_key(MATCH_TYPE));
+    }
+
+    /// Each autocomplete restates what its documented predictions do: the
+    /// first the address on one line and the number and street matched,
+    /// express its formatted address and the unit.
+    #[test]
+    fn a_prediction_restates_what_its_autocomplete_does() {
+        let fields = |feature: &Feature, version| {
+            feature
+                .prediction(version)
+                .custom_fields
+                .into_iter()
+                .filter(|(key, _)| *key != ID_FIELD)
+                .collect::<BTreeMap<_, _>>()
+        };
+        let owned = |pairs: &[(&'static str, &str)]| {
+            pairs
+                .iter()
+                .map(|(key, value)| (*key, value.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            fields(&jordan(), Autocomplete::V1),
+            owned(&[
+                (
+                    "FORMATTED_STRING",
+                    "350 Jordan Ave, Montoursville, PA 17754"
+                ),
+                ("MATCHED_FROM_ADDRESSNUMBER", "350"),
+                ("MATCHED_FROM_STREETNAME", "JORDAN"),
+                ("ADDRESS_NUMBER_FROM", "350"),
+            ])
+        );
+        let mut suite = jordan();
+        suite.properties.address.unit = Some("STE 2".to_string());
+        let express = fields(&suite, Autocomplete::Express);
+        assert_eq!(express.get("UNIT_INFO").map(String::as_str), Some("Ste 2"));
+        assert!(express.contains_key("FORMATTED_STRING"));
+        assert!(!express.contains_key("MATCHED_FROM_ADDRESSNUMBER"));
     }
 
     #[test]

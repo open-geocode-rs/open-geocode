@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Failure, Preferences, country_code, error, given, read_json,
-    result::{Candidate, Feature, FoundBy, Product},
+    result::{Autocomplete, Candidate, Feature, FoundBy, Product},
 };
 use crate::{
     compat::{Args, VendorError, decode_id, native},
@@ -141,6 +141,8 @@ struct InputLocation {
 #[derive(Debug, Deserialize)]
 struct LookupRequest {
     keys: Vec<LookupKey>,
+    #[serde(default)]
+    preferences: Preferences,
 }
 
 /// `LookupSingleRequest`. Country scopes each key independently.
@@ -241,6 +243,7 @@ impl Outcome {
         max: usize,
         product: Product,
         asked_street: Option<&str>,
+        lang: Option<&str>,
     ) -> Self
     where
         &'a T: Into<Feature>,
@@ -252,7 +255,7 @@ impl Outcome {
             .map(|feature| {
                 let mut candidate = feature.candidate(product);
                 feature.judge_street_parts(&mut candidate, asked_street);
-                candidate
+                candidate.in_language(lang)
             })
             .collect::<Vec<_>>();
         Self::answered(address_id, results)
@@ -395,6 +398,7 @@ async fn addresses(
                     max,
                     product,
                     asked_street.as_deref().filter(|street| !street.is_empty()),
+                    body.preferences.lang().as_deref(),
                 ),
                 Err(problem) => Outcome::refused(address_id, problem, address.country()),
             },
@@ -425,13 +429,14 @@ pub(super) async fn reverse(
         .preferences
         .distance_m()?
         .unwrap_or(super::DEFAULT_DISTANCE_M);
+    let lang = body.preferences.lang();
     let mut outcomes = Vec::new();
     for location in checked(body.locations)? {
         let args = Args::new()
             .maybe("lon", location.longitude.map(|lon| lon.to_string()))
             .maybe("lat", location.latitude.map(|lat| lat.to_string()))
             .set("radius", crate::compat::radius(radius_m))
-            .maybe("lang", body.preferences.lang());
+            .maybe("lang", lang.clone());
         let wanted = given(location.country.as_deref()).map(country_code);
         outcomes.push(match native::reverse(&state, args).await {
             Ok(collection) => {
@@ -457,7 +462,7 @@ pub(super) async fn reverse(
                 let results = features
                     .iter()
                     .take(max)
-                    .map(Feature::reverse_candidate)
+                    .map(|feature| feature.reverse_candidate().in_language(lang.as_deref()))
                     .collect();
                 Outcome::answered(location.address_id, results)
             }
@@ -496,7 +501,13 @@ pub(super) async fn lookup(
             ),
             (_, None) => invalid("Lookup key cannot be null or empty (DIS-LI-1027)".to_string()),
             ("PB_KEY", Some(value)) => {
-                lookup_key(&state, value, given(key.country.as_deref())).await
+                lookup_key(
+                    &state,
+                    value,
+                    given(key.country.as_deref()),
+                    body.preferences.lang().as_deref(),
+                )
+                .await
             }
             (kind, Some(_)) => invalid(format!("Key type {kind} is not supported by this server")),
         });
@@ -510,7 +521,12 @@ pub(super) async fn lookup(
     ))
 }
 
-async fn lookup_key(state: &AppState, value: &str, country: Option<&str>) -> Outcome {
+async fn lookup_key(
+    state: &AppState,
+    value: &str,
+    country: Option<&str>,
+    lang: Option<&str>,
+) -> Outcome {
     let code = country
         .map(country_code)
         .map(|code| code.to_ascii_uppercase())
@@ -533,11 +549,14 @@ async fn lookup_key(state: &AppState, value: &str, country: Option<&str>) -> Out
     let Some(named) = decode_id(value) else {
         return empty();
     };
-    match native::by_id(state, &named, None).await {
+    match native::by_id(state, &named, lang).await {
         Ok(Some(hit)) => {
             let feature = Feature::from(&hit);
             if feature.country_code() == Some(code.as_str()) {
-                Outcome::answered(None, vec![feature.unasked_candidate(FoundBy::Key)])
+                Outcome::answered(
+                    None,
+                    vec![feature.unasked_candidate(FoundBy::Key).in_language(lang)],
+                )
             } else {
                 empty()
             }
@@ -581,7 +600,7 @@ pub(super) async fn autocomplete(
     request: Request,
 ) -> Result<Json<AutocompleteResponse>, VendorError> {
     let body = read_json::<AutocompleteRequest>(&state, request, "INVALID_REQUEST").await?;
-    complete(&state, body, None).await
+    complete(&state, body, None, Autocomplete::V1).await
 }
 
 /// `/v2/express-autocomplete`, v1's request with `filterBias` added, which
@@ -595,13 +614,14 @@ pub(super) async fn express_autocomplete_v2(
     if let Some(filter_bias) = &filter_bias {
         filter_bias.check()?;
     }
-    complete(&state, body, filter_bias.as_ref()).await
+    complete(&state, body, filter_bias.as_ref(), Autocomplete::Express).await
 }
 
 async fn complete(
     state: &AppState,
     body: AutocompleteRequest,
     filter_bias: Option<&super::FilterBias>,
+    version: Autocomplete,
 ) -> Result<Json<AutocompleteResponse>, VendorError> {
     let max = body.preferences.max_results()?;
     let focus = body.preferences.origin()?;
@@ -631,7 +651,22 @@ async fn complete(
     let mut predictions = features
         .iter()
         .map(|feature| {
-            let candidate = feature.prediction();
+            let mut candidate = feature.prediction(version);
+            if version == Autocomplete::V1 {
+                // The first autocomplete restates the distance among its
+                // custom fields, as negative zero when there is no
+                // `originXY` to measure from.
+                let distance = match focus {
+                    Some(_) => feature.distance_m().map(|metres| metres.to_string()),
+                    None => Some("-0.0".to_string()),
+                };
+                if let Some(distance) = distance {
+                    candidate.custom_fields.insert("DISTANCE", distance);
+                    candidate
+                        .custom_fields
+                        .insert("DISTANCE_UNIT", "METERS".to_string());
+                }
+            }
             Prediction {
                 prediction: candidate
                     .address

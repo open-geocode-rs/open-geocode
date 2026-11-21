@@ -118,6 +118,24 @@ impl UsAddress {
         }
     }
 
+    /// The street's type, `AVE` in the postal form.
+    pub(crate) fn street_type(&self, style: Style) -> Option<String> {
+        self.suffix_type
+            .as_deref()
+            .map(|kind| style.abbreviation(kind))
+    }
+
+    /// The unit, its designator first: `Ste 2` in a display.
+    pub(crate) fn unit(&self, style: Style) -> Option<String> {
+        let unit = self.unit.as_ref()?;
+        Some(join([
+            unit.designator
+                .as_deref()
+                .map(|designator| style.abbreviation(designator)),
+            Some(unit.value.clone()),
+        ]))
+    }
+
     pub(crate) fn city(&self, style: Style) -> String {
         style.whole(&style.name(&self.city))
     }

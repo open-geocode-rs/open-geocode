@@ -89,6 +89,47 @@ pub(crate) fn narrowest_box(parts: impl IntoIterator<Item = Extent>) -> Option<E
     })
 }
 
+const GEOHASH_ALPHABET: &[u8] = b"0123456789bcdefghjkmnpqrstuvwxyz";
+
+/// The geohash of a point, `chars` characters long.
+pub(crate) fn geohash(lat: f64, lon: f64, chars: usize) -> String {
+    let mut lat_range = (-90.0f64, 90.0f64);
+    let mut lon_range = (-180.0f64, 180.0f64);
+    let mut hash = String::with_capacity(chars);
+    let mut bit = 0;
+    let mut value = 0usize;
+    let mut even = true;
+    while hash.len() < chars {
+        if even {
+            let mid = (lon_range.0 + lon_range.1) / 2.0;
+            if lon > mid {
+                value = (value << 1) | 1;
+                lon_range.0 = mid;
+            } else {
+                value <<= 1;
+                lon_range.1 = mid;
+            }
+        } else {
+            let mid = (lat_range.0 + lat_range.1) / 2.0;
+            if lat > mid {
+                value = (value << 1) | 1;
+                lat_range.0 = mid;
+            } else {
+                value <<= 1;
+                lat_range.1 = mid;
+            }
+        }
+        even = !even;
+        bit += 1;
+        if bit == 5 {
+            hash.push(GEOHASH_ALPHABET[value] as char);
+            bit = 0;
+            value = 0;
+        }
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +192,26 @@ mod tests {
             coordinates: vec![vec![0.0, 0.0].into(), vec![1.0, 1.0].into()],
         });
         assert_eq!(point_lon_lat(&line), None);
+    }
+
+    #[test]
+    fn geohash_prefixes_agree_for_nearby_points() {
+        let a = geohash(-42.91654, 147.26215, 6);
+        let b = geohash(-42.91669, 147.26209, 6);
+        assert_eq!(a, b, "points ~20m apart share a 6-char geohash");
+        let far = geohash(-33.86, 151.21, 6);
+        assert_ne!(a, far);
+    }
+
+    #[test]
+    fn geohash_length_is_requested_length() {
+        assert_eq!(geohash(-42.9, 147.3, 4).len(), 4);
+        assert_eq!(geohash(-42.9, 147.3, 6).len(), 6);
+    }
+
+    #[test]
+    fn a_geohash_of_twelve_characters_names_a_point_to_centimetres() {
+        assert_eq!(geohash(42.483_939, -71.207_799, 12), "drt3etunfh0x");
+        assert_eq!(geohash(42.682_242, -73.704_443, 12), "dredff441fxf");
     }
 }

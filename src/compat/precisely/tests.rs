@@ -554,8 +554,43 @@ fn address_result(score: &Value, exact: &[&str]) -> Value {
         },
         "addressLines": ["Unit 5", "100 King Street West", "Toronto, ON M5X 1A9", "Canada"],
         "explanation": {"addressMatch": {"type": "ADDRESS", "description": description}},
-        "customFields": {"PB_KEY": address_vendor_id("osm:node:10")},
+        "customFields": restated(json!({
+            "PB_KEY": address_vendor_id("osm:node:10"),
+            "MATCH_TYPE": "ADDRESS",
+            "GEOHASH": "dpz83dh58762",
+        })),
     })
+}
+
+/// A result to a request whose `clientLocale` is `en_US`, which restates
+/// the language.
+fn in_english(mut result: Value) -> Value {
+    result["customFields"]["LANGUAGE"] = json!("en");
+    result
+}
+
+/// The custom fields that restate the King Street West address's parts,
+/// with `fields` besides. Outside the US og writes the street's type as
+/// the address writes it, and its one name for a town as each of the
+/// town's names.
+fn restated(mut fields: Value) -> Value {
+    let parts = json!({
+        "ADDRLINE_SHORT": "100 King Street West, Unit 5",
+        "LASTLINE_SHORT": "ON, M5X 1A9",
+        "CITY_SHORT": "Toronto",
+        "NAME_CITY": "Toronto",
+        "PREF_CITY": "Toronto",
+        "NAME": "King",
+        "NAME_SHORT": "King",
+        "TYPE_SHORT": "Street",
+        "THOROUGHFARE_TYPE": "Street",
+        "POST_THOROUGHFARE_TYPE": "Street",
+        "INTERSECTION": "F",
+    });
+    for (key, value) in parts.as_object().expect("an object") {
+        fields[key] = value.clone();
+    }
+    fields
 }
 
 /// The street's type and direction are judged apart from its name: each
@@ -643,15 +678,15 @@ async fn geocode_answers_each_address_in_order() {
     assert_eq!(
         reply.json(),
         json!({"responses": [
-            {"addressId": "1", "status": "OK", "results": [address_result(
+            {"addressId": "1", "status": "OK", "results": [in_english(address_result(
                 &score,
                 &["addressNumber", "street"],
-            )]},
+            ))]},
             {"addressId": "2", "status": "ZERO_RESULTS", "results": []},
-            {"addressId": "3", "status": "OK", "results": [address_result(
+            {"addressId": "3", "status": "OK", "results": [in_english(address_result(
                 &structured_score,
                 &["addressNumber", "street", "city", "postalCode"],
-            )]},
+            ))]},
         ]})
     );
 }
@@ -840,7 +875,16 @@ async fn a_poi_says_what_it_is_and_where() {
             },
             "addressLines": ["120 King Street West", "Toronto, ON M5X 1A9", "Canada"],
             "explanation": {"addressMatch": {"type": "POI", "description": typed}},
-            "customFields": {"PB_KEY": encode_parts("osm:way:11", Some(Layer::Poi), "")},
+            // A place has no number of its own to start a range, and with
+            // no `originXY` the distance is negative zero.
+            "customFields": {
+                "PB_KEY": encode_parts("osm:way:11", Some(Layer::Poi), ""),
+                "FORMATTED_STRING": "Queen Bakery, 120 King Street West, Toronto, ON, M5X 1A9",
+                "MATCHED_FROM_ADDRESSNUMBER": "120",
+                "MATCHED_FROM_STREETNAME": "King",
+                "DISTANCE": "-0.0",
+                "DISTANCE_UNIT": "METERS",
+            },
             "distance": {"value": 0.0, "distanceUnit": "METER"},
         }]}})
     );
@@ -1022,6 +1066,11 @@ async fn reverse_geocode_answers_each_point() {
         .map(|label| json!({"label": label, "matchType": if exact.contains(label) { "EXACT" } else { "NONE" }}))
         .collect::<Vec<_>>()
     );
+    // No address was asked, and the point is the one asked, so the answer
+    // names no kind of match and restates no geohash.
+    let fields = expected["customFields"].as_object_mut().expect("an object");
+    fields.remove("MATCH_TYPE");
+    fields.remove("GEOHASH");
     // The house stands on the asked point.
     expected["customFields"]["REVERSE_GEOCODE_DISTANCE"] = json!("0");
     expected["customFields"]["REVERSE_GEOCODE_DISTANCE_UNIT"] = json!("METERS");
@@ -1744,11 +1793,13 @@ fn verified_result(score: &Value, stated: &[&str], codes: [&str; 2]) -> Value {
         },
         "addressLines": ["Unit 5", "100 King Street West", "Toronto, ON M5X 1A9", "Canada"],
         "explanation": {"addressMatch": {"type": "ADDRESS", "description": description}},
-        "customFields": {
+        // Verify places nothing, so it restates no geohash.
+        "customFields": restated(json!({
             "PB_KEY": address_vendor_id("osm:node:10"),
+            "MATCH_TYPE": "ADDRESS",
             "SIMPLE_MATCH_CODE": codes[0],
             "EXTENDED_MATCH_CODE": codes[1],
-        },
+        })),
     })
 }
 
