@@ -606,20 +606,14 @@ pub(crate) mod native {
             .and_then(|limit| limit.parse::<usize>().ok())
             .filter(|limit| *limit > 0);
         let query = args.get("q").map(str::to_owned);
-        let (addresses, places) =
-            tokio::join!(geocode(state, args.copied()), self::places(state, args));
-        let (mut addresses, places) = match (addresses, places) {
-            (Ok(addresses), Ok(places)) => (addresses, places.features),
-            (Ok(addresses), Err(_)) => (addresses, Vec::new()),
-            (Err(_), Ok(places)) => return Ok(places),
-            (Err(_), Err(problem)) => return Err(problem),
-        };
+        let mut addresses = geocode(state, args.copied()).await?;
+        let places = self::places(state, args).await?.features;
         let limit = limit.unwrap_or_else(|| addresses.features.len().max(places.len()));
         addresses.features.retain(|feature| {
             names_answer(feature)
                 || query
                     .as_deref()
-                    .is_some_and(|query| names_japanese_block_address(feature, query))
+                    .is_some_and(|query| names_block_address(feature, query))
         });
         addresses.features = merge_search_results(addresses.features, places, query.as_deref());
         let mut seen = std::collections::HashSet::new();
@@ -725,7 +719,7 @@ pub(crate) mod native {
         })
     }
 
-    fn names_japanese_block_address(feature: &ForwardFeature, query: &str) -> bool {
+    fn names_block_address(feature: &ForwardFeature, query: &str) -> bool {
         use crate::{record::Layer, util::text::normalize_for_compare};
 
         let properties = &feature.properties;
@@ -736,7 +730,6 @@ pub(crate) mod native {
             || address.street.is_some()
             || address.areas.is_empty()
             || address.block_parts().is_none()
-            || super::country_code(&common.context).or(address.country.as_deref()) != Some("JP")
         {
             return false;
         }

@@ -9,6 +9,7 @@
 //! `/jobs/{id}` as any other.
 
 mod batch;
+pub(crate) use batch::sweep;
 mod category;
 mod food_types;
 mod hours;

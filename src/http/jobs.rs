@@ -1792,6 +1792,7 @@ pub(crate) async fn sweep_forever(state: AppState) {
     loop {
         every.tick().await;
         state.jobs().sweep();
+        crate::compat::here::sweep(&state).await;
         crate::compat::precisely::sweep(&state);
     }
 }

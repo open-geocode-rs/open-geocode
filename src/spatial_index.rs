@@ -490,9 +490,13 @@ impl Tree {
         u64::from_le_bytes(id)
     }
 
-    fn intersects(&self, bounds: BoundingBox) -> bool {
+    fn intersects_where(
+        &self,
+        bounds: BoundingBox,
+        mut matches: impl FnMut(u64) -> Result<bool>,
+    ) -> Result<bool> {
         let Some(root) = self.levels.len().checked_sub(1) else {
-            return false;
+            return Ok(false);
         };
         let mut pending = vec![(root, 0)];
         while let Some((level, node)) = pending.pop() {
@@ -506,13 +510,16 @@ impl Tree {
                 continue;
             }
             if level == 0 {
-                return true;
+                if matches(self.id(node))? {
+                    return Ok(true);
+                }
+                continue;
             }
             let (_, count) = self.levels[level - 1];
             let children = node * NODE_SIZE..((node + 1) * NODE_SIZE).min(count);
             pending.extend(children.map(|child| (level - 1, child)));
         }
-        false
+        Ok(false)
     }
 
     /// Items whose boxes lie within `radius_m` of the point, nearest box
@@ -737,15 +744,42 @@ impl Reader {
         })
     }
 
-    pub(crate) fn has_spatial_data_in_box(&self, bounds: [f64; 4]) -> Result<bool> {
-        let [west, south, east, north] = bounds;
+    pub(crate) fn has_street_or_address(&self, area: &geo::Polygon) -> Result<bool> {
+        use geo::{BoundingRect, Intersects};
+
+        let Some(bounds) = area.bounding_rect() else {
+            return Ok(false);
+        };
         let quantized = [
-            quantize(west)?,
-            quantize(south)?,
-            quantize(east)?,
-            quantize(north)?,
+            quantize(bounds.min().x)?,
+            quantize(bounds.min().y)?,
+            quantize(bounds.max().x)?,
+            quantize(bounds.max().y)?,
         ];
-        Ok(self.lines.intersects(quantized) || self.blocks.intersects(quantized))
+        if self.lines.intersects_where(quantized, |id| {
+            let Some(parts) = self.records.line(id)? else {
+                return Ok(false);
+            };
+            Ok(parts.into_iter().any(|part| {
+                let line = geo::LineString::from_iter(
+                    part.into_iter()
+                        .map(|[lon, lat]| (dequantize(lon), dequantize(lat))),
+                );
+                area.intersects(&line)
+            }))
+        })? {
+            return Ok(true);
+        }
+        self.blocks.intersects_where(quantized, |block| {
+            let mut found = false;
+            self.records.block_points(block, |_, layer, lon, lat, _| {
+                if !found && layer == Layer::Address {
+                    found = area.intersects(&geo::Point::new(dequantize(lon), dequantize(lat)));
+                }
+                Ok(())
+            })?;
+            Ok(found)
+        })
     }
 
     pub(crate) fn address_points_in_box(
@@ -1458,6 +1492,22 @@ mod tests {
             Reader::open(&container, records).expect("spatial reader"),
             commit,
         )
+    }
+
+    #[test]
+    fn county_coverage_checks_points_inside_the_outline() {
+        let (reader, _) = build(&[address(-79.0, 43.0, 7)]);
+        let triangle = |vertices| geo::Polygon::new(geo::LineString::from_iter(vertices), vec![]);
+        assert!(
+            reader
+                .has_street_or_address(&triangle([(-80.0, 42.0), (-78.0, 43.0), (-80.0, 44.0)]))
+                .expect("read county")
+        );
+        assert!(
+            !reader
+                .has_street_or_address(&triangle([(-80.0, 42.0), (-78.8, 42.0), (-80.0, 43.5)]))
+                .expect("read county")
+        );
     }
 
     #[test]

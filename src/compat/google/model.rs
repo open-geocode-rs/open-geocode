@@ -229,6 +229,8 @@ pub(super) struct Place {
     pub(super) id: String,
     pub(super) display_name: LocalizedText,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) attributions: Vec<Attribution>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) types: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) primary_type: Option<&'static str>,
@@ -262,6 +264,14 @@ pub(super) struct Place {
     pub(super) entrances: Vec<PlaceEntrance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) address_descriptor: Option<AddressDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Attribution {
+    pub(super) provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) provider_uri: Option<String>,
 }
 
 /// Where a place is, told by the places near it and the areas holding it.
@@ -370,6 +380,7 @@ impl Place {
                 text: common.name.clone(),
                 language_code: language.of(common.record_id, &common.context),
             },
+            attributions: Vec::new(),
             types: kind.types(),
             primary_type: kind.primary(),
             formatted_address,

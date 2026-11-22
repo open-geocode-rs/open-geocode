@@ -363,9 +363,9 @@ fn parse_countries(country: &Param) -> Result<Vec<String>, Problem> {
 #[derive(Debug, Deserialize)]
 pub(crate) struct GeocodeParams {
     q: Param,
-    /// `lon,lat`, with `q` only; see [`bounds::parse_focus`].
+    /// `lon,lat`; see [`bounds::parse_focus`].
     focus: Param,
-    /// `min_lon,min_lat,max_lon,max_lat`, with `q` only; see
+    /// `min_lon,min_lat,max_lon,max_lat`; see
     /// [`bounds::parse_bbox`].
     bbox: Param,
     address: Param,
@@ -1131,7 +1131,27 @@ pub(crate) async fn autocomplete(
     params: Result<Query<AutocompleteParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
+    let request = (AUTOCOMPLETE.prepare)(&state, params)?;
+    let worker = state.clone();
+    let collection = lookup(&state, move || (AUTOCOMPLETE.answer)(&worker, request)).await?;
+    Ok(Json(collection))
+}
 
+pub(crate) type AutocompleteRequest = Named<(TextAutocompleteOptions, Option<Layer>)>;
+
+pub(crate) const AUTOCOMPLETE: batch::Lookup<
+    AutocompleteParams,
+    AutocompleteRequest,
+    ForwardCollection,
+    String,
+> = batch::Lookup {
+    route: "/autocomplete",
+    prepare: |_, params| autocomplete_request(&params),
+    place: |request| request.request.0.query.to_lowercase(),
+    answer: autocomplete_answer,
+};
+
+fn autocomplete_request(params: &AutocompleteParams) -> Result<AutocompleteRequest, Problem> {
     // Nothing typed yet is no suggestions, not an error, so only the length is
     // bounded here; the searcher answers an empty or very short query with
     // none, and caps the result count itself.
@@ -1146,56 +1166,62 @@ pub(crate) async fn autocomplete(
     let focus = bounds::parse_focus(&params.focus)?;
     let bbox = bounds::parse_bbox(&params.bbox)?;
 
-    let mut options = TextAutocompleteOptions {
-        query: query.clone(),
-        limit: params.limit,
-        layer: layer.map(|layer| layer.as_str().to_string()),
-        countries,
-        focus,
-        bbox,
-    };
-    let worker = state.clone();
-    let collection = lookup(&state, move || {
-        let asked = effective_autocomplete_limit(options.limit);
-        let mut collection = loop {
-            let limit = effective_autocomplete_limit(options.limit);
-            let hits = match layer {
-                Some(Layer::Poi) => {
-                    let options = TextAutocompleteOptions {
-                        layer: None,
-                        ..options.clone()
-                    };
-                    let hits = worker.places.autocomplete(&options)?;
-                    prefer_poi_names(&worker, &options, limit, hits)?.0
-                }
-                Some(_) => worker.searcher.autocomplete(&options)?,
-                None => {
-                    let named = suggest(&worker.searcher, &worker.places, &options)?;
-                    nearest_of_category(&worker, &options, limit, named)?
-                }
-            };
-            let mut found = api::forward_collection(&worker.pack, query.clone(), hits)?;
-            let held = found.features.len();
-            house::one_per_house(&mut found.features);
-            let Some(more) = house::ask_again(
-                asked,
-                limit,
-                held,
-                found.features.len(),
-                crate::search::MAX_AUTOCOMPLETE_LIMIT,
-            ) else {
-                found.features.truncate(asked);
-                break found;
-            };
-            options.limit = more;
-        };
-        api::measure_from(&mut collection, focus);
-        api::localize_forward(&worker.pack, &mut collection, &languages);
-        Ok(collection)
+    Ok(Named {
+        request: (
+            TextAutocompleteOptions {
+                query,
+                limit: params.limit,
+                layer: layer.map(|layer| layer.as_str().to_string()),
+                countries,
+                focus,
+                bbox,
+            },
+            layer,
+        ),
+        languages,
     })
-    .await?;
+}
 
-    Ok(Json(collection))
+fn autocomplete_answer(state: &AppState, named: AutocompleteRequest) -> Result<ForwardCollection> {
+    let (mut options, layer) = named.request;
+    let focus = options.focus;
+    let languages = named.languages;
+    let asked = effective_autocomplete_limit(options.limit);
+    let mut collection = loop {
+        let limit = effective_autocomplete_limit(options.limit);
+        let hits = match layer {
+            Some(Layer::Poi) => {
+                let options = TextAutocompleteOptions {
+                    layer: None,
+                    ..options.clone()
+                };
+                let hits = state.places.autocomplete(&options)?;
+                prefer_poi_names(state, &options, limit, hits)?.0
+            }
+            Some(_) => state.searcher.autocomplete(&options)?,
+            None => {
+                let named = suggest(&state.searcher, &state.places, &options)?;
+                nearest_of_category(state, &options, limit, named)?
+            }
+        };
+        let mut found = api::forward_collection(&state.pack, options.query.clone(), hits)?;
+        let held = found.features.len();
+        house::one_per_house(&mut found.features);
+        let Some(more) = house::ask_again(
+            asked,
+            limit,
+            held,
+            found.features.len(),
+            crate::search::MAX_AUTOCOMPLETE_LIMIT,
+        ) else {
+            found.features.truncate(asked);
+            break found;
+        };
+        options.limit = more;
+    };
+    api::measure_from(&mut collection, focus);
+    api::localize_forward(&state.pack, &mut collection, &languages);
+    Ok(collection)
 }
 
 /// A search for places by their kind. No route of og's own answers one.
@@ -1486,11 +1512,11 @@ fn place_named(
                         counts as given.",
          example = "10 King Street, Toronto", max_length = 256),
         ("focus" = Option<String>, Query,
-         description = "With `q`: point to prefer results near, as `lon,lat`. \
+         description = "Point to prefer results near, as `lon,lat`. \
                         Breaks ties between equally good matches only.",
          example = "-79.38,43.65"),
         ("bbox" = Option<String>, Query,
-         description = "With `q`: return only results inside this box, as \
+         description = "Return only results inside this box, as \
                         `min_lon,min_lat,max_lon,max_lat`. The box cannot cross \
                         the antimeridian.",
          example = "-79.64,43.58,-79.12,43.86"),
@@ -1650,7 +1676,11 @@ pub(crate) const GEOCODE: Lookup<
 #[derive(Debug, Clone)]
 pub(crate) enum GeocodeRequest {
     Text(TextSearchOptions),
-    Fields(AddressGeocodeOptions),
+    Fields {
+        options: AddressGeocodeOptions,
+        focus: Option<[f64; 2]>,
+        bbox: Option<crate::search::BoundingBox>,
+    },
 }
 
 /// `/geocode`'s parameters, checked.
@@ -1675,7 +1705,11 @@ fn geocode_request(_: &AppState, params: GeocodeParams) -> Result<GeocodeRequest
         (Param::Empty, false) => return Err(bounds::empty_query()),
         (Param::Value(q), false) => q.clone(),
         (Param::Missing, _) => {
-            return geocode_fields(&params).map(GeocodeRequest::Fields);
+            return Ok(GeocodeRequest::Fields {
+                options: geocode_fields(&params)?,
+                focus: bounds::parse_focus(&params.focus)?,
+                bbox: bounds::parse_bbox(&params.bbox)?,
+            });
         }
     };
     let mut options = text_request(TextParams {
@@ -1728,7 +1762,7 @@ fn context_field(field: &Param) -> Result<Option<String>, Problem> {
 fn geocode_place(request: &GeocodeRequest) -> [String; 3] {
     let field = |value: &Option<String>| value.as_deref().unwrap_or_default().to_lowercase();
     match request {
-        GeocodeRequest::Fields(options) => [
+        GeocodeRequest::Fields { options, .. } => [
             field(&options.postcode).replace(' ', ""),
             field(&options.region),
             field(&options.locality),
@@ -1745,10 +1779,19 @@ fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCo
             let hits = state.searcher.search(&options)?;
             (options.query, hits, options.focus)
         }
-        GeocodeRequest::Fields(options) => match state.searcher.geocode_address(&options)? {
-            Some(found) => (found.query, vec![found.hit], None),
-            None => (options.address, Vec::new(), None),
-        },
+        GeocodeRequest::Fields {
+            options,
+            focus,
+            bbox,
+        } => {
+            match state
+                .searcher
+                .geocode_address_scoped(&options, focus, bbox)?
+            {
+                Some(found) => (found.query, vec![found.hit], focus),
+                None => (options.address, Vec::new(), focus),
+            }
+        }
     };
     let mut collection = api::forward_collection(&state.pack, query, hits)?;
     api::measure_from(&mut collection, focus);

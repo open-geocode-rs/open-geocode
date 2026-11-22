@@ -123,11 +123,10 @@ fn described(found: Found, pack: &Reader) -> (Described, Placed, Poi) {
     // `secondary_address` layer Search Box has no counterpart of.
     let context = Context {
         secondary_address: None,
-        block: (crate::compat::country_code(&common.context).or(common.address.country.as_deref())
-            == Some("JP"))
-        .then(|| common.address.block_parts())
-        .flatten()
-        .map(|(block, _)| super::Area::named(None, block)),
+        block: common
+            .address
+            .block_parts()
+            .map(|(block, _)| super::Area::named(None, block)),
         ..translated.context
     };
     (

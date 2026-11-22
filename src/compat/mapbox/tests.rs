@@ -895,6 +895,30 @@ async fn geocoding_batch_answers_each_query_in_order() {
 }
 
 #[tokio::test]
+async fn geocoding_batch_and_forward_share_constraints_and_completion() {
+    let pack = write_pack();
+    let router = router(&pack);
+    let base = "/compat/mapbox/search/geocode/v6";
+    let (status, blocked) = get(
+        &router,
+        &format!("{base}/forward?address_line1=10%20King%20Street&place=Toronto&bbox=0,0,1,1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(blocked["features"], json!([]));
+    let (status, batch) = send(
+        &router, "POST", &format!("{base}/batch"),
+        Some(r#"[{"address_line1":"10 King Street","place":"Toronto","bbox":[0,0,1,1]},{"q":"Toront","limit":1}]"#),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(batch["batch"][0], blocked);
+    let (status, single) = get(&router, &format!("{base}/forward?q=Toront&limit=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(single["features"][0]["properties"]["name"], "Toronto");
+    assert_eq!(batch["batch"][1], single);
+}
+
+#[tokio::test]
 async fn geocoding_batch_refuses_bad_input_whole() {
     let pack = write_pack();
     let limits = Limits {
@@ -1209,7 +1233,26 @@ async fn search_box_forward_keeps_location_qualifiers_behind_the_place() {
 }
 
 #[tokio::test]
-async fn search_box_forward_keeps_a_japanese_block_address() {
+async fn search_box_forward_keeps_places_with_one_lookup_slot() {
+    let pack = write_pack();
+    let router = router_with(
+        &pack,
+        Limits {
+            max_concurrent_lookups: NonZeroUsize::new(1),
+            ..Limits::DEFAULT
+        },
+    );
+    let (status, body) = get(
+        &router,
+        "/compat/mapbox/search/searchbox/v1/forward?q=Queen%20Cafe",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["features"][0]["properties"]["name"], "Queen Cafe");
+}
+
+#[tokio::test]
+async fn search_box_forward_keeps_a_verified_block_address_without_country() {
     let pack = Pack(std::env::temp_dir().join(format!(
         "open-geocode-compat-mapbox-jp-{}",
         uuid::Uuid::new_v4()
@@ -1224,7 +1267,7 @@ async fn search_box_forward_keeps_a_japanese_block_address() {
                     areas: vec!["丸の内".to_string(), "丸の内一丁目".to_string()],
                     locality: Some("千代田区".to_string()),
                     region: Some("東京都".to_string()),
-                    country: Some("JP".to_string()),
+                    country: None,
                     street: None,
                     place: None,
                     unit: None,

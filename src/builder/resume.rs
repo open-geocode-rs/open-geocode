@@ -127,6 +127,8 @@ pub struct Fingerprint {
     pub addresses: Option<String>,
     #[serde(default)]
     pub tiger: bool,
+    #[serde(default)]
+    pub timezones: Option<FileStamp>,
     /// The address files it imported, once it has.
     pub imported: Vec<FileStamp>,
 }
@@ -148,6 +150,7 @@ impl Fingerprint {
             input_sources: input_sources.to_vec(),
             addresses,
             tiger: false,
+            timezones: None,
             imported: Vec::new(),
         })
     }
@@ -193,6 +196,11 @@ impl Fingerprint {
         }
         if self.tiger != now.tiger {
             out.push("the --tiger option changed".into());
+        }
+        match (&self.timezones, &now.timezones) {
+            (Some(was), Some(is)) => was.differences(is, "timezone boundary file", &mut out),
+            (None, None) => {}
+            _ => out.push("the --timezones option changed".into()),
         }
         for file in &self.imported {
             match FileStamp::of(&file.path) {

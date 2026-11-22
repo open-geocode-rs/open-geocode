@@ -103,7 +103,10 @@ pub struct Source {
 /// The credits of an answer whose results are `results`. They are
 /// OpenStreetMap, each other data set a result comes from, and the timezone
 /// boundaries when a result carries a timezone.
-fn attribution<'a>(pack: &Reader, results: impl Iterator<Item = &'a Common>) -> Vec<Attribution> {
+pub(crate) fn attribution<'a>(
+    pack: &Reader,
+    results: impl Iterator<Item = &'a Common>,
+) -> Vec<Attribution> {
     let mut named = vec![OSM_DATASET];
     let mut zoned = false;
     for result in results {

@@ -526,39 +526,17 @@ async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compa
             complete,
             limit,
         } => {
-            let numbered_with_context = geocode.get("q").is_some_and(|query| {
-                query.split_once(',').is_some_and(|(address, context)| {
-                    !context.trim().is_empty()
-                        && address
-                            .split_whitespace()
-                            .any(crate::text_index::is_numeric_token)
-                })
-            });
+            let numbered_with_context = numbered_with_context(&geocode);
             let found = super::forward_geocode(state, geocode, types)
                 .await
                 .map_err(failed)?;
-            if numbered_with_context
-                || reads_whole(&found)
-                || found.features.first().is_some_and(|feature| {
-                    feature.properties.matched.as_ref().is_some_and(|parts| {
-                        (parts.housenumber.is_some() && parts.street == Some(PartMatch::Matched))
-                            || (parts.housenumber == Some(PartMatch::Matched)
-                                && parts.street == Some(PartMatch::Partial)
-                                && [parts.locality, parts.region]
-                                    .contains(&Some(PartMatch::Matched)))
-                    })
-                })
-            {
+            if numbered_with_context || keeps_forward(&found) {
                 return translated(Collection::forward(&found, types, naming));
             }
             let mut completed = super::complete(state, complete, types)
                 .await
                 .map_err(failed)?;
-            // Geocoding answers no POIs.
-            completed
-                .features
-                .retain(|feature| feature.properties.common.layer != crate::record::Layer::Poi);
-            completed.features.truncate(limit);
+            retain_completions(&mut completed, limit);
             translated(Collection::forward(&completed, types, naming))
         }
         Lookup::Reverse { args, countries } => {
@@ -567,6 +545,36 @@ async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compa
             translated(Collection::reverse(&found, types, naming))
         }
     }
+}
+
+fn numbered_with_context(args: &Args) -> bool {
+    args.get("q").is_some_and(|query| {
+        query.split_once(',').is_some_and(|(address, context)| {
+            !context.trim().is_empty()
+                && address
+                    .split_whitespace()
+                    .any(crate::text_index::is_numeric_token)
+        })
+    })
+}
+
+fn keeps_forward(found: &ForwardCollection) -> bool {
+    reads_whole(found)
+        || found.features.first().is_some_and(|feature| {
+            feature.properties.matched.as_ref().is_some_and(|parts| {
+                (parts.housenumber.is_some() && parts.street == Some(PartMatch::Matched))
+                    || (parts.housenumber == Some(PartMatch::Matched)
+                        && parts.street == Some(PartMatch::Partial)
+                        && [parts.locality, parts.region].contains(&Some(PartMatch::Matched)))
+            })
+        })
+}
+
+fn retain_completions(found: &mut ForwardCollection, limit: usize) {
+    found
+        .features
+        .retain(|feature| feature.properties.common.layer != crate::record::Layer::Poi);
+    found.features.truncate(limit);
 }
 
 /// Whether the geocode answers the query as typed, so nothing is left to
@@ -734,10 +742,13 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
         Some(line) => Lookup::Geocode(
             Args::new()
                 .set("address", line)
+                .set("limit", wanted.unwrap_or(DEFAULT_LIMIT).to_string())
                 .maybe("locality", params.get("place"))
                 .maybe("region", params.get("region"))
                 .maybe("postcode", params.get("postcode"))
                 .maybe("country", code)
+                .maybe("focus", focus)
+                .maybe("bbox", bbox)
                 .maybe("lang", lang.clone()),
         ),
         // og's address fields need a street. Areas alone are a search for
@@ -760,8 +771,8 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
                 .set("q", named)
                 .set("limit", wanted.unwrap_or(DEFAULT_LIMIT).to_string())
                 .maybe("country", code)
-                .maybe("focus", params.focus(Api::Geocoding)?)
-                .maybe("bbox", params.bbox(Api::Geocoding)?)
+                .maybe("focus", focus)
+                .maybe("bbox", bbox)
                 .maybe("lang", lang.clone());
             Lookup::Geocode(args)
         }
@@ -840,11 +851,20 @@ pub(super) struct Batch {
 enum Checked {
     Places(Named<PlacesRequest>),
     Geocode(Named<GeocodeRequest>),
+    Typed(Box<BatchCompletion>),
     /// The geocode of the label a vendor id carries, kept to the record the
     /// id names (see [`native::keep_named`]).
     Labelled(Named<GeocodeRequest>, crate::compat::OgRef),
     /// The reverse lookup and the countries `country` keeps.
     Reverse(Named<runtime::ReverseRequest>, Vec<String>),
+}
+
+#[derive(Clone)]
+struct BatchCompletion {
+    geocode: Named<GeocodeRequest>,
+    autocomplete: runtime::AutocompleteRequest,
+    numbered_with_context: bool,
+    limit: usize,
 }
 
 /// Where a query reads in the Pack, so neighbours run together.
@@ -889,7 +909,7 @@ pub(super) async fn batch(
         } else {
             forward_plan(&params)?
         };
-        checked.push(check(&state, plan.lookup)?);
+        checked.push(check(&state, plan.lookup, plan.types.as_ref())?);
         types.push(plan.types);
         languages.push((plan.languages, plan.locality));
     }
@@ -964,7 +984,11 @@ fn batch_params(query: &Value) -> Result<Params, crate::compat::VendorError> {
 }
 
 /// A query checked by the rules its og GET is checked with.
-fn check(state: &AppState, lookup: Lookup) -> Result<Checked, crate::compat::VendorError> {
+fn check(
+    state: &AppState,
+    lookup: Lookup,
+    types: Option<&Types>,
+) -> Result<Checked, crate::compat::VendorError> {
     fn prepared<Q>(prepared: Prepared<Q>) -> Result<Q, Problem> {
         match prepared {
             Prepared::Ready { query, .. } => Ok(query),
@@ -972,11 +996,43 @@ fn check(state: &AppState, lookup: Lookup) -> Result<Checked, crate::compat::Ven
         }
     }
     let checked = match lookup {
-        // og's batch engine has no autocomplete, so a batch query is read
-        // whole, as `autocomplete=false` reads it.
-        Lookup::Geocode(args) | Lookup::Typed { geocode: args, .. } => {
+        Lookup::Geocode(args) => {
             prepared(og_batch::prepare(state, runtime::GEOCODE, &[], item(args)))
                 .map(Checked::Geocode)
+        }
+        Lookup::Typed {
+            geocode,
+            complete,
+            limit,
+        } => {
+            let parsed = || {
+                let numbered_with_context = numbered_with_context(&geocode);
+                let geocode = prepared(og_batch::prepare(
+                    state,
+                    runtime::GEOCODE,
+                    &[],
+                    item(geocode),
+                ))?;
+                let complete = complete.maybe(
+                    "layer",
+                    types
+                        .and_then(Types::og_layer)
+                        .filter(|layer| *layer != "address"),
+                );
+                let autocomplete = prepared(og_batch::prepare(
+                    state,
+                    runtime::AUTOCOMPLETE,
+                    &[],
+                    item(complete),
+                ))?;
+                Ok(Checked::Typed(Box::new(BatchCompletion {
+                    geocode,
+                    autocomplete,
+                    numbered_with_context,
+                    limit,
+                })))
+            };
+            parsed()
         }
         Lookup::Id { named, lang, text } => {
             let id = match &named {
@@ -1024,6 +1080,7 @@ fn place(query: &Checked) -> Place {
         Checked::Geocode(request) | Checked::Labelled(request, _) => {
             Place::Geocode((runtime::GEOCODE.place)(request))
         }
+        Checked::Typed(query) => Place::Geocode((runtime::GEOCODE.place)(&query.geocode)),
         Checked::Reverse(options, _) => Place::Reverse((runtime::REVERSE.place)(options)),
     }
 }
@@ -1046,6 +1103,27 @@ fn look_up(state: &AppState, query: &Checked, cancel: &Arc<AtomicBool>) -> Resul
             cancel,
         ))
         .map(Answer::Forward),
+        Checked::Typed(query) => {
+            let found = outcome(og_batch::look_up(
+                state,
+                runtime::GEOCODE,
+                None,
+                query.geocode.clone(),
+                cancel,
+            ))?;
+            if query.numbered_with_context || keeps_forward(&found) {
+                return Ok(Answer::Forward(found));
+            }
+            let mut completed = outcome(og_batch::look_up(
+                state,
+                runtime::AUTOCOMPLETE,
+                None,
+                query.autocomplete.clone(),
+                cancel,
+            ))?;
+            retain_completions(&mut completed, query.limit);
+            Ok(Answer::Forward(completed))
+        }
         Checked::Labelled(request, named) => outcome(og_batch::look_up(
             state,
             runtime::GEOCODE,

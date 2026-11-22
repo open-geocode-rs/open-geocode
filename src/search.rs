@@ -1200,7 +1200,16 @@ impl TextSearcher {
         &self,
         options: &AddressGeocodeOptions,
     ) -> Result<Option<AddressGeocodeHit>> {
-        let (query, hits) = self.geocode_address_candidates(options, None)?;
+        self.geocode_address_scoped(options, None, None)
+    }
+
+    pub(crate) fn geocode_address_scoped(
+        &self,
+        options: &AddressGeocodeOptions,
+        focus: Option<[f64; 2]>,
+        bbox: Option<BoundingBox>,
+    ) -> Result<Option<AddressGeocodeHit>> {
+        let (query, hits) = self.geocode_address_candidates(options, focus, bbox, None)?;
         if number_reading::allows_retry(options.layer.as_deref(), hits.iter())
             && let Some(mut reading) = number_reading::address_variant(&options.address)
         {
@@ -1210,7 +1219,8 @@ impl TextSearcher {
                 limit: DEFAULT_SEARCH_LIMIT,
                 ..options.clone()
             };
-            let (_, retry) = self.geocode_address_candidates(&alternative, Some(&mut reading))?;
+            let (_, retry) =
+                self.geocode_address_candidates(&alternative, focus, bbox, Some(&mut reading))?;
             if let Some(hit) = reading.unique_confirmed(retry) {
                 return Ok(Some(AddressGeocodeHit { query, hit }));
             }
@@ -1224,6 +1234,8 @@ impl TextSearcher {
     fn geocode_address_candidates(
         &self,
         options: &AddressGeocodeOptions,
+        focus: Option<[f64; 2]>,
+        bbox: Option<BoundingBox>,
         mut reading: Option<&mut number_reading::AddressVariant>,
     ) -> Result<(String, Vec<TextSearchHit>)> {
         let limit = effective_limit(options.limit);
@@ -1281,8 +1293,8 @@ impl TextSearcher {
         } = self.search_variants(
             address,
             &context,
-            &Filters::new(options.layer.as_deref(), &options.countries, None),
-            None,
+            &Filters::new(options.layer.as_deref(), &options.countries, bbox),
+            focus,
             limit.max(2),
             // A weaker parse that reads the number as a unit or a word finds
             // what the query never asked for: another house, or a POI on the
@@ -1337,8 +1349,8 @@ impl TextSearcher {
             },
         )?;
         if hits.is_empty() && options.layer.is_none() {
-            let filters = Filters::new(None, &options.countries, None);
-            hits = self.fallback(address, &context, &filters, None, 2)?;
+            let filters = Filters::new(None, &options.countries, bbox);
+            hits = self.fallback(address, &context, &filters, focus, 2)?;
         }
         self.rate(&mut hits, numbered);
         stated_country(&options.countries, &mut hits);

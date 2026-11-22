@@ -149,11 +149,12 @@ const MAX_COUNTY_ENTRY_BYTES: u64 = 512 << 20;
 
 pub(super) fn counties_for_pack(path: &Path, cache: &Path) -> Result<BTreeSet<String>> {
     let reader = pack::Reader::open(path)?;
-    let states = reader.tiger_states();
-    if states.is_empty() {
-        return Ok(BTreeSet::new());
-    }
     let spatial = spatial_index::Reader::open(reader.container(), reader.records().clone())?;
+    let supported: BTreeSet<_> = Gazetteer::load(cache)?
+        .counties
+        .into_iter()
+        .map(|county| county.code)
+        .collect();
     const NAME: &str = "tl_2026_us_county";
     const URL: &str = "https://www2.census.gov/geo/tiger/TIGER2026/COUNTY/tl_2026_us_county.zip";
     let bad = |error: String| Error::BadInput(format!("TIGER {NAME}: {error}"));
@@ -187,20 +188,15 @@ pub(super) fn counties_for_pack(path: &Path, cache: &Path) -> Result<BTreeSet<St
         let code = dbf_text(&row, "GEOID")
             .filter(|code| code.len() == 5 && code.bytes().all(|byte| byte.is_ascii_digit()))
             .ok_or_else(|| bad("invalid county GEOID".into()))?;
-        if !states.contains(&code[..2]) {
+        if !supported.contains(code) {
             continue;
         }
-        let bbox = shape.bbox();
-        // A road within the TIGER join tolerance may sit across the boundary.
-        const PAD: f64 = 0.002;
-        let bounds = [
-            (bbox.min.x - PAD).max(-180.0),
-            (bbox.min.y - PAD).max(-90.0),
-            (bbox.max.x + PAD).min(180.0),
-            (bbox.max.y + PAD).min(90.0),
-        ];
-        if spatial.has_spatial_data_in_box(bounds)? {
-            counties.insert(code.to_string());
+        let outline = geo::MultiPolygon::try_from(shape).map_err(|error| bad(error.to_string()))?;
+        for polygon in &outline.0 {
+            if spatial.has_street_or_address(polygon)? {
+                counties.insert(code.to_string());
+                break;
+            }
         }
     }
     Ok(counties)
@@ -459,6 +455,7 @@ impl rstar::RTreeObject for CensusBlock {
 pub(super) fn add_blocks(
     sealed: &mut pack::SealedPack,
     cache: &Path,
+    counties: &BTreeSet<String>,
     progress: &crate::builder::progress::Progress,
     historical: bool,
 ) -> Result<u64> {
@@ -468,7 +465,8 @@ pub(super) fn add_blocks(
         let pack = pack::Reader::open(sealed.path())?;
         let spatial = spatial_index::Reader::open(pack.container(), pack.records().clone())?;
         let mut codes = Vec::new();
-        for state in pack.tiger_states() {
+        let states: BTreeSet<_> = counties.iter().map(|county| &county[..2]).collect();
+        for state in states {
             progress.check()?;
             let (name, folder, field) = if historical {
                 (

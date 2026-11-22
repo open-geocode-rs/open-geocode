@@ -516,6 +516,14 @@ async fn described(
     path: &[&str],
 ) -> Result<Place, VendorError> {
     let mut found = place(feature, language);
+    found.attributions =
+        crate::api::attribution(state.pack(), std::iter::once(&feature.properties.common))
+            .into_iter()
+            .map(|credit| super::model::Attribution {
+                provider: credit.text,
+                provider_uri: credit.url,
+            })
+            .collect();
     if FieldMask::asks(mask, path) {
         let point = feature.geometry.coordinates;
         let landmarks = native::landmarks(
@@ -704,7 +712,7 @@ struct AutocompleteResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 enum Suggestion {
-    PlacePrediction(PlacePrediction),
+    PlacePrediction(Box<PlacePrediction>),
     QueryPrediction(QueryPrediction),
 }
 
@@ -870,7 +878,9 @@ pub(super) async fn autocomplete(
             .filter(|_| countries.is_empty());
         let suggestions = eligible
             .take(MAX_SUGGESTIONS - usize::from(query.is_some()))
-            .map(|feature| Suggestion::PlacePrediction(prediction(feature, origin, &language)))
+            .map(|feature| {
+                Suggestion::PlacePrediction(Box::new(prediction(feature, origin, &language)))
+            })
             .chain(query.map(Suggestion::QueryPrediction))
             .collect();
         Ok(respond(

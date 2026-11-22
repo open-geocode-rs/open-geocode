@@ -187,7 +187,9 @@ impl Ranges {
 
     pub(crate) fn for_street(&self, street: RecordId) -> impl Iterator<Item = Range> + '_ {
         self.street_bytes(street)
-            .chunks_exact(RANGE_WIDTH)
+            .as_chunks::<RANGE_WIDTH>()
+            .0
+            .iter()
             .map(move |bytes| Range::read(street, bytes))
     }
 

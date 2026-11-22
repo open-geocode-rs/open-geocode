@@ -287,6 +287,7 @@ fn bakery_place() -> Value {
         "name": format!("places/{id}"),
         "id": id,
         "displayName": {"text": "Queen Bakery"},
+        "attributions": [{"provider": "© OpenStreetMap contributors", "providerUri": "https://www.openstreetmap.org/copyright"}],
         "types": ["bakery", "french_restaurant", "food", "store", "point_of_interest", "establishment"],
         "primaryType": "bakery",
         "formattedAddress": "12 King Street, Toronto, ON M5V 1A1, Canada",
@@ -938,6 +939,7 @@ async fn place_geocoding_answers_one_bare_result() {
         "regularOpeningHours",
         "entrances",
         "addressDescriptor",
+        "attributions",
     ] {
         fields.remove(field);
     }
@@ -1711,6 +1713,7 @@ fn bakery_destination() -> Value {
         "regularOpeningHours",
         "entrances",
         "addressDescriptor",
+        "attributions",
     ] {
         fields.remove(field);
     }

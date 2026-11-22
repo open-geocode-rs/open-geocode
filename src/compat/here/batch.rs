@@ -382,6 +382,7 @@ fn remove_files(state: &AppState, id: &str, record_too: bool) {
     }
     if record_too {
         let _ = fs::remove_file(file(state, id, "json"));
+        let _ = fs::remove_file(file(state, id, "json.partial"));
     }
 }
 
@@ -454,18 +455,30 @@ fn find(state: &AppState, id: &str) -> Result<View, BatchError> {
         .ok_or_else(BatchError::job_not_found)
 }
 
-/// Every kept job, newest first.
-fn all(state: &AppState) -> Vec<View> {
+fn stored(state: &AppState) -> Vec<Meta> {
     let Ok(entries) = fs::read_dir(store_dir(state)) else {
         return Vec::new();
     };
-    let mut views = entries
+    entries
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name();
-            let id = name.to_str()?.strip_suffix(".json")?.to_string();
-            load(state, &id)
+            load(state, name.to_str()?.strip_suffix(".json")?)
         })
+        .collect()
+}
+
+pub(crate) async fn sweep(state: &AppState) {
+    let _guard = LOCK.lock().await;
+    for meta in stored(state) {
+        view(state, meta);
+    }
+}
+
+/// Every kept job, newest first.
+fn all(state: &AppState) -> Vec<View> {
+    let mut views = stored(state)
+        .into_iter()
         .filter_map(|meta| view(state, meta))
         .collect::<Vec<_>>();
     views.sort_by(|a, b| {

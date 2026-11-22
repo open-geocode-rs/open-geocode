@@ -648,6 +648,11 @@ impl<'a> Run<'a> {
                 .map(|source| format!("{source:?}")),
         )?;
         fingerprint.tiger = options.tiger;
+        fingerprint.timezones = options
+            .timezones
+            .as_deref()
+            .map(crate::builder::resume::FileStamp::of)
+            .transpose()?;
         match settle_leftovers(options)? {
             Some(found) => Self::resume(options, plan, fingerprint, &found),
             None => {
@@ -822,7 +827,7 @@ impl<'a> Run<'a> {
             path: found.manifest(),
             source,
         })?;
-        let manifest: Manifest<State> = serde_json::from_slice(&manifest)?;
+        let manifest: Manifest<Box<State>> = serde_json::from_slice(&manifest)?;
         if manifest.format != FORMAT_VERSION {
             return Err(Error::BadOptions(
                 format!(
@@ -2309,8 +2314,13 @@ impl<'a> Run<'a> {
                     "tiger:2010:tabblock10",
                 ),
             ] {
-                let bytes =
-                    tiger::add_blocks(&mut sealed, &self.options.pack, &self.progress, historical)?;
+                let bytes = tiger::add_blocks(
+                    &mut sealed,
+                    &self.options.pack,
+                    &counties,
+                    &self.progress,
+                    historical,
+                )?;
                 if bytes > 0 {
                     self.build.report.datasets.push(dataset.to_string());
                     stats.sections.insert(section.to_string(), bytes);
