@@ -28,13 +28,15 @@ COLUMNS = (
 LOCALITY = ("city", "town", "village", "suburb", "hamlet", "municipality")
 
 
-def fetch(url, path: Path):
+def fetch(url, path: Path, *, bearer=None):
     """Download `url` to `path` once, and the date the server says it was
     published beside it, as the release of a register that names none."""
     stamp = path.with_name(path.name + ".release")
     if not path.is_file():
         partial = path.with_name(path.name + ".part")
         request = urllib.request.Request(url, headers={"User-Agent": "open-geocode fixtures"})
+        if bearer:
+            request.add_unredirected_header("Authorization", f"Bearer {bearer}")
         with urllib.request.urlopen(request) as response, open(partial, "wb") as handle:
             shutil.copyfileobj(response, handle, 1 << 20)
             modified = response.headers.get("Last-Modified")
