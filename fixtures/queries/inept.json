@@ -8,7 +8,7 @@
   "licence_url": "https://inspire-geoportal.ec.europa.eu/srv/eng/catalog.search#/datasetdetails?country=pt&view=themeOverview&theme=none&resourceId=1b772914-e3e9-4663-8557-a6aef5aa596a",
   "attribution": "Instituto Nacional de Estatística, I.P., Base Nacional de Moradas, CC BY 4.0. Processed by OpenAddresses and open-geocode.",
   "url": "https://data.openaddresses.io/cache/uploads/jeffdefacto/2026-02-23-921i3/pt_addresses.csv.zip",
-  "notes": "OpenAddresses CSV extract retains the INSPIRE address ID and WGS84 point. Unit or floor rows are excluded. The extract has no state field. The Pack source openaddresses:pt/countrywide uses the same dataset.",
+  "notes": "OpenAddresses CSV extract retains the INSPIRE address ID and WGS84 point. Unit or floor rows and addresses without a named street are excluded. The extract has no state field. The Pack source openaddresses:pt/countrywide uses the same dataset.",
   "release": "2026-02-23 (OpenAddresses INE extract)",
   "files": {
    "pt_addresses.csv.zip": "6fe01d52f3bff30979b66c8b3013f108b262c0473cf562940c5571f3fc65f743"
@@ -16,8 +16,8 @@
   "rows": 5911139,
   "dropped": {
    "no house number": 969139,
-   "no locality": 1656,
-   "no street": 1496,
+   "no locality": 1639,
+   "no street": 2621,
    "unit": 2829156
   },
   "seed": 2026,
@@ -1819,8 +1819,6 @@
   {"name": "pt.ine.add.PTCONT.3869478:messy", "q": "R ARROTEIA 1765, MAIA", "form": "messy", "cohort": "address", "expect_lat": 41.217533, "expect_lon": -8.5922173},
   {"name": "pt.ine.add.PTCONT.3785817:full", "q": "R GESTOSA DE CIMA 176, 4415-829 SANDIM, Portugal", "form": "full", "cohort": "address", "expect_lat": 41.0456443, "expect_lon": -8.5142461},
   {"name": "pt.ine.add.PTCONT.3785817:messy", "q": "R GESTOSA DE CIMA 176, SANDIM", "form": "messy", "cohort": "address", "expect_lat": 41.0456443, "expect_lon": -8.5142461},
-  {"name": "pt.ine.add.PTCONT.1390602:full", "q": "SEM DESIGNACAO 48, 7170-104 REDONDO, Portugal", "form": "full", "cohort": "address", "expect_lat": 38.6208374, "expect_lon": -7.5636214},
-  {"name": "pt.ine.add.PTCONT.1390602:messy", "q": "SEM DESIGNACAO 48, REDONDO", "form": "messy", "cohort": "address", "expect_lat": 38.6208374, "expect_lon": -7.5636214},
   {"name": "pt.ine.add.PTCONT.1430440:full", "q": "R DR ANTÓNIO JOSE ALMEIDA 78, 7200-053 MONTOITO, Portugal", "form": "full", "cohort": "address", "expect_lat": 38.5070011, "expect_lon": -7.5984741},
   {"name": "pt.ine.add.PTCONT.1430440:messy", "q": "R DR ANTÓNIO JOSE ALMEIDA 78, MONTOITO", "form": "messy", "cohort": "address", "expect_lat": 38.5070011, "expect_lon": -7.5984741},
   {"name": "pt.ine.add.PTCONT.889488:full", "q": "R DO CASTELO 8, 5360-011 ASSARES, Portugal", "form": "full", "cohort": "address", "expect_lat": 41.3397417, "expect_lon": -7.0769366},
@@ -4036,6 +4034,8 @@
   {"name": "pt.ine.add.PTCONT.638343:full", "q": "R SANTA APOLONIA 31, 4835-436 GUIMARÃES, Portugal", "form": "full", "cohort": "address", "expect_lat": 41.4415178, "expect_lon": -8.3282693},
   {"name": "pt.ine.add.PTCONT.638343:messy", "q": "R SANTA APOLONIA 31, GUIMARÃES", "form": "messy", "cohort": "address", "expect_lat": 41.4415178, "expect_lon": -8.3282693},
   {"name": "pt.ine.add.PTCONT.2007814:full", "q": "R PRINCIPAL 3, 2500-643 SALIR DE MATOS, Portugal", "form": "full", "cohort": "address", "expect_lat": 39.4620149, "expect_lon": -9.0871062},
-  {"name": "pt.ine.add.PTCONT.2007814:messy", "q": "R PRINCIPAL 3, SALIR DE MATOS", "form": "messy", "cohort": "address", "expect_lat": 39.4620149, "expect_lon": -9.0871062}
+  {"name": "pt.ine.add.PTCONT.2007814:messy", "q": "R PRINCIPAL 3, SALIR DE MATOS", "form": "messy", "cohort": "address", "expect_lat": 39.4620149, "expect_lon": -9.0871062},
+  {"name": "pt.ine.add.PTCONT.2273179:full", "q": "AZ SILVA 3, 2550-522 VERMELHA, Portugal", "form": "full", "cohort": "address", "expect_lat": 39.2744481, "expect_lon": -9.103145},
+  {"name": "pt.ine.add.PTCONT.2273179:messy", "q": "AZ SILVA 3, VERMELHA", "form": "messy", "cohort": "address", "expect_lat": 39.2744481, "expect_lon": -9.103145}
  ]
 }

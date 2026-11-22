@@ -11,6 +11,7 @@ since eligibility was decided in SQL.
 """
 
 import email.utils
+import hashlib
 import io
 import shutil
 import urllib.request
@@ -65,6 +66,13 @@ def unzip(archive: Path, out: Path, keep=lambda name: True, encoding=None):
                     shutil.copyfileobj(source, sink, 1 << 20)
     partial.replace(out)
     return out
+
+
+def derived_path(archive: Path, name: str):
+    """Bind cached extracts to the source archive that the fixture hashes."""
+    with archive.open("rb") as handle:
+        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    return archive.parent / f"{digest}-{name}"
 
 
 def to_parquet(select, out: Path):

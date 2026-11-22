@@ -1,4 +1,4 @@
-from . import fetch, unzip
+from . import derived_path, fetch, unzip
 
 CSV = "pt_addresses.csv"
 RELEASE = "2026-02-23 (OpenAddresses INE extract)"
@@ -13,7 +13,7 @@ SOURCE = {
     "url": "https://data.openaddresses.io/cache/uploads/jeffdefacto/2026-02-23-921i3/pt_addresses.csv.zip",
     "notes": (
         "OpenAddresses CSV extract retains the INSPIRE address ID and WGS84 point. "
-        "Unit or floor rows are excluded. The extract has no state field. "
+        "Unit or floor rows and addresses without a named street are excluded. The extract has no state field. "
         "The Pack source openaddresses:pt/countrywide uses the same dataset."
     ),
 }
@@ -21,15 +21,18 @@ SOURCE = {
 
 def download(cache):
     archive, _ = fetch(SOURCE["url"], cache / f"{CSV}.zip")
-    unzip(archive, cache / "csv", keep=lambda name: name == CSV)
     return [archive], RELEASE
 
 
 def query(files):
-    csv = files[0].parent / "csv" / CSV
+    archive = files[0]
+    csv = unzip(archive, derived_path(archive, "csv"), keep=lambda name: name == CSV) / CSV
+    csv = csv.as_posix().replace("'", "''")
     return f"""
         select id, lon as x, lat as y, 'EPSG:4326' as crs,
                nullif(trim(unit), '') is not null or nullif(trim(floor), '') is not null as unit,
-               house as house_number, street as road, postcode, city
-        from read_csv('{csv.as_posix()}', delim=',', quote='"', escape='"', header=true, all_varchar=true)
+               house as house_number,
+               case when strip_accents(upper(trim(street))) <> 'SEM DESIGNACAO' then street end as road,
+               postcode, city
+        from read_csv('{csv}', delim=',', quote='"', escape='"', header=true, all_varchar=true)
     """
