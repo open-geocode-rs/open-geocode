@@ -76,6 +76,12 @@ impl ErrorLog {
         self.write(&line.to_string());
     }
 
+    /// One line an operator reads that no error caused, such as a call the
+    /// server made out to a client's own endpoint.
+    pub(crate) fn event(&self, line: &serde_json::Value) {
+        self.write(&line.to_string());
+    }
+
     fn write(&self, line: &str) {
         #[cfg(test)]
         if let Some(lines) = &self.captured {
@@ -90,6 +96,11 @@ impl ErrorLog {
 /// inside a 200, as a batch does.
 #[derive(Debug, Clone)]
 pub(crate) struct RequestId(pub String);
+
+/// The Problem behind an error a route answers in another shape, such as a
+/// vendor's error under `/compat`: logged like a Problem, its body left alone.
+#[derive(Debug, Clone)]
+pub(crate) struct Logged(pub Problem);
 
 /// Middleware: resolve (or generate) the request id, set it on the response
 /// `x-request-id` header and in any Problem body, and log a 500 with its cause.
@@ -125,9 +136,11 @@ pub(crate) async fn propagate(
     }
     // Only a 500 is ours to fix; a 4xx is the request's fault and a 503 from
     // `/readyz` is the expected answer while the Pack loads.
+    let logged = response.extensions_mut().remove::<Logged>();
     if response.status() == StatusCode::INTERNAL_SERVER_ERROR {
         let cause = problem
             .as_ref()
+            .or_else(|| logged.as_ref().map(|logged| &logged.0))
             .and_then(Problem::cause)
             .map(|cause| format!("{cause:#}"));
         log.internal_error(&id, &route, None, started, cause.as_deref());

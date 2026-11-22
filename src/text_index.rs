@@ -998,8 +998,10 @@ impl PackDirectory {
                 continue;
             };
             if info.version != TEXT_INDEX_SCHEMA_VERSION {
-                return Err(Error::UnsupportedVersion {
+                return Err(Error::UnsupportedFormat {
+                    part: format!("section {name}"),
                     found: info.version,
+                    expected: TEXT_INDEX_SCHEMA_VERSION,
                 });
             }
             files.insert(PathBuf::from(file), container.raw_section(name)?);
@@ -1820,6 +1822,8 @@ mod tests {
         let mut writer = crate::pack::Writer::create(&dir).expect("writer");
         for index in 0..count {
             let record = AddressRecord {
+                building: None,
+                access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
@@ -1882,6 +1886,8 @@ mod tests {
     #[test]
     fn projects_address_fields_for_search() {
         let record = AddressRecord {
+            building: None,
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
@@ -2025,6 +2031,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
 

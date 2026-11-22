@@ -17,8 +17,8 @@ use crate::{
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
-        Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, Prominence, Record,
-        SourceProvenance, place_rank, point_geometry,
+        Entrance, Extent, Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord,
+        Prominence, Record, SourceProvenance, place_rank, point_geometry,
     },
     util::{
         geo::{EARTH_RADIUS_M, point_lon_lat},
@@ -28,23 +28,26 @@ use crate::{
 
 use super::{
     admin_levels::{self, admin_levels},
-    containment::{ShapeRef, ShapeWriter, Shapes, encode_shape},
+    containment::{SHAPES_LABEL, ShapeRef, ShapeWriter, Shapes, encode_shape, narrowest_extent},
     place::place_layer,
     poi::{PoiCandidate, outline},
     street::is_settlement,
-    tags::{OsmTags, alternate_names, item, name_tags, prominence},
+    tags::{OsmTags, alternate_names, item, language_names, name_tags, prominence},
+    timezone::Timezones,
 };
 
 /// Tags a boundary keeps after the scan besides its names. Its Wikidata
 /// and Wikipedia links rank it (see [`prominence`]).
-const BOUNDARY_TAG_KEYS: [&str; 10] = [
+const BOUNDARY_TAG_KEYS: [&str; 12] = [
     "ISO3166-1:alpha2",
     "ISO3166-1:alpha3",
     "ISO3166-2",
     "admin_level",
     "boundary",
     "country_code",
+    "default_language",
     "designation",
+    "license_plate_code",
     "place",
     "wikidata",
     "wikipedia",
@@ -94,6 +97,10 @@ pub(crate) struct BoundaryIndex {
     shapes: Arc<Shapes>,
     /// The towns mapped only as a point, which a record near one may lie in.
     dots: RTree<TownDot>,
+    /// Each boundary by its record id.
+    by_record: HashMap<RecordId, usize>,
+    /// Each boundary by the OSM object it was built from.
+    by_source: HashMap<(ObjectType, i64), usize>,
 }
 
 /// A town mapped only as a point, a city, town, village or hamlet node that
@@ -229,6 +236,8 @@ struct BuiltBoundary {
     place_type: Option<String>,
     name: String,
     alt_names: Vec<String>,
+    /// Its name in each language a `name:<lang>` tag states.
+    language_names: Vec<(String, String)>,
     prominence: Prominence,
     wikidata: Option<u32>,
     /// The layer its `place` tag names, if any (`place=city` is a locality).
@@ -242,9 +251,18 @@ struct BuiltBoundary {
     /// country with many levels need not be the region tier.
     subdivision_code: Option<String>,
     area_tags: AreaTags,
+    /// Its `license_plate_code` tag, the code of its vehicle plates (`SIM`).
+    plate_code: Option<String>,
+    /// Its `default_language` tag, the language its local names are written
+    /// in, as it writes it (`en`, `nl;fr`).
+    default_language: Option<String>,
     /// Where its shape lies in the shape file; nothing until it is written.
     shape: ShapeRef,
     bounds: Rect<f64>,
+    /// The box an answer gives. It is `bounds` the short way round, which
+    /// for an area over the antimeridian is not the least and greatest
+    /// longitude.
+    extent: Extent,
     area: f64,
     representative_point: [f64; 2],
     /// A point inside the outline; the representative point of a C-shaped
@@ -309,7 +327,7 @@ impl BoundaryBuilder {
     pub(crate) fn new(scratch: &Arc<crate::extsort::Scratch>) -> crate::error::Result<Self> {
         Ok(Self {
             candidates: Vec::new(),
-            shapes: ShapeWriter::create(scratch)?,
+            shapes: ShapeWriter::create(scratch, SHAPES_LABEL)?,
             heap_bytes: 0,
             vertices: 0,
         })
@@ -437,6 +455,14 @@ impl BoundaryCandidate {
             + text(&boundary.area_tags.admin_level)
             + text(&boundary.area_tags.boundary)
             + text(&boundary.area_tags.place)
+            + text(&boundary.plate_code)
+            + text(&boundary.default_language)
+            + boundary.language_names.capacity() * std::mem::size_of::<(String, String)>()
+            + boundary
+                .language_names
+                .iter()
+                .map(|(code, name)| code.capacity() + name.capacity())
+                .sum::<usize>()
     }
 }
 
@@ -803,6 +829,75 @@ impl BoundarySet {
         boundaries.chain(derived).collect()
     }
 
+    /// The names in other languages of each area record whose boundary
+    /// states any, by record id.
+    pub(crate) fn language_names(
+        &self,
+        boundary_record_ids: &[RecordId],
+    ) -> HashMap<RecordId, crate::pack::LanguageNames> {
+        self.candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .filter(|(candidate, _)| !candidate.boundary.language_names.is_empty())
+            .map(|(candidate, record_id)| (*record_id, candidate.boundary.language_names.clone()))
+            .collect()
+    }
+
+    /// The ISO 3166-2 code of each area record below a country whose
+    /// boundary states one (`CA-ON`), by record id.
+    pub(crate) fn subdivision_codes(
+        &self,
+        boundary_record_ids: &[RecordId],
+    ) -> HashMap<RecordId, String> {
+        self.candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .filter_map(|(candidate, record_id)| {
+                let code = candidate.boundary.subdivision_code.clone()?;
+                Some((*record_id, code))
+            })
+            .collect()
+    }
+
+    /// The vehicle plate code of each area record whose boundary states one
+    /// (`SIM`), by record id.
+    pub(crate) fn plate_codes(
+        &self,
+        boundary_record_ids: &[RecordId],
+    ) -> HashMap<RecordId, String> {
+        self.candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .filter_map(|(candidate, record_id)| {
+                Some((*record_id, candidate.boundary.plate_code.clone()?))
+            })
+            .collect()
+    }
+
+    /// The default language of each area record whose boundary states one,
+    /// as it writes it, by record id.
+    pub(crate) fn default_languages(
+        &self,
+        boundary_record_ids: &[RecordId],
+    ) -> HashMap<RecordId, String> {
+        self.candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .filter_map(|(candidate, record_id)| {
+                Some((*record_id, candidate.boundary.default_language.clone()?))
+            })
+            .collect()
+    }
+
+    /// The box around each area, by record id.
+    pub(crate) fn extents(&self, boundary_record_ids: &[RecordId]) -> Vec<(RecordId, Extent)> {
+        self.candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .map(|(candidate, record_id)| (*record_id, candidate.boundary.extent))
+            .collect()
+    }
+
     /// The groups of regions each admin region lies in, by record id: the
     /// larger admin regions of another name covering its representative
     /// point ("関東地方" of "千葉県"). A record keeps the smaller region as
@@ -954,6 +1049,20 @@ impl RTreeObject for BoundaryBox {
 }
 
 impl BoundaryIndex {
+    /// The timezone of each area that lies wholly in one, by record id, and
+    /// how many areas there are.
+    pub(crate) fn timezones(&self, zones: &Timezones) -> (Vec<(RecordId, u16)>, u64) {
+        let zoned = self
+            .boundaries
+            .par_iter()
+            .filter_map(|boundary| {
+                let block = self.shapes.block(boundary.shape)?;
+                Some((boundary.record_id, zones.of_area(block, boundary.bounds)?))
+            })
+            .collect();
+        (zoned, self.boundaries.len() as u64)
+    }
+
     fn new(boundaries: Vec<AcceptedBoundary>, shapes: Arc<Shapes>) -> Self {
         let boxes = boundaries
             .iter()
@@ -963,11 +1072,23 @@ impl BoundaryIndex {
                 boundary_id,
             })
             .collect::<Vec<_>>();
+        let by_record = boundaries
+            .iter()
+            .enumerate()
+            .map(|(at, boundary)| (boundary.record_id, at))
+            .collect();
+        let by_source = boundaries
+            .iter()
+            .enumerate()
+            .map(|(at, boundary)| ((boundary.source_object_type, boundary.source_object_id), at))
+            .collect();
         Self {
             boundaries,
             tree: RTree::bulk_load(boxes),
             shapes,
             dots: RTree::new(),
+            by_record,
+            by_source,
         }
     }
 
@@ -1051,6 +1172,34 @@ impl BoundaryIndex {
             .map(|boundary| boundary.record_id)
     }
 
+    /// The context of an area of `tier`: the areas at its point that are
+    /// broader than it and whose box holds its own. An island's point lies
+    /// in one of the towns on it, which does not hold the island. An area
+    /// with no outline, a place mapped as a node, is its point.
+    pub(crate) fn area_context(
+        &self,
+        tier: PlaceLayer,
+        record: &Record,
+        source: &SourceProvenance,
+    ) -> Option<RecordContext> {
+        let [lon, lat] = record.display_point()?;
+        let own = self
+            .by_source
+            .get(&(source.object_type, source.object_id))
+            .map_or_else(
+                || Rect::new((lon, lat), (lon, lat)),
+                |&at| self.boundaries[at].bounds,
+            );
+        let mut context = record_context(self, record, None)?;
+        context.admin_context = context.admin_context.above(tier);
+        context.admin_context.retain(|entry| {
+            self.by_record
+                .get(&entry.record_id)
+                .is_none_or(|&at| holds(self.boundaries[at].bounds, own))
+        });
+        Some(context)
+    }
+
     pub(crate) fn context_for_point(
         &self,
         lon: f64,
@@ -1103,6 +1252,7 @@ impl BoundaryIndex {
             admin_context: at.tuple,
             flags: at.flags,
             enclosing: enclosing(covered, derived_country, own.map(|own| own.area)),
+            zone: None,
         }
     }
 
@@ -1654,6 +1804,7 @@ fn boundary_from_relation(
 pub(crate) fn place_relations(
     relations: &[BoundaryRelationStub],
     member_line: impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>> + Sync,
+    entrances: &HashMap<i64, String>,
 ) -> crate::error::Result<Vec<PoiCandidate>> {
     relations
         .par_iter()
@@ -1668,6 +1819,19 @@ pub(crate) fn place_relations(
                 .chain(&lines.inner)
                 .flatten()
                 .map(|vertex| vertex.node_id)
+                .collect();
+            // Two member ways meet at a node, which is one entrance.
+            let mut seen = HashSet::new();
+            let entrances = lines
+                .outer
+                .iter()
+                .chain(&lines.inner)
+                .flatten()
+                .filter(|vertex| seen.insert(vertex.node_id))
+                .filter_map(|vertex| {
+                    let kind = entrances.get(&vertex.node_id)?;
+                    Entrance::of_tag(Some(kind), vertex.lon, vertex.lat)
+                })
                 .collect();
             let Some((geometry, _)) = rings_geometry(lines) else {
                 return Ok(None);
@@ -1684,6 +1848,7 @@ pub(crate) fn place_relations(
                 tags: stub.tags.clone(),
                 outline: Some(outline(&geometry)),
                 nodes,
+                entrances,
             }))
         })
         .filter_map(crate::error::Result::transpose)
@@ -1755,6 +1920,7 @@ fn built(
     let bounds = geometry.bounding_rect()?;
     let mut block = Vec::new();
     encode_shape(geometry, &mut block);
+    let extent = narrowest_extent(&block)?;
     Some((
         BuiltBoundary {
             layer,
@@ -1762,6 +1928,7 @@ fn built(
             place_type,
             name,
             alt_names,
+            language_names: language_names(tags),
             prominence: prominence(tags),
             wikidata: item(tags, "wikidata"),
             place_layer,
@@ -1769,8 +1936,11 @@ fn built(
             inferred_country_code: country_code_from_tags(tags, layer),
             subdivision_code: subdivision_code_from_tags(tags, layer),
             area_tags: AreaTags::from_osm(tags),
+            plate_code: tags.cleaned("license_plate_code"),
+            default_language: tags.cleaned("default_language"),
             shape: ShapeRef::default(),
             bounds,
+            extent,
             area: geometry.unsigned_area(),
             representative_point,
             interior_point: geometry
@@ -2569,6 +2739,14 @@ fn source_value_for_layer<'a>(
     }
 }
 
+/// Whether box `outer` holds box `inner`, edges included.
+fn holds(outer: Rect<f64>, inner: Rect<f64>) -> bool {
+    outer.min().x <= inner.min().x
+        && outer.min().y <= inner.min().y
+        && outer.max().x >= inner.max().x
+        && outer.max().y >= inner.max().y
+}
+
 fn envelope_from_rect(rect: Rect<f64>) -> AABB<[f64; 2]> {
     AABB::from_corners([rect.min().x, rect.min().y], [rect.max().x, rect.max().y])
 }
@@ -2765,7 +2943,7 @@ impl BoundarySet {
 
 impl crate::extsort::Spill for SetItem {
     fn encode(&self, out: &mut Vec<u8>) {
-        use crate::util::codec::{put_i64, put_opt_str, put_str, put_u64};
+        use crate::util::codec::{put_extent, put_i64, put_opt_str, put_str, put_u64};
         match self {
             Self::Candidate(candidate) => {
                 out.push(0);
@@ -2784,6 +2962,11 @@ impl crate::extsort::Spill for SetItem {
                 for name in &boundary.alt_names {
                     put_str(out, name);
                 }
+                put_u64(out, boundary.language_names.len() as u64);
+                for (code, name) in &boundary.language_names {
+                    put_str(out, code);
+                    put_str(out, name);
+                }
                 out.push(boundary.prominence.to_byte());
                 out.push(boundary.prominence.importance);
                 put_u64(out, boundary.wikidata.map_or(0, u64::from));
@@ -2792,6 +2975,8 @@ impl crate::extsort::Spill for SetItem {
                 put_opt_str(out, boundary.inferred_country_code.as_deref());
                 put_opt_str(out, boundary.subdivision_code.as_deref());
                 boundary.area_tags.put(out);
+                put_opt_str(out, boundary.plate_code.as_deref());
+                put_opt_str(out, boundary.default_language.as_deref());
                 put_u64(out, boundary.shape.offset);
                 put_u64(out, boundary.shape.bytes);
                 let (min, max) = (boundary.bounds.min(), boundary.bounds.max());
@@ -2816,6 +3001,7 @@ impl crate::extsort::Spill for SetItem {
                     }
                     None => out.push(0),
                 }
+                put_extent(out, boundary.extent);
                 out.push(u8::from(boundary.rings_closed));
             }
             Self::DerivedCountry(code, record) => {
@@ -2836,7 +3022,7 @@ impl crate::extsort::Spill for SetItem {
     fn decode(input: &mut &[u8]) -> crate::error::Result<Self> {
         use crate::{
             error::Error,
-            util::codec::{get_i64, get_opt_string, get_string, get_u8, get_u64},
+            util::codec::{get_extent, get_i64, get_opt_string, get_string, get_u8, get_u64},
         };
         let layer = |code: u8| {
             PlaceLayer::ALL
@@ -2855,6 +3041,9 @@ impl crate::extsort::Spill for SetItem {
                 let alt_names = (0..get_u64(input)?)
                     .map(|_| get_string(input))
                     .collect::<crate::error::Result<Vec<_>>>()?;
+                let language_names = (0..get_u64(input)?)
+                    .map(|_| Ok((get_string(input)?, get_string(input)?)))
+                    .collect::<crate::error::Result<Vec<_>>>()?;
                 let prominence = Prominence::from_byte(get_u8(input)?, get_u8(input)?);
                 let wikidata = match get_u64(input)? {
                     0 => None,
@@ -2871,6 +3060,8 @@ impl crate::extsort::Spill for SetItem {
                 let inferred_country_code = get_opt_string(input)?;
                 let subdivision_code = get_opt_string(input)?;
                 let area_tags = AreaTags::get(input)?;
+                let plate_code = get_opt_string(input)?;
+                let default_language = get_opt_string(input)?;
                 let shape = ShapeRef {
                     offset: get_u64(input)?,
                     bytes: get_u64(input)?,
@@ -2901,6 +3092,7 @@ impl crate::extsort::Spill for SetItem {
                 } else {
                     None
                 };
+                let extent = get_extent(input)?;
                 let rings_closed = flag(input, "a saved boundary's ring flag is not 0 or 1")?;
                 Self::Candidate(Box::new(BoundaryCandidate {
                     source_object_type,
@@ -2912,6 +3104,7 @@ impl crate::extsort::Spill for SetItem {
                         place_type,
                         name,
                         alt_names,
+                        language_names,
                         prominence,
                         wikidata,
                         place_layer,
@@ -2919,8 +3112,11 @@ impl crate::extsort::Spill for SetItem {
                         inferred_country_code,
                         subdivision_code,
                         area_tags,
+                        plate_code,
+                        default_language,
                         shape,
                         bounds: Rect::new((min_x, min_y), (max_x, max_y)),
+                        extent,
                         area,
                         representative_point: [lon, lat],
                         interior_point,
@@ -3171,6 +3367,10 @@ mod tests {
             };
             assert_eq!(read.boundary.rings_closed, rings_closed);
             assert_eq!(read.boundary.interior_point, interior_point);
+            assert_eq!(
+                read.boundary.extent,
+                [-10_000_000, -10_000_000, 10_000_000, 10_000_000]
+            );
         }
         let mut bytes = Vec::new();
         SetItem::Candidate(Box::new(BoundaryCandidate {
@@ -3343,15 +3543,19 @@ mod tests {
             place_type: None,
             name: "Test".to_string(),
             alt_names: Vec::new(),
+            language_names: Vec::new(),
             place_layer: None,
             designation: None,
             inferred_country_code: None,
             subdivision_code: None,
             area_tags: AreaTags::default(),
+            plate_code: None,
+            default_language: None,
             representative_point: representative_point(&geometry).expect("point"),
             interior_point: None,
             shape: ShapeRef::default(),
             bounds: geometry.bounding_rect().expect("bounds"),
+            extent: [-10_000_000, -10_000_000, 10_000_000, 10_000_000],
             area: geometry.unsigned_area(),
             prominence: Default::default(),
             wikidata: None,
@@ -3716,7 +3920,7 @@ mod tests {
         levels: &[(u8, Option<PlaceLayer>, usize)],
     ) -> BTreeMap<u8, PlaceLayer> {
         let scratch = test_scratch();
-        let mut shapes = ShapeWriter::create(&scratch).expect("shape file");
+        let mut shapes = ShapeWriter::create(&scratch, SHAPES_LABEL).expect("shape file");
         let mut candidates = Vec::new();
         let levels = levels
             .iter()
@@ -3746,6 +3950,7 @@ mod tests {
                     place_type: None,
                     name: format!("level {level}"),
                     alt_names: Vec::new(),
+                    language_names: Vec::new(),
                     place_layer,
                     designation: None,
                     inferred_country_code: country
@@ -3753,10 +3958,19 @@ mod tests {
                         .or_else(|| (level <= 2).then(|| "AU".to_string())),
                     subdivision_code: None,
                     area_tags: AreaTags::default(),
+                    plate_code: None,
+                    default_language: None,
                     representative_point: representative_point(&geometry).expect("point"),
                     interior_point: None,
                     shape,
                     bounds,
+                    extent: [
+                        bounds.min().x,
+                        bounds.min().y,
+                        bounds.max().x,
+                        bounds.max().y,
+                    ]
+                    .map(|side| (side * 1e7) as i32),
                     area,
                     prominence: Default::default(),
                     wikidata: None,
@@ -4007,7 +4221,7 @@ mod tests {
     /// An index of square boundaries, each the square its box is.
     fn test_index(mut boundaries: Vec<AcceptedBoundary>) -> BoundaryIndex {
         let scratch = test_scratch();
-        let mut shapes = ShapeWriter::create(&scratch).expect("shape file");
+        let mut shapes = ShapeWriter::create(&scratch, SHAPES_LABEL).expect("shape file");
         for boundary in &mut boundaries {
             let square = MultiPolygon::new(vec![boundary.bounds.to_polygon()]);
             boundary.shape = with_shape(&mut shapes, &square).0;

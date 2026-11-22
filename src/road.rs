@@ -38,8 +38,55 @@ const DIRECTIONS: [&str; 8] = [
     "southwest",
 ];
 
-fn direction_of(word: &str) -> Option<&'static str> {
+pub(crate) fn direction_of(word: &str) -> Option<&'static str> {
     direction_word(word).or_else(|| DIRECTIONS.iter().find(|full| **full == word).copied())
+}
+
+/// The parts of a street name as written: "W Main St N" is the prefix "W",
+/// the name "Main", the type "St" and the suffix "N".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StreetParts<'a> {
+    pub(crate) prefix: Option<&'a str>,
+    pub(crate) name: String,
+    pub(crate) kind: Option<&'a str>,
+    pub(crate) suffix: Option<&'a str>,
+}
+
+impl<'a> StreetParts<'a> {
+    /// `street` split into its parts, `None` when it has no type or
+    /// direction to split off. A word is split off only while a word that
+    /// names the street is left: "North Street" is the name "North" and the
+    /// type "Street", never a direction and a type alone.
+    pub(crate) fn of(street: &'a str) -> Option<Self> {
+        let words = street.split_whitespace().collect::<Vec<_>>();
+        let key = |word: &str| search_key(word).unwrap_or_default();
+        // A type is written in full or short, and a short form may stand
+        // for more than one word ("st" for street and saint).
+        let is_type = |word: &str| {
+            let key = key(word);
+            is_street_type(&key)
+                || lattice::other_forms(&key)
+                    .iter()
+                    .any(|form| is_street_type(form))
+        };
+        let is_direction = |word: &str| direction_of(&key(word)).is_some();
+        let (mut first, mut last) = (0, words.len());
+        let mut parts = Self::default();
+        if last - first > 1 && is_direction(words[last - 1]) {
+            parts.suffix = Some(words[last - 1]);
+            last -= 1;
+        }
+        if last - first > 1 && is_type(words[last - 1]) {
+            parts.kind = Some(words[last - 1]);
+            last -= 1;
+        }
+        if last - first > 1 && is_direction(words[first]) {
+            parts.prefix = Some(words[first]);
+            first += 1;
+        }
+        parts.name = words[first..last].join(" ");
+        (parts.prefix.is_some() || parts.kind.is_some() || parts.suffix.is_some()).then_some(parts)
+    }
 }
 
 impl RoadName {
@@ -208,6 +255,28 @@ pub(crate) fn road_middle(points: &[[f64; 2]]) -> Option<[f64; 2]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_street_splits_into_its_written_parts() {
+        let parts = |street| super::StreetParts::of(street);
+        let main = parts("W Main St N").expect("parts");
+        assert_eq!(
+            (main.prefix, main.name.as_str(), main.kind, main.suffix),
+            (Some("W"), "Main", Some("St"), Some("N"))
+        );
+        let king = parts("King Street West").expect("parts");
+        assert_eq!(
+            (king.prefix, king.name.as_str(), king.kind, king.suffix),
+            (None, "King", Some("Street"), Some("West"))
+        );
+        let north = parts("North Street").expect("parts");
+        assert_eq!(
+            (north.prefix, north.name.as_str(), north.kind),
+            (None, "North", Some("Street"))
+        );
+        assert_eq!(parts("Broadway"), None);
+        assert_eq!(parts("Street"), None);
+    }
+
     use super::*;
 
     #[test]

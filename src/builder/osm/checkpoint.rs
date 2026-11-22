@@ -310,6 +310,9 @@ pub(super) enum GeometryItem {
     Way(BoundaryWay),
     /// A relation member way's vertices, `None` when a node is missing.
     Member(i64, Option<Vec<Vertex>>),
+    /// A node of a relation member way that is tagged `entrance`, with the
+    /// tag's value.
+    Entrance(i64, String),
 }
 
 impl Spill for GeometryItem {
@@ -355,6 +358,11 @@ impl Spill for GeometryItem {
                     }
                     None => out.push(0),
                 }
+            }
+            Self::Entrance(node_id, kind) => {
+                out.push(4);
+                put_i64(out, *node_id);
+                put_str(out, kind);
             }
         }
     }
@@ -404,6 +412,7 @@ impl Spill for GeometryItem {
                 };
                 Self::Member(way_id, vertices)
             }
+            4 => Self::Entrance(get_i64(input)?, get_string(input)?),
             _ => return Err(Error::Decode("unknown boundary geometry item")),
         })
     }
@@ -419,6 +428,7 @@ impl Spill for GeometryItem {
                 Self::Feature(_) => 0,
                 Self::Way(way) => tags_bytes(&way.tags) + vertices(&way.vertices),
                 Self::Member(_, line) => line.as_deref().map_or(0, vertices),
+                Self::Entrance(_, kind) => kind.len(),
             }
     }
 }

@@ -13,10 +13,20 @@
         "address": {
           "housenumber": "10",
           "postcode": "M5V 1A1",
-          "street": "King Street"
+          "street": "King Street",
+          "street_parts": {
+            "name": "King",
+            "type": "Street"
+          }
         },
+        "address_lines": [
+          "10 King Street",
+          "Toronto, ON M5V 1A1",
+          "Canada"
+        ],
         "context": {
           "country": {
+            "code": "CA",
             "id": "osm:relation:1",
             "name": "Canada"
           },
@@ -25,6 +35,7 @@
             "name": "Toronto"
           },
           "region": {
+            "code": "CA-ON",
             "id": "osm:relation:2",
             "name": "Ontario"
           }
@@ -36,7 +47,8 @@
         "name": "10 King Street",
         "source": {
           "dataset": "osm"
-        }
+        },
+        "timezone": "America/Toronto"
       },
       "type": "Feature"
     },
@@ -50,13 +62,20 @@
       },
       "properties": {
         "accuracy": "centroid",
+        "bbox": [
+          -79.6392727,
+          43.5796082,
+          -79.1132193,
+          43.8554425
+        ],
         "id": "osm:relation:3",
         "label": "Toronto",
         "layer": "locality",
         "name": "Toronto",
         "source": {
           "dataset": "osm"
-        }
+        },
+        "timezone": "America/Toronto"
       },
       "type": "Feature"
     },
@@ -70,6 +89,13 @@
       },
       "properties": {
         "accuracy": "centroid",
+        "bbox": [
+          -95.1537,
+          41.6765,
+          -74.3199,
+          56.8593
+        ],
+        "code": "CA-ON",
         "id": "osm:relation:2",
         "label": "Ontario",
         "layer": "region",
@@ -90,6 +116,13 @@
       },
       "properties": {
         "accuracy": "centroid",
+        "bbox": [
+          -141.0027,
+          41.6765,
+          -52.3231,
+          83.3362
+        ],
+        "code": "CA",
         "id": "osm:relation:1",
         "label": "Canada",
         "layer": "country",
@@ -107,6 +140,11 @@
         "licence": "ODbL 1.0",
         "text": "© OpenStreetMap contributors",
         "url": "https://www.openstreetmap.org/copyright"
+      },
+      {
+        "licence": "ODbL 1.0",
+        "text": "Timezone boundaries © OpenStreetMap contributors",
+        "url": "https://github.com/evansiroky/timezone-boundary-builder"
       }
     ],
     "point": {

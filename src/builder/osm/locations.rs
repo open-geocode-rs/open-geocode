@@ -16,7 +16,7 @@
 //! page cache serves much like memory as long as it can hold it.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
     sync::{
@@ -537,13 +537,55 @@ impl Slots {
     }
 }
 
-/// The coordinates of every needed node the input has, and the address tags
-/// of the few whose tags a way reads.
+/// The entrances among the needed nodes, which are the ones tagged
+/// `entrance`. Each takes twelve bytes, as a planet has millions on the
+/// outlines of its buildings.
+#[derive(Debug, Default)]
+struct Entrances {
+    /// In id order, as the input is.
+    ids: Vec<i64>,
+    /// Each one's `entrance` value, by its index in `values`.
+    kinds: Vec<u32>,
+    values: Vec<String>,
+    index: HashMap<String, u32>,
+}
+
+impl Entrances {
+    fn push(&mut self, id: i64, kind: &str) {
+        let kind = match self.index.get(kind) {
+            Some(kind) => *kind,
+            None => {
+                let next = self.values.len() as u32;
+                self.values.push(kind.to_string());
+                self.index.insert(kind.to_string(), next);
+                next
+            }
+        };
+        self.ids.push(id);
+        self.kinds.push(kind);
+    }
+
+    fn get(&self, id: i64) -> Option<&str> {
+        let at = self.ids.binary_search(&id).ok()?;
+        Some(&self.values[self.kinds[at] as usize])
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (i64, &str)> {
+        self.ids
+            .iter()
+            .zip(&self.kinds)
+            .map(|(id, kind)| (*id, self.values[*kind as usize].as_str()))
+    }
+}
+
+/// The coordinates of every needed node the input has, the address tags
+/// of the few whose tags a way reads, and which of them are entrances.
 #[derive(Debug)]
 pub(crate) struct Locations {
     set: NodeSet,
     slots: Slots,
     tags: Vec<(i64, BTreeMap<String, String>)>,
+    entrances: Entrances,
     /// What a checkpoint saved of them, kept on disk while they are used.
     saved: Option<Saved>,
 }
@@ -553,6 +595,7 @@ pub(crate) struct Locations {
 struct Saved {
     set: SpoolFile<ChunkBits>,
     tags: SpoolFile<Tagged>,
+    entrances: SpoolFile<EntranceNode>,
     /// The coordinates, when they were in memory; mapped ones are saved in
     /// their own file.
     slots: Option<ScratchFile>,
@@ -563,6 +606,7 @@ struct Saved {
 pub(crate) struct LocationsState {
     set: RunState,
     tags: RunState,
+    entrances: RunState,
     /// The file the coordinates are in, and how many.
     slots: String,
     len: usize,
@@ -603,6 +647,28 @@ impl Spill for Tagged {
     }
 }
 
+/// An entrance node as a checkpoint saves it, by its id and its kind.
+#[derive(Debug)]
+pub(crate) struct EntranceNode(i64, String);
+
+impl Spill for EntranceNode {
+    fn encode(&self, out: &mut Vec<u8>) {
+        crate::util::codec::put_i64(out, self.0);
+        crate::util::codec::put_str(out, &self.1);
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        Ok(Self(
+            crate::util::codec::get_i64(input)?,
+            crate::util::codec::get_string(input)?,
+        ))
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.1.len()
+    }
+}
+
 /// What the node pass stored and read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct LoadStats {
@@ -615,6 +681,8 @@ pub(crate) struct LoadStats {
     /// Whether the coordinates lie in a scratch file.
     pub mapped: bool,
     pub tagged: u64,
+    /// Needed nodes tagged `entrance`.
+    pub entrances: u64,
     pub read_bytes: u64,
 }
 
@@ -628,6 +696,10 @@ impl Locations {
             let mut tags = Spool::create(scratch, "node-tags")?;
             for (id, values) in &self.tags {
                 tags.write(&Tagged(*id, values.clone()))?;
+            }
+            let mut entrances = Spool::create(scratch, "node-entrances")?;
+            for (id, kind) in self.entrances.iter() {
+                entrances.write(&EntranceNode(id, kind.to_string()))?;
             }
             let slots = match &self.slots {
                 Slots::Memory { locations, .. } => {
@@ -656,6 +728,7 @@ impl Locations {
             self.saved = Some(Saved {
                 set,
                 tags: tags.finish()?,
+                entrances: entrances.finish()?,
                 slots,
             });
         }
@@ -672,6 +745,7 @@ impl Locations {
         Ok(LocationsState {
             set: saved.set.state(),
             tags: saved.tags.state(),
+            entrances: saved.entrances.state(),
             slots,
             len: self.slots.len(),
         })
@@ -684,6 +758,7 @@ impl Locations {
         };
         let mut files = saved.set.state().files(scratch).collect::<Vec<_>>();
         files.extend(saved.tags.state().files(scratch));
+        files.extend(saved.entrances.state().files(scratch));
         match (&saved.slots, &self.slots) {
             (Some(file), _) => files.push(file.path().to_path_buf()),
             (None, Slots::Mapped(mapped)) => files.push(mapped.path.clone()),
@@ -707,14 +782,22 @@ impl Locations {
             .reader()?
             .map(|tagged| tagged.map(|Tagged(id, tags)| (id, tags)))
             .collect::<Result<Vec<_>>>()?;
+        let entrances_file = SpoolFile::<EntranceNode>::restore(scratch, &state.entrances)?;
+        let mut entrances = Entrances::default();
+        for entrance in entrances_file.reader()? {
+            let EntranceNode(id, kind) = entrance?;
+            entrances.push(id, &kind);
+        }
         let slots = Slots::Mapped(MappedSlots::reopen(scratch, &state.slots, state.len)?);
         Ok(Self {
             set,
             slots,
             tags,
+            entrances,
             saved: Some(Saved {
                 set: set_file,
                 tags: tags_file,
+                entrances: entrances_file,
                 slots: None,
             }),
         })
@@ -722,6 +805,11 @@ impl Locations {
 
     pub(crate) fn get(&self, id: i64) -> Option<Location> {
         self.set.slot(id).map(|slot| self.slots.get(slot))
+    }
+
+    /// The value of a stored node's `entrance` tag, when it has one.
+    pub(crate) fn entrance(&self, id: i64) -> Option<&str> {
+        self.entrances.get(id)
     }
 
     /// The address tags of a node whose tags were asked for, when it has any.
@@ -738,6 +826,7 @@ impl Locations {
 struct Found {
     nodes: Vec<(i64, Location)>,
     tags: Vec<(i64, BTreeMap<String, String>)>,
+    entrances: Vec<(i64, String)>,
     first: Option<i64>,
     last: Option<i64>,
     /// Two ids out of order within the block.
@@ -746,27 +835,33 @@ struct Found {
 
 fn find(block: &PrimitiveBlock, set: &NodeSet, tag_ids: &[i64]) -> Found {
     let mut found = Found::default();
-    let mut visit =
-        |id: i64, lat_e7: i32, lon_e7: i32, tags: &dyn Fn() -> BTreeMap<String, String>| {
-            if let Some(last) = found.last
-                && id <= last
-                && found.unsorted.is_none()
-            {
-                found.unsorted = Some((last, id));
+    let mut visit = |id: i64,
+                     lat_e7: i32,
+                     lon_e7: i32,
+                     tags: &dyn Fn() -> BTreeMap<String, String>,
+                     entrance: &dyn Fn() -> Option<String>| {
+        if let Some(last) = found.last
+            && id <= last
+            && found.unsorted.is_none()
+        {
+            found.unsorted = Some((last, id));
+        }
+        found.first.get_or_insert(id);
+        found.last = Some(id);
+        if !set.contains(id) {
+            return;
+        }
+        found.nodes.push((id, Location { lat_e7, lon_e7 }));
+        if let Some(kind) = entrance() {
+            found.entrances.push((id, kind));
+        }
+        if tag_ids.binary_search(&id).is_ok() {
+            let tags = tags();
+            if !tags.is_empty() {
+                found.tags.push((id, tags));
             }
-            found.first.get_or_insert(id);
-            found.last = Some(id);
-            if !set.contains(id) {
-                return;
-            }
-            found.nodes.push((id, Location { lat_e7, lon_e7 }));
-            if tag_ids.binary_search(&id).is_ok() {
-                let tags = tags();
-                if !tags.is_empty() {
-                    found.tags.push((id, tags));
-                }
-            }
-        };
+        }
+    };
     for element in block.elements() {
         match element {
             Element::DenseNode(node) => visit(
@@ -774,17 +869,29 @@ fn find(block: &PrimitiveBlock, set: &NodeSet, tag_ids: &[i64]) -> Found {
                 node.decimicro_lat(),
                 node.decimicro_lon(),
                 &|| addr_tags(|| node.tags()),
+                &|| entrance_kind(node.tags()),
             ),
             Element::Node(node) => visit(
                 node.id(),
                 node.decimicro_lat(),
                 node.decimicro_lon(),
                 &|| addr_tags(|| node.tags()),
+                &|| entrance_kind(node.tags()),
             ),
             Element::Way(_) | Element::Relation(_) => {}
         }
     }
     found
+}
+
+/// The value of the `entrance` tag among `tags`, when it says anything.
+pub(crate) fn entrance_kind<'a>(
+    mut tags: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Option<String> {
+    tags.find(|(key, _)| *key == "entrance")
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn addr_tags<'a, I: Iterator<Item = (&'a str, &'a str)>>(
@@ -816,6 +923,7 @@ pub(crate) fn load(
 ) -> Result<(Locations, LoadStats)> {
     let needed = set.len();
     let mut tags = Vec::new();
+    let mut entrances = Entrances::default();
     let mut last: Option<i64> = None;
     // Marked ids the input lacks are unmarked as the pass goes, so that
     // every marked id below a stored node has a slot, and ranks stay dense.
@@ -844,6 +952,9 @@ pub(crate) fn load(
                 slots.push(location)?;
             }
             tags.extend(found.tags);
+            for (id, kind) in found.entrances {
+                entrances.push(id, &kind);
+            }
             Ok(())
         },
     )?;
@@ -857,6 +968,7 @@ pub(crate) fn load(
         location_bytes: needed * LOCATION_BYTES,
         mapped: matches!(slots, Slots::Mapped(_)),
         tagged: tags.len() as u64,
+        entrances: entrances.ids.len() as u64,
         read_bytes,
     };
     Ok((
@@ -864,6 +976,7 @@ pub(crate) fn load(
             set,
             slots,
             tags,
+            entrances,
             saved: None,
         },
         stats,

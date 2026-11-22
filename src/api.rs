@@ -3,8 +3,10 @@
 //!
 //! Every response is one GeoJSON FeatureCollection: a `geocoding` block that
 //! says what was asked, then one Feature per answer. Forward features carry a
-//! `score` and, from a calibrated Pack, a `confidence`; reverse features a
-//! `distance_m`; nothing else differs. The types here are the only definition of that shape. The contract tests
+//! `score`, from a calibrated Pack a `confidence`, and a `distance_m` from
+//! the request's `focus` when it gives one; reverse features a `distance_m`
+//! from the queried point; nothing else differs. The types here are the only
+//! definition of that shape. The contract tests
 //! compare real answers with the committed examples in
 //! `contract/responses/`, so a change to the shape lands with its examples.
 //!
@@ -12,18 +14,18 @@
 //! ([`flat_columns`]), so a CSV row and a JSON answer never drift apart
 //! either.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{Error, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
     labels,
     pack::{Reader, RecordId, Summary},
     record::{
-        AddressComponents, Brand, InterpolationAddressComponents, Layer, OSM_DATASET, ObjectType,
-        PlaceLayer, RoadClass,
+        AccessPoint, AddressComponents, Brand, Contact, InterpolationAddressComponents, Layer,
+        OSM_DATASET, ObjectType, PlaceLayer, RoadClass,
     },
     records, reverse,
     reverse::{GeocodeResponse, MatchKind},
@@ -98,27 +100,35 @@ pub struct Source {
     pub dataset: String,
 }
 
-fn attribution<'a>(pack: &Reader, datasets: impl Iterator<Item = &'a str>) -> Vec<Attribution> {
+/// The credits of an answer whose results are `results`. They are
+/// OpenStreetMap, each other data set a result comes from, and the timezone
+/// boundaries when a result carries a timezone.
+fn attribution<'a>(pack: &Reader, results: impl Iterator<Item = &'a Common>) -> Vec<Attribution> {
     let mut named = vec![OSM_DATASET];
-    for dataset in datasets {
+    let mut zoned = false;
+    for result in results {
+        let dataset = result.source.dataset.as_str();
         if !named.contains(&dataset) {
             named.push(dataset);
         }
+        zoned |= result.timezone.is_some();
     }
+    let credit = |licence: crate::licences::Licence, dataset: &str| Attribution {
+        text: licence.attribution.unwrap_or_else(|| dataset.to_string()),
+        licence: Some(licence.name),
+        url: licence.url,
+    };
     named
         .into_iter()
         .map(|dataset| match pack.records().licence(dataset) {
-            Some(licence) => Attribution {
-                text: licence.attribution.unwrap_or_else(|| dataset.to_string()),
-                licence: Some(licence.name),
-                url: licence.url,
-            },
+            Some(licence) => credit(licence, dataset),
             None => Attribution {
                 text: dataset.to_string(),
                 licence: None,
                 url: None,
             },
         })
+        .chain(zoned.then(|| credit(crate::licences::timezones(), "timezones")))
         .collect()
 }
 
@@ -186,7 +196,7 @@ pub enum PointType {
 // [`ReverseProperties`], which add the field each direction ranks by, so both
 // are one flat object on the wire.
 /// Properties shared by forward and reverse results.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct Common {
     /// Stable ID from the source data, such as `osm:node:123`. Store it to
     /// find the record again: it outlives a Pack rebuild.
@@ -196,7 +206,16 @@ pub struct Common {
     /// House number and street for an address (`12 King Street West`), or
     /// the name of a street, area or POI.
     pub name: String,
-    /// One-line display label: `name` followed by its location.
+    /// ISO code of a result that is an area: on a country its ISO 3166-1
+    /// alpha-2 code, on an area below it its ISO 3166-2 code, as
+    /// `context` gives them. Absent on any other result, and on an area
+    /// the source data gives no code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "MC")]
+    pub code: Option<String>,
+    /// One-line display label: `name` followed by its location. With
+    /// `lang`, each part that names the result or one of its areas is that
+    /// name in the language asked, as `name` and `context` are.
     pub label: String,
     /// POI category, such as `amenity:cafe`. Present only on POIs.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -209,6 +228,75 @@ pub struct Common {
     /// Zanoli" is an Esso. Present only on places.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brand: Option<Brand>,
+    /// How to reach a place: its phone number, website and email, each as
+    /// its source writes it. og rewrites none and does not check that one
+    /// still answers. Present only on POIs that state at least one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact: Option<Contact>,
+    /// When a place is open, in OpenStreetMap's `opening_hours` syntax as
+    /// its source writes it. og does not parse it, so it never says whether
+    /// the place is open now. Present only on POIs that state it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Mo-Fr 08:00-18:00; Sa 09:00-13:00")]
+    pub opening_hours: Option<String>,
+    /// The box around a result that covers more than a point, as `[west,
+    /// south, east, north]` in degrees. It holds an area's outline, a
+    /// street's line, or the outline a POI is drawn with. It is the
+    /// narrowest box, so for a result that crosses the antimeridian `west`
+    /// is greater than `east`, and only then. Absent on a result that is
+    /// only a point.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = json!([7.4090279, 43.7247599, 7.4398704, 43.7519311]))]
+    pub bbox: Option<[f64; 4]>,
+    /// The IANA name of the timezone the result lies in, such as
+    /// `Europe/Monaco`. Its offset from UTC is the reader's to compute,
+    /// as it changes with the date. An area's is the zone it lies wholly in,
+    /// and any other result's is the zone at its point. Absent on an area
+    /// that reaches into two zones, where the timezone boundaries name no
+    /// zone or two, and on every result of a Pack built without them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Europe/Monaco")]
+    pub timezone: Option<String>,
+    /// The kinds of food a place serves, as OpenStreetMap's `cuisine` tag
+    /// lists them, in lower case and in order. Absent on a result that
+    /// states none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!(["pizza", "italian"]))]
+    pub cuisine: Vec<String>,
+    /// The building an address's source draws it as, and its name when it
+    /// has one. Absent on an address mapped as a point on no building, and
+    /// on every other result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub building: Option<crate::record::Building>,
+    /// For an address that states no postcode, the one postcode the other
+    /// addresses of its street state, when they all state the same one. It
+    /// is where the address most likely lies, and `address.postcode` stays
+    /// what the source states. Absent on every other result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "94124")]
+    pub street_postcode: Option<String>,
+    /// The points to route to when going to the result, which are the
+    /// entrances OpenStreetMap maps for it. They are the nodes tagged
+    /// `entrance` on the outline of the building or site an address or a
+    /// POI is drawn with, or the result's own point when its node is so
+    /// tagged. Absent when OpenStreetMap maps none, and on every other
+    /// layer.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!([{"lon": 7.4263, "lat": 43.7396, "kind": "main"}]))]
+    pub access: Vec<AccessPoint>,
+    /// The address as the lines of a postal address, top to bottom, the way
+    /// the result's country writes one. The country's address template
+    /// says which parts go on which line and in what order. Each part is
+    /// what `address` states or, where it states none, the area of
+    /// `context`, and a part og has nothing for is left out. A region is
+    /// its ISO 3166-2 short code where the template asks for one. The last
+    /// line names the country as `context.country` does, so `lang` names it
+    /// too. Present on an address with its house number, and on a POI that
+    /// states its street. Absent on every other layer, and on a result in
+    /// no country og has a template for.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(example = json!(["10 King Street West", "Toronto, ON M5H 1A1", "Canada"]))]
+    pub address_lines: Vec<String>,
     /// Address parts stated by the source record.
     #[serde(skip_serializing_if = "Address::is_empty")]
     pub address: Address,
@@ -216,6 +304,18 @@ pub struct Common {
     #[serde(skip_serializing_if = "Context::is_empty")]
     pub context: Context,
     pub source: Source,
+    /// The result's name in each further language `lang` asks for, by the
+    /// code as asked. Present only when `lang` names more than one language
+    /// and the result has a name in at least one of the others.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = json!({"de": "Genf"}))]
+    pub translations: Option<BTreeMap<String, String>>,
+    /// The record behind the result, for the names `lang` asks for.
+    #[serde(skip)]
+    pub record_id: Option<RecordId>,
+    /// The result's local name, when `lang` renamed it.
+    #[serde(skip)]
+    pub local_name: Option<String>,
 }
 
 /// Properties of a forward geocoding result.
@@ -228,7 +328,8 @@ pub struct ForwardProperties {
     pub score: f32,
     /// Probability, from 0 to 1, that this is the address the query asks
     /// for. Of results at 0.8, about 8 in 10 are correct. Present only when
-    /// the Pack is calibrated. `0` on a `fallback` result.
+    /// the Pack is calibrated and the query states a house number, the
+    /// queries calibration measures. `0` on a `fallback` result.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(minimum = 0, maximum = 1)]
     pub confidence: Option<f32>,
@@ -238,6 +339,127 @@ pub struct ForwardProperties {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[schema(value_type = Option<bool>)]
     pub fallback: bool,
+    /// Distance from the request's `focus` point in meters. Present only
+    /// when the request gives `focus`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance_m: Option<f64>,
+    /// How each address part the query states matched the result. Present
+    /// on a `/geocode` result when the query states a part. A place found
+    /// because the whole query is one of its names states the part it is.
+    /// Absent on `/places` and `/autocomplete`. A place is sought by its
+    /// name and a suggestion by what is typed so far, which no address
+    /// reading judges.
+    #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
+    pub matched: Option<QueryMatch>,
+    /// The parts of `label` the typed text matched, in order, none
+    /// overlapping. Present on `/autocomplete` results, the only ones found
+    /// by text still being typed. A place suggested for the kind the text
+    /// names is marked where the typed words lie in its label too. Absent
+    /// when no typed word can be placed in the label.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Option<Vec<Highlight>>)]
+    pub highlights: Vec<Highlight>,
+}
+
+/// A range of a result's `label` that the typed text matched.
+///
+/// `start` and `end` count Unicode scalar values from the start of the
+/// label, `end` exclusive. They are not bytes and not UTF-16 code units, so
+/// a client converts them to the offsets its strings use.
+///
+/// Search matches typed words against the record, not against the label,
+/// so each typed word is placed by finding it again in the label, cut into
+/// words and folded as the index folds text. `elysee` marks `Élysée`. A
+/// word still being typed marks only the letters typed so far, and a word
+/// matched through a typo marks the whole label word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Highlight {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// How each address part a query states matched one result. A part the
+/// query does not state is absent, whatever the result holds for it. Every
+/// result fills in parts the query left out, so naming them says nothing.
+/// The query's parts are the ones its reading labels, so no query states a
+/// district. A `country` filter states the country too. A query that is
+/// wholly one of a place's names states the part that place is, its
+/// `locality` for a town or a county, its `region`, `postcode`, `country`
+/// or `street`, and that part is `matched`.
+///
+/// What judges each part is listed below.
+///
+/// - `housenumber`: `matched` when the result states the number.
+///   `partial` when the number is placed on a range or between its
+///   neighbours, or the result states the number the stated one starts
+///   with (`407` for `407a`). `unmatched` when a street or an area answers
+///   for it.
+/// - `street`: the query's street words against the words of the result's
+///   street, as search counts typos. `matched` when the street has each
+///   word, the word an abbreviation stands for, or its abbreviation
+///   (`Street` for a street written `St`), and the query writes every word
+///   of the street but its type. `partial` when a word is a typo away or
+///   missing, or the street has a word the query leaves out (`South Main
+///   Street` for `Main St`). `unmatched` when it has none of them or the
+///   result has no street.
+/// - `unit`: `matched` when the result states the unit, else `unmatched`.
+/// - `locality`: `matched` when an area the result lies in has the name.
+///   `partial` when the name is read through a typo, is the postal town of
+///   the stated postcode, or is a settlement mapped as a point beside the
+///   result, and on a town or county result whose name has a word the
+///   query leaves out (`East Providence` for `Providence`). `unmatched` when the result lies elsewhere or the Pack does
+///   not know the name.
+/// - `region` and `country`: `matched` when the result lies in the one
+///   named, or in a country the `country` filter names. `partial` when the
+///   name is read through a typo. `unmatched` when the Pack does not know
+///   the name.
+/// - `postcode`: `matched` when the result or its street states the
+///   postcode. `partial` when one starts the other, or the result only
+///   lies where the postcode does. `unmatched` when the result states
+///   another or nothing places it.
+///
+/// On a `fallback` result the parts the area answers for are judged, and
+/// every other stated part is `unmatched`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct QueryMatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub housenumber: Option<PartMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub street: Option<PartMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<PartMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locality: Option<PartMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<PartMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postcode: Option<PartMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<PartMatch>,
+}
+
+impl QueryMatch {
+    /// Whether the query states no part.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// How one stated address part matched a result, best first.
+///
+/// - `matched`: the result has the value the query states, after
+///   normalisation such as case, accents and abbreviations.
+/// - `partial`: the result's value differs and was accepted as the same.
+/// - `unmatched`: the result does not have the part, has another value, or
+///   nothing says it has the stated one.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PartMatch {
+    Matched,
+    Partial,
+    Unmatched,
 }
 
 /// Properties of a reverse geocoding result.
@@ -263,7 +485,9 @@ pub struct ReverseProperties {
 /// - `centroid`: the centre of a mapped area.
 /// - `approximate`: a point standing for something larger, such as a town
 ///   or postcode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Accuracy {
     Rooftop,
@@ -324,9 +548,45 @@ pub struct Address {
     pub postcode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
+    /// `street` split into its parts as written. Absent when the street has
+    /// no type or direction to split off, such as `Broadway`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub street_parts: Option<StreetParts>,
+}
+
+/// The parts of a street name, as written: `W Main St N` is the prefix `W`,
+/// the name `Main`, the type `St` and the suffix `N`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ToSchema)]
+pub struct StreetParts {
+    /// Direction before the name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// The street's own name, without its type and directions.
+    pub name: String,
+    /// Street type, such as `Street` or `Ave`.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Direction after the name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<String>,
 }
 
 impl Address {
+    /// Fills the parts read from `street`.
+    pub fn with_parts(mut self) -> Self {
+        self.street_parts = self
+            .street
+            .as_deref()
+            .and_then(crate::road::StreetParts::of)
+            .map(|parts| StreetParts {
+                prefix: parts.prefix.map(str::to_string),
+                name: parts.name,
+                kind: parts.kind.map(str::to_string),
+                suffix: parts.suffix.map(str::to_string),
+            });
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
@@ -357,6 +617,7 @@ impl From<&AddressComponents> for Address {
             region: stated(address.region.as_deref()),
             postcode: stated(address.postcode.as_deref()),
             country: stated(address.country.as_deref()),
+            ..Self::default()
         }
     }
 }
@@ -414,6 +675,23 @@ impl Context {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+
+    /// Its areas, smallest first.
+    pub fn areas(&self) -> impl Iterator<Item = &ContextArea> {
+        [
+            &self.neighbourhood,
+            &self.sublocality,
+            &self.locality,
+            &self.subdistrict,
+            &self.district,
+            &self.subregion,
+            &self.region,
+            &self.country,
+            &self.place,
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
@@ -421,6 +699,31 @@ pub struct ContextArea {
     /// Stable ID from the source data, as in a result's `id`.
     pub id: String,
     pub name: String,
+    /// ISO code of the area. On `country` its ISO 3166-1 alpha-2 code, such
+    /// as `NZ`. On an area below it, its ISO 3166-2 code, such as `CA-ON`,
+    /// when the source data gives one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "NZ")]
+    pub code: Option<String>,
+    /// The area's name in each further language `lang` asks for, by the
+    /// code as asked. Present only when `lang` names more than one language
+    /// and the area has a name in at least one of the others.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = json!({"de": "Genf"}))]
+    pub translations: Option<BTreeMap<String, String>>,
+    /// The area's record, for the names `lang` asks for.
+    #[serde(skip)]
+    pub record_id: RecordId,
+    /// The area's local name, when `lang` renamed it.
+    #[serde(skip)]
+    pub local_name: Option<String>,
+    /// The area's Wikidata item, for the vendors that write one.
+    #[serde(skip)]
+    pub wikidata: Option<u32>,
+    /// The code on the area's vehicle plates (`SIM`), for the vendors that
+    /// write one.
+    #[serde(skip)]
+    pub plate_code: Option<String>,
 }
 
 impl Point {
@@ -482,6 +785,8 @@ impl ReverseFeature {
 pub struct Contexts<'a> {
     pack: &'a Reader,
     areas: HashMap<RecordId, Option<ContextArea>>,
+    /// Every name of each area, as search compares them.
+    keys: HashMap<RecordId, Vec<String>>,
 }
 
 impl<'a> Contexts<'a> {
@@ -489,6 +794,7 @@ impl<'a> Contexts<'a> {
         Self {
             pack,
             areas: HashMap::new(),
+            keys: HashMap::new(),
         }
     }
 
@@ -512,6 +818,44 @@ impl<'a> Contexts<'a> {
         })
     }
 
+    /// Whether `stated` is area `record_id`'s ISO code or the short code
+    /// after its country's (`CA` of `US-CA`). A code is written one way in
+    /// every language, so it stays as the source writes it.
+    fn is_code(&self, record_id: RecordId, stated: &str) -> bool {
+        self.code(record_id).is_some_and(|code| {
+            code.eq_ignore_ascii_case(stated)
+                || code
+                    .split_once('-')
+                    .is_some_and(|(_, short)| short.eq_ignore_ascii_case(stated))
+        })
+    }
+
+    /// Whether `stated` is a name of area `record_id`, in any language.
+    fn names_area(&mut self, record_id: RecordId, stated: &str) -> Result<bool> {
+        let Some(stated) = crate::util::fold::search_key(stated) else {
+            return Ok(false);
+        };
+        if !self.keys.contains_key(&record_id) {
+            let names = self.pack.records().names(record_id)?;
+            let keys = names
+                .iter()
+                .map(String::as_str)
+                .chain(self.pack.language_names(record_id))
+                .filter_map(crate::util::fold::search_key)
+                .collect();
+            self.keys.insert(record_id, keys);
+        }
+        Ok(self.keys[&record_id].contains(&stated))
+    }
+
+    /// An area's ISO code: a country's own, else its subdivision code.
+    fn code(&self, record_id: RecordId) -> Option<String> {
+        self.pack
+            .country_code(record_id)
+            .map(|code| code.as_str().to_string())
+            .or_else(|| self.pack.subdivision_code(record_id).map(str::to_string))
+    }
+
     fn area(&mut self, record_id: Option<RecordId>) -> Result<Option<ContextArea>> {
         let Some(record_id) = record_id else {
             return Ok(None);
@@ -522,10 +866,19 @@ impl<'a> Contexts<'a> {
         let area = self
             .pack
             .context_record(record_id)?
-            .map(|record| ContextArea {
-                id: record.id,
-                name: record.name,
-            });
+            .map(|record| {
+                Ok::<_, crate::Error>(ContextArea {
+                    id: record.id,
+                    name: record.name,
+                    code: self.code(record_id),
+                    translations: None,
+                    record_id,
+                    local_name: None,
+                    wikidata: self.pack.records().wikidata(record_id)?,
+                    plate_code: self.pack.plate_code(record_id).map(str::to_string),
+                })
+            })
+            .transpose()?;
         self.areas.insert(record_id, area.clone());
         Ok(area)
     }
@@ -545,9 +898,7 @@ pub fn forward_collection(
         .collect::<Result<Vec<_>>>()?;
     let attribution = attribution(
         pack,
-        features
-            .iter()
-            .map(|feature| feature.properties.common.source.dataset.as_str()),
+        features.iter().map(|feature| &feature.properties.common),
     );
     Ok(ForwardCollection {
         kind: FeatureCollectionType::FeatureCollection,
@@ -560,6 +911,276 @@ pub fn forward_collection(
     })
 }
 
+/// The languages a request asks names in, which `lang` gives as
+/// comma-separated language codes, such as `fr,de`. The first names each
+/// result and area, and the others give their `translations`. Repeats
+/// count once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Languages(Vec<String>);
+
+/// Most distinct languages one request may ask names in. Each one adds a
+/// name to every result and every area of it, so the cap bounds the size of
+/// an answer.
+pub const MAX_LANGUAGES: usize = 20;
+
+/// Why `lang` cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanguagesError {
+    /// The first code that is not a language code.
+    NotACode(String),
+    /// More than [`MAX_LANGUAGES`] distinct codes, with how many.
+    TooMany(usize),
+}
+
+impl Languages {
+    /// Reads `lang`. A language code is two or three letters, then optional
+    /// subtags of letters and digits, such as `de`, `zh-Hant` or `pt-BR`.
+    /// Repeats are dropped before the cap counts, keeping the first spelling.
+    pub fn parse(lang: &str) -> std::result::Result<Self, LanguagesError> {
+        let mut codes = Vec::<String>::new();
+        for code in lang
+            .split(',')
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+        {
+            if !is_language_code(code) {
+                return Err(LanguagesError::NotACode(code.to_string()));
+            }
+            if !codes.iter().any(|known| known.eq_ignore_ascii_case(code)) {
+                codes.push(code.to_string());
+            }
+        }
+        if codes.len() > MAX_LANGUAGES {
+            return Err(LanguagesError::TooMany(codes.len()));
+        }
+        Ok(Self(codes))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn codes(&self) -> &[String] {
+        &self.0
+    }
+}
+
+fn is_language_code(code: &str) -> bool {
+    let mut parts = code.split(['-', '_']);
+    let language = parts.next().unwrap_or_default();
+    (2..=3).contains(&language.len())
+        && language.bytes().all(|byte| byte.is_ascii_alphabetic())
+        && parts.all(|part| {
+            !part.is_empty()
+                && part.len() <= 8
+                && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+}
+
+/// Names a result or area in `languages`. The first gives `name`, or the
+/// local name stays when it has none in that language. A renamed one keeps
+/// its local name in `local_name`. Each other language it has a name in goes
+/// into `translations`.
+fn localize_names(
+    pack: &Reader,
+    record_id: RecordId,
+    languages: &Languages,
+    name: &mut String,
+    local_name: &mut Option<String>,
+    translations: &mut Option<BTreeMap<String, String>>,
+) {
+    let Some((first, others)) = languages.codes().split_first() else {
+        return;
+    };
+    if let Some(named) = pack.language_name(record_id, first)
+        && named != name.as_str()
+    {
+        *local_name = Some(std::mem::replace(name, named.to_string()));
+    }
+    let found = others
+        .iter()
+        .filter_map(|code| {
+            Some((
+                code.clone(),
+                pack.language_name(record_id, code)?.to_string(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    *translations = (!found.is_empty()).then_some(found);
+}
+
+/// Names a result and its areas in `languages`, and rewrites its label to
+/// match. Returns how each part of the old label moved (see [`relabel`]).
+fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) -> Vec<Moved> {
+    if let Some(record_id) = common.record_id {
+        localize_names(
+            pack,
+            record_id,
+            languages,
+            &mut common.name,
+            &mut common.local_name,
+            &mut common.translations,
+        );
+    }
+    let context = &mut common.context;
+    for area in [
+        &mut context.neighbourhood,
+        &mut context.sublocality,
+        &mut context.locality,
+        &mut context.subdistrict,
+        &mut context.district,
+        &mut context.subregion,
+        &mut context.region,
+        &mut context.country,
+        &mut context.place,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        localize_names(
+            pack,
+            area.record_id,
+            languages,
+            &mut area.name,
+            &mut area.local_name,
+            &mut area.translations,
+        );
+    }
+    // A part the source states that names an area was written as the area
+    // (see [`name_stated_parts`]), so it is renamed with it.
+    let address = &mut common.address;
+    for part in [
+        &mut address.locality,
+        &mut address.region,
+        &mut address.country,
+        &mut address.place,
+    ]
+    .into_iter()
+    .flatten()
+    .chain(&mut address.areas)
+    {
+        if let Some(area) = context
+            .areas()
+            .find(|area| area.local_name.as_deref() == Some(part.as_str()))
+        {
+            part.clone_from(&area.name);
+        }
+    }
+    // The lines name areas, which just changed language.
+    common.address_lines =
+        crate::address_lines::address_lines(common.layer, &common.address, &common.context);
+    let context = &common.context;
+    let renamed = std::iter::once((common.local_name.as_deref(), common.name.as_str()))
+        .chain(
+            [
+                &context.neighbourhood,
+                &context.sublocality,
+                &context.locality,
+                &context.subdistrict,
+                &context.district,
+                &context.subregion,
+                &context.region,
+                &context.country,
+                &context.place,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|area| (area.local_name.as_deref(), area.name.as_str())),
+        )
+        .filter_map(|(local, named)| Some((local?.to_string(), named.to_string())))
+        .collect::<Vec<_>>();
+    let (label, moved) = relabel(&common.label, &renamed);
+    common.label = label;
+    moved
+}
+
+/// Where a part of an old label went in a new one, in characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Moved {
+    start: usize,
+    end: usize,
+    /// Where the part starts in the new label, `None` when it was renamed.
+    to: Option<usize>,
+}
+
+/// Separates the parts of a label.
+const LABEL_SEPARATOR: &str = ", ";
+
+/// `label` with each part that is a local name of `renamed` replaced by its
+/// new name, and how each old part moved. A part is the label's text
+/// between separators; the parts that name the result and its areas are
+/// their names as written.
+fn relabel(label: &str, renamed: &[(String, String)]) -> (String, Vec<Moved>) {
+    let mut parts = Vec::new();
+    let mut moved = Vec::new();
+    let (mut start, mut to) = (0, 0);
+    for part in label.split(LABEL_SEPARATOR) {
+        let length = part.chars().count();
+        let new = renamed
+            .iter()
+            .find(|(local, _)| local == part)
+            .map(|(_, named)| named.as_str());
+        moved.push(Moved {
+            start,
+            end: start + length,
+            to: new.is_none().then_some(to),
+        });
+        let written = new.unwrap_or(part);
+        to += written.chars().count() + LABEL_SEPARATOR.chars().count();
+        start += length + LABEL_SEPARATOR.chars().count();
+        parts.push(written);
+    }
+    (parts.join(LABEL_SEPARATOR), moved)
+}
+
+/// `highlights` moved with their label's parts. A highlight in a renamed
+/// part is dropped: the typed text matched the local name, not the new one.
+fn move_highlights(highlights: &mut Vec<Highlight>, moved: &[Moved]) {
+    highlights.retain_mut(|highlight| {
+        let Some(part) = moved
+            .iter()
+            .find(|part| part.start <= highlight.start && highlight.end <= part.end)
+        else {
+            return false;
+        };
+        let Some(to) = part.to else {
+            return false;
+        };
+        let shift = |offset: usize| offset - part.start + to;
+        (highlight.start, highlight.end) = (shift(highlight.start), shift(highlight.end));
+        true
+    });
+}
+
+/// Names every result and context area of a forward answer in the
+/// languages `lang` asked for.
+pub fn localize_forward(pack: &Reader, collection: &mut ForwardCollection, languages: &Languages) {
+    for feature in &mut collection.features {
+        let moved = localize_common(pack, &mut feature.properties.common, languages);
+        move_highlights(&mut feature.properties.highlights, &moved);
+    }
+}
+
+/// [`localize_forward`] for a reverse answer.
+pub fn localize_reverse(pack: &Reader, collection: &mut ReverseCollection, languages: &Languages) {
+    for feature in &mut collection.features {
+        localize_common(pack, &mut feature.properties.common, languages);
+    }
+}
+
+/// Sets each result's distance from `focus`, when the request gave one.
+pub fn measure_from(collection: &mut ForwardCollection, focus: Option<[f64; 2]>) {
+    let Some([lon, lat]) = focus else {
+        return;
+    };
+    for feature in &mut collection.features {
+        let [feature_lon, feature_lat] = feature.geometry.coordinates;
+        let metres = crate::spatial_index::haversine_m(lon, lat, feature_lon, feature_lat);
+        // To the centimetre: finer is noise next to the point's own precision.
+        feature.properties.distance_m = Some((metres * 100.0).round() / 100.0);
+    }
+}
+
 /// One search hit as a feature. The hit's summary already holds what search
 /// placed or estimated (an interpolated house number, a street's centre
 /// line), so nothing is read again but its context.
@@ -569,11 +1190,20 @@ pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<Fo
         .point
         .ok_or_else(|| Error::Inconsistent(format!("search hit {} has no point", hit.record.id)))?;
     let accuracy = Accuracy::of(point.precision, &hit.record.source);
+    let mut common = common(contexts, hit.record_id, hit.record, accuracy)?;
+    let mut highlights = hit.highlights;
+    let moved = name_stated_parts(contexts, &mut common)?;
+    if !moved.is_empty() {
+        move_highlights(&mut highlights, &moved);
+    }
     let properties = ForwardProperties {
-        common: common(contexts, hit.record_id, hit.record, accuracy)?,
+        common,
         score: hit.score,
         confidence: hit.confidence,
         fallback: hit.fallback,
+        distance_m: None,
+        matched: (!hit.matched.is_empty()).then_some(hit.matched),
+        highlights,
     };
     Ok(ForwardFeature::new(point.lon, point.lat, properties))
 }
@@ -644,8 +1274,10 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
             summary.layer.clone_from(layer);
         }
         summary.label.clone_from(&result.label);
+        let mut common = common(&mut contexts, record_id, summary, accuracy)?;
+        name_stated_parts(&mut contexts, &mut common)?;
         let properties = ReverseProperties {
-            common: common(&mut contexts, record_id, summary, accuracy)?,
+            common,
             distance_m: result.distance_m,
         };
         features.push(ReverseFeature::new(lon, lat, properties));
@@ -677,9 +1309,7 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
 
     let attribution = attribution(
         pack,
-        features
-            .iter()
-            .map(|feature| feature.properties.common.source.dataset.as_str()),
+        features.iter().map(|feature| &feature.properties.common),
     );
     Ok(ReverseCollection {
         kind: FeatureCollectionType::FeatureCollection,
@@ -738,8 +1368,14 @@ fn common(
             summary.layer
         ))
     })?;
+    let address = summary.address.with_parts();
+    let context = contexts.of(record_id)?;
     Ok(Common {
         id: summary.id,
+        code: layer
+            .is_context()
+            .then(|| contexts.code(record_id))
+            .flatten(),
         layer,
         accuracy,
         name: summary.name,
@@ -747,12 +1383,70 @@ fn common(
         category: summary.category,
         road_class: summary.road_class,
         brand: summary.brand,
-        address: summary.address,
-        context: contexts.of(record_id)?,
+        contact: summary.contact,
+        opening_hours: summary.opening_hours,
+        bbox: summary.bbox,
+        timezone: summary.timezone,
+        cuisine: summary.cuisine,
+        street_postcode: summary.street_postcode,
+        building: summary.building,
+        access: summary.access,
+        address_lines: crate::address_lines::address_lines(layer, &address, &context),
+        address,
+        context,
         source: Source {
             dataset: summary.source.dataset,
         },
+        translations: None,
+        record_id: Some(record_id),
+        local_name: None,
     })
+}
+
+/// Writes each place the source states, its town, region, country or a
+/// named part of a town, as the area of the result's context it names, so
+/// one answer never names a place two ways: an address tagged `Vienna` in
+/// Wien says `Wien`, and with `lang` says what the area does. A code (`CA`,
+/// `AT`) is the same in every language and stays. The label
+/// follows, and how its parts moved is returned (see [`relabel`]), none when
+/// nothing was renamed. A part that names no area of the context stays as
+/// the source wrote it.
+fn name_stated_parts(contexts: &mut Contexts, common: &mut Common) -> Result<Vec<Moved>> {
+    let areas = common
+        .context
+        .areas()
+        .map(|area| (area.record_id, area.name.clone()))
+        .collect::<Vec<_>>();
+    let mut renamed = Vec::new();
+    let address = &mut common.address;
+    let parts = [
+        &mut address.locality,
+        &mut address.region,
+        &mut address.country,
+        &mut address.place,
+    ]
+    .into_iter()
+    .flatten()
+    .chain(&mut address.areas);
+    for part in parts {
+        for (record_id, name) in &areas {
+            if part == name || contexts.is_code(*record_id, part) {
+                break;
+            }
+            if contexts.names_area(*record_id, part)? {
+                renamed.push((std::mem::replace(part, name.clone()), name.clone()));
+                break;
+            }
+        }
+    }
+    if renamed.is_empty() {
+        return Ok(Vec::new());
+    }
+    common.address_lines =
+        crate::address_lines::address_lines(common.layer, &common.address, &common.context);
+    let (label, moved) = relabel(&common.label, &renamed);
+    common.label = label;
+    Ok(moved)
 }
 
 /// The result columns of one forward feature, by name, in the order
@@ -818,6 +1512,24 @@ fn flat(
         ("lat", coordinate(1)),
         ("lon", coordinate(0)),
         (
+            "bbox",
+            field(&|p| {
+                p.bbox
+                    .map(|bbox| bbox.map(|side| format!("{side:.7}")).join(","))
+            }),
+        ),
+        ("timezone", field(&|p| p.timezone.clone())),
+        (
+            "access",
+            field(&|p| {
+                let points = p
+                    .access
+                    .iter()
+                    .map(|point| format!("{:.7},{:.7},{}", point.lon, point.lat, point.kind));
+                Some(points.collect::<Vec<_>>().join("; "))
+            }),
+        ),
+        (
             "address_housenumber",
             field(&|p| p.address.housenumber.clone()),
         ),
@@ -832,6 +1544,10 @@ fn flat(
         ("address_region", field(&|p| p.address.region.clone())),
         ("address_postcode", field(&|p| p.address.postcode.clone())),
         ("address_country", field(&|p| p.address.country.clone())),
+        (
+            "address_lines",
+            field(&|p| Some(p.address_lines.join("; "))),
+        ),
         (
             "context_neighbourhood",
             area(|context| &context.neighbourhood),
@@ -852,6 +1568,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_label_names_its_parts_as_lang_does_and_its_highlights_follow() {
+        let renamed = [("Monaco".to_string(), "Монако-Вилль".to_string())];
+        let (label, moved) = relabel("Casino, Place du Casino, Monaco, 98000, MC", &renamed);
+        assert_eq!(label, "Casino, Place du Casino, Монако-Вилль, 98000, MC");
+        let mut highlights = vec![
+            Highlight { start: 0, end: 3 },
+            // "Mon" of the local name, which the label no longer writes.
+            Highlight { start: 25, end: 28 },
+            Highlight { start: 33, end: 38 },
+        ];
+        move_highlights(&mut highlights, &moved);
+        assert_eq!(
+            highlights,
+            [
+                Highlight { start: 0, end: 3 },
+                Highlight { start: 39, end: 44 }
+            ]
+        );
+    }
+
+    /// Twenty distinct codes, the cap, are read in the order given.
+    const TWENTY: [&str; MAX_LANGUAGES] = [
+        "ar", "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "he", "hu", "it", "ja",
+        "ko", "nl", "pl", "pt", "ru",
+    ];
+
+    #[test]
+    fn lang_takes_up_to_twenty_distinct_languages() {
+        let languages = Languages::parse(&TWENTY.join(",")).expect("twenty is the cap");
+        assert_eq!(languages.codes(), TWENTY);
+
+        let twenty_one = format!("{},sv", TWENTY.join(","));
+        assert_eq!(
+            Languages::parse(&twenty_one),
+            Err(LanguagesError::TooMany(21))
+        );
+    }
+
+    #[test]
+    fn repeats_drop_before_the_cap_counts_and_the_first_spelling_stays() {
+        let repeated = format!("{},DE,de,Ar,ar", TWENTY.join(","));
+        let languages = Languages::parse(&repeated).expect("repeats count once");
+        assert_eq!(languages.codes(), TWENTY);
+
+        let languages = Languages::parse("pt-BR, de,PT-br,fr,De").expect("repeats count once");
+        assert_eq!(languages.codes(), ["pt-BR", "de", "fr"]);
+    }
+
+    #[test]
+    fn a_malformed_code_is_named_even_past_the_cap() {
+        let twenty_one = format!("{},sv,d3", TWENTY.join(","));
+        assert_eq!(
+            Languages::parse(&twenty_one),
+            Err(LanguagesError::NotACode("d3".to_string()))
+        );
+    }
+
+    #[test]
     fn an_answer_credits_openstreetmap_and_each_imported_data_set_it_holds() {
         use crate::record::{AddressRecord, LocationPrecision, SourceProvenance, point_geometry};
         let dir = std::env::temp_dir().join(format!(
@@ -862,6 +1636,8 @@ mod tests {
         writer
             .write(
                 &AddressRecord {
+                    building: None,
+                    access: Vec::new(),
                     disputed: false,
                     street_postcodes: Vec::new(),
                     address: AddressComponents {

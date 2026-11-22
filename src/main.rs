@@ -103,6 +103,26 @@ enum Commands {
         #[command(flatten)]
         limits: Limits,
 
+        /// A host a job may call back when it ends, as `name` or `name:port`.
+        /// Repeat it, or comma-separate it, for more. None by default: a
+        /// callback URL a client stores would otherwise make the server
+        /// reach any address it can, internal ones included.
+        #[arg(
+            long = "hook-host",
+            env = "OG_HOOK_HOSTS",
+            value_name = "HOST",
+            value_delimiter = ','
+        )]
+        hook_hosts: Vec<String>,
+
+        /// The URL clients reach this server by, such as
+        /// `https://geo.example.com`, when a proxy stands in front of it.
+        /// Every absolute URL the server hands back starts with it. Without
+        /// it such a URL takes the `Host` the client connected with, over
+        /// plain HTTP.
+        #[arg(long, env = "OG_PUBLIC_URL", value_name = "URL", value_parser = public_url)]
+        public_url: Option<String>,
+
         /// Longest, in seconds, the server takes to stop after Ctrl-C or
         /// SIGTERM; what is still open then is dropped. 0 drops it at once.
         #[arg(long, value_name = "SECS", default_value_t = DEFAULT_SHUTDOWN_TIMEOUT_SECS)]
@@ -208,6 +228,15 @@ enum PackCommand {
         /// by their tags alone.
         #[arg(long, value_name = "PATH")]
         qrank: Option<PathBuf>,
+
+        /// Give each result the timezone it lies in, from the timezone
+        /// boundaries of timezone-boundary-builder. That is the GeoJSON
+        /// file inside `timezones.geojson.zip` of a release at
+        /// https://github.com/evansiroky/timezone-boundary-builder,
+        /// unpacked. It is derived from OpenStreetMap, under the same
+        /// licence. Without one, no result has a timezone.
+        #[arg(long, value_name = "PATH")]
+        timezones: Option<PathBuf>,
     },
 
     /// Inspect Pack records as readable JSON.
@@ -337,7 +366,8 @@ enum GeocodeCommand {
     /// Fit the Pack's answer confidence to held-out address points: each is
     /// written as messy queries, searched, and its answers judged right or
     /// wrong. The model is written beside the Pack file, replacing any
-    /// before it, and every answer from then on carries a `confidence`.
+    /// before it. From then on every answer to a query that states a house
+    /// number carries a `confidence`; answers to other queries carry none.
     Calibrate {
         /// Pack directory or Pack file.
         #[arg(long)]
@@ -612,6 +642,7 @@ async fn main() -> Result<()> {
             openaddresses_non_commercial,
             address_files,
             qrank,
+            timezones,
         }) => {
             resources::opt_out_of_power_throttling();
             resources::yield_to_interactive_programs();
@@ -627,6 +658,7 @@ async fn main() -> Result<()> {
                 pack,
                 addresses,
                 qrank,
+                timezones,
                 memory_budget_bytes: memory_budget_mb
                     .map(|mb| usize::try_from(mb << 20))
                     .transpose()
@@ -797,6 +829,8 @@ async fn main() -> Result<()> {
             basemap,
             job_dir,
             limits,
+            hook_hosts,
+            public_url,
             shutdown_timeout,
         } => {
             serve(ServeOptions {
@@ -806,6 +840,8 @@ async fn main() -> Result<()> {
                 basemap: Some(basemap),
                 job_dir,
                 limits,
+                hook_hosts,
+                public_url,
                 shutdown_timeout: Duration::from_secs(shutdown_timeout),
             })
             .await?;
@@ -1218,8 +1254,38 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
     }))
 }
 
+/// `--public-url`: an `http` or `https` URL with a host and nothing after
+/// its path.
+fn public_url(value: &str) -> std::result::Result<String, String> {
+    let rest = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .ok_or("must start with http:// or https://")?;
+    let host = rest.split('/').next().unwrap_or_default();
+    if host.is_empty() || rest.contains(['?', '#', ' ']) {
+        return Err("must name a host, with no query or fragment".to_string());
+    }
+    Ok(value.trim_end_matches('/').to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_public_url_is_an_http_origin_with_an_optional_path() {
+        assert_eq!(
+            super::public_url("https://geo.example.com/og/").as_deref(),
+            Ok("https://geo.example.com/og")
+        );
+        for refused in [
+            "geo.example.com",
+            "ftp://geo.example.com",
+            "https://",
+            "https://x?y=1",
+        ] {
+            assert!(super::public_url(refused).is_err(), "{refused}");
+        }
+    }
+
     use clap::Parser;
 
     use super::*;

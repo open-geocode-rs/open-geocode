@@ -185,6 +185,22 @@ pub(crate) fn alternate_names(tags: &BTreeMap<String, String>, primary: &str) ->
     names
 }
 
+/// The feature's name in each language a `name:<lang>` tag states, as pairs
+/// of the language code as written and the name, in code order. A
+/// `;`-separated value gives its first name.
+pub(crate) fn language_names(tags: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    tags.iter()
+        .filter_map(|(key, value)| {
+            let language = key.strip_prefix("name:")?;
+            if !is_language_tag(language) {
+                return None;
+            }
+            let name = value.split(';').find_map(collapse_whitespace)?;
+            Some((language.to_string(), name))
+        })
+        .collect()
+}
+
 /// The name tags of `tags`, for the features that keep only some tags past
 /// the scan.
 pub(crate) fn name_tags(tags: &BTreeMap<String, String>) -> impl Iterator<Item = (String, String)> {
@@ -314,6 +330,26 @@ mod tests {
         ] {
             assert!(!is_name_key(key), "{key}");
         }
+    }
+
+    #[test]
+    fn language_names_keep_each_language_tag_and_its_first_name() {
+        let tags = BTreeMap::from([
+            ("name".to_string(), "Genève".to_string()),
+            ("name:de".to_string(), "Genf".to_string()),
+            ("name:it".to_string(), "Ginevra; Genevra".to_string()),
+            ("name:zh-Hant".to_string(), "日內瓦".to_string()),
+            ("name:etymology".to_string(), "river mouth".to_string()),
+            ("alt_name:de".to_string(), "Genff".to_string()),
+        ]);
+        assert_eq!(
+            language_names(&tags),
+            vec![
+                ("de".to_string(), "Genf".to_string()),
+                ("it".to_string(), "Ginevra".to_string()),
+                ("zh-Hant".to_string(), "日內瓦".to_string()),
+            ]
+        );
     }
 
     #[test]

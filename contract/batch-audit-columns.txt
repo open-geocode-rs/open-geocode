@@ -12,6 +12,9 @@ geocode_brand
 geocode_road_class
 geocode_lat
 geocode_lon
+geocode_bbox
+geocode_timezone
+geocode_access
 geocode_address_housenumber
 geocode_address_unit
 geocode_address_street
@@ -21,6 +24,7 @@ geocode_address_locality
 geocode_address_region
 geocode_address_postcode
 geocode_address_country
+geocode_address_lines
 geocode_context_neighbourhood
 geocode_context_locality
 geocode_context_district

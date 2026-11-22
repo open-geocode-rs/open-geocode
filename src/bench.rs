@@ -716,6 +716,7 @@ mod tests {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                details: None,
                 aliases: Vec::new(),
             };
             writer.write(&poi.into(), context).expect("POI");
@@ -867,6 +868,8 @@ mod tests {
         writer
             .write(
                 &AddressRecord {
+                    building: None,
+                    access: Vec::new(),
                     disputed: false,
                     street_postcodes: Vec::new(),
                     address: AddressComponents {

@@ -18,8 +18,8 @@ use serde::Deserialize;
 
 use crate::{
     record::{
-        AddressComponents, AddressRecord, Brand, LocationPrecision, ObjectType, PoiRecord, Record,
-        SourceProvenance, point_geometry,
+        AddressComponents, AddressRecord, Brand, Contact, Entrance, LocationPrecision, ObjectType,
+        PoiDetails, PoiRecord, Record, SourceProvenance, point_geometry,
     },
     util::fold::search_key,
 };
@@ -174,6 +174,11 @@ fn place_preset(tags: &BTreeMap<String, String>, drawn: Drawn) -> Option<&'stati
     (!preset.never).then_some(preset)
 }
 
+// Order decides which value a record keeps when both keys state one.
+const PHONE_KEYS: &[&str] = &["phone", "contact:phone"];
+const WEBSITE_KEYS: &[&str] = &["website", "contact:website"];
+const EMAIL_KEYS: &[&str] = &["email", "contact:email"];
+
 fn poi_category(tags: &BTreeMap<String, String>, drawn: Drawn) -> Option<String> {
     let preset = place_preset(tags, drawn)?;
     let value = tags.get(&preset.key)?;
@@ -193,6 +198,8 @@ pub(crate) struct PoiCandidate {
     pub outline: Option<Vec<u8>>,
     /// See [`Identity::nodes`].
     pub nodes: Vec<i64>,
+    /// The entrances mapped for it (see [`Entrance`]).
+    pub entrances: Vec<Entrance>,
 }
 
 pub(crate) fn is_poi(tags: &BTreeMap<String, String>, drawn: Drawn) -> bool {
@@ -478,6 +485,36 @@ fn merge(leader: &mut PoiRecord, member: PoiRecord) {
     if leader.brand.is_none() {
         leader.brand = member.brand;
     }
+    // One place: what a copy alone states is the place's.
+    let unboxed = |details: Option<Box<PoiDetails>>| details.map(|details| *details);
+    let (own, theirs) = (
+        unboxed(leader.details.take()).unwrap_or_default(),
+        unboxed(member.details).unwrap_or_default(),
+    );
+    let (ours, other) = (
+        own.contact.unwrap_or_default(),
+        theirs.contact.unwrap_or_default(),
+    );
+    leader.details = PoiDetails {
+        contact: Contact::stated(
+            ours.phone.or(other.phone),
+            ours.website.or(other.website),
+            ours.email.or(other.email),
+        ),
+        opening_hours: own.opening_hours.or(theirs.opening_hours),
+        extent: own.extent.or(theirs.extent),
+        access: if own.access.is_empty() {
+            theirs.access
+        } else {
+            own.access
+        },
+        cuisine: if own.cuisine.is_empty() {
+            theirs.cuisine
+        } else {
+            own.cuisine
+        },
+    }
+    .kept();
     leader.prominence = leader.prominence.max(member.prominence);
     for name in std::iter::once(member.name).chain(member.alt_names) {
         let known = std::iter::once(&leader.name)
@@ -489,6 +526,44 @@ fn merge(leader: &mut PoiRecord, member: PoiRecord) {
     }
 }
 
+/// The first value of `keys` that `states` one, as written: one tag may
+/// hold several, split by `;`.
+fn first_stated(
+    tags: &BTreeMap<String, String>,
+    keys: &[&str],
+    states: impl Fn(&str) -> bool,
+) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| tags.get(*key))
+        .flat_map(|value| value.split(';'))
+        .map(str::trim)
+        .find(|value| states(value))
+        .map(str::to_string)
+}
+
+/// Each value is kept as written. Only what cannot be one is passed over:
+/// mappers write "n/a" and "none" where a place has nothing.
+fn contact(tags: &BTreeMap<String, String>) -> Option<Contact> {
+    let spaced = |value: &str| value.chars().any(char::is_whitespace);
+    Contact::stated(
+        first_stated(tags, PHONE_KEYS, |value| {
+            value.chars().any(char::is_numeric)
+        }),
+        first_stated(tags, WEBSITE_KEYS, |value| {
+            !spaced(value)
+                && value
+                    .split_once('.')
+                    .is_some_and(|(host, rest)| !host.is_empty() && !rest.is_empty())
+        }),
+        first_stated(tags, EMAIL_KEYS, |value| {
+            !spaced(value)
+                && value
+                    .split_once('@')
+                    .is_some_and(|(name, host)| !name.is_empty() && !host.is_empty())
+        }),
+    )
+}
+
 fn brand(tags: &BTreeMap<String, String>) -> Option<Brand> {
     Some(Brand {
         name: tags.cleaned("brand")?,
@@ -497,8 +572,8 @@ fn brand(tags: &BTreeMap<String, String>) -> Option<Brand> {
 }
 
 /// The tags a POI keeps: its names, its category tags, its Wikidata and
-/// Wikipedia links, what tells it from another of its name, and, when they
-/// state a valid address, its `addr:*` tags.
+/// Wikipedia links, what tells it from another of its name, how to reach it,
+/// its opening hours, and, when they state a valid address, its `addr:*` tags.
 pub(crate) fn poi_tags(
     tags: &BTreeMap<String, String>,
     address_tags: Option<&BTreeMap<String, String>>,
@@ -507,16 +582,11 @@ pub(crate) fn poi_tags(
         .filter(|(key, _)| {
             matches!(
                 key.as_str(),
-                "wikidata"
-                    | "wikipedia"
-                    | "brand"
-                    | "brand:wikidata"
-                    | "website"
-                    | "contact:website"
-                    | "phone"
-                    | "contact:phone"
-                    | "ref"
-            ) || is_place_key(key)
+                "wikidata" | "wikipedia" | "brand" | "brand:wikidata" | "opening_hours" | "ref"
+            ) || [PHONE_KEYS, WEBSITE_KEYS, EMAIL_KEYS]
+                .iter()
+                .any(|keys| keys.contains(&key.as_str()))
+                || is_place_key(key)
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .chain(name_tags(tags))
@@ -527,6 +597,23 @@ pub(crate) fn poi_tags(
                 .map(|(key, value)| (key.clone(), value.clone())),
         )
         .collect()
+}
+
+/// The kinds of food a place's `cuisine` tag lists, each once, in lower
+/// case and in the tag's order: `Pizza; italian` is `pizza` and `italian`.
+fn cuisine(tags: &BTreeMap<String, String>) -> Vec<String> {
+    let mut kinds = Vec::<String>::new();
+    for kind in tags
+        .get("cuisine")
+        .into_iter()
+        .flat_map(|value| value.split(';'))
+    {
+        let kind = kind.trim().to_lowercase();
+        if !kind.is_empty() && !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    kinds
 }
 
 /// Emit a POI from its kept tags; their `addr:*` tags are already validated.
@@ -543,12 +630,14 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
     // house only a POI states.
     if let Some(address) = &address {
         let record = AddressRecord {
+            building: super::address::building_of(tags),
             disputed: false,
             street_postcodes: Vec::new(),
             address: address.clone(),
             geometry: geometry.clone(),
             location_precision: candidate.location_precision,
             source: source.clone(),
+            access: candidate.entrances.clone(),
         };
         out.report.accept_address_with_tags(&record, Some(tags));
         out.records.push(Record::Address(record));
@@ -564,6 +653,22 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
         prominence: prominence(tags),
         wikidata: item(tags, "wikidata"),
         brand: brand(tags),
+        details: PoiDetails {
+            contact: contact(tags),
+            // Whitespace is its syntax's separator: only the ends are trimmed.
+            opening_hours: tags
+                .get("opening_hours")
+                .map(|hours| hours.trim())
+                .filter(|hours| !hours.is_empty())
+                .map(str::to_string),
+            extent: candidate
+                .outline
+                .as_deref()
+                .and_then(containment::narrowest_extent),
+            access: candidate.entrances.clone(),
+            cuisine: cuisine(tags),
+        }
+        .kept(),
         aliases: Vec::new(),
     };
     out.report.accept_poi(&record);
@@ -577,7 +682,7 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
                 nodes.dedup();
                 nodes
             },
-            websites: values(tags, &["website", "contact:website"], |value| {
+            websites: values(tags, WEBSITE_KEYS, |value| {
                 let value = value.to_lowercase();
                 let value = value
                     .strip_prefix("https://")
@@ -588,7 +693,7 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
             }),
             // The last nine digits: one number written with its country
             // code and without.
-            phones: values(tags, &["phone", "contact:phone"], |value| {
+            phones: values(tags, PHONE_KEYS, |value| {
                 let digits = value
                     .chars()
                     .filter(char::is_ascii_digit)
@@ -643,6 +748,7 @@ mod tests {
         let mut out = Emitted::default();
         emit_poi(
             &PoiCandidate {
+                entrances: Vec::new(),
                 object_type: ObjectType::Node,
                 object_id: 7,
                 lat: 43.65,
@@ -677,6 +783,7 @@ mod tests {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                details: None,
                 aliases: Vec::new(),
             },
             identity: Identity {
@@ -1074,6 +1181,7 @@ mod tests {
         ]);
         emit_poi(
             &PoiCandidate {
+                entrances: Vec::new(),
                 object_type: ObjectType::Way,
                 object_id: 9,
                 lat: 43.65,
@@ -1148,6 +1256,182 @@ mod tests {
         );
         let plain = emit(&[("name", "Shell"), ("amenity", "fuel"), ("phone", "n/a")]);
         assert_eq!(plain.places[0].identity.phones, Vec::<String>::new());
+    }
+
+    fn details(pairs: &[(&str, &str)]) -> Option<PoiDetails> {
+        let mut pairs = pairs.to_vec();
+        pairs.extend([("name", "Shell"), ("amenity", "fuel")]);
+        let out = emit(&pairs);
+        let [Place { record, .. }] = out.places.as_slice() else {
+            panic!("one POI record");
+        };
+        record.details.as_deref().cloned()
+    }
+
+    fn reached(phone: Option<&str>, website: Option<&str>, email: Option<&str>) -> PoiDetails {
+        PoiDetails {
+            contact: Some(Contact {
+                phone: phone.map(str::to_string),
+                website: website.map(str::to_string),
+                email: email.map(str::to_string),
+            }),
+            ..PoiDetails::default()
+        }
+    }
+
+    #[test]
+    fn a_poi_keeps_the_kinds_of_food_its_cuisine_lists() {
+        assert_eq!(
+            details(&[("cuisine", " Pizza;italian ; pizza;; ")]),
+            Some(PoiDetails {
+                cuisine: vec!["pizza".to_string(), "italian".to_string()],
+                ..PoiDetails::default()
+            })
+        );
+        assert_eq!(details(&[("cuisine", " ; ")]), None);
+    }
+
+    #[test]
+    fn a_poi_keeps_its_contact_and_opening_hours_as_written() {
+        assert_eq!(
+            details(&[
+                ("phone", " +31 (0)50 123-4567 "),
+                ("website", "HTTP://www.Shell.nl/Stations/"),
+                ("email", "Peize@Shell.nl"),
+                ("opening_hours", " Mo-Fr 08:00-18:00;  Sa 09:00-13:00 "),
+            ]),
+            Some(PoiDetails {
+                access: Vec::new(),
+                contact: Some(Contact {
+                    phone: Some("+31 (0)50 123-4567".into()),
+                    website: Some("HTTP://www.Shell.nl/Stations/".into()),
+                    email: Some("Peize@Shell.nl".into()),
+                }),
+                opening_hours: Some("Mo-Fr 08:00-18:00;  Sa 09:00-13:00".into()),
+                extent: None,
+                cuisine: Vec::new(),
+            })
+        );
+        assert_eq!(
+            details(&[
+                ("contact:phone", "050-1234567"),
+                ("contact:website", "shell.nl/peize"),
+                ("contact:email", "peize@shell.nl"),
+            ]),
+            Some(reached(
+                Some("050-1234567"),
+                Some("shell.nl/peize"),
+                Some("peize@shell.nl")
+            ))
+        );
+    }
+
+    #[test]
+    fn a_poi_keeps_the_first_value_of_each_contact_the_plain_key_first() {
+        assert_eq!(
+            details(&[
+                ("phone", "+31 50 123 4567; +31 50 765 4321"),
+                ("contact:phone", "050-0000000"),
+                ("website", "https://shell.nl/a;https://shell.nl/b"),
+                ("contact:website", "shell.nl/c"),
+                ("email", "a@shell.nl;b@shell.nl"),
+                ("contact:email", "c@shell.nl"),
+            ]),
+            Some(reached(
+                Some("+31 50 123 4567"),
+                Some("https://shell.nl/a"),
+                Some("a@shell.nl")
+            ))
+        );
+        assert_eq!(
+            details(&[("phone", "n/a; ;050-1234567")]),
+            Some(reached(Some("050-1234567"), None, None))
+        );
+        assert_eq!(
+            details(&[("phone", "none"), ("contact:phone", "050-1234567")]),
+            Some(reached(Some("050-1234567"), None, None))
+        );
+    }
+
+    #[test]
+    fn a_poi_stating_no_contact_or_hours_has_none() {
+        assert_eq!(details(&[]), None);
+        assert_eq!(
+            details(&[
+                ("phone", "n/a"),
+                ("contact:phone", " ; "),
+                ("website", "none"),
+                ("contact:website", "shell nl"),
+                ("email", "shell.nl"),
+                ("contact:email", "@"),
+                ("opening_hours", "  "),
+            ]),
+            None
+        );
+        assert_eq!(
+            details(&[("opening_hours", "24/7")]),
+            Some(PoiDetails {
+                access: Vec::new(),
+                contact: None,
+                opening_hours: Some("24/7".into()),
+                extent: None,
+                cuisine: Vec::new(),
+            })
+        );
+        assert_eq!(
+            details(&[("email", "peize@shell.nl")]),
+            Some(reached(None, None, Some("peize@shell.nl")))
+        );
+    }
+
+    /// A lifecycle prefix makes another key, which no preset reads: what is
+    /// closed for good is no place, so no record can say it is closed.
+    #[test]
+    fn an_object_closed_for_good_is_no_poi() {
+        for prefix in ["disused", "abandoned", "was", "demolished", "razed"] {
+            let closed = tags(&[("name", "De Pindol"), (&format!("{prefix}:amenity"), "pub")]);
+            assert!(!is_poi(&closed, Drawn::Point), "{prefix}");
+            assert!(!is_poi(&closed, Drawn::Area), "{prefix}");
+        }
+    }
+
+    #[test]
+    fn a_merged_place_takes_the_contact_and_hours_its_leader_lacks() {
+        let stating = |id: i64, details: PoiDetails| {
+            let mut place = place(id, "amenity:pub", east(0.0));
+            place.record.details = Some(Box::new(details));
+            place
+        };
+        let hours = |hours: &str, details: PoiDetails| PoiDetails {
+            opening_hours: Some(hours.to_string()),
+            ..details
+        };
+        let merged = resolve(vec![
+            outlined(stating(1, reached(Some("050-1234567"), None, None)), 20.0),
+            stating(
+                2,
+                hours(
+                    "Mo-Su 16:00-01:00",
+                    reached(Some("050-7654321"), Some("pindol.nl"), None),
+                ),
+            ),
+        ]);
+        let [record] = merged.as_slice() else {
+            panic!("one place");
+        };
+        assert_eq!(
+            record.details.as_deref(),
+            Some(&hours(
+                "Mo-Su 16:00-01:00",
+                reached(Some("050-1234567"), Some("pindol.nl"), None)
+            ))
+        );
+        let bare = resolve(vec![
+            outlined(place(1, "amenity:pub", east(0.0)), 20.0),
+            place(2, "amenity:pub", east(0.0)),
+        ]);
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].details, None);
     }
 
     #[test]

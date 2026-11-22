@@ -12,16 +12,16 @@ use crate::{
     extsort::Spill,
     parse::lattice::CountryCode,
     record::{
-        AddressComponents, AddressRecord, Brand, DerivedSourceProvenance,
-        InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
-        LocationPrecision, ObjectType, PlaceRecord, PoiRecord, PostcodeRecord, Prominence, Record,
-        RoadClass, SourceProvenance, StreetRecord, point_geometry,
+        AddressComponents, AddressRecord, Brand, Building, Contact, DerivedSourceProvenance,
+        Entrance, InterpolationAddressComponents, InterpolationRange, InterpolationRecord, Layer,
+        LocationPrecision, ObjectType, PlaceRecord, PoiDetails, PoiRecord, PostcodeRecord,
+        Prominence, Record, RoadClass, SourceProvenance, StreetRecord, point_geometry,
     },
     util::{
         codec::{
-            Delta, get_bytes, get_delta, get_front, get_i64, get_opt_string, get_string, get_u8,
-            get_u32, get_u64, put_bytes, put_delta, put_front, put_i64, put_opt_str, put_str,
-            put_u64,
+            Delta, get_bytes, get_delta, get_entrances, get_front, get_i64, get_opt_extent,
+            get_opt_string, get_string, get_u8, get_u32, get_u64, put_bytes, put_delta,
+            put_entrances, put_front, put_i64, put_opt_extent, put_opt_str, put_str, put_u64,
         },
         geo::line_parts,
     },
@@ -197,6 +197,22 @@ pub(crate) struct PendingAddress {
     pub point: [f64; 2],
     pub precision: LocationPrecision,
     pub source: Source,
+    /// The entrances its source maps. A boxed slice, as few have any and
+    /// every pending address is as wide as this makes it.
+    pub access: Box<[Entrance]>,
+    /// The building its source draws it as, boxed for the same reason.
+    pub building: Option<Box<Building>>,
+}
+
+pub(crate) fn in_capitals(text: &str) -> bool {
+    let mut uppercase = 0;
+    for c in text.chars() {
+        if c.is_lowercase() {
+            return false;
+        }
+        uppercase += usize::from(c.is_uppercase());
+    }
+    uppercase > 1
 }
 
 /// The components a street order key holds, borrowed from it.
@@ -277,6 +293,16 @@ impl<'a> Fields<'a> {
     }
 }
 
+/// Bit of a pending address's kind byte. When set, its entrances follow
+/// its point.
+const PENDING_ACCESS: u8 = 8;
+/// Bit of a pending address's kind byte. When set, its source draws it as
+/// a building.
+const PENDING_BUILDING: u8 = 16;
+/// Bit of a pending address's kind byte. When set, its building's name
+/// follows its entrances.
+const PENDING_BUILDING_NAME: u8 = 32;
+
 impl PendingAddress {
     pub(super) fn new(record: &AddressRecord, seq: u64, dataset: u32) -> Result<Self> {
         let point = crate::util::geo::point_lon_lat(&record.geometry)
@@ -293,6 +319,8 @@ impl PendingAddress {
             record.location_precision,
             source,
             seq,
+            record.access.clone().into(),
+            record.building.clone().map(Box::new),
         ))
     }
 
@@ -302,6 +330,8 @@ impl PendingAddress {
         precision: LocationPrecision,
         source: Source,
         seq: u64,
+        access: Box<[Entrance]>,
+        building: Option<Box<Building>>,
     ) -> Self {
         let [lon, lat] = point;
         let mut order = Vec::new();
@@ -347,6 +377,8 @@ impl PendingAddress {
             point,
             precision,
             source,
+            access,
+            building,
         }
     }
 
@@ -359,7 +391,15 @@ impl PendingAddress {
 
     /// The same address stating `address` instead.
     pub(super) fn restated(&self, address: &AddressComponents) -> Self {
-        Self::from_parts(address, self.point, self.precision, self.source, self.seq)
+        Self::from_parts(
+            address,
+            self.point,
+            self.precision,
+            self.source,
+            self.seq,
+            self.access.clone(),
+            self.building.clone(),
+        )
     }
 
     /// The components its key holds.
@@ -378,6 +418,8 @@ impl PendingAddress {
             street_postcodes: Vec::new(),
             location_precision: self.precision,
             disputed: false,
+            access: self.access.to_vec(),
+            building: self.building.as_deref().cloned(),
             source: datasets.provenance(self.source)?,
             geometry: point_geometry(self.point[0], self.point[1]),
         })
@@ -471,12 +513,32 @@ impl PendingAddress {
             LocationPrecision::Point => 0,
             LocationPrecision::Centroid => 4,
         };
-        out.push(kind | precision);
+        let access = if self.access.is_empty() {
+            0
+        } else {
+            PENDING_ACCESS
+        };
+        let building = match self.building.as_deref() {
+            None => 0,
+            Some(Building { name: None }) => PENDING_BUILDING,
+            Some(Building { name: Some(_) }) => PENDING_BUILDING | PENDING_BUILDING_NAME,
+        };
+        out.push(kind | precision | access | building);
         put_i64(out, self.source.object_id);
         if self.source.object_type == ObjectType::Row {
             put_u64(out, u64::from(self.source.dataset));
         }
         encode_compact_point(out, self.point);
+        if !self.access.is_empty() {
+            put_entrances(out, &self.access);
+        }
+        if let Some(name) = self
+            .building
+            .as_deref()
+            .and_then(|building| building.name.as_deref())
+        {
+            put_str(out, name);
+        }
     }
 
     fn decode_rest(previous: Option<&Self>, input: &mut &[u8]) -> Result<Self> {
@@ -530,6 +592,18 @@ impl PendingAddress {
                 dataset,
             },
             point: decode_compact_point(input)?,
+            access: if kind & PENDING_ACCESS == 0 {
+                Box::default()
+            } else {
+                get_entrances(input)?.into()
+            },
+            building: match (kind & PENDING_BUILDING, kind & PENDING_BUILDING_NAME) {
+                (0, _) => None,
+                (_, 0) => Some(Box::default()),
+                _ => Some(Box::new(Building {
+                    name: Some(get_string(input)?),
+                })),
+            },
         })
     }
 }
@@ -649,26 +723,35 @@ impl Spill for House {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedAddress {
     pub at: u64,
-    /// Where its street's postcodes wait, when it is lent any.
-    pub postcodes: Option<u64>,
+    /// Where what its street lends it waits, when it is lent anything.
+    pub lent: Option<u64>,
     pub disputed: bool,
 }
 
-/// The postcodes lent to the addresses of one street.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Postcodes(pub Vec<String>);
+/// What an address is lent from the others of its street: the postcodes
+/// they state, when it states none, and their spelling of its street, when
+/// it writes the street in capitals alone.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Lent {
+    pub postcodes: Vec<String>,
+    pub spellings: Vec<String>,
+}
 
-impl Spill for Postcodes {
+impl Spill for Lent {
     fn encode(&self, out: &mut Vec<u8>) {
-        put_strs(out, &self.0);
+        put_strs(out, &self.postcodes);
+        put_strs(out, &self.spellings);
     }
 
     fn decode(input: &mut &[u8]) -> Result<Self> {
-        Ok(Self(get_strings(input)?))
+        Ok(Self {
+            postcodes: get_strings(input)?,
+            spellings: get_strings(input)?,
+        })
     }
 }
 
-impl Entry for Postcodes {}
+impl Entry for Lent {}
 
 impl Entry for PendingAddress {
     fn encode_following(&self, previous: Option<&Self>, out: &mut Vec<u8>) {
@@ -979,7 +1062,7 @@ impl Spill for PendingAddress {
     }
 
     fn resident_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.order.capacity()
+        std::mem::size_of::<Self>() + self.order.capacity() + entrances_heap_bytes(&self.access)
     }
 }
 
@@ -1008,7 +1091,7 @@ impl PendingRecord {
             put_u64(out, placed.at);
             put_u64(
                 out,
-                placed.postcodes.map_or(0, |at| at + 1) << 1 | u64::from(placed.disputed),
+                placed.lent.map_or(0, |at| at + 1) << 1 | u64::from(placed.disputed),
             );
             return;
         }
@@ -1043,7 +1126,7 @@ impl PendingRecord {
                     origin: None,
                     body: Body::Address(PlacedAddress {
                         at,
-                        postcodes: (lent >> 1).checked_sub(1),
+                        lent: (lent >> 1).checked_sub(1),
                         disputed: lent & 1 != 0,
                     }),
                 });
@@ -1089,6 +1172,13 @@ impl Spill for PendingRecord {
     }
 }
 
+fn entrances_heap_bytes(entrances: &[Entrance]) -> usize {
+    entrances
+        .iter()
+        .map(|entrance| std::mem::size_of::<Entrance>() + entrance.kind.len())
+        .sum()
+}
+
 fn record_heap_bytes(record: &Record) -> usize {
     let strings = match record {
         Record::Address(_) => 0,
@@ -1097,6 +1187,22 @@ fn record_heap_bytes(record: &Record) -> usize {
                 + strings_heap_bytes(&record.alt_names)
                 + record.category.len()
                 + record.address.as_ref().map_or(0, address_heap_bytes)
+                + record.details.as_ref().map_or(0, |details| {
+                    let contact = details.contact.as_ref();
+                    std::mem::size_of::<PoiDetails>()
+                        + [
+                            contact.and_then(|contact| contact.phone.as_ref()),
+                            contact.and_then(|contact| contact.website.as_ref()),
+                            contact.and_then(|contact| contact.email.as_ref()),
+                            details.opening_hours.as_ref(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .map(String::len)
+                        .sum::<usize>()
+                        + entrances_heap_bytes(&details.access)
+                        + strings_heap_bytes(&details.cuisine)
+                })
         }
         Record::Interpolation(_) => 96,
         Record::Street(record) => {
@@ -1230,6 +1336,21 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
                     .and_then(|brand| brand.wikidata)
                     .map_or(0, u64::from),
             );
+            let contact = record.contact();
+            for value in [
+                contact.and_then(|contact| contact.phone.as_deref()),
+                contact.and_then(|contact| contact.website.as_deref()),
+                contact.and_then(|contact| contact.email.as_deref()),
+                record.opening_hours(),
+            ] {
+                put_opt_str(out, value);
+            }
+            put_opt_extent(out, record.extent());
+            put_entrances(out, record.access());
+            put_u64(out, record.cuisine().len() as u64);
+            for kind in record.cuisine() {
+                put_str(out, kind);
+            }
             encode_source(out, &record.source);
             encode_geometry(out, &record.geometry);
         }
@@ -1322,6 +1443,20 @@ pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
                 let wikidata = spilled_item(input)?;
                 name.map(|name| Brand { name, wikidata })
             },
+            details: PoiDetails {
+                contact: Contact::stated(
+                    get_opt_string(input)?,
+                    get_opt_string(input)?,
+                    get_opt_string(input)?,
+                ),
+                opening_hours: get_opt_string(input)?,
+                extent: get_opt_extent(input)?,
+                access: get_entrances(input)?,
+                cuisine: (0..get_u64(input)?)
+                    .map(|_| get_string(input))
+                    .collect::<crate::error::Result<Vec<_>>>()?,
+            }
+            .kept(),
             source: decode_source(input)?,
             geometry: decode_geometry(input)?,
         }),
@@ -1756,6 +1891,7 @@ mod tests {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                details: None,
                 aliases: Vec::new(),
             }),
             Record::Poi(PoiRecord {
@@ -1769,6 +1905,7 @@ mod tests {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                details: None,
                 aliases: Vec::new(),
             }),
         ];
@@ -1861,6 +1998,8 @@ mod tests {
                 let lat = 34.0 + (street_id / 1000) as f64 * 0.001 + (random % 1000) as f64 * 1e-7;
                 let parse = |value: f64| format!("{value:.7}").parse::<f64>().expect("number");
                 AddressRecord {
+                    building: None,
+                    access: Vec::new(),
                     disputed: false,
                     street_postcodes: Vec::new(),
                     address: AddressComponents {
@@ -1899,6 +2038,8 @@ mod tests {
         source: SourceProvenance,
     ) -> AddressRecord {
         AddressRecord {
+            building: None,
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
@@ -2107,6 +2248,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         };
         let mut outline = Vec::new();
@@ -2141,21 +2283,149 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_address_keeps_the_entrances_of_its_record() {
+        let mut record = address_record(
+            "5",
+            Some("Kadeweg"),
+            [4.0002, 52.00015],
+            SourceProvenance::osm(ObjectType::Way, 100),
+        );
+        record.location_precision = LocationPrecision::Centroid;
+        record.access = vec![
+            Entrance {
+                at: [40_000_000, 520_000_000],
+                kind: "main".into(),
+            },
+            Entrance {
+                at: [40_004_000, 520_003_000],
+                kind: "service".into(),
+            },
+        ];
+        let datasets = Datasets::default();
+        let pending = PendingAddress::new(&record, 4, 0).expect("new");
+        assert_eq!(pending.record(&datasets).expect("record"), record);
+        round_trip(&pending);
+        let bare = PendingAddress::new(
+            &address_record(
+                "7",
+                Some("Kadeweg"),
+                [4.0003, 52.0002],
+                SourceProvenance::osm(ObjectType::Node, 7),
+            ),
+            5,
+            0,
+        )
+        .expect("new");
+        // In the address book, after an address with none and before one.
+        for (previous, address) in [(&bare, &pending), (&pending, &bare)] {
+            let mut out = Vec::new();
+            address.encode_following(Some(previous), &mut out);
+            let mut input = out.as_slice();
+            assert_eq!(
+                &PendingAddress::decode_following(Some(previous), &mut input).expect("decode"),
+                address
+            );
+            assert!(input.is_empty());
+        }
+        // Stating its street another way, it is still the same building.
+        let mut restated = record.address.clone();
+        restated.street = Some("Kade Weg".into());
+        assert_eq!(
+            pending
+                .restated(&restated)
+                .record(&datasets)
+                .expect("record")
+                .access,
+            record.access
+        );
+        assert!(bare.record(&datasets).expect("record").access.is_empty());
+    }
+
+    #[test]
+    fn a_pending_place_round_trips_its_contact_and_hours() {
+        let text = |value: &str| Some(value.to_string());
+        for details in [
+            None,
+            PoiDetails::stated(None, text("24/7")),
+            PoiDetails::stated(Contact::stated(None, None, text("peize@shell.nl")), None),
+            PoiDetails {
+                extent: Some([65_660_000, 532_190_000, 65_670_000, 532_198_000]),
+                cuisine: vec!["pizza".into(), "italian".into()],
+                ..PoiDetails::default()
+            }
+            .kept(),
+            PoiDetails {
+                access: vec![
+                    Entrance {
+                        at: [65_664_000, 532_190_000],
+                        kind: "main".into(),
+                    },
+                    Entrance {
+                        at: [65_670_000, 532_195_000],
+                        kind: "service".into(),
+                    },
+                ],
+                ..PoiDetails::default()
+            }
+            .kept(),
+            PoiDetails::stated(
+                Contact::stated(
+                    text("+31 50 123 4567"),
+                    text("https://shell.nl/peize"),
+                    text("peize@shell.nl"),
+                ),
+                text("Mo-Su 06:00-23:00"),
+            ),
+        ] {
+            let record = PoiRecord {
+                alt_names: Vec::new(),
+                name: "Shell".into(),
+                category: "amenity:fuel".into(),
+                address: None,
+                geometry: point_geometry(6.5665, 53.2194),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, 16),
+                prominence: Default::default(),
+                wikidata: None,
+                brand: None,
+                details,
+                aliases: Vec::new(),
+            };
+            let pending = PendingNamed::place(
+                Place {
+                    record: record.clone(),
+                    identity: Identity::default(),
+                },
+                3,
+            )
+            .expect("a place");
+            round_trip(&pending);
+            assert_eq!(pending.into_place().record, record);
+        }
+    }
+
+    #[test]
     fn round_trips_a_placed_address() {
-        for (postcodes, disputed) in [(None, false), (Some(0), true), (Some(70_000), false)] {
+        for (lent, disputed) in [(None, false), (Some(0), true), (Some(70_000), false)] {
             round_trip(&PendingRecord {
                 key: u64::MAX,
                 seq: 7,
                 origin: None,
                 body: Body::Address(PlacedAddress {
                     at: 1 << 40,
-                    postcodes,
+                    lent,
                     disputed,
                 }),
             });
         }
-        let postcodes = Postcodes(vec!["M5V 1A1".into(), "M5V 2B2".into()]);
-        round_trip(&postcodes);
+        round_trip(&Lent {
+            postcodes: vec!["M5V 1A1".into(), "M5V 2B2".into()],
+            spellings: Vec::new(),
+        });
+        round_trip(&Lent {
+            postcodes: Vec::new(),
+            spellings: vec!["Piazza della Repubblica".into()],
+        });
     }
 
     /// Run-file bytes per address of each sort and of the address book,
@@ -2203,7 +2473,7 @@ mod tests {
                     origin: None,
                     body: Body::Address(PlacedAddress {
                         at: at as u64,
-                        postcodes: address
+                        lent: address
                             .fields()
                             .postcode
                             .is_none()

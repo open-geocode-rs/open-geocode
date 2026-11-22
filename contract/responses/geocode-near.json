@@ -10,9 +10,15 @@
       },
       "properties": {
         "accuracy": "street",
-        "confidence": 0.37754068,
+        "bbox": [
+          -79.0,
+          43.0,
+          -79.0,
+          43.001
+        ],
         "context": {
           "country": {
+            "code": "CA",
             "id": "osm:relation:1",
             "name": "Canada"
           },
@@ -21,19 +27,25 @@
             "name": "Toronto"
           },
           "region": {
+            "code": "CA-ON",
             "id": "osm:relation:2",
             "name": "Ontario"
           }
         },
+        "distance_m": 55.6,
         "id": "osm:way:12",
         "label": "King Street",
         "layer": "street",
+        "match": {
+          "street": "matched"
+        },
         "name": "King Street",
         "road_class": "residential",
         "score": 14.22728,
         "source": {
           "dataset": "osm"
-        }
+        },
+        "timezone": "America/Toronto"
       },
       "type": "Feature"
     },
@@ -50,11 +62,20 @@
         "address": {
           "housenumber": "10",
           "postcode": "M5V 1A1",
-          "street": "King Street"
+          "street": "King Street",
+          "street_parts": {
+            "name": "King",
+            "type": "Street"
+          }
         },
-        "confidence": 0.76852477,
+        "address_lines": [
+          "10 King Street",
+          "Toronto, ON M5V 1A1",
+          "Canada"
+        ],
         "context": {
           "country": {
+            "code": "CA",
             "id": "osm:relation:1",
             "name": "Canada"
           },
@@ -63,18 +84,24 @@
             "name": "Toronto"
           },
           "region": {
+            "code": "CA-ON",
             "id": "osm:relation:2",
             "name": "Ontario"
           }
         },
+        "distance_m": 0.0,
         "id": "osm:node:10",
         "label": "10 King Street, M5V 1A1",
         "layer": "address",
+        "match": {
+          "street": "matched"
+        },
         "name": "10 King Street",
         "score": 14.22728,
         "source": {
           "dataset": "osm"
-        }
+        },
+        "timezone": "America/Toronto"
       },
       "type": "Feature"
     }
@@ -85,6 +112,11 @@
         "licence": "ODbL 1.0",
         "text": "© OpenStreetMap contributors",
         "url": "https://www.openstreetmap.org/copyright"
+      },
+      {
+        "licence": "ODbL 1.0",
+        "text": "Timezone boundaries © OpenStreetMap contributors",
+        "url": "https://github.com/evansiroky/timezone-boundary-builder"
       }
     ],
     "query": "King Street",

@@ -69,7 +69,8 @@ mod tags;
 mod towns;
 
 #[cfg(test)]
-mod test_pbf;
+pub(crate) mod test_pbf;
+mod timezone;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -96,7 +97,7 @@ use crate::{
         qrank::QRank,
         report::{
             BUILD_REPORT_SCHEMA_VERSION, BuilderReport, CheckpointReport, QRankReport, ReportInput,
-            ResumeReport, SlashNumberCounts, SorterReport, StageReport,
+            ResumeReport, SlashNumberCounts, SorterReport, StageReport, TimezoneReport,
         },
         resume::{self, FORMAT_VERSION, FileStamp, Fingerprint, Found, Leftover, Manifest},
     },
@@ -116,7 +117,8 @@ use crate::{
         weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
     },
     record::{
-        OSM_DATASET, ObjectType, PlaceLayer, PlaceRecord, Record, RejectedRecord, StreetRecord,
+        Extent, OSM_DATASET, ObjectType, PlaceLayer, PlaceRecord, Record, RejectedRecord,
+        StreetRecord,
     },
     records::quantize,
     resources::Resources,
@@ -143,9 +145,10 @@ use pbf::for_each_block;
 pub use pbf::replication_timestamp;
 use scan::scan_block;
 use spill::{
-    Body, Datasets, House, PendingAddress, PendingNamed, PendingRecord, PlacedAddress, Postcodes,
+    Body, Datasets, House, Lent, PendingAddress, PendingNamed, PendingRecord, PlacedAddress,
     WayKind,
 };
+use timezone::Timezones;
 
 /// Records written per parallel batch.
 const WRITE_BATCH_RECORDS: usize = 16_384;
@@ -201,6 +204,9 @@ pub struct BuildOsmOptions {
     pub imported_rows: u64,
     /// QRank file (see [`crate::builder::qrank`]).
     pub qrank: Option<PathBuf>,
+    /// Timezone boundaries, the GeoJSON of timezone-boundary-builder. With
+    /// them a record carries the timezone it lies in.
+    pub timezones: Option<PathBuf>,
 }
 
 impl Default for BuildOsmOptions {
@@ -219,6 +225,7 @@ impl Default for BuildOsmOptions {
             addresses: None,
             imported_rows: 0,
             qrank: None,
+            timezones: None,
         }
     }
 }
@@ -238,6 +245,7 @@ impl fmt::Debug for BuildOsmOptions {
             .field("cancel", &self.cancel)
             .field("addresses", &self.addresses)
             .field("qrank", &self.qrank)
+            .field("timezones", &self.timezones)
             .finish_non_exhaustive()
     }
 }
@@ -447,6 +455,11 @@ struct Contexts {
     area_names: HashMap<RecordId, Vec<String>>,
     area_tags: BTreeMap<RecordId, AreaTags>,
     country_codes: HashMap<RecordId, CountryCode>,
+    subdivision_codes: HashMap<RecordId, String>,
+    plate_codes: HashMap<RecordId, String>,
+    default_languages: HashMap<RecordId, String>,
+    language_names: HashMap<RecordId, crate::pack::LanguageNames>,
+    extents: Vec<(RecordId, Extent)>,
     region_groups: HashMap<RecordId, Vec<RecordId>>,
 }
 
@@ -470,6 +483,11 @@ impl Contexts {
         reach: TownReach,
     ) -> Result<Self> {
         let country_codes = boundaries.country_codes(&boundary_ids, &country_ids);
+        let subdivision_codes = boundaries.subdivision_codes(&boundary_ids);
+        let plate_codes = boundaries.plate_codes(&boundary_ids);
+        let default_languages = boundaries.default_languages(&boundary_ids);
+        let language_names = boundaries.language_names(&boundary_ids);
+        let extents = boundaries.extents(&boundary_ids);
         let area_names = boundaries.context_names(&boundary_ids, &country_ids);
         let area_tags = boundaries.area_tags(&boundary_ids);
         let region_groups = boundaries.region_groups(&boundary_ids);
@@ -603,6 +621,11 @@ impl Contexts {
             area_names,
             area_tags,
             country_codes,
+            subdivision_codes,
+            plate_codes,
+            default_languages,
+            language_names,
+            extents,
             region_groups,
         })
     }
@@ -901,10 +924,10 @@ impl<'a> Run<'a> {
             if let Some(book) = &addresses.book {
                 run.address_book = Some(BookFile::restore(&scratch, book)?);
             }
-            if let Some((book, postcodes)) = &addresses.placed {
+            if let Some((book, lent)) = &addresses.placed {
                 run.books = Some(AddressBook {
                     addresses: BookFile::restore(&scratch, book)?,
-                    postcodes: BookFile::restore(&scratch, postcodes)?,
+                    lent: BookFile::restore(&scratch, lent)?,
                     datasets: Datasets::from_names(state.datasets.clone()),
                 });
             }
@@ -1260,6 +1283,12 @@ impl<'a> Run<'a> {
                 }
                 part.extend(
                     assembled
+                        .entrances
+                        .into_iter()
+                        .map(|(node, kind)| GeometryItem::Entrance(node, kind)),
+                );
+                part.extend(
+                    assembled
                         .output
                         .boundary_ways
                         .into_iter()
@@ -1319,6 +1348,9 @@ impl<'a> Run<'a> {
         let mut line_at = Vec::<(i64, u32, u32)>::new();
         let mut ways = Vec::new();
         let mut way_vertices = 0;
+        // The entrance nodes on the member ways, for the places relations
+        // draw.
+        let mut entrances = HashMap::new();
         for part in &self.geometry_saved {
             for item in part.reader()? {
                 let (way_id, line) = match item? {
@@ -1342,6 +1374,10 @@ impl<'a> Run<'a> {
                         (way_id, Some(vertices))
                     }
                     GeometryItem::Member(way_id, line) => (way_id, line),
+                    GeometryItem::Entrance(node, kind) => {
+                        entrances.insert(node, kind);
+                        continue;
+                    }
                     GeometryItem::Relation(_) | GeometryItem::Feature(_) => continue,
                 };
                 let vertices = line.as_ref().map_or(0, Vec::len);
@@ -1400,7 +1436,7 @@ impl<'a> Run<'a> {
         }
         self.progress.check()?;
         let mut places = Emitted::default();
-        for candidate in boundary::place_relations(&relations, member_line)? {
+        for candidate in boundary::place_relations(&relations, member_line, &entrances)? {
             poi::emit_poi(&candidate, &mut places);
         }
         self.build.absorb(places)?;
@@ -1749,7 +1785,7 @@ impl<'a> Run<'a> {
             .contexts
             .as_ref()
             .ok_or_else(|| missing("the contexts"))?;
-        let lent = Book::create(&self.scratch, "street-postcodes")?;
+        let lent = Book::create(&self.scratch, "street-lending")?;
         let records = open(&mut self.build.records, "records")?;
         let seq = &mut self.build.seq;
         let (postcodes, book, lent) = match self.address_book.take() {
@@ -1799,7 +1835,7 @@ impl<'a> Run<'a> {
         };
         self.books = Some(AddressBook {
             addresses: book,
-            postcodes: lent.finish()?,
+            lent: lent.finish()?,
             datasets: Datasets::from_names(self.build.datasets.names().to_vec()),
         });
         let report = &mut self.build.report;
@@ -1838,6 +1874,11 @@ impl<'a> Run<'a> {
             area_names,
             area_tags,
             country_codes,
+            subdivision_codes,
+            plate_codes,
+            default_languages,
+            language_names,
+            extents,
             region_groups,
             ..
         } = self
@@ -1856,6 +1897,11 @@ impl<'a> Run<'a> {
         writer.set_context_names(area_names);
         writer.set_area_tags(area_tags);
         writer.set_country_codes(country_codes);
+        writer.set_subdivision_codes(subdivision_codes);
+        writer.set_plate_codes(plate_codes);
+        writer.set_default_languages(default_languages);
+        writer.set_language_names(language_names);
+        writer.set_extents(extents);
         writer.set_region_groups(region_groups);
         let mut sample = Sampler::default();
         let context_count = ordered.len();
@@ -1863,6 +1909,22 @@ impl<'a> Run<'a> {
         // QRank ranks too.
         let qrank = match &self.options.qrank {
             Some(path) => Some(QRank::load(path, &self.memory)?),
+            None => None,
+        };
+        let zoning = match &self.options.timezones {
+            Some(path) => {
+                let zones = Timezones::load(path, &self.scratch)?;
+                let (areas, area_count) = index.timezones(&zones);
+                writer.set_timezones(zones.names().to_vec(), areas.clone());
+                Some(Zoning {
+                    zones,
+                    areas: areas.into_iter().collect(),
+                    area_count,
+                    by_area: AtomicU64::new(0),
+                    by_point: AtomicU64::new(0),
+                    without: AtomicU64::new(0),
+                })
+            }
             None => None,
         };
         let ranked_contexts = write_ordered(
@@ -1873,6 +1935,7 @@ impl<'a> Run<'a> {
             &index,
             None,
             qrank.as_ref(),
+            zoning.as_ref(),
             &self.progress,
             BuildStage::ContextRecords,
         )?;
@@ -1905,9 +1968,28 @@ impl<'a> Run<'a> {
             &index,
             Some(&books),
             qrank.as_ref(),
+            zoning.as_ref(),
             &self.progress,
             BuildStage::Records,
         )?;
+        if let (Some(path), Some(zoning)) = (&self.options.timezones, &zoning) {
+            let metadata = fs::metadata(path)?;
+            self.build.report.timezones = Some(TimezoneReport {
+                path: path.display().to_string(),
+                bytes: metadata.len(),
+                modified_unix: metadata
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_secs()),
+                zones: zoning.zones.names().len() as u64,
+                areas: zoning.area_count,
+                areas_in_one_zone: zoning.areas.len() as u64,
+                records_zoned_by_area: zoning.by_area.load(Ordering::Relaxed),
+                records_zoned_by_point: zoning.by_point.load(Ordering::Relaxed),
+                records_without_zone: zoning.without.load(Ordering::Relaxed),
+            });
+        }
+        drop(zoning);
         if let (Some(path), Some(qrank)) = (&self.options.qrank, &qrank) {
             let metadata = fs::metadata(path)?;
             self.build.report.qrank = Some(QRankReport {
@@ -1986,10 +2068,10 @@ impl<'a> Run<'a> {
         if let Some(books) = &mut self.books {
             addresses.placed = Some((
                 books.addresses.state(&scratch)?,
-                books.postcodes.state(&scratch)?,
+                books.lent.state(&scratch)?,
             ));
             files.extend(books.addresses.files());
-            files.extend(books.postcodes.files());
+            files.extend(books.lent.files());
         }
         let geometry = self
             .geometry_saved
@@ -2438,12 +2520,8 @@ struct AddressRuns<'a> {
     seq: &'a mut u64,
     index: &'a BoundaryIndex,
     country_codes: &'a HashMap<RecordId, CountryCode>,
-    street: postcode::Street,
     postcodes: postcode::Accumulator,
-    /// The postcodes lent to each street, and the street key and position
-    /// of the last street's.
-    lent: Book<Postcodes>,
-    lent_street: Option<(Vec<u8>, u64)>,
+    lending: StreetLending,
     /// Where the addresses not yet in an address book are written as they
     /// are placed.
     book: Option<Book<PendingAddress>>,
@@ -2461,7 +2539,7 @@ impl<'a> AddressRuns<'a> {
         seq: &'a mut u64,
         index: &'a BoundaryIndex,
         country_codes: &'a HashMap<RecordId, CountryCode>,
-        lent: Book<Postcodes>,
+        lent: Book<Lent>,
         book: Option<Book<PendingAddress>>,
     ) -> Self {
         Self {
@@ -2469,10 +2547,8 @@ impl<'a> AddressRuns<'a> {
             seq,
             index,
             country_codes,
-            street: postcode::Street::default(),
             postcodes: postcode::Accumulator::default(),
-            lent,
-            lent_street: None,
+            lending: StreetLending::new(lent),
             book,
             batch: Vec::new(),
             group: None,
@@ -2495,11 +2571,12 @@ impl<'a> AddressRuns<'a> {
         mut self,
     ) -> Result<(
         postcode::Accumulator,
-        Book<Postcodes>,
+        Book<Lent>,
         Option<Book<PendingAddress>>,
     )> {
         self.place_batch()?;
-        Ok((self.postcodes, self.lent, self.book))
+        self.lending.close_street()?;
+        Ok((self.postcodes, self.lending.book, self.book))
     }
 
     fn place_batch(&mut self) -> Result<()> {
@@ -2552,17 +2629,7 @@ impl<'a> AddressRuns<'a> {
             let (_, key, country) = self.group.as_ref().expect("a group has a start");
             let (key, country) = (*key, *country);
             let fields = address.fields();
-            let postcodes = match self.street.lend(address.street_key(), &fields) {
-                Some(lent) => Some(match &self.lent_street {
-                    Some((street, at)) if street[..] == *address.street_key() => *at,
-                    _ => {
-                        let at = self.lent.push(Postcodes(lent.to_vec()))?;
-                        self.lent_street = Some((address.street_key().to_vec(), at));
-                        at
-                    }
-                }),
-                None => None,
-            };
+            let lent = self.lending.offer(address.street_key(), &fields)?;
             self.postcodes
                 .accept(country, fields.postcode, address.point);
             let (at, disputed) = match shelved {
@@ -2579,13 +2646,76 @@ impl<'a> AddressRuns<'a> {
                 key,
                 seq: *self.seq,
                 origin: None,
-                body: Body::Address(PlacedAddress {
-                    at,
-                    postcodes,
-                    disputed,
-                }),
+                body: Body::Address(PlacedAddress { at, lent, disputed }),
             })?;
             *self.seq += 1;
+        }
+        Ok(())
+    }
+}
+
+struct StreetLending {
+    book: Book<Lent>,
+    key: Vec<u8>,
+    postcodes: postcode::Street,
+    spellings: BTreeSet<String>,
+    lend_postcodes: bool,
+    lend_spellings: bool,
+}
+
+impl StreetLending {
+    fn new(book: Book<Lent>) -> Self {
+        Self {
+            book,
+            key: Vec::new(),
+            postcodes: postcode::Street::default(),
+            spellings: BTreeSet::new(),
+            lend_postcodes: false,
+            lend_spellings: false,
+        }
+    }
+
+    fn offer(&mut self, key: &[u8], fields: &spill::Fields<'_>) -> Result<Option<u64>> {
+        if self.key != key {
+            self.close_street()?;
+            self.key.clear();
+            self.key.extend_from_slice(key);
+        }
+        let postcode = self.postcodes.lends_to(fields);
+        let spelling = fields.street.is_some_and(|name| {
+            if spill::in_capitals(name) {
+                return true;
+            }
+            if !self.spellings.contains(name) {
+                self.spellings.insert(name.to_owned());
+            }
+            false
+        });
+        self.lend_postcodes |= postcode;
+        self.lend_spellings |= spelling;
+        // Spelling can come from a later row. Reserve one entry for the whole
+        // street so postcode-first order and bounded address batches stay intact.
+        Ok((postcode || spelling).then(|| self.book.next_position()))
+    }
+
+    fn close_street(&mut self) -> Result<()> {
+        let postcodes = std::mem::take(&mut self.postcodes).postcodes;
+        let spellings = std::mem::take(&mut self.spellings);
+        let lend_postcodes = std::mem::take(&mut self.lend_postcodes);
+        let lend_spellings = std::mem::take(&mut self.lend_spellings);
+        if lend_postcodes || lend_spellings {
+            self.book.push(Lent {
+                postcodes: if lend_postcodes {
+                    postcodes
+                } else {
+                    Vec::new()
+                },
+                spellings: if lend_spellings {
+                    spellings.into_iter().collect()
+                } else {
+                    Vec::new()
+                },
+            })?;
         }
         Ok(())
     }
@@ -2595,7 +2725,7 @@ impl<'a> AddressRuns<'a> {
 /// read back as the records standing for them are written.
 struct AddressBook {
     addresses: BookFile<PendingAddress>,
-    postcodes: BookFile<Postcodes>,
+    lent: BookFile<Lent>,
     datasets: Datasets,
 }
 
@@ -2605,15 +2735,15 @@ impl AddressBook {
     /// chunk it needs is read once.
     fn records(&self, batch: Vec<PendingRecord>) -> Result<Vec<(Record, Option<ContextOrigin>)>> {
         let mut address_chunks = Vec::new();
-        let mut postcode_chunks = Vec::new();
+        let mut lending_chunks = Vec::new();
         for pending in &batch {
             if let Body::Address(placed) = &pending.body {
                 address_chunks.push(BookFile::<PendingAddress>::chunk_of(placed.at));
-                postcode_chunks.extend(placed.postcodes.map(BookFile::<Postcodes>::chunk_of));
+                lending_chunks.extend(placed.lent.map(BookFile::<Lent>::chunk_of));
             }
         }
         let addresses = read_chunks(&self.addresses, address_chunks)?;
-        let postcodes = read_chunks(&self.postcodes, postcode_chunks)?;
+        let lending = read_chunks(&self.lent, lending_chunks)?;
         batch
             .into_par_iter()
             .map(|pending| {
@@ -2624,11 +2754,25 @@ impl AddressBook {
                         let mut record =
                             BookFile::pick(chunk, placed.at)?.record(&self.datasets)?;
                         record.disputed = placed.disputed;
-                        if let Some(at) = placed.postcodes {
-                            let chunk = &postcodes[&BookFile::<Postcodes>::chunk_of(at)];
-                            record
-                                .street_postcodes
-                                .clone_from(&BookFile::pick(chunk, at)?.0);
+                        if let Some(at) = placed.lent {
+                            let chunk = &lending[&BookFile::<Lent>::chunk_of(at)];
+                            let lent = BookFile::pick(chunk, at)?;
+                            if record.address.postcode.is_none() {
+                                record.street_postcodes.clone_from(&lent.postcodes);
+                            }
+                            if let Some(street) = record.address.street.as_mut()
+                                && !lent.spellings.is_empty()
+                                && spill::in_capitals(street)
+                            {
+                                let lowercase = street.to_lowercase();
+                                if let Some(spelling) = lent
+                                    .spellings
+                                    .iter()
+                                    .find(|spelling| spelling.to_lowercase() == lowercase)
+                                {
+                                    street.clone_from(spelling);
+                                }
+                            }
                         }
                         Record::Address(record)
                     }
@@ -2796,7 +2940,7 @@ const REPEATED_HOUSE_RADIUS_M: f64 = 100.0;
 /// numbers start over). A large rural parcel's centroid lies a few hundred
 /// metres from its house; a row geocoded to the wrong end of a street or to
 /// another town does not, and is kept as the house it says it is.
-const DISPUTED_HOUSE_RADIUS_M: f64 = 1_000.0;
+pub(crate) const DISPUTED_HOUSE_RADIUS_M: f64 = 1_000.0;
 
 /// What finding repeated houses decided about an address: dropped, or kept
 /// and disputed. Sorted after its position in the address book.
@@ -2969,8 +3113,8 @@ impl Geometry {
                     self.boundary_feature_ids.insert(way_id);
                 }
                 // Their vertices stay on disk, in the input's spool, until
-                // the boundary stage reads them.
-                GeometryItem::Way(_) | GeometryItem::Member(..) => {}
+                // the boundary stage reads them, as the entrances do.
+                GeometryItem::Way(_) | GeometryItem::Member(..) | GeometryItem::Entrance(..) => {}
             }
         }
         Ok(())
@@ -3196,10 +3340,46 @@ fn overlapped<T: Send>(
     })
 }
 
+/// The timezones of a build given timezone boundaries, and how each
+/// record came by its.
+struct Zoning {
+    zones: Timezones,
+    /// The zone of each area that lies wholly in one, by record id.
+    areas: HashMap<RecordId, u16>,
+    area_count: u64,
+    by_area: AtomicU64,
+    by_point: AtomicU64,
+    without: AtomicU64,
+}
+
+impl Zoning {
+    /// Gives `context` the zone at the record's point, unless an area of
+    /// its chain already says the zone. Every record of such an area reads
+    /// it from there, and the chain stays one for them all.
+    fn stamp(&self, record: &Record, context: &mut RecordContext) {
+        let chain = context.admin_context.entries();
+        let count = if chain
+            .iter()
+            .any(|entry| self.areas.contains_key(&entry.record_id))
+        {
+            &self.by_area
+        } else {
+            context.zone = record
+                .display_point()
+                .and_then(|point| self.zones.at(point));
+            if context.zone.is_some() {
+                &self.by_point
+            } else {
+                &self.without
+            }
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Write sorted records in batches, computing admin context in parallel, and
 /// offer each record to the parser's training sample under the country it
-/// lies in. Boundary and derived-country records describe context and get
-/// none, but are offered under the country their point lies in.
+/// lies in. An area record's context holds only the areas broader than it.
 #[allow(clippy::too_many_arguments)]
 fn write_ordered(
     writer: &mut Writer,
@@ -3209,6 +3389,7 @@ fn write_ordered(
     index: &BoundaryIndex,
     book: Option<&AddressBook>,
     qrank: Option<&QRank>,
+    zoning: Option<&Zoning>,
     progress: &Progress,
     stage: BuildStage,
 ) -> Result<u64> {
@@ -3270,7 +3451,7 @@ fn write_ordered(
                                     .as_ref()
                                     .and_then(|context| context.admin_context.country_record_id());
                                 // A country derived from regions has none around it.
-                                let context = match origin {
+                                let mut context = match origin {
                                     Some(ContextOrigin::DerivedCountry(_)) => None,
                                     Some(ContextOrigin::Boundary(_)) => located
                                         .map(|located| RecordContext {
@@ -3278,8 +3459,21 @@ fn write_ordered(
                                             ..Default::default()
                                         })
                                         .filter(RecordContext::is_area_list),
-                                    None => located,
+                                    None => match &record {
+                                        Record::Place(tier, place) => {
+                                            index.area_context(*tier, &record, &place.source)
+                                        }
+                                        _ => located,
+                                    },
                                 };
+                                // An area's zone is the one it lies wholly in,
+                                // which the zoning's areas say, never the zone
+                                // at its point.
+                                if let (Some(zoning), Some(context)) = (zoning, &mut context)
+                                    && !matches!(record, Record::Place(..))
+                                {
+                                    zoning.stamp(&record, context);
+                                }
                                 ((record, context), country)
                             })
                             .unzip();
@@ -3976,6 +4170,58 @@ mod tests {
             !disputed("openaddresses:test:row:3"),
             "another postcode: another house"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_address_in_capitals_takes_the_spelling_its_street_writes() {
+        let dir = temp_dir("street-spelling");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let path = dir.join("register.csv");
+        fs::write(
+            &path,
+            "LON,LAT,NUMBER,STREET,CITY,POSTCODE\n\
+             -79.40,43.600,40,KING STREET,Toronto,\n\
+             -79.40,43.601,42,QUEEN STREET,Toronto,\n\
+             -79.40,43.601,50,ELM STREET,Toronto,M5G 1H2\n\
+             -79.40,43.601,52,Elm Street,Toronto,\n\
+             -79.40,43.601,54,ELM ST,Toronto,\n",
+        )
+        .expect("csv");
+        build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::new(addresses::AddressFiles(vec![
+                addresses::AddressFile {
+                    dataset: "openaddresses:register".to_string(),
+                    path,
+                    entry: None,
+                    area: None,
+                },
+            ]))),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        for (row, (street, postcodes)) in [
+            ("King Street", &["M5V 1A1"][..]),
+            ("QUEEN STREET", &[][..]),
+            ("Elm Street", &[][..]),
+            ("Elm Street", &["M5G 1H2"][..]),
+            ("ELM ST", &["M5G 1H2"][..]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("openaddresses:register:row:{}", row + 1);
+            let record = reader.find_by_source_id(&id).expect("lookup").expect(&id);
+            let Record::Address(address) = reader.records().record(record).expect("record") else {
+                panic!("{id} is an address");
+            };
+            assert_eq!(address.address.street.as_deref(), Some(street), "{id}");
+            assert_eq!(address.street_postcodes, postcodes, "{id}");
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -5093,6 +5339,778 @@ mod tests {
     }
 
     #[test]
+    fn a_built_place_answers_with_the_contact_and_hours_its_tags_state() {
+        let dir = temp_dir("contact");
+        let input = dir.join("contact.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(
+                        1,
+                        52.37,
+                        4.89,
+                        &[
+                            ("name", "Cafe Zanoli"),
+                            ("amenity", "cafe"),
+                            ("phone", "+31 20 555 0111;+31 20 555 0112"),
+                            ("contact:website", "https://Zanoli.example/"),
+                            ("email", "n/a"),
+                            ("opening_hours", "Mo-Fr 08:00-18:00; Sa 09:00-13:00"),
+                        ],
+                    ),
+                    node(
+                        2,
+                        52.38,
+                        4.90,
+                        &[("name", "Cafe Blauw"), ("amenity", "cafe")],
+                    ),
+                    node(
+                        3,
+                        52.39,
+                        4.91,
+                        &[
+                            ("name", "Cafe Oud"),
+                            ("disused:amenity", "cafe"),
+                            ("phone", "+31 20 555 0113"),
+                        ],
+                    ),
+                ],
+                vec![],
+                vec![],
+            ],
+        );
+        build(&dir.join("pack"), &input, None);
+
+        let places = TextSearcher::open(dir.join("pack"))
+            .expect("searcher")
+            .places();
+        let found = |query: &str| {
+            places
+                .search(&TextSearchOptions {
+                    query: query.into(),
+                    limit: 5,
+                    layer: None,
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                })
+                .expect("search")
+                .into_iter()
+                .map(|hit| hit.record)
+                .map(|record| (record.id, record.contact, record.opening_hours))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            found("Cafe Zanoli")[0],
+            (
+                "osm:node:1".to_string(),
+                Some(crate::record::Contact {
+                    phone: Some("+31 20 555 0111".to_string()),
+                    website: Some("https://Zanoli.example/".to_string()),
+                    email: None,
+                }),
+                Some("Mo-Fr 08:00-18:00; Sa 09:00-13:00".to_string()),
+            )
+        );
+        assert_eq!(
+            found("Cafe Blauw")[0],
+            ("osm:node:2".to_string(), None, None)
+        );
+        // Closed for good is no place: the Pack holds no record to label.
+        assert!(
+            found("Cafe Oud")
+                .iter()
+                .all(|(id, _, _)| id != "osm:node:3")
+        );
+    }
+
+    #[test]
+    fn a_built_area_street_and_outlined_place_answer_with_their_bbox() {
+        let dir = temp_dir("bbox");
+        let input = dir.join("bbox.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(1, 52.0, 4.0, &[]),
+                    node(2, 52.0, 4.2, &[]),
+                    node(3, 52.1, 4.2, &[]),
+                    node(4, 52.1, 4.0, &[]),
+                    node(10, 52.03, 4.05, &[]),
+                    node(11, 52.04, 4.07, &[]),
+                    node(12, 52.035, 4.11, &[]),
+                    node(20, 52.0500, 4.1000, &[]),
+                    node(21, 52.0500, 4.1004, &[]),
+                    node(22, 52.0503, 4.1004, &[]),
+                    node(23, 52.0503, 4.1000, &[]),
+                    node(
+                        30,
+                        52.06,
+                        4.12,
+                        &[("name", "Cafe Blauw"), ("amenity", "cafe")],
+                    ),
+                    node(
+                        31,
+                        52.07,
+                        4.13,
+                        &[("addr:housenumber", "8"), ("addr:street", "Kadeweg")],
+                    ),
+                    // An island group over the antimeridian, drawn as OSM
+                    // draws one, a ring each side that meet at 180.
+                    node(40, -17.0, 179.0, &[]),
+                    node(41, -17.0, 180.0, &[]),
+                    node(42, -16.0, 180.0, &[]),
+                    node(43, -16.0, 179.0, &[]),
+                    node(44, -17.0, -180.0, &[]),
+                    node(45, -17.0, -179.5, &[]),
+                    node(46, -16.5, -179.5, &[]),
+                    node(47, -16.5, -180.0, &[]),
+                ],
+                vec![
+                    way(100, &[1, 2, 3, 4, 1], &[]),
+                    way(
+                        101,
+                        &[10, 11, 12],
+                        &[("highway", "residential"), ("name", "Kadeweg")],
+                    ),
+                    way(
+                        102,
+                        &[20, 21, 22, 23, 20],
+                        &[("name", "Havenhal"), ("amenity", "theatre")],
+                    ),
+                    way(103, &[40, 41, 42, 43, 40], &[]),
+                    way(104, &[44, 45, 46, 47, 44], &[]),
+                ],
+                vec![
+                    relation(
+                        900,
+                        &[(100, "outer")],
+                        &[
+                            ("boundary", "administrative"),
+                            ("admin_level", "8"),
+                            ("name", "Havenstad"),
+                        ],
+                    ),
+                    relation(
+                        901,
+                        &[(103, "outer"), (104, "outer")],
+                        &[
+                            ("type", "multipolygon"),
+                            ("place", "island"),
+                            ("name", "Datumeiland"),
+                        ],
+                    ),
+                ],
+            ],
+        );
+        build(&dir.join("pack"), &input, None);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let bbox = |id: &str| {
+            let record = reader
+                .find_by_source_id(id)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{id} is in the Pack"));
+            reader.record_summary(record).expect("summary").bbox
+        };
+        assert_eq!(bbox("osm:relation:900"), Some([4.0, 52.0, 4.2, 52.1]));
+        assert_eq!(bbox("osm:way:101"), Some([4.05, 52.03, 4.11, 52.04]));
+        assert_eq!(bbox("osm:way:102"), Some([4.1, 52.05, 4.1004, 52.0503]));
+        assert_eq!(
+            bbox("osm:relation:901"),
+            Some([179.0, -17.0, -179.5, -16.0])
+        );
+        assert_eq!(bbox("osm:node:30"), None);
+        assert_eq!(bbox("osm:node:31"), None);
+    }
+
+    /// A town over the border of two zones with a suburb wholly in the
+    /// western one, a house in the suburb, one in the town either side of
+    /// the border, a cafe east of the town and a house in no zone.
+    fn town_in_two_zones(dir: &Path) -> (PathBuf, PathBuf) {
+        let input = dir.join("zones.osm.pbf");
+        let house = |id: i64, lat: f64, lon: f64| {
+            node(
+                id,
+                lat,
+                lon,
+                &[("addr:housenumber", "8"), ("addr:street", "Kadeweg")],
+            )
+        };
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(1, 52.0, 4.0, &[]),
+                    node(2, 52.0, 4.2, &[]),
+                    node(3, 52.1, 4.2, &[]),
+                    node(4, 52.1, 4.0, &[]),
+                    node(5, 52.02, 4.02, &[]),
+                    node(6, 52.02, 4.06, &[]),
+                    node(7, 52.06, 4.06, &[]),
+                    node(8, 52.06, 4.02, &[]),
+                    house(10, 52.04, 4.04),
+                    house(11, 52.08, 4.08),
+                    house(12, 52.05, 4.15),
+                    node(
+                        13,
+                        52.05,
+                        4.25,
+                        &[("name", "Cafe Oost"), ("amenity", "cafe")],
+                    ),
+                    house(14, 52.05, 4.5),
+                ],
+                vec![
+                    way(100, &[1, 2, 3, 4, 1], &[]),
+                    way(
+                        101,
+                        &[5, 6, 7, 8, 5],
+                        &[("place", "suburb"), ("name", "Westwijk")],
+                    ),
+                ],
+                vec![relation(
+                    900,
+                    &[(100, "outer")],
+                    &[
+                        ("boundary", "administrative"),
+                        ("admin_level", "8"),
+                        ("name", "Havenstad"),
+                    ],
+                )],
+            ],
+        );
+        let zones = dir.join("zones.json");
+        let zone = |tzid: &str, west: f64, east: f64| {
+            format!(
+                r#"{{"type":"Feature","properties":{{"tzid":"{tzid}"}},"geometry":{{"type":"Polygon","coordinates":[[[{west},51.9],[{east},51.9],[{east},52.2],[{west},52.2],[{west},51.9]]]}}}}"#
+            )
+        };
+        fs::write(
+            &zones,
+            format!(
+                r#"{{"type":"FeatureCollection","features":[{},{}]}}"#,
+                zone("Test/West", 3.9, 4.1),
+                zone("Test/East", 4.1, 4.3)
+            ),
+        )
+        .expect("zones");
+        (input, zones)
+    }
+
+    #[test]
+    fn a_built_area_lies_in_the_areas_broader_than_it() {
+        let dir = temp_dir("area-context");
+        let (input, _) = town_in_two_zones(&dir);
+        build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let record = |id: &str| {
+            reader
+                .find_by_source_id(id)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{id} is in the Pack"))
+        };
+        let chain = |id: &str| {
+            reader
+                .boundary_context(record(id))
+                .expect("context")
+                .map(|context| {
+                    context
+                        .admin_context
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.record_id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let (town, suburb) = (record("osm:relation:900"), record("osm:way:101"));
+        // The suburb lies in the town, the town in nothing broader, and
+        // neither names itself or the finer area its point falls in.
+        assert_eq!(chain("osm:way:101"), [town]);
+        assert_eq!(chain("osm:relation:900"), Vec::<RecordId>::new());
+        assert!(chain("osm:node:10").contains(&suburb));
+    }
+
+    /// Every section a built Pack holds, by name and format version, a group
+    /// of one format (`records/*`) as one.
+    fn section_formats(pack: &Path) -> Vec<(String, u32)> {
+        let reader = Reader::open(pack).expect("reader");
+        let mut formats = reader
+            .container()
+            .sections()
+            .iter()
+            .map(|(name, info)| {
+                let name = match name.split_once('/') {
+                    Some((group, _)) => format!("{group}/*"),
+                    None => name.clone(),
+                };
+                (name, info.version)
+            })
+            .collect::<Vec<_>>();
+        formats.dedup();
+        formats
+    }
+
+    #[test]
+    fn the_schema_moves_with_every_section() {
+        let dir = temp_dir("section-formats");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(1, 52.0, 4.0, &[]),
+                    node(2, 52.0, 4.1, &[]),
+                    node(3, 52.1, 4.1, &[]),
+                    node(4, 52.1, 4.0, &[]),
+                    node(5, 52.05, 4.05, &[("place", "town"), ("name", "Havenstad")]),
+                ],
+                vec![way(100, &[1, 2, 3, 4, 1], &[])],
+                vec![relation(
+                    900,
+                    &[(100, "outer")],
+                    &[
+                        ("boundary", "administrative"),
+                        ("admin_level", "8"),
+                        ("name", "Havenstad"),
+                    ],
+                )],
+            ],
+        );
+        build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        // A section whose format changes fails this. Move
+        // PACK_SCHEMA_VERSION with it, so a Pack of the old format is told
+        // apart by its schema, then write the new formats here. Sections
+        // only some builds write (calibration's, timezones) are not listed.
+        let formats = section_formats(&dir.join("pack"));
+        let expected = [
+            ("context/*", 4),
+            ("country_codes", 1),
+            ("default_languages", 1),
+            ("extents", 1),
+            ("gazetteer/*", 1),
+            ("language_names", 1),
+            ("manifest", 1),
+            ("parse/*", 4),
+            ("places/*", 3),
+            ("plate_codes", 1),
+            ("postcode_addresses", 1),
+            ("records/*", 14),
+            ("spatial/*", 3),
+            ("streets/*", 1),
+            ("subdivision_codes", 1),
+            ("text/*", 15),
+        ]
+        .map(|(name, version)| (name.to_string(), version));
+        assert_eq!(
+            (crate::pack::PACK_SCHEMA_VERSION, formats),
+            (11, expected.to_vec())
+        );
+    }
+
+    #[test]
+    fn an_area_lies_only_in_the_areas_that_hold_it() {
+        let dir = temp_dir("island-context");
+        let input = dir.join("island.osm.pbf");
+        // A town on an island that reaches past it on both sides, with the
+        // island's point in the town.
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(1, 52.0, 4.0, &[]),
+                    node(2, 52.0, 4.2, &[]),
+                    node(3, 52.1, 4.2, &[]),
+                    node(4, 52.1, 4.0, &[]),
+                    node(5, 51.99, 3.95, &[]),
+                    node(6, 51.99, 4.3, &[]),
+                    node(7, 52.11, 4.3, &[]),
+                    node(8, 52.11, 3.95, &[]),
+                ],
+                vec![
+                    way(100, &[1, 2, 3, 4, 1], &[]),
+                    way(
+                        101,
+                        &[5, 6, 7, 8, 5],
+                        &[("place", "island"), ("name", "Groot Eiland")],
+                    ),
+                ],
+                vec![relation(
+                    900,
+                    &[(100, "outer")],
+                    &[
+                        ("boundary", "administrative"),
+                        ("admin_level", "8"),
+                        ("name", "Havenstad"),
+                    ],
+                )],
+            ],
+        );
+        build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let island = reader
+            .find_by_source_id("osm:way:101")
+            .expect("lookup")
+            .expect("the island is in the Pack");
+        let point = reader
+            .record_summary(island)
+            .expect("summary")
+            .point
+            .expect("point");
+        assert!(
+            (4.0..4.2).contains(&point.lon) && (52.0..52.1).contains(&point.lat),
+            "the island's point is in the town"
+        );
+        let chain = reader
+            .boundary_context(island)
+            .expect("context")
+            .map_or(0, |context| context.admin_context.entries().len());
+        assert_eq!(chain, 0, "the town does not hold the island");
+    }
+
+    #[test]
+    fn a_built_record_answers_with_the_timezone_it_lies_in() {
+        let dir = temp_dir("timezones");
+        let (input, zones) = town_in_two_zones(&dir);
+        let report = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            timezones: Some(zones.clone()),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+        let zoned = report.timezones.expect("the timezone file read");
+        assert_eq!(
+            (
+                zoned.path,
+                zoned.zones,
+                zoned.areas,
+                zoned.areas_in_one_zone
+            ),
+            (zones.display().to_string(), 2, 2, 1)
+        );
+        assert_eq!(
+            (
+                zoned.records_zoned_by_area,
+                zoned.records_zoned_by_point,
+                zoned.records_without_zone
+            ),
+            (1, 3, 1)
+        );
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let record = |id: &str| {
+            reader
+                .find_by_source_id(id)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{id} is in the Pack"))
+        };
+        let timezone = |id: &str| {
+            let record = record(id);
+            let zone = reader
+                .timezone(record)
+                .expect("timezone")
+                .map(str::to_string);
+            assert_eq!(
+                reader.record_summary(record).expect("summary").timezone,
+                zone
+            );
+            zone
+        };
+        // What the record's own chain stores, which is a zone only where
+        // no area of the chain says it.
+        let stamped = |id: &str| {
+            reader
+                .boundary_context(record(id))
+                .expect("context")
+                .and_then(|context| context.zone)
+        };
+        let (west, east) = (Some("Test/West".to_string()), Some("Test/East".to_string()));
+        assert_eq!(timezone("osm:way:101"), west, "a suburb in one zone");
+        assert_eq!(timezone("osm:relation:900"), None, "a town in two");
+        assert_eq!(
+            (timezone("osm:node:10"), stamped("osm:node:10")),
+            (west.clone(), None)
+        );
+        assert_eq!(
+            (timezone("osm:node:11"), stamped("osm:node:11")),
+            (west, Some(0))
+        );
+        assert_eq!(
+            (timezone("osm:node:12"), stamped("osm:node:12")),
+            (east.clone(), Some(1))
+        );
+        assert_eq!(
+            (timezone("osm:node:13"), stamped("osm:node:13")),
+            (east, Some(1))
+        );
+        assert_eq!(
+            (timezone("osm:node:14"), stamped("osm:node:14")),
+            (None, None)
+        );
+        assert_eq!(
+            reader
+                .boundary_context(record("osm:node:13"))
+                .expect("context"),
+            Some(RecordContext {
+                zone: Some(1),
+                ..RecordContext::default()
+            }),
+            "a zone alone is a context"
+        );
+    }
+
+    #[test]
+    fn a_build_given_no_timezones_or_a_bad_file_names_no_zone() {
+        let dir = temp_dir("no-timezones");
+        let (input, zones) = town_in_two_zones(&dir);
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.timezones, None);
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        for id in [
+            "osm:way:101",
+            "osm:relation:900",
+            "osm:node:10",
+            "osm:node:13",
+        ] {
+            let record = reader.find_by_source_id(id).expect("lookup").expect(id);
+            assert_eq!(reader.timezone(record).expect("timezone"), None, "{id}");
+            assert_eq!(
+                reader.record_summary(record).expect("summary").timezone,
+                None,
+                "{id}"
+            );
+        }
+        assert_eq!(
+            reader
+                .boundary_context(
+                    reader
+                        .find_by_source_id("osm:node:13")
+                        .expect("lookup")
+                        .expect("cafe")
+                )
+                .expect("context"),
+            None
+        );
+
+        fs::write(&zones, r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"tzid":"Test/Line"},"geometry":{"type":"LineString","coordinates":[[4.0,52.0],[4.1,52.0]]}}]}"#)
+            .expect("zones");
+        let error = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("bad"),
+            timezones: Some(zones.clone()),
+            ..BuildOsmOptions::default()
+        })
+        .expect_err("a file of lines");
+        assert_eq!(
+            error.to_string(),
+            Error::BadInput(format!(
+                "timezone file {} is not usable (zone Test/Line is a LineString, not a Polygon \
+                 or a MultiPolygon at line 1 column 164). It must be the GeoJSON of \
+                 timezone-boundary-builder, one feature per zone, each a Polygon or a \
+                 MultiPolygon with a `tzid` property",
+                zones.display()
+            ))
+            .to_string()
+        );
+        assert!(
+            Reader::open(dir.join("bad")).is_err(),
+            "nothing is published"
+        );
+    }
+
+    /// A house and a theatre drawn as buildings and a school drawn as a
+    /// multipolygon, each with entrances on its outline, a house and a cafe
+    /// mapped on an entrance node, and a house and a hall with none.
+    fn buildings_with_entrances() -> Vec<Vec<TestElement>> {
+        let house =
+            |number: &'static str| [("addr:housenumber", number), ("addr:street", "Kadeweg")];
+        vec![
+            vec![
+                node(1, 52.0000, 4.0000, &[("entrance", "main")]),
+                node(2, 52.0000, 4.0004, &[]),
+                node(3, 52.0003, 4.0004, &[("entrance", "service")]),
+                // The tag says nothing, so the node is no entrance.
+                node(4, 52.0003, 4.0000, &[("entrance", " ")]),
+                node(10, 52.0010, 4.0010, &[("entrance", "yes")]),
+                node(11, 52.0010, 4.0014, &[]),
+                node(12, 52.0013, 4.0014, &[]),
+                node(13, 52.0013, 4.0010, &[]),
+                node(
+                    20,
+                    52.0020,
+                    4.0020,
+                    &[
+                        ("addr:housenumber", "8"),
+                        ("addr:street", "Kadeweg"),
+                        ("entrance", "main"),
+                    ],
+                ),
+                node(21, 52.0021, 4.0021, &house("9")),
+                node(
+                    22,
+                    52.0022,
+                    4.0022,
+                    &[
+                        ("name", "Cafe Deur"),
+                        ("amenity", "cafe"),
+                        ("entrance", "staircase"),
+                    ],
+                ),
+                node(30, 52.0030, 4.0030, &[]),
+                node(31, 52.0030, 4.0040, &[("entrance", "main")]),
+                node(32, 52.0040, 4.0040, &[]),
+                node(33, 52.0040, 4.0030, &[]),
+                node(34, 52.0033, 4.0033, &[]),
+                node(35, 52.0033, 4.0037, &[("entrance", "emergency")]),
+                node(36, 52.0037, 4.0037, &[]),
+                node(37, 52.0037, 4.0033, &[]),
+                node(40, 52.0050, 4.0050, &[]),
+                node(41, 52.0050, 4.0054, &[]),
+                node(42, 52.0053, 4.0054, &[]),
+                node(43, 52.0053, 4.0050, &[]),
+            ],
+            vec![
+                way(
+                    100,
+                    &[1, 2, 3, 4, 1],
+                    &[
+                        ("building", "yes"),
+                        ("addr:housenumber", "5"),
+                        ("addr:street", "Kadeweg"),
+                    ],
+                ),
+                way(
+                    101,
+                    &[10, 11, 12, 13, 10],
+                    &[("name", "Havenhal"), ("amenity", "theatre")],
+                ),
+                way(102, &[30, 31, 32], &[]),
+                way(103, &[32, 33, 30], &[]),
+                way(104, &[34, 35, 36, 37, 34], &[]),
+                way(
+                    105,
+                    &[40, 41, 42, 43, 40],
+                    &[("name", "Lege Hal"), ("amenity", "theatre")],
+                ),
+            ],
+            vec![relation(
+                900,
+                &[(102, "outer"), (103, "outer"), (104, "inner")],
+                &[
+                    ("type", "multipolygon"),
+                    ("name", "Havenschool"),
+                    ("amenity", "school"),
+                ],
+            )],
+        ]
+    }
+
+    #[test]
+    fn a_built_record_answers_with_the_entrances_mapped_for_it() {
+        use crate::record::AccessPoint;
+        let dir = temp_dir("entrances");
+        let input = dir.join("entrances.osm.pbf");
+        write_pbf(&input, &buildings_with_entrances());
+        let report = build(&dir.join("pack"), &input, None);
+        // Nodes 1, 3, 10, 31 and 35 are the entrances on a way the build
+        // keeps.
+        assert_eq!(report.geometry_passes.entrance_nodes, 5);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let access = |id: &str| {
+            let record = reader
+                .find_by_source_id(id)
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("{id} is in the Pack"));
+            reader.record_summary(record).expect("summary").access
+        };
+        let point = |lon: f64, lat: f64, kind: &str| AccessPoint {
+            lon,
+            lat,
+            kind: kind.to_string(),
+        };
+        assert_eq!(
+            access("osm:way:100"),
+            [point(4.0, 52.0, "main"), point(4.0004, 52.0003, "service")]
+        );
+        assert_eq!(access("osm:way:101"), [point(4.001, 52.001, "yes")]);
+        assert_eq!(access("osm:node:20"), [point(4.002, 52.002, "main")]);
+        assert_eq!(access("osm:node:21"), []);
+        assert_eq!(access("osm:node:22"), [point(4.0022, 52.0022, "staircase")]);
+        assert_eq!(
+            access("osm:relation:900"),
+            [
+                point(4.004, 52.003, "main"),
+                point(4.0037, 52.0033, "emergency")
+            ]
+        );
+        assert_eq!(access("osm:way:105"), []);
+    }
+
+    /// The entrances wait in the node store and beside the boundary
+    /// geometry between steps, so a build stopped at any step has to find
+    /// them again.
+    #[test]
+    fn a_build_resumed_after_any_step_keeps_the_entrances() {
+        let dir = temp_dir("resume-entrances");
+        let input = dir.join("entrances.osm.pbf");
+        write_pbf(&input, &buildings_with_entrances());
+        let options = BuildOsmOptions {
+            inputs: vec![input],
+            ..BuildOsmOptions::default()
+        };
+        build_osm_pack(&BuildOsmOptions {
+            pack: dir.join("whole"),
+            ..options.clone()
+        })
+        .expect("uninterrupted build");
+        let expected = records_and_contexts(&dir.join("whole"));
+        let with_access = expected
+            .iter()
+            .filter(|(record, _)| record.get("access").is_some())
+            .count();
+        assert_eq!(with_access, 5);
+        for (at, step) in Step::all(1).iter().enumerate() {
+            let pack = dir.join(format!("stopped-{at}"));
+            let options = BuildOsmOptions {
+                pack: pack.clone(),
+                ..options.clone()
+            };
+            let error = fail_before(&options, *step);
+            assert!(format!("{error}").contains("injected"), "{error}");
+            build_osm_pack(&BuildOsmOptions {
+                leftover: Leftover::Resume,
+                ..options
+            })
+            .unwrap_or_else(|error| panic!("resumed after {step:?}: {error}"));
+            assert_eq!(
+                records_and_contexts(&pack),
+                expected,
+                "the Pack resumed before the checkpoint of {step:?}"
+            );
+            let _ = fs::remove_dir_all(&pack);
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn a_place_whose_wikidata_item_is_read_more_ranks_first() {
         let dir = temp_dir("qrank");
         let input = dir.join("cafes.osm.pbf");
@@ -5269,6 +6287,83 @@ mod tests {
         assert_eq!(found(703), ["osm:way:703"], "the far road stays its own");
         assert_eq!(found(711), ["osm:way:710"]);
         assert!(found(720).is_empty(), "a platform is no street");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A boundary's vehicle plate code and default language are kept on
+    /// its area record, as its tags write them.
+    #[test]
+    fn a_boundary_keeps_its_plate_code_and_default_language() {
+        let dir = temp_dir("plate-codes");
+        let input = dir.join("germany.osm.pbf");
+        let mut nodes = Vec::new();
+        let mut ways = Vec::new();
+        let mut relations = Vec::new();
+        type Area<'a> = (&'a str, f64, f64, &'a [(&'a str, &'a str)]);
+        let areas: [Area; 3] = [
+            (
+                "2",
+                0.0,
+                10.0,
+                &[
+                    ("name", "Deutschland"),
+                    ("ISO3166-1:alpha2", "DE"),
+                    ("default_language", "de"),
+                ],
+            ),
+            (
+                "6",
+                1.0,
+                5.0,
+                &[
+                    ("name", "Rhein-Hunsrück-Kreis"),
+                    ("license_plate_code", "SIM"),
+                ],
+            ),
+            ("6", 6.0, 9.0, &[("name", "Kreis ohne Kennzeichen")]),
+        ];
+        for (index, (level, low, high, tags)) in areas.into_iter().enumerate() {
+            let id = 100 + 10 * index as i64;
+            nodes.extend([
+                node(id, low, low, &[]),
+                node(id + 1, low, high, &[]),
+                node(id + 2, high, high, &[]),
+                node(id + 3, high, low, &[]),
+            ]);
+            ways.push(way(id, &[id, id + 1, id + 2, id + 3, id], &[]));
+            let mut tags = tags.to_vec();
+            tags.extend([("boundary", "administrative"), ("admin_level", level)]);
+            relations.push(relation(id, &[(id, "outer")], &tags));
+        }
+        write_pbf(&input, &[nodes, ways, relations]);
+        build(&dir.join("pack"), &input, None);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let kept = (0..reader.records().record_count())
+            .filter_map(|record_id| {
+                let summary = reader.record_summary(record_id).ok()?;
+                let defaults = reader.default_languages(record_id).collect::<Vec<_>>();
+                Some((
+                    summary.name,
+                    reader.plate_code(record_id).map(str::to_string),
+                    defaults.join(";"),
+                ))
+            })
+            .filter(|(_, plate, default)| plate.is_some() || !default.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            [
+                ("Deutschland".to_string(), None, "de".to_string()),
+                (
+                    "Rhein-Hunsrück-Kreis".to_string(),
+                    Some("SIM".to_string()),
+                    String::new()
+                ),
+            ]
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -6602,7 +7697,8 @@ mod tests {
              -79.40005,43.60003,10,KING ST,Toronto,M5V 1A1\n\
              -79.4003,43.6003,16,King Street,Toronto,M5V 1A1\n\
              -79.40,43.604,10,King Street,Toronto,M5V 1A1\n\
-             -79.45,43.65,3,Queen Street,Toronto,\n",
+             -79.45,43.65,3,QUEEN STREET,Toronto,M5V 2B1\n\
+             -79.45,43.65,5,Queen Street,Toronto,\n",
         )
         .expect("csv");
         BuildOsmOptions {
@@ -6716,6 +7812,36 @@ mod tests {
             );
             let _ = fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn an_older_checkpoint_is_refused_and_kept() {
+        let dir = temp_dir("old-checkpoint");
+        let options = BuildOsmOptions {
+            pack: dir.join("pack"),
+            ..resumable_inputs(&dir)
+        };
+        fail_before(&options, Step::Contexts);
+        let found = resume::find(&options.pack).expect("find");
+        let manifest = found[0].manifest();
+        let mut prior: Manifest<State> =
+            serde_json::from_slice(&fs::read(&manifest).expect("read")).expect("manifest");
+        prior.format = FORMAT_VERSION - 1;
+        let bytes = serde_json::to_vec(&prior).expect("serialize");
+        fs::write(&manifest, &bytes).expect("write");
+
+        let failure = build_osm_pack(&BuildOsmOptions {
+            leftover: Leftover::Resume,
+            ..options
+        })
+        .expect_err("old checkpoint is refused");
+        let expected = format!(
+            "checkpoint of format {}, not {FORMAT_VERSION}",
+            prior.format
+        );
+        assert!(failure.to_string().contains(&expected), "{failure}");
+        assert_eq!(fs::read(&manifest).expect("checkpoint kept"), bytes);
+        fs::remove_dir_all(dir).expect("remove fixture");
     }
 
     #[test]

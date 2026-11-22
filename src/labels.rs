@@ -16,7 +16,7 @@ pub fn address_name(components: &AddressComponents) -> String {
 
 /// A unit as a label shows it: "Unit 1" for a bare "1", so it never reads
 /// as a place; "Flat 2" or "Apt 4B" as stated.
-fn unit_label(unit: &str) -> String {
+pub(crate) fn unit_label(unit: &str) -> String {
     let unit = unit.trim();
     if unit.split_whitespace().count() > 1
         || unit.starts_with(|character: char| character.is_alphabetic())

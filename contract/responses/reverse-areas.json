@@ -10,32 +10,46 @@
       },
       "properties": {
         "accuracy": "centroid",
-        "id": "osm:relation:1",
-        "label": "Toronto, Ontario, Canada",
-        "layer": "country",
-        "name": "Canada",
-        "source": {
-          "dataset": "osm"
-        }
-      },
-      "type": "Feature"
-    },
-    {
-      "geometry": {
-        "coordinates": [
-          -79.0,
-          43.0
+        "bbox": [
+          -79.6392727,
+          43.5796082,
+          -79.1132193,
+          43.8554425
         ],
-        "type": "Point"
-      },
-      "properties": {
-        "accuracy": "centroid",
         "id": "osm:relation:3",
-        "label": "Toronto",
+        "label": "Toronto, Ontario, Canada",
         "layer": "locality",
         "name": "Toronto",
         "source": {
           "dataset": "osm"
+        },
+        "timezone": "America/Toronto"
+      },
+      "type": "Feature"
+    },
+    {
+      "geometry": {
+        "coordinates": [
+          -79.0,
+          43.0
+        ],
+        "type": "Point"
+      },
+      "properties": {
+        "accuracy": "centroid",
+        "bbox": [
+          -95.1537,
+          41.6765,
+          -74.3199,
+          56.8593
+        ],
+        "code": "CA-ON",
+        "id": "osm:relation:2",
+        "label": "Ontario",
+        "layer": "region",
+        "name": "Ontario",
+        "source": {
+          "dataset": "osm"
         }
       },
       "type": "Feature"
@@ -50,10 +64,17 @@
       },
       "properties": {
         "accuracy": "centroid",
-        "id": "osm:relation:2",
-        "label": "Ontario",
-        "layer": "region",
-        "name": "Ontario",
+        "bbox": [
+          -141.0027,
+          41.6765,
+          -52.3231,
+          83.3362
+        ],
+        "code": "CA",
+        "id": "osm:relation:1",
+        "label": "Canada",
+        "layer": "country",
+        "name": "Canada",
         "source": {
           "dataset": "osm"
         }
@@ -67,6 +88,11 @@
         "licence": "ODbL 1.0",
         "text": "© OpenStreetMap contributors",
         "url": "https://www.openstreetmap.org/copyright"
+      },
+      {
+        "licence": "ODbL 1.0",
+        "text": "Timezone boundaries © OpenStreetMap contributors",
+        "url": "https://github.com/evansiroky/timezone-boundary-builder"
       }
     ],
     "point": {

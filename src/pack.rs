@@ -43,7 +43,7 @@ use crate::{
         CountryCode,
         dictionary::{Builder, RecordNames},
     },
-    record::{InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
+    record::{Extent, InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
     records, spatial_index,
     text_index::{self, PostcodeAreas},
 };
@@ -62,12 +62,28 @@ pub const PACK_FILE: &str = "pack.ogp";
 pub const AUDIT_DIR: &str = "audit";
 pub const REJECTIONS_FILE: &str = "rejections.jsonl";
 pub const BUILD_REPORT_FILE: &str = "build-report.json";
-pub const PACK_SCHEMA_VERSION: u32 = 10;
+/// Moves whenever any section's format does, so a Pack another og wrote is
+/// told apart by its schema alone (see `the_schema_moves_with_every_section`).
+pub const PACK_SCHEMA_VERSION: u32 = 11;
 
 const MANIFEST_SECTION: &str = "manifest";
 const MANIFEST_VERSION: u32 = 1;
 const POSTCODE_ADDRESSES_SECTION: &str = "postcode_addresses";
 const POSTCODE_ADDRESSES_VERSION: u32 = 1;
+const COUNTRY_CODES_SECTION: &str = "country_codes";
+const COUNTRY_CODES_VERSION: u32 = 1;
+const SUBDIVISION_CODES_SECTION: &str = "subdivision_codes";
+const SUBDIVISION_CODES_VERSION: u32 = 1;
+const PLATE_CODES_SECTION: &str = "plate_codes";
+const PLATE_CODES_VERSION: u32 = 1;
+const DEFAULT_LANGUAGES_SECTION: &str = "default_languages";
+const DEFAULT_LANGUAGES_VERSION: u32 = 1;
+const LANGUAGE_NAMES_SECTION: &str = "language_names";
+const LANGUAGE_NAMES_VERSION: u32 = 1;
+const EXTENTS_SECTION: &str = "extents";
+const EXTENTS_VERSION: u32 = 1;
+const TIMEZONES_SECTION: &str = "timezones";
+const TIMEZONES_VERSION: u32 = 1;
 const SCRATCH_DIR: &str = ".scratch";
 const DEFAULT_TEXT_INDEX_MEMORY_BYTES: usize = 1 << 30;
 
@@ -148,6 +164,292 @@ impl PostcodeAddresses {
     }
 }
 
+/// Bytes of one country code entry: the country record's id and its code as a
+/// `u16`, little-endian.
+const COUNTRY_CODES_ENTRY_BYTES: usize = 10;
+
+fn country_codes_to_bytes(codes: &HashMap<RecordId, CountryCode>) -> Vec<u8> {
+    let mut sorted = codes.iter().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mut bytes = Vec::with_capacity(sorted.len() * COUNTRY_CODES_ENTRY_BYTES);
+    for (record_id, code) in sorted {
+        bytes.extend_from_slice(&record_id.to_le_bytes());
+        bytes.extend_from_slice(&code.to_u16().to_le_bytes());
+    }
+    bytes
+}
+
+fn country_codes_from_bytes(bytes: &[u8]) -> Result<HashMap<RecordId, CountryCode>> {
+    if !bytes.len().is_multiple_of(COUNTRY_CODES_ENTRY_BYTES) {
+        return Err(Error::Decode("country codes are truncated"));
+    }
+    bytes
+        .as_chunks::<COUNTRY_CODES_ENTRY_BYTES>()
+        .0
+        .iter()
+        .map(|entry| {
+            let (record_id, code) = entry.split_at(8);
+            let record_id = RecordId::from_le_bytes(record_id.try_into().expect("eight bytes"));
+            let code = CountryCode::from_u16(u16::from_le_bytes([code[0], code[1]]))
+                .ok_or(Error::Decode("country record's code is not a country code"))?;
+            Ok((record_id, code))
+        })
+        .collect()
+}
+
+/// A short text of each area record that has one, such as its ISO 3166-2
+/// code (`CA-ON`), its vehicle plate code (`SIM`) or its default language
+/// (`de`). Each entry is the area record's id, little-endian, then the
+/// text's length in one byte and the text itself.
+fn area_codes_to_bytes(codes: &HashMap<RecordId, String>) -> Vec<u8> {
+    let mut sorted = codes
+        .iter()
+        .filter(|(_, code)| u8::try_from(code.len()).is_ok())
+        .collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mut bytes = Vec::new();
+    for (record_id, code) in sorted {
+        bytes.extend_from_slice(&record_id.to_le_bytes());
+        bytes.push(u8::try_from(code.len()).expect("filtered to fit"));
+        bytes.extend_from_slice(code.as_bytes());
+    }
+    bytes
+}
+
+fn area_codes_from_bytes(mut bytes: &[u8]) -> Result<HashMap<RecordId, String>> {
+    let truncated = || Error::Decode("area codes are truncated");
+    let mut codes = HashMap::new();
+    while !bytes.is_empty() {
+        let (record_id, rest) = bytes.split_at_checked(8).ok_or_else(truncated)?;
+        let (&length, rest) = rest.split_first().ok_or_else(truncated)?;
+        let (code, rest) = rest
+            .split_at_checked(usize::from(length))
+            .ok_or_else(truncated)?;
+        let record_id = RecordId::from_le_bytes(record_id.try_into().expect("eight bytes"));
+        let code =
+            std::str::from_utf8(code).map_err(|_| Error::Decode("an area code is not text"))?;
+        codes.insert(record_id, code.to_string());
+        bytes = rest;
+    }
+    Ok(codes)
+}
+
+/// The name of an area in each language it has one in, as pairs of a
+/// language code as its tag writes it (`de`, `zh-Hant`) and the name, in code
+/// order.
+pub type LanguageNames = Vec<(String, String)>;
+
+/// Each entry is the record's id, little-endian, then its name count as a
+/// little-endian `u16`, then each name as its code's length in one byte, the
+/// code, the name's length as a little-endian `u16` and the name.
+fn language_names_to_bytes(names: &HashMap<RecordId, LanguageNames>) -> Vec<u8> {
+    let fits = |(code, name): &&(String, String)| {
+        u8::try_from(code.len()).is_ok() && u16::try_from(name.len()).is_ok()
+    };
+    let mut sorted = names.iter().collect::<Vec<_>>();
+    sorted.sort_unstable_by_key(|(record_id, _)| **record_id);
+    let mut bytes = Vec::new();
+    for (record_id, names) in sorted {
+        let kept = names
+            .iter()
+            .filter(fits)
+            .take(usize::from(u16::MAX))
+            .collect::<Vec<_>>();
+        if kept.is_empty() {
+            continue;
+        }
+        bytes.extend_from_slice(&record_id.to_le_bytes());
+        let count = u16::try_from(kept.len()).expect("taken to fit");
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for (code, name) in kept {
+            bytes.push(u8::try_from(code.len()).expect("filtered to fit"));
+            bytes.extend_from_slice(code.as_bytes());
+            let length = u16::try_from(name.len()).expect("filtered to fit");
+            bytes.extend_from_slice(&length.to_le_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+        }
+    }
+    bytes
+}
+
+fn language_names_from_bytes(mut bytes: &[u8]) -> Result<HashMap<RecordId, LanguageNames>> {
+    let truncated = || Error::Decode("language names are truncated");
+    let text = |bytes: &[u8]| {
+        std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|_| Error::Decode("a language name is not text"))
+    };
+    let mut all = HashMap::new();
+    while !bytes.is_empty() {
+        let (record_id, rest) = bytes.split_at_checked(8).ok_or_else(truncated)?;
+        let (count, mut rest) = rest.split_at_checked(2).ok_or_else(truncated)?;
+        let count = u16::from_le_bytes(count.try_into().expect("two bytes"));
+        let mut names = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            let (&length, after) = rest.split_first().ok_or_else(truncated)?;
+            let (code, after) = after
+                .split_at_checked(usize::from(length))
+                .ok_or_else(truncated)?;
+            let (length, after) = after.split_at_checked(2).ok_or_else(truncated)?;
+            let length = u16::from_le_bytes(length.try_into().expect("two bytes"));
+            let (name, after) = after
+                .split_at_checked(usize::from(length))
+                .ok_or_else(truncated)?;
+            names.push((text(code)?, text(name)?));
+            rest = after;
+        }
+        let record_id = RecordId::from_le_bytes(record_id.try_into().expect("eight bytes"));
+        all.insert(record_id, names);
+        bytes = rest;
+    }
+    Ok(all)
+}
+
+/// Bytes of one extent entry, which is the area record's id, then its west,
+/// south, east and north sides in 1e-7 degrees, all little-endian.
+const EXTENT_ENTRY_BYTES: usize = 24;
+
+fn extents_to_bytes(mut extents: Vec<(RecordId, Extent)>) -> Vec<u8> {
+    extents.sort_unstable();
+    extents.dedup_by_key(|(record_id, _)| *record_id);
+    let mut bytes = Vec::with_capacity(extents.len() * EXTENT_ENTRY_BYTES);
+    for (record_id, extent) in extents {
+        bytes.extend_from_slice(&record_id.to_le_bytes());
+        for side in extent {
+            bytes.extend_from_slice(&side.to_le_bytes());
+        }
+    }
+    bytes
+}
+
+/// The box around each area record, in id order and read where the Pack
+/// holds it, as a planet has an area for every town and suburb.
+#[derive(Debug, Default)]
+struct Extents(Option<container::Bytes>);
+
+impl Extents {
+    fn open(bytes: container::Bytes) -> Result<Self> {
+        let (entries, rest) = bytes.as_chunks::<EXTENT_ENTRY_BYTES>();
+        if !rest.is_empty() {
+            return Err(Error::Decode("area extents are truncated"));
+        }
+        let id = |entry: &[u8; EXTENT_ENTRY_BYTES]| {
+            RecordId::from_le_bytes(entry[..8].try_into().expect("eight bytes"))
+        };
+        if !entries.is_sorted_by(|left, right| id(left) < id(right)) {
+            return Err(Error::Decode("area extents are out of order"));
+        }
+        Ok(Self(Some(bytes)))
+    }
+
+    fn get(&self, record_id: RecordId) -> Option<Extent> {
+        let entries = self.0.as_ref()?.as_chunks::<EXTENT_ENTRY_BYTES>().0;
+        let at = entries
+            .binary_search_by_key(&record_id, |entry| {
+                RecordId::from_le_bytes(entry[..8].try_into().expect("eight bytes"))
+            })
+            .ok()?;
+        let entry = &entries[at];
+        Some(std::array::from_fn(|index| {
+            let from = 8 + 4 * index;
+            i32::from_le_bytes(entry[from..from + 4].try_into().expect("four bytes"))
+        }))
+    }
+}
+
+/// Bytes of one area's timezone, which is the area record's id, then the
+/// zone's index in the names, both little-endian.
+const AREA_ZONE_BYTES: usize = 10;
+
+/// The zone names as a little-endian `u16` count, then each name's length
+/// in one byte and the name, then an entry per area that lies wholly in one
+/// zone, in id order.
+fn timezones_to_bytes(names: &[String], mut areas: Vec<(RecordId, u16)>) -> Result<Vec<u8>> {
+    let count = u16::try_from(names.len())
+        .map_err(|_| Error::Inconsistent("more timezones than the Pack names".into()))?;
+    let mut bytes = count.to_le_bytes().to_vec();
+    for name in names {
+        let length = u8::try_from(name.len()).map_err(|_| {
+            Error::Inconsistent(format!("timezone name {name:?} is longer than 255 bytes"))
+        })?;
+        bytes.push(length);
+        bytes.extend_from_slice(name.as_bytes());
+    }
+    areas.sort_unstable();
+    areas.dedup_by_key(|(record_id, _)| *record_id);
+    for (record_id, zone) in areas {
+        if zone >= count {
+            return Err(Error::Inconsistent(format!(
+                "area record {record_id} lies in timezone {zone} of {count}"
+            )));
+        }
+        bytes.extend_from_slice(&record_id.to_le_bytes());
+        bytes.extend_from_slice(&zone.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+/// The timezone names of a Pack built with timezone boundaries, and the
+/// zone of each area that lies wholly in one, read where the Pack holds it.
+#[derive(Debug, Default)]
+struct Timezones {
+    names: Vec<String>,
+    /// The section, and where its area entries start.
+    areas: Option<(container::Bytes, usize)>,
+}
+
+impl Timezones {
+    fn open(bytes: container::Bytes) -> Result<Self> {
+        let truncated = || Error::Decode("timezones are truncated");
+        let (count, mut rest) = bytes.split_at_checked(2).ok_or_else(truncated)?;
+        let count = u16::from_le_bytes([count[0], count[1]]);
+        let mut names = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            let (&length, after) = rest.split_first().ok_or_else(truncated)?;
+            let (name, after) = after
+                .split_at_checked(usize::from(length))
+                .ok_or_else(truncated)?;
+            let name = std::str::from_utf8(name)
+                .map_err(|_| Error::Decode("a timezone name is not text"))?;
+            names.push(name.to_string());
+            rest = after;
+        }
+        let (entries, cut) = rest.as_chunks::<AREA_ZONE_BYTES>();
+        if !cut.is_empty() {
+            return Err(truncated());
+        }
+        if !entries.is_sorted_by(|left, right| area_of(left) < area_of(right)) {
+            return Err(Error::Decode("area timezones are out of order"));
+        }
+        if entries.iter().any(|entry| zone_of(entry) >= count) {
+            return Err(Error::Decode(
+                "an area lies in a timezone the Pack does not name",
+            ));
+        }
+        let areas_at = bytes.len() - rest.len();
+        Ok(Self {
+            names,
+            areas: Some((bytes, areas_at)),
+        })
+    }
+
+    /// The zone the area record lies wholly in, by its index in the names.
+    fn of_area(&self, record_id: RecordId) -> Option<u16> {
+        let (bytes, at) = self.areas.as_ref()?;
+        let entries = bytes[*at..].as_chunks::<AREA_ZONE_BYTES>().0;
+        let found = entries.binary_search_by_key(&record_id, area_of).ok()?;
+        Some(zone_of(&entries[found]))
+    }
+}
+
+fn area_of(entry: &[u8; AREA_ZONE_BYTES]) -> RecordId {
+    RecordId::from_le_bytes(entry[..8].try_into().expect("eight bytes"))
+}
+
+fn zone_of(entry: &[u8; AREA_ZONE_BYTES]) -> u16 {
+    u16::from_le_bytes([entry[8], entry[9]])
+}
+
 #[derive(Debug, Clone)]
 pub struct WriterOptions {
     /// Pool every buffer of the build reserves from.
@@ -191,6 +493,14 @@ fn indexed_area_names<'a>(
         .map(String::as_str)
 }
 
+/// The timezone names, and the zone of each area record that lies wholly
+/// in one, by its index in them.
+#[derive(Debug)]
+struct AreaZones {
+    names: Vec<String>,
+    areas: Vec<(RecordId, u16)>,
+}
+
 /// Writes records in their final order. Record ids are assigned sequentially.
 #[derive(Debug)]
 pub struct Writer {
@@ -202,6 +512,13 @@ pub struct Writer {
     layer_counts: BTreeMap<Layer, u64>,
     context_names: Arc<HashMap<RecordId, Vec<String>>>,
     country_codes: Arc<HashMap<RecordId, CountryCode>>,
+    subdivision_codes: HashMap<RecordId, String>,
+    plate_codes: HashMap<RecordId, String>,
+    default_languages: HashMap<RecordId, String>,
+    language_names: HashMap<RecordId, LanguageNames>,
+    extents: Vec<(RecordId, Extent)>,
+    /// When the build was given timezone boundaries.
+    timezones: Option<AreaZones>,
     postcode_areas: Arc<PostcodeAreas>,
     postcode_addresses: PostcodeAddresses,
     dictionaries: Builder,
@@ -347,6 +664,12 @@ impl Writer {
             layer_counts: BTreeMap::new(),
             context_names: Arc::default(),
             country_codes: Arc::default(),
+            subdivision_codes: HashMap::new(),
+            plate_codes: HashMap::new(),
+            default_languages: HashMap::new(),
+            language_names: HashMap::new(),
+            extents: Vec::new(),
+            timezones: None,
             postcode_areas: Arc::default(),
             postcode_addresses: PostcodeAddresses::default(),
             dictionaries: Builder::default(),
@@ -389,6 +712,42 @@ impl Writer {
         // holds one entry per country record, not per record.
         self.country_codes = Arc::new(codes.clone());
         self.dictionaries.set_country_codes(codes);
+    }
+
+    /// The ISO 3166-2 code of each area record below a country that has one
+    /// (`CA-ON`), by the area's id.
+    pub fn set_subdivision_codes(&mut self, codes: HashMap<RecordId, String>) {
+        self.subdivision_codes = codes;
+    }
+
+    /// The vehicle plate code of each area record whose boundary states one
+    /// (`SIM`), by the area's id.
+    pub fn set_plate_codes(&mut self, codes: HashMap<RecordId, String>) {
+        self.plate_codes = codes;
+    }
+
+    /// The default language of each area record whose boundary states one,
+    /// as it writes it (`en`, `nl;fr`), by the area's id.
+    pub fn set_default_languages(&mut self, languages: HashMap<RecordId, String>) {
+        self.default_languages = languages;
+    }
+
+    /// The names of each area record in the languages it has one in, by the
+    /// area's id.
+    pub fn set_language_names(&mut self, names: HashMap<RecordId, LanguageNames>) {
+        self.language_names = names;
+    }
+
+    /// The box around each area record, by the area's id.
+    pub fn set_extents(&mut self, extents: Vec<(RecordId, Extent)>) {
+        self.extents = extents;
+    }
+
+    /// The timezone names a record's context may point at by index (see
+    /// [`RecordContext::zone`]), and the zone of each area record that lies
+    /// wholly in one, by the area's id.
+    pub fn set_timezones(&mut self, names: Vec<String>, areas: Vec<(RecordId, u16)>) {
+        self.timezones = Some(AreaZones { names, areas });
     }
 
     /// The groups of regions each region lies in, by the region's id.
@@ -528,6 +887,13 @@ impl Writer {
             spatial,
             layer_counts,
             context_names,
+            country_codes,
+            subdivision_codes,
+            plate_codes,
+            default_languages,
+            language_names,
+            extents,
+            timezones,
             postcode_addresses,
             dictionaries,
             ..
@@ -556,6 +922,44 @@ impl Writer {
             POSTCODE_ADDRESSES_VERSION,
             &postcode_addresses.to_bytes(),
         )?;
+        pack.add(
+            COUNTRY_CODES_SECTION,
+            COUNTRY_CODES_VERSION,
+            &country_codes_to_bytes(&country_codes),
+        )?;
+        drop(country_codes);
+        pack.add(
+            SUBDIVISION_CODES_SECTION,
+            SUBDIVISION_CODES_VERSION,
+            &area_codes_to_bytes(&subdivision_codes),
+        )?;
+        drop(subdivision_codes);
+        pack.add(
+            PLATE_CODES_SECTION,
+            PLATE_CODES_VERSION,
+            &area_codes_to_bytes(&plate_codes),
+        )?;
+        drop(plate_codes);
+        pack.add(
+            DEFAULT_LANGUAGES_SECTION,
+            DEFAULT_LANGUAGES_VERSION,
+            &area_codes_to_bytes(&default_languages),
+        )?;
+        drop(default_languages);
+        pack.add(
+            LANGUAGE_NAMES_SECTION,
+            LANGUAGE_NAMES_VERSION,
+            &language_names_to_bytes(&language_names),
+        )?;
+        drop(language_names);
+        pack.add(EXTENTS_SECTION, EXTENTS_VERSION, &extents_to_bytes(extents))?;
+        if let Some(AreaZones { names, areas }) = timezones {
+            pack.add(
+                TIMEZONES_SECTION,
+                TIMEZONES_VERSION,
+                &timezones_to_bytes(&names, areas)?,
+            )?;
+        }
         Ok(Sealing {
             generation,
             scratch,
@@ -928,6 +1332,18 @@ pub struct Reader {
     /// `None` for a Pack built before enclosing areas.
     enclosing: Option<enclosing::Reader>,
     postcode_addresses: PostcodeAddresses,
+    /// The code of each country record, by its id.
+    country_codes: HashMap<RecordId, CountryCode>,
+    /// The ISO 3166-2 code of each area record that has one, by its id.
+    subdivision_codes: HashMap<RecordId, String>,
+    /// The vehicle plate code of each area record that has one, by its id.
+    plate_codes: HashMap<RecordId, String>,
+    /// The default language of each area record that states one, by its id.
+    default_languages: HashMap<RecordId, String>,
+    /// The names of each area record in other languages, by its id.
+    language_names: HashMap<RecordId, LanguageNames>,
+    extents: Extents,
+    timezones: Timezones,
 }
 
 impl std::fmt::Debug for Reader {
@@ -948,8 +1364,10 @@ impl Reader {
         let manifest: Manifest =
             serde_json::from_slice(&container.section(MANIFEST_SECTION, MANIFEST_VERSION)?)?;
         if manifest.schema_version != PACK_SCHEMA_VERSION {
-            return Err(Error::UnsupportedVersion {
+            return Err(Error::UnsupportedFormat {
+                part: "schema".to_string(),
                 found: manifest.schema_version,
+                expected: PACK_SCHEMA_VERSION,
             });
         }
         let records = records::Reader::open(&container)?;
@@ -965,6 +1383,48 @@ impl Reader {
         let postcode_addresses = PostcodeAddresses::from_bytes(
             &container.section(POSTCODE_ADDRESSES_SECTION, POSTCODE_ADDRESSES_VERSION)?,
         )?;
+        // Optional: a Pack sealed before the section has none, and answers
+        // without country codes rather than failing to open.
+        let country_codes = if container.sections().contains_key(COUNTRY_CODES_SECTION) {
+            country_codes_from_bytes(
+                &container.section(COUNTRY_CODES_SECTION, COUNTRY_CODES_VERSION)?,
+            )?
+        } else {
+            HashMap::new()
+        };
+        let subdivision_codes = if container.sections().contains_key(SUBDIVISION_CODES_SECTION) {
+            area_codes_from_bytes(
+                &container.section(SUBDIVISION_CODES_SECTION, SUBDIVISION_CODES_VERSION)?,
+            )?
+        } else {
+            HashMap::new()
+        };
+        let codes = |section: &str, version: u32| -> Result<HashMap<RecordId, String>> {
+            if container.sections().contains_key(section) {
+                area_codes_from_bytes(&container.section(section, version)?)
+            } else {
+                Ok(HashMap::new())
+            }
+        };
+        let plate_codes = codes(PLATE_CODES_SECTION, PLATE_CODES_VERSION)?;
+        let default_languages = codes(DEFAULT_LANGUAGES_SECTION, DEFAULT_LANGUAGES_VERSION)?;
+        let language_names = if container.sections().contains_key(LANGUAGE_NAMES_SECTION) {
+            language_names_from_bytes(
+                &container.section(LANGUAGE_NAMES_SECTION, LANGUAGE_NAMES_VERSION)?,
+            )?
+        } else {
+            HashMap::new()
+        };
+        let extents = if container.sections().contains_key(EXTENTS_SECTION) {
+            Extents::open(container.section(EXTENTS_SECTION, EXTENTS_VERSION)?)?
+        } else {
+            Extents::default()
+        };
+        let timezones = if container.sections().contains_key(TIMEZONES_SECTION) {
+            Timezones::open(container.section(TIMEZONES_SECTION, TIMEZONES_VERSION)?)?
+        } else {
+            Timezones::default()
+        };
         Ok(Self {
             path,
             container,
@@ -973,6 +1433,13 @@ impl Reader {
             context,
             enclosing,
             postcode_addresses,
+            country_codes,
+            subdivision_codes,
+            plate_codes,
+            default_languages,
+            language_names,
+            extents,
+            timezones,
         })
     }
 
@@ -994,6 +1461,133 @@ impl Reader {
         self.container.verify()
     }
 
+    /// The ISO 3166-1 code of a country record. `None` for any other record,
+    /// and for every record of a Pack sealed without country codes.
+    pub fn country_code(&self, record_id: RecordId) -> Option<CountryCode> {
+        self.country_codes.get(&record_id).copied()
+    }
+
+    /// The country records of the ISO 3166-1 code `code`.
+    pub fn countries_of(&self, code: CountryCode) -> Vec<RecordId> {
+        self.country_codes
+            .iter()
+            .filter(|(_, held)| **held == code)
+            .map(|(record, _)| *record)
+            .collect()
+    }
+
+    /// The ISO 3166-2 code of an area record below a country (`CA-ON`).
+    /// `None` for an area OpenStreetMap gives no code, for any other record,
+    /// and for every record of a Pack sealed without subdivision codes.
+    pub fn subdivision_code(&self, record_id: RecordId) -> Option<&str> {
+        self.subdivision_codes.get(&record_id).map(String::as_str)
+    }
+
+    /// The vehicle plate code of an area record (`SIM` of Rhein-Hunsrück),
+    /// as its boundary states it. `None` for an area that states none, and
+    /// for every record of a Pack sealed without plate codes.
+    pub fn plate_code(&self, record_id: RecordId) -> Option<&str> {
+        self.plate_codes.get(&record_id).map(String::as_str)
+    }
+
+    /// The languages an area record's boundary names as its default, in
+    /// order (`nl` and `fr` of `nl;fr`). None for an area that states none,
+    /// and for every record of a Pack sealed without them.
+    pub fn default_languages(&self, record_id: RecordId) -> impl Iterator<Item = &str> {
+        self.default_languages
+            .get(&record_id)
+            .into_iter()
+            .flat_map(|languages| languages.split(';'))
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+    }
+
+    /// An area record's name in `language` (`de`, `zh-Hant`), matched
+    /// without regard to case. A language with a region or script that has
+    /// no name of its own takes the name of its base language, so `de-CH`
+    /// reads `de`. `None` when the record has no name in it, and for every
+    /// record of a Pack sealed without language names.
+    pub fn language_name(&self, record_id: RecordId, language: &str) -> Option<&str> {
+        self.language_name_as(record_id, language)
+            .map(|(_, name)| name)
+    }
+
+    /// Every name an area record has in a language of its own, as
+    /// [`Self::language_name`] reads them one at a time.
+    /// A record's names by language, as `(code, name)`.
+    pub fn names_by_language(&self, record_id: RecordId) -> &[(String, String)] {
+        self.language_names
+            .get(&record_id)
+            .map_or(&[][..], Vec::as_slice)
+    }
+
+    pub fn language_names(&self, record_id: RecordId) -> impl Iterator<Item = &str> {
+        self.language_names
+            .get(&record_id)
+            .into_iter()
+            .flatten()
+            .map(|(_, name)| name.as_str())
+    }
+
+    /// [`Self::language_name`], with the code the name is held under. That is
+    /// `de` when `de-CH` reads its base language.
+    pub fn language_name_as(&self, record_id: RecordId, language: &str) -> Option<(&str, &str)> {
+        let names = self.language_names.get(&record_id)?;
+        let find = |wanted: &str| {
+            names
+                .iter()
+                .find(|(code, _)| code.eq_ignore_ascii_case(wanted))
+                .map(|(code, name)| (code.as_str(), name.as_str()))
+        };
+        find(language).or_else(|| {
+            let mut subtags = language.split(['-', '_']);
+            let base = subtags.next()?;
+            if base.len() == language.len() {
+                return None;
+            }
+            let found = find(base)?;
+            // A script subtag asks for the name written in that script, which
+            // the base name may not be: `sr` names are mostly Cyrillic, so
+            // `sr-Latn` takes one only when it is Latin.
+            match subtags.find(|subtag| is_script_subtag(subtag)) {
+                Some(script) => written_in(found.1, script).then_some(found),
+                None => Some(found),
+            }
+        })
+    }
+
+    /// The IANA name of the timezone a record lies in, such as
+    /// `Europe/Monaco`. An area's is the zone it lies wholly in. Any other
+    /// record's is that of the most specific area of its context that has
+    /// one, else the zone the build found at its point. `None` where the
+    /// timezone boundaries name no zone or two, for an area that reaches
+    /// into two, and for every record of a Pack built without them.
+    pub fn timezone(&self, record_id: RecordId) -> Result<Option<&str>> {
+        if self.timezones.names.is_empty() {
+            return Ok(None);
+        }
+        let zone = match self.timezones.of_area(record_id) {
+            Some(zone) => Some(zone),
+            None => self.boundary_context(record_id)?.and_then(|context| {
+                context
+                    .admin_context
+                    .parent_record_ids()
+                    .find_map(|area| self.timezones.of_area(area))
+                    .or(context.zone)
+            }),
+        };
+        zone.map(|zone| {
+            self.timezones
+                .names
+                .get(usize::from(zone))
+                .map(String::as_str)
+                .ok_or(Error::Decode(
+                    "a record lies in a timezone the Pack does not name",
+                ))
+        })
+        .transpose()
+    }
+
     /// See [`PostcodeAddresses`].
     pub fn postcode_addresses(&self) -> &PostcodeAddresses {
         &self.postcode_addresses
@@ -1013,9 +1607,14 @@ impl Reader {
     }
 
     /// The summary search and autocomplete return. A POI whose address states
-    /// no locality is labelled with the locality it lies in.
+    /// no locality is labelled with the locality it lies in, and an area
+    /// carries the box around it.
     pub fn record_summary(&self, record_id: RecordId) -> Result<Summary> {
         let mut summary = self.records.summary(record_id)?;
+        if summary.bbox.is_none() {
+            summary.bbox = self.extents.get(record_id).map(records::bbox);
+        }
+        summary.timezone = self.timezone(record_id)?.map(str::to_string);
         if summary.layer == Layer::Poi.as_str()
             && let Record::Poi(poi) = self.records.record(record_id)?
             && poi
@@ -1235,6 +1834,38 @@ struct PreparedRecord {
     names: RecordNames,
 }
 
+/// Whether a language tag's subtag is an ISO 15924 script code: four
+/// letters, such as `Latn` of `sr-Latn`.
+fn is_script_subtag(subtag: &str) -> bool {
+    subtag.len() == 4 && subtag.bytes().all(|byte| byte.is_ascii_alphabetic())
+}
+
+/// Whether `name` is written in the ISO 15924 script `code`: its letters
+/// are all of it. Simplified and traditional Chinese are both Han, and a
+/// script og cannot tell apart from another is never claimed.
+fn written_in(name: &str, code: &str) -> bool {
+    use unicode_script::{Script, UnicodeScript};
+    let wanted = match code.to_ascii_lowercase().as_str() {
+        "hans" | "hant" | "hani" => Some(Script::Han),
+        _ => {
+            let mut chars = code.chars();
+            let titled = chars.next().map(|first| {
+                first.to_ascii_uppercase().to_string() + &chars.as_str().to_ascii_lowercase()
+            });
+            titled.as_deref().and_then(Script::from_short_name)
+        }
+    };
+    let Some(wanted) = wanted else {
+        return false;
+    };
+    let mut letters = name
+        .chars()
+        .map(|character| character.script())
+        .filter(|script| !matches!(script, Script::Common | Script::Inherited))
+        .peekable();
+    letters.peek().is_some() && letters.all(|script| script == wanted)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -1249,12 +1880,145 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn a_script_subtag_takes_a_base_name_only_in_that_script() {
+        assert!(written_in("Beograd", "Latn"));
+        assert!(!written_in("Београд", "Latn"));
+        assert!(written_in("Београд", "cyrl"));
+        assert!(written_in("北京市", "Hans"));
+        assert!(!written_in("Beijing", "Hant"));
+        assert!(!written_in("123", "Latn"), "no letters, no script");
+        assert!(!written_in("Beograd", "Zzzz"));
+        assert!(is_script_subtag("Latn"));
+        assert!(!is_script_subtag("CH"));
+        assert!(!is_script_subtag("419"));
+    }
+
+    #[test]
+    fn language_names_survive_the_section_and_a_cut_one_fails() {
+        let names = HashMap::from([
+            (
+                3,
+                vec![
+                    ("de".to_string(), "Genf".to_string()),
+                    ("it".to_string(), "Ginevra".to_string()),
+                ],
+            ),
+            (9, vec![("zh-Hant".to_string(), "日內瓦".to_string())]),
+        ]);
+        let bytes = language_names_to_bytes(&names);
+        assert_eq!(language_names_from_bytes(&bytes).expect("decodes"), names);
+        assert!(language_names_from_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn extents_are_found_by_record_id_and_a_bad_section_fails() {
+        let crossing = [1_770_000_000, -190_000_000, -1_785_000_000, -155_000_000];
+        let monaco = [74_090_279, 437_247_599, 74_398_704, 437_519_311];
+        let bytes = extents_to_bytes(vec![(9, crossing), (3, monaco), (3, crossing)]);
+        assert_eq!(bytes.len(), 2 * EXTENT_ENTRY_BYTES);
+        let extents = Extents::open(container::Bytes::new(bytes.clone())).expect("opens");
+        assert_eq!(extents.get(3), Some(monaco));
+        assert_eq!(extents.get(9), Some(crossing));
+        assert_eq!(extents.get(4), None);
+        assert_eq!(Extents::default().get(3), None);
+        assert!(matches!(
+            Extents::open(container::Bytes::new(bytes[..bytes.len() - 1].to_vec())),
+            Err(Error::Decode("area extents are truncated"))
+        ));
+        let mut swapped = bytes[EXTENT_ENTRY_BYTES..].to_vec();
+        swapped.extend_from_slice(&bytes[..EXTENT_ENTRY_BYTES]);
+        assert!(matches!(
+            Extents::open(container::Bytes::new(swapped)),
+            Err(Error::Decode("area extents are out of order"))
+        ));
+        let mut twice = bytes[..EXTENT_ENTRY_BYTES].to_vec();
+        twice.extend_from_slice(&bytes[..EXTENT_ENTRY_BYTES]);
+        assert!(matches!(
+            Extents::open(container::Bytes::new(twice)),
+            Err(Error::Decode("area extents are out of order"))
+        ));
+    }
+
+    #[test]
+    fn timezones_are_found_by_area_and_a_bad_section_fails() {
+        let names = vec!["Europe/Monaco".to_string(), "Europe/Paris".to_string()];
+        let bytes = timezones_to_bytes(&names, vec![(9, 1), (3, 0), (3, 1)]).expect("the section");
+        let zones = Timezones::open(container::Bytes::new(bytes.clone())).expect("opens");
+        assert_eq!(zones.names, names);
+        assert_eq!(zones.of_area(3), Some(0));
+        assert_eq!(zones.of_area(9), Some(1));
+        assert_eq!(zones.of_area(4), None);
+        assert_eq!(Timezones::default().of_area(3), None);
+        let none = Timezones::open(container::Bytes::new(
+            timezones_to_bytes(&names, Vec::new()).expect("the section"),
+        ))
+        .expect("opens");
+        assert_eq!((none.of_area(3), none.names), (None, names.clone()));
+
+        let refused = |bytes: Vec<u8>| {
+            Timezones::open(container::Bytes::new(bytes))
+                .expect_err("refused")
+                .to_string()
+        };
+        let decode = |message: &'static str| Error::Decode(message).to_string();
+        for cut in [0, 1, 5, bytes.len() - 1] {
+            assert_eq!(
+                refused(bytes[..cut].to_vec()),
+                decode("timezones are truncated"),
+                "{cut}"
+            );
+        }
+        let areas_at = bytes.len() - 2 * AREA_ZONE_BYTES;
+        let mut swapped = bytes[..areas_at].to_vec();
+        swapped.extend_from_slice(&bytes[areas_at + AREA_ZONE_BYTES..]);
+        swapped.extend_from_slice(&bytes[areas_at..areas_at + AREA_ZONE_BYTES]);
+        assert_eq!(refused(swapped), decode("area timezones are out of order"));
+        let mut unnamed = bytes.clone();
+        *unnamed.last_mut().expect("a zone") = 2;
+        unnamed[bytes.len() - 2] = 2;
+        assert_eq!(
+            refused(unnamed),
+            decode("an area lies in a timezone the Pack does not name")
+        );
+        let mut garbled = bytes.clone();
+        garbled[3] = 0xff;
+        assert_eq!(refused(garbled), decode("a timezone name is not text"));
+
+        assert_eq!(
+            timezones_to_bytes(&names, vec![(3, 2)])
+                .expect_err("no such zone")
+                .to_string(),
+            Error::Inconsistent("area record 3 lies in timezone 2 of 2".into()).to_string()
+        );
+        assert_eq!(
+            timezones_to_bytes(&["x".repeat(256)], Vec::new())
+                .expect_err("too long")
+                .to_string(),
+            Error::Inconsistent(format!(
+                "timezone name {:?} is longer than 255 bytes",
+                "x".repeat(256)
+            ))
+            .to_string()
+        );
+    }
+
+    #[test]
+    fn subdivision_codes_survive_the_section_and_a_cut_one_fails() {
+        let codes = HashMap::from([(3, "CA-ON".to_string()), (9, "NZ-AUK".to_string())]);
+        let bytes = area_codes_to_bytes(&codes);
+        assert_eq!(area_codes_from_bytes(&bytes).expect("decodes"), codes);
+        assert!(area_codes_from_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
+
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("open-geocode-{name}-{}", uuid::Uuid::new_v4()))
     }
 
     fn address_record(object_id: i64, number: &str, street: &str) -> Record {
         Record::Address(AddressRecord {
+            building: None,
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
