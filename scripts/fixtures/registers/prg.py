@@ -32,12 +32,12 @@ def download(cache):
 
 
 def query(files):
-    paths = [path.as_posix() for path in files]
+    paths = ", ".join("'" + path.as_posix().replace("'", "''") + "'" for path in files)
     return f"""
         select properties.id as id, geometry.coordinates[1] as x, geometry.coordinates[2] as y,
                'EPSG:4326' as crs, properties.number as house_number, properties.street as road,
                properties.postcode as postcode, properties.city as city, properties.region as state
-        from read_ndjson({paths}, columns={{
+        from read_ndjson([{paths}], columns={{
             properties: 'STRUCT(id VARCHAR, number VARCHAR, street VARCHAR, postcode VARCHAR, city VARCHAR, region VARCHAR)',
             geometry: 'STRUCT(coordinates DOUBLE[])'
         }})
