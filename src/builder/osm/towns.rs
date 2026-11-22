@@ -129,7 +129,7 @@ fn nearest_m(
     accept: impl Fn(usize) -> bool,
 ) -> Option<f64> {
     let mut best = None::<f64>;
-    for (peer, distance_2) in tree.nearest_neighbor_iter_with_distance_2(&[lon, lat]) {
+    for (peer, distance_2) in tree.nearest_neighbor_iter_with_distance_2([lon, lat]) {
         if best.is_some_and(|best| distance_2 > degrees_within(lat, best).powi(2)) {
             break;
         }
@@ -153,7 +153,7 @@ fn nearer_than(
     accept: impl Fn(usize) -> bool,
 ) -> bool {
     let bound = degrees_within(lat, metres).powi(2);
-    tree.nearest_neighbor_iter_with_distance_2(&[lon, lat])
+    tree.nearest_neighbor_iter_with_distance_2([lon, lat])
         .take_while(|(_, distance_2)| *distance_2 <= bound)
         .any(|(peer, _)| {
             let [peer_lon, peer_lat] = *peer.geom();

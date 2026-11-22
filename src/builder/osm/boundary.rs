@@ -1109,7 +1109,7 @@ impl BoundaryIndex {
     fn covered(&self, lon: f64, lat: f64) -> Vec<&AcceptedBoundary> {
         let envelope = AABB::from_point([lon, lat]);
         self.tree
-            .locate_in_envelope_intersecting(&envelope)
+            .locate_in_envelope_intersecting(envelope)
             .map(|boundary_box| &self.boundaries[boundary_box.boundary_id])
             .filter(|boundary| self.shapes.covers(boundary.shape, lon, lat))
             .collect()
@@ -1213,7 +1213,7 @@ impl BoundaryIndex {
             .into_iter()
             .flat_map(move |turned| {
                 self.dots
-                    .locate_in_envelope_intersecting(&AABB::from_point([turned, lat]))
+                    .locate_in_envelope_intersecting(AABB::from_point([turned, lat]))
             })
             .filter(move |dot| dot.country == country)
             .filter_map(move |dot| {

@@ -294,12 +294,12 @@ pub(crate) fn resolve(mut places: Vec<Place>) -> Vec<PoiRecord> {
             .copied()
             .chain(
                 outlines
-                    .locate_all_at_point(&point)
+                    .locate_all_at_point(point)
                     .map(|leader| leader.data),
             )
             .chain(extent.into_iter().flat_map(|[west, south, east, north]| {
                 points
-                    .locate_in_envelope(&AABB::from_corners([west, south], [east, north]))
+                    .locate_in_envelope(AABB::from_corners([west, south], [east, north]))
                     .map(|leader| leader.data)
             }))
             .collect::<Vec<_>>();
