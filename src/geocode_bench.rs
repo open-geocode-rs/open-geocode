@@ -17,11 +17,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::search::{TextSearchOptions, TextSearcher};
-
-/// Metres per degree of latitude, good enough for the sub-kilometre
-/// comparisons these buckets make.
-const METRES_PER_DEGREE: f64 = 111_320.0;
+use crate::{
+    search::{TextSearchOptions, TextSearcher},
+    util::geo::METRES_PER_DEGREE,
+};
 
 #[derive(Debug, Clone)]
 pub struct GeocodeBenchmarkOptions {

@@ -4,7 +4,7 @@ use crate::{
     builder::report::CandidateIssue,
     record::{ObjectType, Record, RoadClass, SourceProvenance, StreetRecord},
     spatial_index::haversine_m,
-    util::geo::{line_geometry, line_parts},
+    util::geo::{METRES_PER_DEGREE, line_geometry, line_parts},
 };
 
 use super::{
@@ -101,9 +101,6 @@ pub(crate) fn emit_street(
 /// roundabout or a bridge named otherwise leaves a gap of tens of metres.
 /// Two roads of one name in one locality lie farther apart than that.
 pub(crate) const JOIN_GAP_M: f64 = 50.0;
-
-/// Metres in a degree of latitude, to size the grid ends are looked up in.
-const METRES_PER_DEGREE: f64 = 111_320.0;
 
 /// The ways of one street name in one area, as streets: a way whose end
 /// lies within [`JOIN_GAP_M`] of another's line joins it, and a street is

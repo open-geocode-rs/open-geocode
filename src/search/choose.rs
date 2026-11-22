@@ -4,6 +4,7 @@
 //! placed between and the stretch a street answer stands on.
 
 use super::*;
+use crate::parse::lattice::{dictionary::same_admin_name, dictionary_key};
 
 /// The house number, road, postcodes and towns a query's best reading
 /// names, as a record's own fields are compared with them.
@@ -13,7 +14,7 @@ pub(super) struct Named {
     road: Option<road::RoadName>,
     /// Each postcode, its letters and digits only, upper case.
     postcodes: Vec<String>,
-    /// Each town, as [`search_key`] folds it.
+    /// Each town, as [`dictionary_key`] folds it.
     towns: Vec<String>,
 }
 
@@ -38,7 +39,7 @@ impl Named {
                 .filter_map(|postcode| letters(&postcode))
                 .collect(),
             towns: parts(Label::Locality)
-                .filter_map(|town| search_key(&town))
+                .filter_map(|town| dictionary_key(&town))
                 .collect(),
         }
     }
@@ -54,10 +55,13 @@ impl Named {
         })
     }
 
+    /// Whether `locality` is a town the query names, either perhaps with
+    /// the word of its type. A query for "Narva linn" names the houses that
+    /// state "Narva".
     fn town_is(&self, locality: Option<&str>) -> bool {
         locality
-            .and_then(search_key)
-            .is_some_and(|town| self.towns.contains(&town))
+            .and_then(dictionary_key)
+            .is_some_and(|town| self.towns.iter().any(|named| same_admin_name(named, &town)))
     }
 
     /// Whether an address that states `postcode` and `locality` may be

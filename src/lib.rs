@@ -10,6 +10,7 @@ pub mod container;
 pub mod context;
 #[cfg(test)]
 mod contract_tests;
+pub mod enclosing;
 pub mod error;
 pub mod extsort;
 pub mod geocode_bench;

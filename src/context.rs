@@ -10,7 +10,9 @@
 //!
 //! Most records share their chain with many neighbours, so chains are
 //! interned. A record body stores only the chain id ([`ContextRef`]); this
-//! module stores the chain table.
+//! module stores the chain table. Each tuple also carries the list of every
+//! area the record lies in (see [`crate::enclosing`]), so two records with
+//! one chain and different lists have two tuple ids.
 //!
 //! ```text
 //! context/tuples  chain_count u64, then per chain:
@@ -19,13 +21,14 @@
 //!                 can be two things at once; chains sorted by outermost
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     container::{Bytes, Container, Writer},
+    enclosing::{self, AreaTags},
     pack::RecordId,
     record::PlaceLayer,
     records::ContextRef,
@@ -131,6 +134,18 @@ pub struct AdminContextTuple {
 pub struct RecordContext {
     pub admin_context: AdminContextTuple,
     pub flags: u16,
+    /// Every area the record lies in, smallest first. Written to the Pack;
+    /// what a Pack reads back is [`crate::pack::Reader::enclosing_areas`].
+    pub enclosing: Vec<RecordId>,
+}
+
+impl RecordContext {
+    /// The list of an area's own record: the areas around it, and no chain,
+    /// so nothing the parser's dictionaries may count as its context. A record
+    /// outside every area has neither, and its empty chain is counted.
+    pub fn is_area_list(&self) -> bool {
+        self.admin_context.is_empty() && !self.enclosing.is_empty()
+    }
 }
 
 impl AdminContextTuple {
@@ -285,16 +300,25 @@ impl FromIterator<AdminEntry> for AdminContextTuple {
 #[derive(Debug, Default)]
 pub struct TupleWriter {
     tuples: Vec<AdminContextTuple>,
-    ids: HashMap<AdminContextTuple, u32>,
+    /// By tuple id, parallel to `tuples`.
+    lists: Vec<Vec<RecordId>>,
+    ids: HashMap<(AdminContextTuple, Vec<RecordId>), u32>,
+    area_tags: BTreeMap<RecordId, AreaTags>,
 }
 
 impl TupleWriter {
-    /// Reference for a record's context; `None` when there is no admin context.
+    pub fn set_area_tags(&mut self, tags: BTreeMap<RecordId, AreaTags>) {
+        self.area_tags = tags;
+    }
+
+    /// Reference for a record's context; `None` when there is no admin context
+    /// and no list of areas.
     pub fn intern(&mut self, context: &RecordContext) -> Result<Option<ContextRef>> {
-        if context.admin_context.is_empty() {
+        if context.admin_context.is_empty() && context.enclosing.is_empty() {
             return Ok(None);
         }
-        let tuple_id = match self.ids.get(&context.admin_context) {
+        let key = (context.admin_context.clone(), context.enclosing.clone());
+        let tuple_id = match self.ids.get(&key) {
             Some(id) => *id,
             None => {
                 for entry in context.admin_context.entries() {
@@ -312,8 +336,9 @@ impl TupleWriter {
                 }
                 let id = u32::try_from(self.tuples.len())
                     .map_err(|_| Error::Inconsistent("context table is full".into()))?;
-                self.tuples.push(context.admin_context.clone());
-                self.ids.insert(context.admin_context.clone(), id);
+                self.tuples.push(key.0.clone());
+                self.lists.push(key.1.clone());
+                self.ids.insert(key, id);
                 id
             }
         };
@@ -339,6 +364,7 @@ impl TupleWriter {
             }
         }
         pack.add(SECTION_TUPLES, CONTEXT_VERSION, &bytes)?;
+        enclosing::write(pack, &self.lists, &self.area_tags)?;
         Ok(self.tuples)
     }
 }
@@ -411,6 +437,7 @@ impl Reader {
             } else {
                 0
             },
+            enclosing: Vec::new(),
         })
     }
 }
@@ -480,6 +507,7 @@ mod tests {
             .intern(&RecordContext {
                 admin_context: tuple.clone(),
                 flags: 0,
+                ..Default::default()
             })
             .expect("intern")
             .expect("reference");
@@ -487,6 +515,7 @@ mod tests {
             .intern(&RecordContext {
                 admin_context: tuple.clone(),
                 flags: CONTEXT_FLAG_AMBIGUOUS_ADMIN,
+                ..Default::default()
             })
             .expect("intern")
             .expect("reference");

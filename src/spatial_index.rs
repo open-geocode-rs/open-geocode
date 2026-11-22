@@ -42,7 +42,10 @@ use crate::{
     pack::RecordId,
     record::{Layer, Record},
     records::{self, BLOCK_RECORDS, dequantize, quantize},
-    util::{codec::read_u64_le, geo::line_parts},
+    util::{
+        codec::read_u64_le,
+        geo::{EARTH_RADIUS_M, line_parts},
+    },
 };
 
 pub const SPATIAL_VERSION: u32 = 3;
@@ -53,7 +56,6 @@ const CONTEXT: &str = "spatial/context";
 const NODE_SIZE: usize = 16;
 const BOX_BYTES: usize = 16;
 const HEADER_BYTES: usize = 9;
-const EARTH_RADIUS_M: f64 = 6_371_008.8;
 /// Box distances are flat-earth estimates. Scaled down by this they stay
 /// below the haversine distance of every point inside the box for the radii
 /// queries use, so no candidate is skipped.

@@ -1421,6 +1421,14 @@ pub(super) fn is_admin_type(key: &str) -> bool {
     admin_types().iter().any(|(phrase, _)| phrase == key)
 }
 
+/// Whether two names of an area, as dictionary keys, are one name, one of
+/// them perhaps with the word of its type, such as "narva linn" and "narva".
+pub(crate) fn same_admin_name(left: &str, right: &str) -> bool {
+    left == right
+        || admin_aliases(left).iter().any(|alias| alias == right)
+        || admin_aliases(right).iter().any(|alias| alias == left)
+}
+
 /// The names an admin area's name `key` (a dictionary key) is also written
 /// as without the word of its type: "愛知" of "愛知県", "bayern" of
 /// "freistaat bayern", "madrid" of "comunidad de madrid", "경기" of "경기도".
@@ -1665,6 +1673,15 @@ mod tests {
         assert!(!aliases("shi nagoya").contains(&"nagoya".to_string()));
     }
 
+    #[test]
+    fn a_name_is_the_same_with_or_without_the_word_for_its_type() {
+        assert!(same_admin_name("narva linn", "narva"));
+        assert!(same_admin_name("narva", "narva linn"));
+        assert!(same_admin_name("narva", "narva"));
+        assert!(!same_admin_name("narva", "tartu linn"));
+        assert!(!same_admin_name("narva linn", "narva joesuu"));
+    }
+
     /// The names of `names` with their fields.
     fn named(names: &RecordNames) -> Vec<(Field, String)> {
         names
@@ -1854,6 +1871,7 @@ mod tests {
         let context = RecordContext {
             admin_context: crate::pack::AdminContextTuple::from_tiers([(PlaceLayer::Locality, 9)]),
             flags: 0,
+            ..Default::default()
         };
         for _ in 0..3 {
             builder.add(RecordNames::default(), Some(&context));
@@ -1908,6 +1926,7 @@ mod tests {
                 (PlaceLayer::Locality, locality),
             ]),
             flags: 0,
+            ..Default::default()
         };
         let contexts = [(1, 2), (3, 4), (3, 5)].map(|(region, locality)| context(region, locality));
         for context in &contexts {
