@@ -470,7 +470,7 @@ pub(super) fn add_blocks(
                 progress.check()?;
                 let target = geo::Point::new(point[0], point[1]);
                 let mut areas = tree
-                    .locate_in_envelope_intersecting(&rstar::AABB::from_point(point))
+                    .locate_in_envelope_intersecting(rstar::AABB::from_point(point))
                     .filter(|block| block.outline.contains(&target));
                 if let Some(area) = areas.next()
                     && areas.next().is_none()

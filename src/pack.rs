@@ -35,6 +35,7 @@ use serde_json::Value;
 use crate::{
     container::{self, Container},
     context::{self, TupleWriter},
+    enclosing::{self, AreaTags},
     extsort::Scratch,
     labels,
     memory::Budget,
@@ -701,6 +702,11 @@ impl Writer {
         self.context_names = Arc::new(names);
     }
 
+    /// The OSM tags of the areas records lie in, by record id.
+    pub fn set_area_tags(&mut self, tags: BTreeMap<RecordId, AreaTags>) {
+        self.contexts.set_area_tags(tags);
+    }
+
     /// Country codes of the country records admin contexts point at, so the
     /// parser's dictionaries know which country each name is used in.
     pub fn set_country_codes(&mut self, codes: HashMap<RecordId, CountryCode>) {
@@ -823,12 +829,13 @@ impl Writer {
         std::thread::scope(|scope| {
             let named = scope.spawn(move || {
                 for (offset, (names, (_, context))) in names.into_iter().zip(placed).enumerate() {
+                    let context = context.as_ref().filter(|context| !context.is_area_list());
                     if let Some(context) = context
                         && names.is_place()
                     {
                         dictionaries.add_place(first + offset as u64, context, &names);
                     }
-                    dictionaries.add(names, context.as_ref());
+                    dictionaries.add(names, context);
                 }
             });
             let indexed = scope.spawn(move || {
@@ -1338,6 +1345,8 @@ pub struct Reader {
     manifest: Manifest,
     records: records::Reader,
     context: context::Reader,
+    /// `None` for a Pack built before enclosing areas.
+    enclosing: Option<enclosing::Reader>,
     postcode_addresses: PostcodeAddresses,
     /// The code of each country record, by its id.
     country_codes: HashMap<RecordId, CountryCode>,
@@ -1389,6 +1398,11 @@ impl Reader {
             return Err(Error::ManifestMismatch);
         }
         let context = context::Reader::open(&container)?;
+        let enclosing = enclosing::Reader::open(
+            &container,
+            manifest.context_tuple_count,
+            manifest.record_count,
+        )?;
         let postcode_addresses = PostcodeAddresses::from_bytes(
             &container.section(POSTCODE_ADDRESSES_SECTION, POSTCODE_ADDRESSES_VERSION)?,
         )?;
@@ -1448,6 +1462,7 @@ impl Reader {
             manifest,
             records,
             context,
+            enclosing,
             postcode_addresses,
             country_codes,
             subdivision_codes,
@@ -1741,11 +1756,29 @@ impl Reader {
     }
 
     pub fn boundary_context(&self, record_id: RecordId) -> Result<Option<RecordContext>> {
-        self.records
+        let context = self
+            .records
             .header(record_id)?
             .context
             .map(|reference| self.context.resolve(reference))
-            .transpose()
+            .transpose()?;
+        Ok(context.filter(|context| !context.admin_context.is_empty() || context.zone.is_some()))
+    }
+
+    /// Every area the record lies in, smallest first; empty for a record with
+    /// no context and for a Pack that has no enclosing areas.
+    pub fn enclosing_areas(&self, record_id: RecordId) -> Result<Vec<RecordId>> {
+        match (&self.enclosing, self.records.header(record_id)?.context) {
+            (Some(enclosing), Some(reference)) => enclosing.areas(reference.tuple_id),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// The tags of an area record; `None` when it has none.
+    pub fn area_tags(&self, area: RecordId) -> Result<Option<AreaTags>> {
+        self.enclosing
+            .as_ref()
+            .map_or(Ok(None), |enclosing| enclosing.tags(area))
     }
 
     /// Rejected source objects recorded by the build that produced this Pack.

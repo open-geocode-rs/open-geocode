@@ -127,6 +127,7 @@ fn write_pack(dir: &Path) {
         ]),
         flags: 0,
         zone: None,
+        enclosing: Vec::new(),
     });
     let address = AddressComponents {
         block_number_len: None,

@@ -3132,6 +3132,7 @@ pub(crate) mod router_tests {
                     ]),
                     flags: 0,
                     zone: None,
+                    enclosing: Vec::new(),
                 }),
             )
             .expect("a house in the town");
@@ -3711,6 +3712,7 @@ pub(crate) mod router_tests {
                 admin_context: AdminContextTuple::from_tiers(tiers.iter().copied()),
                 flags: 0,
                 zone: None,
+                enclosing: Vec::new(),
             })
         };
         let house = |id: i64,
@@ -4029,6 +4031,7 @@ pub(crate) mod router_tests {
                 admin_context: AdminContextTuple::from_tiers(tiers.iter().copied()),
                 flags: 0,
                 zone: None,
+                enclosing: Vec::new(),
             })
         };
         let in_toronto = || {
@@ -4279,6 +4282,7 @@ pub(crate) mod router_tests {
                 admin_context: AdminContextTuple::from_tiers(tiers.iter().copied()),
                 flags: 0,
                 zone: None,
+                enclosing: Vec::new(),
             })
         };
         let mut place = |layer, name: &str, id, context| {

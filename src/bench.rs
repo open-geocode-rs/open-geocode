@@ -689,7 +689,7 @@ mod tests {
                     .flatten(),
                 ),
                 flags: 0,
-                zone: None,
+                ..Default::default()
             })
         };
         let downtown = in_area(None, Some(toronto));

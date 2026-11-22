@@ -2,6 +2,13 @@ use geojson::{Geometry, GeometryValue, Position};
 
 use crate::record::Extent;
 
+/// Metres in a degree of latitude, near enough for sizing a lookup box or
+/// comparing short distances.
+pub(crate) const METRES_PER_DEGREE: f64 = 111_320.0;
+
+/// The mean Earth radius `haversine_m` measures with.
+pub(crate) const EARTH_RADIUS_M: f64 = 6_371_008.8;
+
 /// Longitude/latitude of a point geometry, or `None` if it is not a point or
 /// either coordinate is non-finite. This is the single canonical, strict
 /// reader; callers that previously skipped the finite check now reject NaN/inf

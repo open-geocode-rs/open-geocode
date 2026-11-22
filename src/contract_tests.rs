@@ -953,7 +953,7 @@ fn write_pack(dir: &PathBuf) {
             (PlaceLayer::Locality, locality),
         ]),
         flags: 0,
-        zone: None,
+        ..Default::default()
     });
     let king = AddressComponents {
         block_number_len: None,
@@ -1124,6 +1124,7 @@ fn write_geneva_pack(dir: &PathBuf) {
             admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Country, country)]),
             flags: 0,
             zone: None,
+            enclosing: Vec::new(),
         }),
     );
     let names = |pairs: &[(&str, &str)]| {
@@ -1161,6 +1162,7 @@ fn write_geneva_pack(dir: &PathBuf) {
         ]),
         flags: 0,
         zone: None,
+        enclosing: Vec::new(),
     });
     writer
         .write(

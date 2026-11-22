@@ -137,6 +137,7 @@ pub(super) fn pack(name: &str) -> TestPack {
         ]),
         flags: 0,
         zone: None,
+        enclosing: Vec::new(),
     });
     let king = AddressComponents {
         block_number_len: None,

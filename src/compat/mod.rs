@@ -1390,6 +1390,7 @@ mod tests {
             ]),
             flags: 0,
             zone: None,
+            enclosing: Vec::new(),
         });
         let house = AddressRecord {
             building: Some(crate::record::Building {
@@ -1454,6 +1455,7 @@ mod tests {
             )]),
             flags: 0,
             zone: None,
+            enclosing: Vec::new(),
         });
         writer.write(&rivoli.into(), in_paris).expect("paris house");
         writer.write(&front.into(), context).expect("front door");
@@ -1620,6 +1622,7 @@ mod tests {
                 ),
                 flags: 0,
                 zone: None,
+                enclosing: Vec::new(),
             });
             writer.write(&record, context).expect("area")
         };

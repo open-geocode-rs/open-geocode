@@ -122,7 +122,7 @@ impl Timezones {
     /// zones cover it.
     pub(crate) fn at(&self, [lon, lat]: [f64; 2]) -> Option<u16> {
         let mut found = None;
-        for zone in self.boxes.locate_all_at_point(&[lon, lat]) {
+        for zone in self.boxes.locate_all_at_point([lon, lat]) {
             let zone = &self.zones[zone.data as usize];
             if !self.shapes.covers(zone.shape, lon, lat) {
                 continue;
@@ -145,14 +145,14 @@ impl Timezones {
             [bounds.max().x + RESOLUTION, bounds.max().y + RESOLUTION],
         );
         let mut held = None;
-        for found in self.boxes.locate_all_at_point(&[lon, lat]) {
+        for found in self.boxes.locate_all_at_point([lon, lat]) {
             let zone = &self.zones[found.data as usize];
             let shape = self.shapes.block(zone.shape)?;
             // Inside it, its outline never out of it, and no hole or end of
             // the zone inside the area.
             let holds = covers(shape, lon, lat)
                 && outline_within(block, shape, RESOLUTION)
-                && !self.rings.locate_in_envelope(&reach).any(|ring| {
+                && !self.rings.locate_in_envelope(reach).any(|ring| {
                     ring.data.0 == found.data && ring_inside(shape, ring.data.1, block)
                 });
             if !holds {

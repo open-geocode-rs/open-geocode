@@ -74,6 +74,7 @@ fn write_pack() -> Pack {
                     admin_context: AdminContextTuple::from_tiers(within.iter().copied()),
                     flags: 0,
                     zone: None,
+                    enclosing: Vec::new(),
                 }),
             )
             .expect("place")
@@ -142,6 +143,7 @@ fn write_pack() -> Pack {
         ]),
         flags: 0,
         zone: None,
+        enclosing: Vec::new(),
     });
     // The postcode the addresses state, as a build derives it from them.
     writer
