@@ -477,11 +477,8 @@ fn with_street_postcode(address: &mut crate::api::Address, street_postcode: Opti
 }
 
 pub(crate) mod native {
+    pub(super) use super::house::ask_again;
     use super::*;
-
-    // A vendor answers a house once, og each record of it it holds, so the
-    // answers that can hold a house keep one copy of it
-    // (see [`house::one_per_house`]).
 
     /// The answer as a vendor writes it ([`as_vendors_write`]).
     fn local_forward(
@@ -543,20 +540,6 @@ pub(crate) mod native {
         }
     }
 
-    /// How many answers to ask og for next, having asked for `ask`, been
-    /// answered `held` and kept `kept` houses of the `asked`. `None` once
-    /// enough are kept, og has no more, or `most` was asked.
-    pub(super) fn ask_again(
-        asked: usize,
-        ask: usize,
-        held: usize,
-        kept: usize,
-        most: usize,
-    ) -> Option<usize> {
-        let more = (ask * 2).min(most);
-        (kept < asked && held >= ask && more > ask).then_some(more)
-    }
-
     pub(crate) async fn geocode(
         state: &AppState,
         args: Args,
@@ -588,18 +571,9 @@ pub(crate) mod native {
         args: Args,
     ) -> Result<ForwardCollection, Problem> {
         let args_lang = args.get("lang").is_some();
-        one_per_house(
-            args,
-            crate::search::MAX_AUTOCOMPLETE_LIMIT,
-            |found: &mut ForwardCollection| &mut found.features,
-            |args| async move {
-                Ok(runtime::autocomplete(State(state.clone()), args.query())
-                    .await?
-                    .0)
-            },
-        )
-        .await
-        .map(|found| local_forward(state, args_lang, found))
+        runtime::autocomplete(State(state.clone()), args.query())
+            .await
+            .map(|json| local_forward(state, args_lang, json.0))
     }
 
     /// Free text answered with addresses, areas and places together, as a
@@ -607,8 +581,8 @@ pub(crate) mod native {
     /// apart (`/geocode`, `/places`), so both run. An address or an area
     /// joins the answer only when it is what the query names, its street or
     /// its own part matched and no part it states unmatched, since
-    /// `/geocode` answers any text with its nearest reading. Those come
-    /// first, the places after.
+    /// `/geocode` answers any text with its nearest reading. A geography
+    /// qualifier follows the place it locates.
     pub(crate) async fn search(state: &AppState, args: Args) -> Result<ForwardCollection, Problem> {
         let limit = args
             .get("limit")
@@ -630,18 +604,79 @@ pub(crate) mod native {
                     .as_deref()
                     .is_some_and(|query| names_japanese_block_address(feature, query))
         });
-        let mut seen = addresses
+        addresses.features = merge_search_results(addresses.features, places, query.as_deref());
+        let mut seen = std::collections::HashSet::new();
+        addresses
             .features
-            .iter()
-            .map(|feature| feature.properties.common.id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        addresses.features.extend(
-            places
-                .into_iter()
-                .filter(|feature| seen.insert(feature.properties.common.id.clone())),
-        );
+            .retain(|feature| seen.insert(feature.properties.common.id.clone()));
         addresses.features.truncate(limit);
         Ok(addresses)
+    }
+
+    fn merge_search_results(
+        mut addresses: Vec<ForwardFeature>,
+        places: Vec<ForwardFeature>,
+        query: Option<&str>,
+    ) -> Vec<ForwardFeature> {
+        use crate::{text_index::expand_address_abbreviations, util::fold::search_key};
+
+        let qualified_query = query.filter(|_| !places.is_empty()).and_then(|query| {
+            let lowercase = query.to_ascii_lowercase();
+            let (subject, location) = lowercase
+                .split_once(" near ")
+                .or_else(|| lowercase.split_once(" in "))?;
+            let subject = expand_address_abbreviations(&search_key(subject)?);
+            let location: Vec<_> = location.split(',').filter_map(search_key).collect();
+            (!location.is_empty()).then_some((subject, location, search_key(query)))
+        });
+        let Some((subject, location, full_query)) = qualified_query else {
+            addresses.extend(places);
+            return addresses;
+        };
+
+        let names_subject = |hit: &ForwardFeature| {
+            let common = &hit.properties.common;
+            let name = search_key(&common.name);
+            name == full_query
+                || [name, common.address.street.as_deref().and_then(search_key)]
+                    .into_iter()
+                    .flatten()
+                    .any(|name| expand_address_abbreviations(&name) == subject)
+        };
+        if addresses.iter().any(names_subject) {
+            addresses.extend(places);
+            return addresses;
+        }
+
+        let (mut qualified_places, other_places): (Vec<_>, Vec<_>) =
+            places.into_iter().partition(|feature| {
+                let common = &feature.properties.common;
+                if common.layer != Layer::Poi {
+                    return false;
+                }
+                let address = &common.address;
+                let names: Vec<_> = common
+                    .context
+                    .areas()
+                    .map(|area| area.name.as_str())
+                    .chain(address.areas.iter().map(String::as_str))
+                    .chain(
+                        [
+                            &address.place,
+                            &address.locality,
+                            &address.region,
+                            &address.country,
+                        ]
+                        .into_iter()
+                        .filter_map(|name| name.as_deref()),
+                    )
+                    .filter_map(search_key)
+                    .collect();
+                location.iter().all(|part| names.contains(part))
+            });
+        qualified_places.extend(addresses);
+        qualified_places.extend(other_places);
+        qualified_places
     }
 
     /// Whether a `/geocode` answer is the address, street or area the query

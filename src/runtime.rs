@@ -29,6 +29,7 @@ use tower_http::{
 use crate::{
     api::{self, ForwardCollection, ReverseCollection},
     categories, compat,
+    compat::house,
     http::{
         batch::{self, Lookup},
         bounds, health,
@@ -915,7 +916,38 @@ fn places_place(request: &PlacesRequest) -> String {
 fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardCollection> {
     let (catalogue, ids) = match request {
         PlacesRequest::Text(options) => {
-            let named = state.places.search(&options)?;
+            let mut named = Vec::new();
+            let key = search_key(&options.query).unwrap_or_default();
+            let subject = key
+                .split_once(" in ")
+                .map_or(key.as_str(), |(subject, _)| subject);
+            let food = categories::presets_for_word("food");
+            let words = subject.split_whitespace().collect::<Vec<_>>();
+            for hit in state.places.search(&options)? {
+                let asks_for_food = hit.record.category.as_deref().is_some_and(|category| {
+                    categories::holds(&food, category)
+                        && (hit.record.cuisine.iter().any(|cuisine| {
+                            search_key(cuisine).is_some_and(|key| words.contains(&key.as_str()))
+                        }) || (words.contains(&"food")
+                            && search_key(&hit.record.name).is_some_and(|name| {
+                                name.split_whitespace().any(|word| {
+                                    word.len() >= 4 && word != "food" && words.contains(&word)
+                                })
+                            })))
+                });
+                if hit.record.layer != Layer::Poi.as_str()
+                    || asks_for_food
+                    || state.places.matches_poi_name(&hit, &key)?
+                    || hit
+                        .record
+                        .address
+                        .street
+                        .as_deref()
+                        .is_some_and(|street| crate::road::same_road(street, &key))
+                {
+                    named.push(hit);
+                }
+            }
             // A query that only names a kind of place means the nearest
             // ones, as autocomplete reads it.
             let as_typed = TextAutocompleteOptions {
@@ -1115,7 +1147,7 @@ pub(crate) async fn autocomplete(
     let focus = bounds::parse_focus(&params.focus)?;
     let bbox = bounds::parse_bbox(&params.bbox)?;
 
-    let options = TextAutocompleteOptions {
+    let mut options = TextAutocompleteOptions {
         query: query.clone(),
         limit: params.limit,
         layer: layer.map(|layer| layer.as_str().to_string()),
@@ -1125,19 +1157,39 @@ pub(crate) async fn autocomplete(
     };
     let worker = state.clone();
     let collection = lookup(&state, move || {
-        let hits = match layer {
-            Some(Layer::Poi) => worker.places.autocomplete(&TextAutocompleteOptions {
-                layer: None,
-                ..options
-            })?,
-            Some(_) => worker.searcher.autocomplete(&options)?,
-            None => {
-                let named = suggest(&worker.searcher, &worker.places, &options)?;
-                let limit = effective_autocomplete_limit(options.limit);
-                nearest_of_category(&worker, &options, limit, named)?
-            }
+        let asked = effective_autocomplete_limit(options.limit);
+        let mut collection = loop {
+            let limit = effective_autocomplete_limit(options.limit);
+            let hits = match layer {
+                Some(Layer::Poi) => {
+                    let options = TextAutocompleteOptions {
+                        layer: None,
+                        ..options.clone()
+                    };
+                    let hits = worker.places.autocomplete(&options)?;
+                    prefer_poi_names(&worker, &options, limit, hits)?.0
+                }
+                Some(_) => worker.searcher.autocomplete(&options)?,
+                None => {
+                    let named = suggest(&worker.searcher, &worker.places, &options)?;
+                    nearest_of_category(&worker, &options, limit, named)?
+                }
+            };
+            let mut found = api::forward_collection(&worker.pack, query.clone(), hits)?;
+            let held = found.features.len();
+            house::one_per_house(&mut found.features);
+            let Some(more) = house::ask_again(
+                asked,
+                limit,
+                held,
+                found.features.len(),
+                crate::search::MAX_AUTOCOMPLETE_LIMIT,
+            ) else {
+                found.features.truncate(asked);
+                break found;
+            };
+            options.limit = more;
         };
-        let mut collection = api::forward_collection(&worker.pack, query, hits)?;
         api::measure_from(&mut collection, focus);
         api::localize_forward(&worker.pack, &mut collection, &languages);
         Ok(collection)
@@ -1218,6 +1270,7 @@ fn nearest_of_category(
     limit: usize,
     named: Vec<TextSearchHit>,
 ) -> Result<Vec<TextSearchHit>> {
+    let (named, exact_poi) = prefer_poi_names(state, options, limit, named)?;
     // Through a typo the kind is never the whole query's own name.
     let typo = |kind: &str| category_typo(kind);
     let (request, through_typo) = match categories::of_request(&options.query) {
@@ -1233,6 +1286,9 @@ fn nearest_of_category(
             None => return Ok(named),
         },
     };
+    if exact_poi && !request.whole {
+        return Ok(named);
+    }
     let typed = search_key(&options.query);
     let tokens = autocomplete_tokens(&options.query);
     let near = |hit: &TextSearchHit| {
@@ -1284,6 +1340,51 @@ fn nearest_of_category(
         }
     }
     Ok(hits)
+}
+
+fn prefer_poi_names(
+    state: &AppState,
+    options: &TextAutocompleteOptions,
+    limit: usize,
+    mut hits: Vec<TextSearchHit>,
+) -> Result<(Vec<TextSearchHit>, bool)> {
+    let Some(key) = search_key(&options.query) else {
+        return Ok((hits, false));
+    };
+    let first_whole = hits
+        .first()
+        .is_some_and(|hit| search_key(&hit.record.name).as_ref() == Some(&key));
+    for (index, hit) in hits.iter().enumerate() {
+        if hit.record.layer == Layer::Poi.as_str()
+            && state
+                .pack
+                .records()
+                .names(hit.record_id)?
+                .iter()
+                .any(|name| search_key(name).as_ref() == Some(&key))
+        {
+            if index != 0 && !first_whole {
+                let hit = hits.remove(index);
+                hits.insert(0, hit);
+            }
+            return Ok((hits, true));
+        }
+    }
+    if first_whole {
+        return Ok((hits, false));
+    }
+    let mut qualified = state.places.qualified_pois(options)?;
+    if qualified.is_empty() {
+        return Ok((hits, false));
+    }
+    hits.retain(|hit| {
+        !qualified
+            .iter()
+            .any(|match_| match_.record_id == hit.record_id)
+    });
+    qualified.extend(hits);
+    qualified.truncate(limit);
+    Ok((qualified, true))
 }
 
 /// The POIs of `categories`, as many as `limit`. With a focus and its radius
@@ -1984,6 +2085,128 @@ pub(crate) mod router_tests {
             headers,
             body,
         }
+    }
+
+    #[tokio::test]
+    async fn named_pois_keep_their_rank_in_mixed_search() {
+        use crate::record::{PoiRecord, Prominence};
+
+        let pack = temp_path("named-poi-order");
+        let _ = std::fs::remove_dir_all(&pack);
+        let mut writer = Writer::create(&pack).expect("writer");
+        for (id, name, alias, category, street, town, lon, importance) in [
+            (
+                1,
+                "Harbor Tower",
+                "Harbor Lookout",
+                "tourism:attraction",
+                "Bridge Street",
+                "Fairview",
+                -79.0,
+                10,
+            ),
+            (
+                2,
+                "Garden Tower",
+                "",
+                "man_made:tower",
+                "Park Street",
+                "Fairview",
+                -79.2,
+                250,
+            ),
+            (
+                3,
+                "Juniper Coffee",
+                "",
+                "amenity:cafe",
+                "Bridge Street",
+                "Fairview",
+                -79.0,
+                10,
+            ),
+            (
+                4,
+                "Juniper Coffee",
+                "",
+                "amenity:cafe",
+                "Park Street",
+                "Lakeside",
+                -79.2,
+                250,
+            ),
+        ] {
+            writer
+                .write(
+                    &PoiRecord {
+                        name: name.to_string(),
+                        category: category.to_string(),
+                        alt_names: (!alias.is_empty())
+                            .then(|| alias.to_string())
+                            .into_iter()
+                            .collect(),
+                        address: Some(AddressComponents {
+                            number: "10".to_string(),
+                            street: Some(street.to_string()),
+                            locality: Some(town.to_string()),
+                            block_number_len: None,
+                            areas: Vec::new(),
+                            place: None,
+                            unit: None,
+                            region: None,
+                            postcode: None,
+                            country: None,
+                        }),
+                        geometry: point_geometry(lon, 43.0),
+                        location_precision: LocationPrecision::Point,
+                        source: SourceProvenance::osm(ObjectType::Node, id),
+                        prominence: Prominence {
+                            importance,
+                            ..Default::default()
+                        },
+                        wikidata: None,
+                        brand: None,
+                        details: None,
+                        aliases: Vec::new(),
+                    }
+                    .into(),
+                    None,
+                )
+                .expect("POI");
+        }
+        writer.finish().expect("finish");
+        let router = build_router(state_for(&pack, true), None, None);
+        for route in ["autocomplete", "places"] {
+            for (query, id) in [
+                ("Harbor Tower", "osm:node:1"),
+                ("Harbor Lookout", "osm:node:1"),
+                ("Juniper Coffee", "osm:node:4"),
+                ("Juniper Coffee, Fairview", "osm:node:3"),
+                ("Juniper Coffee, Bridge St", "osm:node:3"),
+                ("Juniper Coffee Bridge St", "osm:node:3"),
+                ("Juniper Coffee, Bridge St, Fairview", "osm:node:3"),
+            ] {
+                let params = serde_urlencoded::to_string([
+                    ("q", query),
+                    ("focus", "-79.2,43"),
+                    ("limit", "5"),
+                ])
+                .expect("query");
+                let reply = send(
+                    router.clone(),
+                    request("GET", &format!("/{route}?{params}")),
+                )
+                .await;
+                assert_eq!(reply.status, StatusCode::OK, "{route}: {query}");
+                assert_eq!(
+                    reply.json()["features"][0]["properties"]["id"],
+                    id,
+                    "{route}: {query}",
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(pack.with_extension("jobs"));
+        let _ = std::fs::remove_dir_all(pack);
     }
 
     #[tokio::test]

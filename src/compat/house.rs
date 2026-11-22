@@ -2,8 +2,7 @@
 //!
 //! A house can be in a Pack more than once: OSM maps it as an address point
 //! and as its building's outline, or several mappers each placed a point
-//! for it. og answers each record it holds, and a vendor answers the house
-//! once, so a vendor route keeps one copy of it, the most precise.
+//! for it. Suggestions and vendor lookups keep the most precise copy.
 
 use crate::{
     api::{Accuracy, Address, Common, ForwardFeature, ReverseFeature},
@@ -82,6 +81,18 @@ pub(crate) fn one_per_house<A: Answer>(answers: &mut Vec<A>) {
         }
     }
     *answers = kept.into_iter().map(|(answer, _)| answer).collect();
+}
+
+/// Fetch more candidates only when copies filled the window.
+pub(crate) fn ask_again(
+    asked: usize,
+    ask: usize,
+    held: usize,
+    kept: usize,
+    most: usize,
+) -> Option<usize> {
+    let more = (ask * 2).min(most);
+    (kept < asked && held >= ask && more > ask).then_some(more)
 }
 
 /// What tells one house from another: its street, number and unit as search

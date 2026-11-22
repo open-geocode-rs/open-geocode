@@ -1197,6 +1197,27 @@ async fn search_box_forward_picks_the_og_search_of_the_same_meaning() {
 }
 
 #[tokio::test]
+async fn search_box_forward_keeps_location_qualifiers_behind_the_place() {
+    let pack = write_pack();
+    let router = router(&pack);
+    let base = "/compat/mapbox/search/searchbox/v1/forward";
+    for (query, name, kind) in [
+        ("Queen Cafe in Toronto", "Queen Cafe", "poi"),
+        ("cafe near Toronto", "Queen Cafe", "poi"),
+        ("Toronto", "Toronto", "place"),
+        ("10 King St in Toronto", "10 King Street", "address"),
+        ("King St in Toronto", "10 King Street", "address"),
+    ] {
+        let params = serde_urlencoded::to_string([("q", query), ("limit", "5")]).expect("query");
+        let (status, body) = get(&router, &format!("{base}?{params}")).await;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        let first = &body["features"][0]["properties"];
+        assert_eq!(first["name"], name, "{query}: {body}");
+        assert_eq!(first["feature_type"], kind, "{query}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn search_box_forward_keeps_a_japanese_block_address() {
     let pack = Pack(std::env::temp_dir().join(format!(
         "open-geocode-compat-mapbox-jp-{}",

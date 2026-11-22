@@ -19,6 +19,7 @@ pub const DEFAULT_RADIUS_M: f64 = 30.0;
 pub const MAX_RADIUS_M: f64 = 1_000.0;
 const CONTEXT_RADIUS_M: f64 = 50_000.0;
 const CANDIDATE_LIMIT: usize = 16;
+const POSTCODE_CANDIDATE_LIMIT: usize = 6;
 
 #[derive(Debug)]
 pub struct PackReverseGeocoder {
@@ -342,15 +343,102 @@ impl PackReverseGeocoder {
         context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<Option<GeocodeResult>> {
-        let Some(candidate) = self
-            .spatial
-            .address_candidates(options.lon, options.lat, options.radius_m, 1)?
-            .into_iter()
-            .next()
+        let candidates = self.spatial.address_candidates(
+            options.lon,
+            options.lat,
+            options.radius_m,
+            POSTCODE_CANDIDATE_LIMIT,
+        )?;
+        let Some(first) = candidates.first() else {
+            return Ok(None);
+        };
+        let candidate = self
+            .corroborated_zip(first, &candidates[1..])?
+            .unwrap_or(first);
+        self.address_at(options, candidate, context, context_record_ids)
+    }
+
+    fn corroborated_zip<'a>(
+        &self,
+        first: &spatial_index::PointCandidate,
+        other: &'a [spatial_index::PointCandidate],
+    ) -> Result<Option<&'a spatial_index::PointCandidate>> {
+        if other.len() < 2 {
+            return Ok(None);
+        }
+        let records = self.pack.records();
+        let Record::Address(first_record) = records.record(first.record_id)? else {
+            return Ok(None);
+        };
+        let address = &first_record.address;
+        if address.country.as_deref().is_some_and(|country| {
+            let code = if country.len() == 2 {
+                Some(country)
+            } else {
+                crate::iso::alpha2_of(country).or_else(|| crate::iso::alpha2_of_name(country))
+            };
+            code.is_some_and(|code| !code.eq_ignore_ascii_case("US"))
+        }) {
+            return Ok(None);
+        }
+        let Some(zip) = address
+            .postcode
+            .as_deref()
+            .filter(|zip| zip.len() == 5 && zip.bytes().all(|byte| byte.is_ascii_digit()))
         else {
             return Ok(None);
         };
-        self.address_at(options, &candidate, context, context_record_ids)
+        let Some(street) = address.street.as_deref() else {
+            return Ok(None);
+        };
+        let mut plain = Vec::new();
+        let mut extended = BTreeSet::new();
+        for candidate in other {
+            if candidate.distance_m > first.distance_m + DEFAULT_RADIUS_M {
+                break;
+            }
+            let Record::Address(record) = records.record(candidate.record_id)? else {
+                continue;
+            };
+            let same_house = record.address.number == address.number
+                && record.address.unit == address.unit
+                && record
+                    .address
+                    .street
+                    .as_deref()
+                    .is_some_and(|name| crate::road::same_road(name, street))
+                && record.address.locality == address.locality
+                && record.address.region == address.region;
+            if !same_house {
+                continue;
+            }
+            let Some(postcode) = record.address.postcode.as_deref() else {
+                continue;
+            };
+            if postcode.len() == 5 && postcode.bytes().all(|byte| byte.is_ascii_digit()) {
+                plain.push((postcode.to_string(), candidate));
+            } else if let Some((base, addon)) = postcode.split_once('-')
+                && base.len() == 5
+                && addon.len() == 4
+                && base
+                    .bytes()
+                    .chain(addon.bytes())
+                    .all(|byte| byte.is_ascii_digit())
+            {
+                extended.insert(base.to_string());
+            }
+        }
+        // A ZIP+4 can break a disagreement only when a separate point for
+        // the same house gives its five-digit ZIP and no other ZIP+4 competes.
+        let Some(preferred) = extended
+            .first()
+            .filter(|preferred| extended.len() == 1 && preferred.as_str() != zip)
+        else {
+            return Ok(None);
+        };
+        Ok(plain
+            .into_iter()
+            .find_map(|(postcode, candidate)| (postcode == *preferred).then_some(candidate)))
     }
 
     /// The address result of `candidate`, the address found near the point.
@@ -924,6 +1012,38 @@ mod tests {
         assert_eq!(result.primary_record_id, Some(1));
         assert_eq!(result.evidence.explicit_address_record_id, Some(1));
 
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn reverse_uses_a_zip_corroborated_by_a_separate_zip_plus_four() {
+        let temp_dir = temp_pack_dir("postal-conflict");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (id, longitude, number, zip) in [
+            (100, -77.0, "10", "20001"),
+            (101, -77.00002, "11", "20001-1111"),
+            (102, -77.00003, "10", "20002"),
+            (103, -77.00010, "10", "20002-4214"),
+        ] {
+            let mut record = address_record();
+            record.address.number = number.into();
+            record.address.locality = Some("Washington".into());
+            record.address.region = Some("DC".into());
+            record.address.country = Some("US".into());
+            record.address.postcode = Some(zip.into());
+            record.geometry = point_geometry(longitude, 38.9);
+            record.source = SourceProvenance::osm(ObjectType::Node, id);
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
+        let result = geocoder
+            .reverse(GeocodeOptions::at(-77.0, 38.9))
+            .expect("reverse")
+            .result
+            .expect("result");
+        assert_eq!(result.id.as_deref(), Some("osm:node:102"));
+        assert_eq!(result.context.postcode.as_deref(), Some("20002"));
         let _ = fs::remove_dir_all(temp_dir);
     }
 

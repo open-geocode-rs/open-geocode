@@ -403,7 +403,7 @@ impl TextSearcher {
             keys.extend(type_free(key, kind, self.tagger.dictionaries()));
         }
         for asked in keys {
-            for (hit, _) in self.by_name(&asked, &asked, filters, focus, NAMED_WINDOW)? {
+            for (hit, _) in self.by_name(&asked, &asked, filters, focus, NAMED_WINDOW, &[])? {
                 if self.naming(key, hit.record_id, &hit.record.layer)? <= Naming::BarType
                     && !named
                         .iter()

@@ -527,10 +527,29 @@ async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compa
             complete,
             limit,
         } => {
+            let numbered_with_context = geocode.get("q").is_some_and(|query| {
+                query.split_once(',').is_some_and(|(address, context)| {
+                    !context.trim().is_empty()
+                        && address
+                            .split_whitespace()
+                            .any(crate::text_index::is_numeric_token)
+                })
+            });
             let found = super::forward_geocode(state, geocode, types)
                 .await
                 .map_err(failed)?;
-            if reads_whole(&found) {
+            if numbered_with_context
+                || reads_whole(&found)
+                || found.features.first().is_some_and(|feature| {
+                    feature.properties.matched.as_ref().is_some_and(|parts| {
+                        (parts.housenumber.is_some() && parts.street == Some(PartMatch::Matched))
+                            || (parts.housenumber == Some(PartMatch::Matched)
+                                && parts.street == Some(PartMatch::Partial)
+                                && [parts.locality, parts.region]
+                                    .contains(&Some(PartMatch::Matched)))
+                    })
+                })
+            {
                 return translated(Collection::forward(&found, types, naming));
             }
             let mut completed = super::complete(state, complete, types)

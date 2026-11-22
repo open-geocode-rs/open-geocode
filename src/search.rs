@@ -559,7 +559,18 @@ impl TextSearcher {
                     .as_ref()
                     .and_then(|model| match (hit.fallback, numbered) {
                         (true, _) => Some(0.0),
-                        (false, Numbered::Yes) => Some(model.rate(&hit.features)),
+                        (false, Numbered::Yes)
+                            if ![
+                                hit.matched.region,
+                                hit.matched.country,
+                                hit.matched.postcode,
+                                hit.matched.locality,
+                            ]
+                            .contains(&Some(PartMatch::Unmatched)) =>
+                        {
+                            Some(model.rate(&hit.features))
+                        }
+                        (false, Numbered::Yes) => None,
                         (false, Numbered::No) => None,
                     });
         }
@@ -609,7 +620,14 @@ impl TextSearcher {
         )?;
         let mut hits = variants.hits;
         if depth == Depth::Query && !self.places && variants.numbered == Numbered::Yes {
-            if let Some(hit) = self.address_with_unconfirmed_neighbourhood(options, &hits)? {
+            let recovered = if let Some(hit) = self.address_with_numeric_street(options, &hits)? {
+                Some(hit)
+            } else if let Some(hit) = self.address_with_abbreviated_street(options, &hits)? {
+                Some(hit)
+            } else {
+                self.address_with_unconfirmed_neighbourhood(options, &hits)?
+            };
+            if let Some(hit) = recovered {
                 hits.insert(0, hit);
             } else if options.layer.is_none() {
                 self.prefer_exact_street(options, &mut hits)?;
@@ -635,12 +653,225 @@ impl TextSearcher {
         if let Some(order) = &variants.order {
             self.order_by_names(order, options, depth, &mut hits)?;
         }
+        if !self.places && variants.numbered == Numbered::Yes {
+            hits.retain(|hit| {
+                let parts = &hit.matched;
+                parts.country != Some(PartMatch::Unmatched)
+                    && !(parts.region == Some(PartMatch::Unmatched)
+                        && parts.postcode == Some(PartMatch::Unmatched))
+            });
+            if hits.is_empty() && filters.layer.is_none() {
+                hits = self.fallback(query_text, &[], &filters, options.focus, limit + 1)?;
+            }
+        }
+        // When the area and its number both match, the number answers
+        // the street address more precisely than its postcode alone.
+        if hits
+            .first()
+            .is_some_and(|hit| hit.record.layer == Layer::Postcode.as_str())
+            && let Some(index) = hits.iter().position(|hit| {
+                hit.matched.housenumber == Some(PartMatch::Matched)
+                    && hit.matched.street == Some(PartMatch::Matched)
+                    && hit.matched.postcode == Some(PartMatch::Matched)
+            })
+        {
+            hits[..=index].rotate_right(1);
+        }
         self.one_per_item(&mut hits, limit)?;
         self.rate(&mut hits, variants.numbered);
         if !self.places {
             stated_country(&options.countries, &mut hits);
         }
         Ok(hits)
+    }
+
+    fn address_with_numeric_street(
+        &self,
+        options: &TextSearchOptions,
+        hits: &[TextSearchHit],
+    ) -> Result<Option<TextSearchHit>> {
+        if hits.first().is_some_and(|hit| {
+            hit.matched.housenumber == Some(PartMatch::Matched)
+                && hit.matched.street == Some(PartMatch::Matched)
+                && ![
+                    hit.matched.locality,
+                    hit.matched.region,
+                    hit.matched.postcode,
+                    hit.matched.country,
+                ]
+                .contains(&Some(PartMatch::Unmatched))
+        }) {
+            return Ok(None);
+        }
+        let Some(key) = search_key(&options.query) else {
+            return Ok(None);
+        };
+        let expanded = expand_address_abbreviations(&key);
+        let mut words = expanded.split_whitespace().collect::<Vec<_>>();
+        let Some((index, number)) =
+            words
+                .windows(2)
+                .enumerate()
+                .skip(1)
+                .find_map(|(index, pair)| {
+                    if !crate::text_index::is_street_type(pair[1]) {
+                        return None;
+                    }
+                    street_ordinal_number(pair[0]).map(|number| (index, number))
+                })
+        else {
+            return Ok(None);
+        };
+        words[index] = number;
+        let focus = if let Some(focus) = options.focus {
+            Some(focus)
+        } else if hits
+            .iter()
+            .any(|hit| hit.matched.postcode == Some(PartMatch::Unmatched))
+        {
+            self.fallback(
+                &options.query,
+                &[],
+                &Filters::new(None, &options.countries, options.bbox),
+                None,
+                1,
+            )?
+            .into_iter()
+            .find_map(|hit| {
+                (hit.record.layer == Layer::Postcode.as_str()
+                    && hit.matched.postcode == Some(PartMatch::Matched))
+                .then_some(hit.record.point)
+                .flatten()
+                .map(|point| [point.lon, point.lat])
+            })
+        } else {
+            None
+        };
+        let street_type = words[index + 1];
+        let abbreviated = crate::text_index::STREET_TYPE_ABBREVIATIONS
+            .iter()
+            .find_map(|(short, full)| (*full == street_type).then_some(*short));
+        // Some address sources write "5 AVE". The alternate spelling needs
+        // independent town or postcode evidence before it can replace a hit.
+        for road_type in std::iter::once(street_type).chain(abbreviated) {
+            words[index + 1] = road_type;
+            let retry = TextSearchOptions {
+                query: words.join(" "),
+                focus,
+                ..options.clone()
+            };
+            if let Some(hit) = self
+                .search_at(&retry, Depth::Retry)?
+                .into_iter()
+                .find(|hit| {
+                    hit.matched.housenumber == Some(PartMatch::Matched)
+                        && hit.matched.street == Some(PartMatch::Matched)
+                        && [hit.matched.locality, hit.matched.postcode]
+                            .contains(&Some(PartMatch::Matched))
+                        && ![
+                            hit.matched.locality,
+                            hit.matched.region,
+                            hit.matched.postcode,
+                            hit.matched.country,
+                        ]
+                        .contains(&Some(PartMatch::Unmatched))
+                })
+            {
+                return Ok(Some(hit));
+            }
+        }
+        Ok(None)
+    }
+
+    fn address_with_abbreviated_street(
+        &self,
+        options: &TextSearchOptions,
+        hits: &[TextSearchHit],
+    ) -> Result<Option<TextSearchHit>> {
+        let Some(anchor) = hits.first().filter(|hit| {
+            hit.matched.housenumber != Some(PartMatch::Matched)
+                && hit.matched.locality == Some(PartMatch::Matched)
+                && hit.matched.street == Some(PartMatch::Partial)
+        }) else {
+            return Ok(None);
+        };
+        let Some(point) = anchor.record.point else {
+            return Ok(None);
+        };
+        let Some(query) = search_key(&options.query) else {
+            return Ok(None);
+        };
+        let expanded = expand_address_abbreviations(&query);
+        let words = expanded.split_whitespace().collect::<Vec<_>>();
+        let Some((number, _)) = words
+            .split_first()
+            .filter(|(number, _)| is_numeric_token(number))
+        else {
+            return Ok(None);
+        };
+        let Some(kind) = words
+            .iter()
+            .enumerate()
+            .skip(2)
+            .find_map(|(index, word)| crate::text_index::is_street_type(word).then_some(index))
+        else {
+            return Ok(None);
+        };
+        let end = kind
+            + 1
+            + usize::from(words.get(kind + 1).is_some_and(|word| {
+                matches!(
+                    *word,
+                    "north"
+                        | "south"
+                        | "west"
+                        | "east"
+                        | "northwest"
+                        | "northeast"
+                        | "southwest"
+                        | "southeast"
+                )
+            }));
+        let Some(town) = words.get(end..).filter(|town| !town.is_empty()) else {
+            return Ok(None);
+        };
+        let focus = [point.lon, point.lat];
+        let complete = TextAutocompleteOptions {
+            query: words[..end].join(" "),
+            limit: 3,
+            layer: Some("address".into()),
+            countries: options.countries.clone(),
+            focus: Some(focus),
+            bbox: options.bbox.or_else(|| Some(bias_bounds(focus))),
+        };
+        for candidate in self.autocomplete_as(&complete, Completion::AddressPrefix)? {
+            let Some(street) = candidate.record.address.street.as_deref() else {
+                continue;
+            };
+            let retry = TextSearchOptions {
+                query: format!("{number} {street}, {}", town.join(" ")),
+                ..options.clone()
+            };
+            if let Some(hit) = self
+                .search_at(&retry, Depth::Retry)?
+                .into_iter()
+                .find(|hit| {
+                    hit.record_id == candidate.record_id
+                        && hit.matched.housenumber == Some(PartMatch::Matched)
+                        && hit.matched.street == Some(PartMatch::Matched)
+                        && hit.matched.locality == Some(PartMatch::Matched)
+                        && ![
+                            hit.matched.region,
+                            hit.matched.country,
+                            hit.matched.postcode,
+                        ]
+                        .contains(&Some(PartMatch::Unmatched))
+                })
+            {
+                return Ok(Some(hit));
+            }
+        }
+        Ok(None)
     }
 
     // When a numbered result adds a direction the query never said, a
@@ -1104,11 +1335,148 @@ impl TextSearcher {
         })
     }
 
-    /// Fallback only when nothing starts as typed. It reads planet-wide
-    /// postings.
+    fn numbered_completion_focus(&self, options: &TextAutocompleteOptions) -> Option<[f64; 2]> {
+        options.focus.filter(|_| {
+            !self.places
+                && search_key(&options.query).is_some_and(|key| {
+                    let words = expand_address_abbreviations(&key);
+                    let tokens = words.split_whitespace().collect::<Vec<_>>();
+                    tokens.first().is_some_and(|word| is_numeric_token(word))
+                        && tokens.iter().skip(1).any(|word| {
+                            self.describes_street(word) || crate::text_index::is_street_type(word)
+                        })
+                        && tokens.last().is_some_and(|word| {
+                            self.describes_street(word)
+                                || crate::text_index::is_street_type(word)
+                                || key
+                                    .split_whitespace()
+                                    .last()
+                                    .and_then(crate::text_index::direction_word)
+                                    .is_some()
+                        })
+                })
+        })
+    }
+
+    fn qualified_directional_completion(
+        &self,
+        options: &TextAutocompleteOptions,
+    ) -> Result<Vec<TextSearchHit>> {
+        if self.places
+            || options.focus.is_some()
+            || options.countries.is_empty()
+            || !matches!(options.layer.as_deref(), None | Some("address"))
+        {
+            return Ok(Vec::new());
+        }
+        let Some(key) = search_key(&options.query) else {
+            return Ok(Vec::new());
+        };
+        let words = key.split_whitespace().collect::<Vec<_>>();
+        if words.len() < 4
+            || !is_numeric_token(words[0])
+            || !self.describes_street(words[words.len() - 2])
+            || crate::text_index::direction_word(words[words.len() - 1]).is_none()
+        {
+            return Ok(Vec::new());
+        }
+        let local = TextAutocompleteOptions {
+            limit: CHOOSER_HITS,
+            layer: Some("address".to_string()),
+            ..options.clone()
+        };
+        let mut found = self.autocomplete_as(&local, Completion::AddressPrefix)?;
+        let Some(first) = found.first() else {
+            return Ok(found);
+        };
+        let Some(point) = first.record.point else {
+            return Ok(Vec::new());
+        };
+        // Without a location bias, a directional abbreviation can recover a
+        // numbered address only if its matches all describe the same site.
+        let street = first
+            .record
+            .address
+            .street
+            .as_deref()
+            .and_then(street_search_text);
+        if found.len() >= CHOOSER_HITS
+            || found.iter().any(|hit| {
+                hit.record
+                    .address
+                    .street
+                    .as_deref()
+                    .and_then(street_search_text)
+                    != street
+                    || hit.record.point.is_none_or(|other| {
+                        haversine_m(point.lon, point.lat, other.lon, other.lat) > FOCUS_BANDS_M[0]
+                    })
+            })
+        {
+            return Ok(Vec::new());
+        }
+        found.truncate(effective_autocomplete_limit(options.limit));
+        Ok(found)
+    }
+
+    /// Fallback only when nothing starts as typed. It reads planet-wide postings.
     pub fn autocomplete(&self, options: &TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
+        let directional = self.qualified_directional_completion(options)?;
+        if !directional.is_empty() {
+            return Ok(directional);
+        }
+        let scoped = self.numbered_completion_focus(options);
+        let street = scoped
+            .and_then(|_| search_key(&options.query))
+            .map(|query| expand_address_abbreviations(&query));
+        let ordinal = street.as_deref().and_then(|street| {
+            let mut words = street.split_whitespace().skip(1).peekable();
+            while let Some(word) = words.next() {
+                if words
+                    .peek()
+                    .is_some_and(|next| crate::text_index::is_street_type(next))
+                    && let Some(number) = street_ordinal_number(word)
+                {
+                    return Some(number);
+                }
+            }
+            None
+        });
+        let matching = |hit: &TextSearchHit, point| {
+            within_bias(hit, point)
+                && ordinal.is_none_or(|number| {
+                    hit.record
+                        .address
+                        .street
+                        .as_deref()
+                        .and_then(search_key)
+                        .is_some_and(|street| {
+                            street.split_whitespace().any(|word| {
+                                word == number || street_ordinal_number(word) == Some(number)
+                            })
+                        })
+                })
+        };
         for completion in Completion::ALL {
-            let hits = self.autocomplete_as(options, completion)?;
+            if completion == Completion::AllWords
+                && let Some(point) = scoped
+                && matches!(options.layer.as_deref(), None | Some("address"))
+            {
+                let local = TextAutocompleteOptions {
+                    bbox: options.bbox.or_else(|| Some(bias_bounds(point))),
+                    layer: Some("address".to_string()),
+                    ..options.clone()
+                };
+                let mut hits = self.autocomplete_as(&local, Completion::AddressPrefix)?;
+                hits.retain(|hit| matching(hit, point));
+                if !hits.is_empty() {
+                    return Ok(hits);
+                }
+            }
+            let mut hits = self.autocomplete_as(options, completion)?;
+            if let Some(point) = scoped {
+                hits.retain(|hit| matching(hit, point));
+            }
             if !hits.is_empty() {
                 return Ok(hits);
             }
@@ -1116,7 +1484,111 @@ impl TextSearcher {
         if let Some(normalized) = autocomplete_country_alias(options) {
             return self.autocomplete(&normalized);
         }
-        self.autocomplete_address(options, false)
+        self.complete_address(options)
+    }
+
+    fn complete_address(&self, options: &TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
+        let hits = self.autocomplete_address(options, false)?;
+        if !hits.is_empty()
+            || self.places
+            || !matches!(
+                options.layer.as_deref(),
+                None | Some("address" | "interpolation")
+            )
+        {
+            return Ok(hits);
+        }
+        let Some((subject, qualifiers)) = options.query.split_once(',') else {
+            return Ok(hits);
+        };
+        let subject = subject.trim();
+        let qualifiers = qualifiers.trim();
+        let Some(at) = subject.find(char::is_whitespace) else {
+            return Ok(hits);
+        };
+        let last = subject.rfind(char::is_whitespace).unwrap_or(at);
+        let digits =
+            |word: &str| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_digit());
+        let (number, street) = if digits(&subject[..at]) {
+            (&subject[..at], subject[at..].trim())
+        } else {
+            (subject[last..].trim(), subject[..last].trim())
+        };
+        if !digits(number) || !street.chars().any(char::is_alphabetic) || qualifiers.is_empty() {
+            return Ok(hits);
+        }
+
+        // Forward search can resolve ranges from a street hit. Layer filtering
+        // here would hide that street before it can supply the range.
+        let query = format!("{number} {street}, {qualifiers}");
+        let (readings, _) = self.tagger.parse_explained_n(&query, 1);
+        let Some(reading) = readings
+            .first()
+            .filter(|read| read.words(Label::Unit).next().is_none())
+        else {
+            return Ok(hits);
+        };
+        let postcode =
+            compact_postcode(&reading.words(Label::Postcode).collect::<Vec<_>>().join(" "));
+        let region = dictionary_key(&reading.words(Label::Region).collect::<Vec<_>>().join(" "));
+        let found = self.search(&TextSearchOptions {
+            query,
+            limit: 5,
+            layer: None,
+            countries: options.countries.clone(),
+            focus: options.focus,
+            bbox: options.bbox,
+        })?;
+        let session = Session::new(self.budget);
+        for mut hit in found {
+            let matched = &hit.matched;
+            let address = &hit.record.address;
+            if hit.fallback
+                || !matches!(hit.record.layer.as_str(), "address" | "interpolation")
+                || options
+                    .layer
+                    .as_ref()
+                    .is_some_and(|layer| layer != &hit.record.layer)
+                || address.housenumber.as_deref() != Some(number)
+                || matched.street != Some(PartMatch::Matched)
+                || matched.locality != Some(PartMatch::Matched)
+                || matched.country == Some(PartMatch::Unmatched)
+                || postcode.as_ref().is_some_and(|asked| {
+                    address
+                        .postcode
+                        .as_deref()
+                        .and_then(compact_postcode)
+                        .as_ref()
+                        != Some(asked)
+                })
+            {
+                continue;
+            }
+            if let Some(region) = &region {
+                // Another forward reading can drop the region or reinterpret it
+                // as part of the postcode. Check the original region against the hit.
+                let chain = self.regions_of(hit.record_id, &session)?;
+                let written = address.region.as_deref().and_then(dictionary_key);
+                let named = self.tagger.dictionaries().regions(region);
+                if written.as_ref() != Some(region)
+                    && !chain.iter().any(|id| {
+                        if region.len() == 2 {
+                            self.pack
+                                .subdivision_code(*id)
+                                .and_then(|iso| iso.split_once('-'))
+                                .is_some_and(|(_, code)| code.eq_ignore_ascii_case(region))
+                        } else {
+                            named.iter().any(|named| RecordId::from(*named) == *id)
+                        }
+                    })
+                {
+                    continue;
+                }
+            }
+            hit.highlights = typed_highlights(&options.query, &hit.record.label);
+            return Ok(vec![hit]);
+        }
+        Ok(hits)
     }
 
     // An incomplete address must not trigger a geocoding retry on each keystroke.
@@ -1250,7 +1722,14 @@ impl TextSearcher {
         }
 
         let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
-        let tokens = autocomplete_query_tokens(&query_text);
+        let expanded;
+        let text = if completion == Completion::AddressPrefix {
+            expanded = expand_address_abbreviations(&query_text);
+            &expanded
+        } else {
+            &query_text
+        };
+        let tokens = autocomplete_query_tokens(text);
         if let Some(number) = autocomplete_number(&tokens) {
             return self.autocomplete_reading(
                 options,
@@ -5047,14 +5526,33 @@ impl TextSearcher {
         };
         let checks = self.plan_checks(plan, placed, stated)?;
         let filters = checks.filters(filters);
-        let mut keep = |hit: &TextSearchHit| -> Result<bool> {
-            Ok(
-                self.kept(&checks, &filters, hit, &ranking.postcode, session)?
-                    && accept(session, plan, &ranking.postcode, hit)?,
-            )
-        };
+        let checked =
+            |hit: &TextSearchHit| self.kept(&checks, &filters, hit, &ranking.postcode, session);
         let query = self.build_query(plan, pass, &filters, &areas)?;
-        let mut candidates = self.ranked_hits(&query, &ranking, limit, &mut keep)?;
+        let mut range_seeds = Vec::new();
+        let can_estimate = scope == Scope::Scoped
+            && plan.house_number.is_some()
+            && plan.unit.is_none()
+            && !self.pack.tiger_ranges.is_empty();
+        let mut candidates = self.ranked_hits(&query, &ranking, limit, &mut |hit| {
+            if !checked(hit)? {
+                return Ok(false);
+            }
+            if accept(session, plan, &ranking.postcode, hit)? {
+                return Ok(true);
+            }
+            // A street without a ZIP can still carry a range that states it.
+            if can_estimate
+                && hit.record.layer == Layer::Street.as_str()
+                && range_seeds.len() < limit
+            {
+                range_seeds.push(hit.clone());
+            }
+            Ok(false)
+        })?;
+        let mut keep = |hit: &TextSearchHit| -> Result<bool> {
+            Ok(checked(hit)? && accept(session, plan, &ranking.postcode, hit)?)
+        };
         // A number no record states nor any range holds is placed between
         // its stated neighbours, before the streets that stand in for it.
         let estimated = scope == Scope::Scoped
@@ -5075,7 +5573,7 @@ impl TextSearcher {
                 candidates.insert(0, hit);
             } else if !self.pack.tiger_ranges.is_empty() && plan.unit.is_none() {
                 let mut unique = None;
-                for street in &candidates {
+                for street in candidates.iter().chain(&range_seeds) {
                     if let Some(hit) = self.tiger_estimate(street, &ranking)?
                         && keep(&hit)?
                     {
@@ -5885,6 +6383,26 @@ impl TextSearcher {
         if postcode.forms.is_empty() {
             return Ok(None);
         }
+        if postcode.explicit
+            && hit.record.layer == Layer::Interpolation.as_str()
+            && hit.record.source.dataset == crate::tiger::DATASET
+            && let Some(own) = hit
+                .record
+                .address
+                .postcode
+                .as_deref()
+                .and_then(compact_postcode)
+        {
+            // A TIGER estimate retains the street's record ID, while the
+            // range's side ZIP applies at the estimated house.
+            return Ok(Some(if postcode.forms.contains(&own) {
+                Standing::Own
+            } else if postcode.holds(&own) {
+                Standing::Taken
+            } else {
+                Standing::Contradicts
+            }));
+        }
         let records = self.pack.records();
         let own = records
             .postcodes(hit.record_id)?
@@ -5967,7 +6485,10 @@ impl TextSearcher {
                 .is_empty()
             && !self.postcode_records(&[first.to_string()], 1)?.is_empty()
         {
-            postcode = QueryPostcode::of(&[first.to_string()]);
+            postcode = QueryPostcode {
+                explicit: postcode.explicit,
+                ..QueryPostcode::of(&[first.to_string()])
+            };
         }
         Ok(postcode)
     }
@@ -6316,6 +6837,32 @@ impl TextSearcher {
                     .collect();
                 clauses.push((Occur::Must, Box::new(BooleanQuery::new(phrases))));
             }
+            Completion::AddressPrefix => {
+                for (at, token) in words.iter().enumerate() {
+                    let typed = if at == last || (token.len() >= 4 && !self.describes_street(token))
+                    {
+                        Typed::Prefix
+                    } else {
+                        Typed::Whole
+                    };
+                    let term = self.autocomplete_word_query(subject, token, typed);
+                    let alternate = words
+                        .get(at + 1)
+                        .filter(|next| crate::text_index::is_street_type(next))
+                        .and_then(|_| street_ordinal_number(token));
+                    let term = match alternate {
+                        Some(number) => Box::new(BooleanQuery::new(vec![
+                            (Occur::Should, term),
+                            (
+                                Occur::Should,
+                                self.autocomplete_word_query(subject, number, Typed::Whole),
+                            ),
+                        ])),
+                        None => term,
+                    };
+                    clauses.push((Occur::Must, term));
+                }
+            }
             Completion::AllWords | Completion::Typos => {
                 let optional = |at: usize| {
                     unlisted_contraction(&words[at])
@@ -6559,6 +7106,7 @@ impl TextSearcher {
             filters,
             focus,
             limit.max(NAMED_PLACES_WINDOW),
+            &[],
         )?;
         let mut hits = Vec::with_capacity(found.len());
         for (mut hit, by_name) in found {
@@ -6589,6 +7137,163 @@ impl TextSearcher {
         Ok(hits)
     }
 
+    pub(crate) fn qualified_pois(
+        &self,
+        options: &TextAutocompleteOptions,
+    ) -> Result<Vec<TextSearchHit>> {
+        let query = options.query.trim();
+        let filters = Filters::new(Some("poi"), &options.countries, options.bbox);
+        let limit = effective_limit(options.limit);
+        let mut splits = Vec::new();
+        let lowercase = query.to_ascii_lowercase();
+        if let Some((at, connector)) = [" near ", " in "]
+            .into_iter()
+            .find_map(|connector| lowercase.find(connector).map(|at| (at, connector)))
+        {
+            splits.push((&query[..at], &query[at + connector.len()..]));
+        } else if let Some((name, suffix)) = query.split_once(',') {
+            splits.push((name, suffix));
+        } else {
+            let dictionaries = self.tagger.dictionaries();
+            for (at, _) in query.rmatch_indices(char::is_whitespace).take(3) {
+                let suffix = query[at..].trim();
+                let Some(key) = dictionary_key(suffix) else {
+                    continue;
+                };
+                if dictionaries.contains(NameField::Locality, &key)
+                    || dictionaries.contains(NameField::Region, &key)
+                    || suffix
+                        .split_whitespace()
+                        .any(|word| search_key(word).is_some_and(|key| self.describes_street(&key)))
+                    || (options.focus.is_some() && area_initials(&key))
+                {
+                    splits.push((&query[..at], suffix));
+                }
+            }
+            splits.reverse();
+        }
+        for (name, suffix) in splits {
+            let Some(key) = search_key(name) else {
+                continue;
+            };
+            // A bare category before an area asks for that kind of place.
+            if key.chars().count() < 3 || crate::categories::of_query(&key).is_some() {
+                continue;
+            }
+            let qualifiers = suffix.split(',').filter_map(search_key).collect::<Vec<_>>();
+            if qualifiers.is_empty() {
+                continue;
+            }
+            let words = qualifiers
+                .iter()
+                .flat_map(|part| {
+                    expand_address_abbreviations(part)
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let allow_initials = qualifiers.len() == 1 && area_initials(&qualifiers[0]);
+            let nearby = options.focus.filter(|_| allow_initials);
+            let qualified_filters = Filters {
+                bbox: filters.bbox.or_else(|| nearby.map(bias_bounds)),
+                ..filters
+            };
+            let mut candidates =
+                self.by_name(&key, name, &filters, options.focus, limit.max(32), &words)?;
+            if candidates.is_empty() && nearby.is_some() {
+                // An initialism may not be indexed. Look around the caller,
+                // then require the result's actual administrative chain to name it.
+                candidates = self.by_name(
+                    &key,
+                    name,
+                    &qualified_filters,
+                    options.focus,
+                    limit.max(32),
+                    &[],
+                )?;
+            }
+            let mut hits = candidates
+                .into_iter()
+                .filter_map(|(hit, evidence)| evidence.exact.then_some(hit))
+                .collect::<Vec<_>>();
+            if hits.is_empty() {
+                let local = TextAutocompleteOptions {
+                    query: name.to_string(),
+                    limit: limit.max(32),
+                    layer: Some("poi".to_string()),
+                    ..options.clone()
+                };
+                hits = self.autocomplete_as(&local, Completion::Typos)?;
+            }
+            let mut matched = Vec::new();
+            for mut hit in hits {
+                if !self.matches_poi_name(&hit, &key)? {
+                    continue;
+                }
+                let areas = self.read_areas(hit.record_id)?;
+                let mut matches_initials = false;
+                if let Some(point) = nearby
+                    && within_bias(&hit, point)
+                {
+                    for id in &areas.chain {
+                        if let Some(area) = self.pack.context_record(*id)?
+                            && search_key(&area.name).is_some_and(|name| {
+                                name.split_whitespace()
+                                    .filter_map(|word| word.chars().next())
+                                    .eq(qualifiers[0].chars())
+                            })
+                        {
+                            matches_initials = true;
+                            break;
+                        }
+                    }
+                }
+                if matches_initials
+                    || qualifiers.iter().all(|part| {
+                        areas.localities.contains(part)
+                            || areas.regions.contains(part)
+                            || hit
+                                .record
+                                .address
+                                .street
+                                .as_deref()
+                                .is_some_and(|street| road::same_road(street, part))
+                    })
+                {
+                    hit.highlights = typed_highlights(query, &hit.record.label);
+                    matched.push(hit);
+                }
+            }
+            self.one_per_item(&mut matched, limit)?;
+            if !matched.is_empty() {
+                return Ok(matched);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    pub(crate) fn matches_poi_name(&self, hit: &TextSearchHit, query: &str) -> Result<bool> {
+        let sought = query.split_whitespace().collect::<Vec<_>>();
+        for name in self.pack.records().names(hit.record_id)? {
+            let Some(name) = search_key(&name) else {
+                continue;
+            };
+            let words = name.split_whitespace().collect::<Vec<_>>();
+            let mut corrections = 0;
+            if sought.iter().all(|word| {
+                if words.iter().any(|held| types_word(word, held, false)) {
+                    return true;
+                }
+                corrections += 1;
+                corrections == 1 && words.iter().any(|held| typo_distance(word, held).is_some())
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The records that hold every word of `key` (a search key) in a name,
     /// at most `window`, in the order a name gives them alone: one of
     /// whose names is `key` before one that only holds its words, then
@@ -6603,6 +7308,7 @@ impl TextSearcher {
         filters: &Filters<'_>,
         focus: Option<[f64; 2]>,
         window: usize,
+        context: &[String],
     ) -> Result<Vec<(TextSearchHit, ByName)>> {
         let words = key.split_whitespace().collect::<Vec<_>>();
         if words.is_empty() {
@@ -6620,6 +7326,15 @@ impl TextSearcher {
                 )
             })
             .collect::<Vec<_>>();
+        for word in context {
+            let either = [self.fields.context_text, self.fields.content_text].map(|field| {
+                Box::new(TermQuery::new(
+                    Term::from_field_text(field, word),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>
+            });
+            clauses.push((Occur::Must, Box::new(BooleanQuery::union(either.into()))));
+        }
         if let Some(bbox) = filters.bbox {
             clauses.push((Occur::Must, self.bbox_query(bbox)));
         }
@@ -7205,7 +7920,28 @@ impl TextSearcher {
         if street.record.layer != Layer::Street.as_str() {
             return Ok(None);
         }
-        if !tiger_street_written(&ranking.query_words.written, number, &street.record.name) {
+        let written = &ranking.query_words.written;
+        let same_street = if ranking.postcode.explicit {
+            // The address line of a numbered field request carries no area
+            // suffix. A range must match the whole street, including direction.
+            let number = number.to_string();
+            written
+                .split_once(' ')
+                .filter(|(first, _)| *first == number)
+                .map(|(_, street)| street)
+                .or_else(|| {
+                    written
+                        .rsplit_once(' ')
+                        .filter(|(_, last)| *last == number)
+                        .map(|(street, _)| street)
+                })
+                .and_then(street_search_text)
+                .zip(street_search_text(&street.record.name))
+                .is_some_and(|(asked, name)| asked == name)
+        } else {
+            tiger_street_written(written, number, &street.record.name)
+        };
+        if !same_street {
             return Ok(None);
         }
         let mut ranges = self
@@ -8770,6 +9506,7 @@ enum Completion {
     /// before common ones on a planet Pack. "mar" never reaches "market".
     CommonCompletions,
     AllWords,
+    AddressPrefix,
     /// Words in any order, each also as the indexed words a typo away, as
     /// `/geocode` and `/places` forgive them ("starbuks", "pharmcy").
     Typos,
@@ -9447,6 +10184,17 @@ fn context_words(plan: &QueryPlan) -> Vec<String> {
         .collect()
 }
 
+fn street_ordinal_number(word: &str) -> Option<&str> {
+    ["st", "nd", "rd", "th"].into_iter().find_map(|suffix| {
+        let number = word.strip_suffix(suffix)?;
+        (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())).then_some(number)
+    })
+}
+
+fn area_initials(key: &str) -> bool {
+    (2..=4).contains(&key.len()) && key.bytes().all(|byte| byte.is_ascii_alphabetic())
+}
+
 fn types_word(typed: &str, word: &str, last: bool) -> bool {
     typed == word
         || (last && word.starts_with(typed))
@@ -10031,6 +10779,8 @@ fn tiger_street_written(query: &str, number: u32, street: &str) -> bool {
 /// one. Longer agreement ranks first, whatever the country's postcode format.
 #[derive(Debug, Clone, Default)]
 struct QueryPostcode {
+    /// Supplied as a separate address field.
+    explicit: bool,
     /// Compacted forms of the postcode part: all of it, and from its first
     /// word with a digit when other words lead ("on m5c 2a1" is "m5c2a1").
     forms: Vec<String>,
@@ -10087,6 +10837,7 @@ impl QueryPostcode {
             forms: unique_strings(vec![words.concat(), words[first_digit..].concat()]),
             exact: words.join(" "),
             areas: Vec::new(),
+            explicit: false,
         }
     }
 
@@ -10248,6 +10999,13 @@ pub fn suggest(
     places: &TextSearcher,
     options: &TextAutocompleteOptions,
 ) -> Result<Vec<TextSearchHit>> {
+    if addresses.numbered_completion_focus(options).is_some() {
+        return addresses.autocomplete(options);
+    }
+    let directional = addresses.qualified_directional_completion(options)?;
+    if !directional.is_empty() {
+        return Ok(directional);
+    }
     // Near first, before the mix cuts to the limit and far hits fill it.
     let tier = |completion, only_near: bool| -> Result<Vec<TextSearchHit>> {
         let mut addresses = addresses.autocomplete_as(options, completion)?;
@@ -10306,7 +11064,7 @@ pub fn suggest(
     if let Some(normalized) = autocomplete_country_alias(options) {
         return suggest(addresses, places, &normalized);
     }
-    addresses.autocomplete_address(options, false)
+    addresses.complete_address(options)
 }
 
 // Address context indexes alpha-2 codes. Retry only an explicit suffix on
@@ -10494,6 +11252,7 @@ pub(crate) fn effective_autocomplete_limit(limit: usize) -> usize {
 /// [`TextSearcher::build_query`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 struct QueryPlan {
+    explicit_postcode: bool,
     /// The house number the parser read ("670", "221b", "993_5"), when other
     /// words name the street it is on.
     house_number: Option<HouseNumber>,
@@ -10943,6 +11702,7 @@ impl QueryPlan {
             }
         }
         plan.context.extend(context.iter().cloned());
+        plan.explicit_postcode = context.iter().any(ContextPart::is_postcode);
         if plan.unit.is_none() && plan.house_number.is_some() {
             plan.unit = unplaced_unit;
         }
@@ -11121,7 +11881,10 @@ impl QueryPlan {
         let Some(part) = self.context.iter().rev().find(|part| part.is_postcode()) else {
             return QueryPostcode::default();
         };
-        QueryPostcode::of(&part.words)
+        QueryPostcode {
+            explicit: self.explicit_postcode,
+            ..QueryPostcode::of(&part.words)
+        }
     }
 
     /// Plans of the areas the plan names, finest first, each with the layers
@@ -15454,6 +16217,130 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn qualified_geocode_and_autocomplete_recover_a_tiger_address() {
+        let dir = temp_pack_path("autocomplete-tiger");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut writer = Writer::create(&dir).expect("writer");
+        let region = place(
+            &mut writer,
+            PlaceLayer::Region,
+            "Rhode Island",
+            ObjectType::Relation,
+            2,
+            [-79.0, 43.0],
+            None,
+        );
+        writer.set_subdivision_codes([(region, "US-RI".to_string())].into_iter().collect());
+        let locality = place(
+            &mut writer,
+            PlaceLayer::Locality,
+            "Fairview",
+            ObjectType::Node,
+            1,
+            [-79.0, 43.0],
+            chain(&[(PlaceLayer::Region, region)]),
+        );
+        writer.set_context_names(
+            [
+                (region, vec!["Rhode Island".to_string()]),
+                (locality, vec!["Fairview".to_string()]),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let mut road = street_record("osm:way:20", "Queen Street West");
+        road.locality = Some("Fairview".to_string());
+        road.geometry = queen_street_line();
+        let street = writer
+            .write(
+                &road.into(),
+                chain(&[
+                    (PlaceLayer::Region, region),
+                    (PlaceLayer::Locality, locality),
+                ]),
+            )
+            .expect("street");
+        let (mut pack, _) = writer.seal().expect("seal");
+        crate::structured::add_to(&mut pack).expect("structured index");
+        let ranges = crate::tiger::encode(vec![crate::tiger::Range {
+            street,
+            from: 2,
+            to: 98,
+            start: 0.0,
+            end: 1.0,
+            zip: Some(2852),
+            line: 20,
+            step: 2,
+            side: b'L',
+        }])
+        .expect("ranges");
+        pack.add_section(crate::tiger::SECTION, crate::tiger::VERSION, &ranges)
+            .expect("TIGER section");
+        pack.publish().expect("publish");
+
+        let addresses = TextSearcher::open(&dir).expect("searcher");
+        let places = addresses.places();
+        let ask = |query: &str, layer: Option<Layer>| {
+            suggest(
+                &addresses,
+                &places,
+                &TextAutocompleteOptions {
+                    query: query.to_string(),
+                    limit: 5,
+                    layer: layer.map(|layer| layer.as_str().to_string()),
+                    countries: Vec::new(),
+                    focus: None,
+                    bbox: None,
+                },
+            )
+            .expect("suggestions")
+        };
+        for query in [
+            "50 Queen Street West, Fairview",
+            "Queen Street West 50, Fairview",
+        ] {
+            let hits = ask(query, None);
+            assert_eq!(hits.len(), 1, "{query}");
+            assert_eq!(hits[0].record.id, "derived:tiger:20:L:50", "{query}");
+            assert!(!hits[0].highlights.is_empty(), "{query}");
+        }
+        for query in [
+            "51 Queen Street West, Fairview",
+            "50 Queen Street West, Wrongtown",
+            "50 Queen Street West, Fairview, Massachusetts",
+        ] {
+            assert!(ask(query, None).is_empty(), "{query}");
+        }
+        assert!(ask("50 Queen Street West, Fairview", Some(Layer::Address)).is_empty());
+        let filters = AddressGeocodeOptions {
+            address: "50 Queen Street West".to_string(),
+            locality: Some("Fairview".to_string()),
+            region: Some("Rhode Island".to_string()),
+            postcode: Some("02852".to_string()),
+            limit: 1,
+            layer: None,
+            countries: Vec::new(),
+        };
+        let found = addresses
+            .geocode_address(&filters)
+            .expect("structured geocode")
+            .expect("interpolated address");
+        assert_eq!(found.hit.record.id, "derived:tiger:20:L:50");
+        assert_eq!(found.hit.matched.postcode, Some(PartMatch::Matched));
+        let with_other_zip = addresses
+            .geocode_address(&AddressGeocodeOptions {
+                postcode: Some("02853".to_string()),
+                ..filters
+            })
+            .expect("structured geocode");
+        assert!(
+            with_other_zip
+                .is_none_or(|found| found.hit.record.layer != Layer::Interpolation.as_str())
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
