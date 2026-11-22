@@ -126,9 +126,7 @@ impl Corridor {
                 bbox[3].max(*lat),
             ];
         }
-        // A degree of latitude is about 111 km; a degree of longitude is
-        // shorter, so the box widens by the latitude furthest from the
-        // equator.
+        // Use the outer latitude for longitude padding, where a degree spans less distance.
         let pad_lat = self.width_m / 111_000.0;
         let widest = bbox[1].abs().max(bbox[3].abs()).min(89.0);
         let pad_lon = pad_lat / widest.to_radians().cos();

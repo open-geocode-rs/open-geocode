@@ -3275,9 +3275,6 @@ mod tests {
             at: [-789_996_000, 430_000_000],
             kind: "main".to_string(),
         }];
-        // 4 and 6 are unnamed buildings, 6 continuing 4's run; 8 is named,
-        // so it starts its own, and 10 is a point on no building. 12 is a
-        // named building with an entrance, and 14 continues no named run.
         let records = [
             house(1, "2", None, Vec::new()),
             house(2, "4", unnamed(), Vec::new()),

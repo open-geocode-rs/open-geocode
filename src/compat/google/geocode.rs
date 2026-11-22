@@ -286,9 +286,7 @@ async fn reverse(
     )
     .await
     .map_err(from_problem)?;
-    // Both are filters on the results, applied after the search as Google
-    // applies them. A result is kept when it has any listed type and any
-    // listed granularity.
+    // Google filters types and granularity after choosing results.
     let types = query.all("types");
     let granularities = query.all("granularity");
     let results = found

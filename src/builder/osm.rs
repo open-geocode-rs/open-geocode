@@ -3537,9 +3537,7 @@ fn write_ordered(
                                     }
                                     None => located,
                                 };
-                                // An area's zone is the one it lies wholly in,
-                                // which the zoning's areas say, never the zone
-                                // at its point.
+                                // A centroid can fall in a zone that does not contain the whole area.
                                 if let (Some(zoning), Some(context)) = (zoning, &mut context)
                                     && !matches!(record, Record::Place(..))
                                 {
@@ -5752,10 +5750,7 @@ mod tests {
             ..BuildOsmOptions::default()
         })
         .expect("build");
-        // A section whose format changes fails this. Move
-        // PACK_SCHEMA_VERSION with it, so a Pack of the old format is told
-        // apart by its schema, then write the new formats here. Sections
-        // only some builds write (calibration's, timezones) are not listed.
+        // Bump PACK_SCHEMA_VERSION when changing a required section format.
         let formats = section_formats(&dir.join("pack"));
         let expected = [
             ("context/*", 1),

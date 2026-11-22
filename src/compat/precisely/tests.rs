@@ -356,9 +356,7 @@ fn assert_carries(
     let judged = &properties["match"];
     slot("match", judged);
     let description = &result["explanation"]["addressMatch"]["description"];
-    // Found by a point or a key, each part is judged by how it was found:
-    // the street, city and state the record holds `EXACT`, and by a key its
-    // postal parts too.
+    // Lookup keys establish postal parts that a point does not.
     if matches!(route, Route::Reverse | Route::Lookup) {
         let address = &result["address"];
         let held = |held: bool| if held { "EXACT" } else { "NONE" };
@@ -1038,9 +1036,7 @@ async fn reverse_geocode_answers_each_point() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::PARTIAL_CONTENT);
-    // A point judges no stated part, so the result scores 0, as Precisely
-    // writes for no address asked. The street segment the point lies on
-    // fixes the street, city and state, and not the number or postcode.
+    // Reverse can confirm a street segment without confirming a house number or postcode.
     let mut expected = address_result(&json!(0), &[]);
     let exact = [
         "admin1",

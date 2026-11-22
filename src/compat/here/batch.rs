@@ -224,9 +224,7 @@ impl BatchError {
         }
     }
 
-    // HERE documents a code for few of its errors. The rest take codes of
-    // the same form, `E600` then the status and a digit, none of which
-    // HERE uses.
+    // HERE publishes few error codes. Unspecified cases use local E600 codes.
     pub(super) fn bad_request(title: impl Into<String>, cause: impl Into<String>) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
@@ -1102,9 +1100,7 @@ fn read_record(layout: &Layout, text: &str, delimiter: char) -> Option<Record> {
         }
         Layout::Delimited(columns) => {
             let cells = cells(text, delimiter);
-            // A line has a cell for each column, but for trailing columns
-            // whose header gives a default: one missing any other does not
-            // conform to the job's format.
+            // The header can supply defaults for omitted trailing columns.
             let short_of_default = columns
                 .iter()
                 .skip(cells.len())
@@ -1852,9 +1848,7 @@ pub(super) async fn stop(
         save(&state, &meta).map_err(internal)?;
         if let Some(job) = meta.runs.last().and_then(|run| state.jobs().get(run)) {
             job.cancel();
-            // The run stops at its next record. Its end is awaited, so the
-            // answer is the job stopped, as HERE answers a stop, or completed
-            // when its last record was already written.
+            // Await the stop: the final record may already have completed the job.
             let _ = tokio::time::timeout(STOP_WAIT, job.ended()).await;
         }
         view(&state, meta).ok_or_else(BatchError::job_not_found)

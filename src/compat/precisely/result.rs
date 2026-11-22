@@ -709,10 +709,7 @@ impl Feature {
             Some((zip, extension)) => (Some(zip.to_string()), Some(extension.to_string())),
             None => (address.postcode.clone(), None),
         };
-        // The record states the region as its address writes it, often an
-        // abbreviation (`NJ`); the area containing it has the full name.
-        // The region's code within its country (`ON` of `CA-ON`) is its short
-        // name when og knows it.
+        // Address fields often use a region abbreviation; the containing area holds the full name.
         let region = self.region();
         let region_code = region
             .and_then(|region| region.code?.split_once('-'))

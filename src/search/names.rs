@@ -148,12 +148,7 @@ impl TextSearcher {
                 parts.push(part);
                 continue;
             }
-            // A field the parser labels in pieces is one name ("Providence
-            // County" read as a town and a region, "Fredrick C Greene
-            // Memorial Boulevard" misspelt and read as a unit and a street),
-            // unless two of its pieces each name something whole and the
-            // field does not ("Lincoln RI", "Bristol 02809"): then each piece
-            // is a part.
+            // Keep compound names whole unless the split names real parts and the whole does not.
             let mut runs = Vec::new();
             for (words, label) in &field {
                 runs.extend(self.part(words, *label, filters, focus)?);
@@ -394,10 +389,7 @@ impl TextSearcher {
         focus: Option<[f64; 2]>,
     ) -> Result<Vec<TextSearchHit>> {
         let mut named = Vec::new();
-        // The part's own words find a name of them and one of them and a
-        // type ("Bristol County" of "Bristol"); its words without a type it
-        // is written with find the name it stands for ("Bristol" of "Town of
-        // Bristol").
+        // Names can include or omit an area type, as in Bristol County or Town of Bristol.
         let mut keys = vec![key.to_string()];
         for kind in [Kind::Area, Kind::Street] {
             keys.extend(type_free(key, kind, self.tagger.dictionaries()));
@@ -646,20 +638,14 @@ impl TextSearcher {
                 hits.push(hit.clone());
             }
         }
-        // What the sought part names is judged by the parts; anything else
-        // keeps the judgement of the reading that found it, which knows
-        // more of it (an address lies on the street the query states).
+        // Keep the original match evidence for results the sought part does not name.
         for hit in hits.iter_mut() {
             let part = &order.parts[sought];
             if self.naming(&part.key, hit.record_id, &hit.record.layer)? < Naming::None {
                 hit.matched = self.judged_by_names(order, sought, hit)?;
             }
         }
-        // A query of one part is a bare name, and a bare name answers as it
-        // did: what the query names whole first, the rest in the search's
-        // order, then the records only the rule found, by the keys.
-        // "Providence" keeps East Providence above Providence Street; "USA",
-        // which the search answers with nothing, the country.
+        // Bare names keep the existing search order after exact names.
         let first = match order.parts.len() {
             1 => {
                 let part = &order.parts[sought];
@@ -680,10 +666,7 @@ impl TextSearcher {
             keyed.push((self.keys(order, sought, &hit)?, at, hit));
         }
         keyed.sort_by_key(|(keys, at, _)| (order_key(*keys), *at));
-        // The order the sought part's words give asked alone decides only
-        // between records the other keys tie, so it is asked only when two
-        // the caller is shown, or the last shown and the next, do. Asked
-        // once, never again from within.
+        // Only search the isolated name when ties can change the visible results.
         let shown = (effective_limit(options.limit) + 1).min(keyed.len());
         let tied = keyed[..shown]
             .windows(2)
@@ -766,9 +749,7 @@ impl TextSearcher {
             let (how, layer) = if at == sought {
                 let how = match self.naming(&part.key, hit.record_id, &hit.record.layer)? {
                     Naming::AsWritten | Naming::Whole => PartMatch::Matched,
-                    // Matched when the part writes every word of a name, bar
-                    // a street type: "Town of Bristol" is Bristol, while
-                    // "Providence" leaves out a word of Providence County.
+                    // Ignoring an area type cannot turn a name prefix into a full match.
                     Naming::BarType => match self.writes_a_name(&part.key, hit)? {
                         true => PartMatch::Matched,
                         false => PartMatch::Partial,
@@ -1509,9 +1490,7 @@ mod tests {
         let mut wrong = Vec::new();
         let mut asked = 0;
         for (record, id, name) in areas_and_streets(searcher) {
-            // A postcode alone reads as a house number, so a part after it
-            // reads as the street that number is on: an address query, which
-            // this rule leaves alone. "Bristol, RI 02809" is asked above.
+            // The parser reads an isolated postcode as a house number in this fixture.
             if record_layer(searcher, &id) == "postcode" {
                 continue;
             }
@@ -1638,9 +1617,7 @@ mod tests {
         let (plain, calibrated) = (searcher(), calibrated());
         let mut wrong = Vec::new();
         for (_, id, name) in areas_and_streets(plain) {
-            // This fixture's parser reads a postcode as a house number, so a
-            // query of one states a number; the Rhode Island Pack reads it
-            // as a postcode, and the postcode sweep checks it there.
+            // The postcode sweep uses a Pack that parses isolated postcodes as postcodes.
             if record_layer(plain, &id) == "postcode" {
                 continue;
             }

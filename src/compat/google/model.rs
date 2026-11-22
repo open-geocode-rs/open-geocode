@@ -745,9 +745,7 @@ fn address_components(common: &Common, language: &Language) -> Vec<AddressCompon
             }
         }
     }
-    // Google numbers the levels below the region by order, not by name, so
-    // the first one present is level 2. og's tiers are sparse, so a country that
-    // maps only `district` gets it as level 2, as Google would number it.
+    // Google numbers the tiers present, even when OG leaves a tier empty.
     let lower = [&context.subregion, &context.district, &context.subdistrict]
         .into_iter()
         .filter_map(Option::as_ref)
@@ -879,10 +877,7 @@ impl Kind {
             Layer::Region => Self::Types(&["administrative_area_level_1", "political"]),
             Layer::Country => Self::Types(&["country", "political"]),
             Layer::Postcode => Self::Types(&["postal_code"]),
-            // og's district holds every tier between region and locality,
-            // so which administrative level it is varies by country. It is
-            // an administrative area all the same. A POI is what its
-            // category says, which only `of` reads.
+            // OG districts span multiple admin tiers, so no single Google level applies.
             Layer::District => Self::Types(&["political"]),
             Layer::Place | Layer::Poi => Self::Unknown,
         }

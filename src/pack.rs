@@ -1588,9 +1588,7 @@ impl Reader {
                 return None;
             }
             let found = find(base)?;
-            // A script subtag asks for the name written in that script, which
-            // the base name may not be: `sr` names are mostly Cyrillic, so
-            // `sr-Latn` takes one only when it is Latin.
+            // A base-language name may use another script, such as Cyrillic for sr-Latn.
             match subtags.find(|subtag| is_script_subtag(subtag)) {
                 Some(script) => written_in(found.1, script).then_some(found),
                 None => Some(found),

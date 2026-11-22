@@ -44,9 +44,7 @@ impl Part {
             "place" => Self::Place,
             "suburb" | "city_district" => Self::Sublocality,
             "neighbourhood" | "quarter" => Self::Neighbourhood,
-            // og keeps one locality and not whether it is a city, a town or
-            // a village. `city` alone takes it, as a template may write a
-            // village and a city on two lines.
+            // Templates can list village and city separately; OG has one locality slot.
             "city" => Self::Locality,
             "county" => Self::District,
             "county_code" => Self::DistrictCode,
