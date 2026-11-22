@@ -908,6 +908,7 @@ fn write_pack(dir: &PathBuf) {
             (PlaceLayer::Locality, locality),
         ]),
         flags: 0,
+        ..Default::default()
     });
     let king = AddressComponents {
         areas: Vec::new(),

@@ -1004,8 +1004,8 @@
   "info": {
     "description": "Forward, autocomplete and reverse geocoding of addresses, served from a Pack built from OpenStreetMap and OpenAddresses.\n\nEvery response is a GeoJSON FeatureCollection. Forward results carry a `score`, and a `confidence` when the Pack is calibrated. Reverse results carry a `distance_m`.\n\nErrors are RFC 9457 problem documents (`application/problem+json`). Branch on `error_code`. `title` and `detail` are prose and may change.",
     "license": {
-      "identifier": "MIT",
-      "name": "MIT"
+      "identifier": "Apache-2.0",
+      "name": "Apache-2.0"
     },
     "title": "open-geocode",
     "version": "0.1.0"
@@ -1014,7 +1014,7 @@
   "paths": {
     "/autocomplete": {
       "get": {
-        "description": "Suggests addresses and places for partial text, as a user types, in one\nlist. A query that starts with a house number suggests addresses first; a\nplace whose name starts as the query does comes before the addresses. An\nempty or very short `q` returns no results.",
+        "description": "Suggests addresses and places for partial text, as a user types, in one\nlist. A query that starts with a house number suggests addresses first; a\nplace whose name starts as the query does comes before the addresses. An\nempty or very short `q` returns no results.\n\nWhen nothing starts as typed, the words are matched in any order, as the\narea a result is in (`starbucks ballard`) and as the words an\nabbreviation stands for (`pike pl mkt`, `2101 n 34`).",
         "operationId": "autocomplete",
         "parameters": [
           {

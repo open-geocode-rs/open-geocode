@@ -66,6 +66,7 @@ mod slash;
 mod spill;
 mod street;
 mod tags;
+mod towns;
 
 #[cfg(test)]
 mod test_pbf;
@@ -99,6 +100,7 @@ use crate::{
         },
         resume::{self, FORMAT_VERSION, FileStamp, Fingerprint, Found, Leftover, Manifest},
     },
+    enclosing::AreaTags,
     extsort::{
         ExternalSorter, IndexedSpool, RunState, Scratch, ScratchFile, Sorted, SorterState, Spill,
         Spool, SpoolFile,
@@ -109,24 +111,26 @@ use crate::{
         RecordId, SCRATCH_POINTER_FILE, SealedPack, Sealing, Writer, WriterOptions,
     },
     parse::lattice::{
-        CountryCode,
+        CountryCode, dictionary_key,
         train::{self, Sampler},
         weights::{WEIGHTS_SECTION, WEIGHTS_VERSION},
     },
-    record::{OSM_DATASET, ObjectType, Record, RejectedRecord, StreetRecord},
+    record::{
+        OSM_DATASET, ObjectType, PlaceLayer, PlaceRecord, Record, RejectedRecord, StreetRecord,
+    },
     records::quantize,
     resources::Resources,
     text_index::PostcodeAreas,
-    util::{fold::search_key, geo::point_lon_lat, hilbert::hilbert_key},
+    util::{geo::point_lon_lat, hilbert::hilbert_key},
 };
 use book::{Book, BookFile};
 use boundary::{
     BoundaryBuilder, BoundaryIndex, BoundaryRelationStub, BoundarySet, ContextOrigin, SetItem,
-    SourceContext, Vertex, record_context,
+    Settlement, SourceContext, TownDot, Vertex, record_context,
 };
 use checkpoint::{
-    AddressState, AuditState, ContextState, GeometryItem, Id, InputState, KeptWays, Pass,
-    PostcodePoint, ScanCounts, State, Step,
+    AddressState, AuditState, ContextState, GeometryItem, Id, InputState, KeptWays, NamedPoint,
+    Pass, ScanCounts, State, Step,
 };
 use containment::Shapes;
 use emitted::{Emitted, Ready};
@@ -415,7 +419,7 @@ struct Run<'a> {
     /// The books the placed addresses are read back from as they are
     /// written.
     books: Option<AddressBook>,
-    postcodes: Option<SpoolFile<PostcodePoint>>,
+    postcodes: Option<SpoolFile<NamedPoint>>,
     sample: Option<Sampler>,
     sample_saved: Option<ScratchFile>,
     sealing: Option<Sealing>,
@@ -441,8 +445,16 @@ struct Contexts {
     settled: HashSet<RecordId>,
     index: BoundaryIndex,
     area_names: HashMap<RecordId, Vec<String>>,
+    area_tags: BTreeMap<RecordId, AreaTags>,
     country_codes: HashMap<RecordId, CountryCode>,
     region_groups: HashMap<RecordId, Vec<RecordId>>,
+}
+
+/// How far each town point reaches, measured from the towns the addresses
+/// name or as a checkpoint saved it.
+enum TownReach {
+    Votes(Vec<SpoolFile<NamedPoint>>),
+    Measured(HashMap<RecordId, u32>),
 }
 
 impl Contexts {
@@ -454,22 +466,145 @@ impl Contexts {
         ordered: SpoolFile<PendingRecord>,
         boundary_ids: Vec<RecordId>,
         country_ids: HashMap<String, RecordId>,
-        settled: HashSet<RecordId>,
-    ) -> Self {
+        mut settled: HashSet<RecordId>,
+        reach: TownReach,
+    ) -> Result<Self> {
         let country_codes = boundaries.country_codes(&boundary_ids, &country_ids);
         let area_names = boundaries.context_names(&boundary_ids, &country_ids);
+        let area_tags = boundaries.area_tags(&boundary_ids);
         let region_groups = boundaries.region_groups(&boundary_ids);
-        let index = boundaries.into_index(&boundary_ids, &country_ids);
-        Self {
+        let mut index = boundaries.into_index(&boundary_ids, &country_ids);
+        // Only the own name counts; other names may translate a town, a district shares its seat's.
+        let mut points = Vec::new();
+        for (record_id, item) in ordered.reader()?.enumerate() {
+            let item = item?;
+            if item.origin.is_none()
+                && let Body::Record(record) = &item.body
+                && let Record::Place(_, place) = record.as_ref()
+                && street::is_settlement(&place.place_type)
+                && let Some(point) = point_lon_lat(&place.geometry)
+            {
+                points.push((record_id as RecordId, place.clone(), point));
+            }
+        }
+        let holders = points
+            .par_iter()
+            .map(|(_, place, [lon, lat])| {
+                let names = std::iter::once(&place.name)
+                    .chain(&place.alt_names)
+                    .filter_map(|name| dictionary_key(name))
+                    .collect::<HashSet<_>>();
+                index.smallest_area_at(*lon, *lat, |area| {
+                    area_names
+                        .get(&area)
+                        .and_then(|names| names.first())
+                        .and_then(|name| dictionary_key(name))
+                        .is_some_and(|name| names.contains(&name))
+                })
+            })
+            .collect::<Vec<_>>();
+        // A bigger town inside means no town, as Bayern holds hamlet Bayern and every Bavarian city.
+        let held = holders.iter().flatten().copied().collect::<HashSet<_>>();
+        let mut towns_in = points
+            .par_iter()
+            .enumerate()
+            .filter_map(|(at, (_, place, [lon, lat]))| {
+                let rank = boundary::town_rank(&place.place_type)?;
+                Some(
+                    index
+                        .areas_at(*lon, *lat)
+                        .filter(|area| held.contains(area))
+                        .map(|area| (area, (at, rank)))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten_iter()
+            .fold(
+                HashMap::<RecordId, Vec<(usize, u8)>>::new,
+                |mut towns, (area, town)| {
+                    towns.entry(area).or_default().push(town);
+                    towns
+                },
+            )
+            .reduce(HashMap::new, |mut left, right| {
+                for (area, towns) in right {
+                    left.entry(area).or_default().extend(towns);
+                }
+                left
+            });
+        // A city merged into its boundary has no point left, so its boundary competes in its place.
+        for (own, rank, [lon, lat]) in index.settlement_areas() {
+            for area in index
+                .areas_at(lon, lat)
+                .filter(|area| *area != own && held.contains(area))
+            {
+                towns_in.entry(area).or_default().push((usize::MAX, rank));
+            }
+        }
+        let holders = holders
+            .into_iter()
+            .zip(&points)
+            .enumerate()
+            .map(|(at, (holder, (_, place, _)))| {
+                let rank = boundary::town_rank(&place.place_type).unwrap_or(u8::MAX);
+                holder.filter(|area| {
+                    towns_in.get(area).is_none_or(|towns| {
+                        towns
+                            .iter()
+                            .all(|(other, other_rank)| *other == at || *other_rank > rank)
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut named = Vec::new();
+        let mut dots = Vec::new();
+        let mut dot_names = Vec::new();
+        for ((record_id, place, point), holder) in points.into_iter().zip(holders) {
+            let settlement = boundary::town_rank(&place.place_type).map(|rank| Settlement {
+                rank,
+                prominence: place.prominence,
+            });
+            match (holder, settlement) {
+                (Some(holder), settlement) => {
+                    settled.insert(holder);
+                    named.extend(settlement.map(|settlement| (holder, settlement)));
+                }
+                (None, Some(settlement)) => {
+                    dot_names.push(
+                        std::iter::once(&place.name)
+                            .chain(&place.alt_names)
+                            .filter_map(|name| dictionary_key(name))
+                            .collect::<Vec<_>>(),
+                    );
+                    dots.push(TownDot::new(record_id, point, place.name, settlement));
+                }
+                (None, None) => {}
+            }
+        }
+        match reach {
+            TownReach::Votes(votes) => towns::measure_reach(
+                &mut dots,
+                &dot_names,
+                votes.into_iter().flat_map(SpoolFile::into_reader),
+            )?,
+            TownReach::Measured(measured) => {
+                for dot in &mut dots {
+                    dot.reach_m = measured.get(&dot.record_id).copied().map_or(0.0, f64::from);
+                }
+            }
+        }
+        index.add_towns(named, dots);
+        Ok(Self {
             ordered,
             boundary_ids,
             country_ids,
             settled,
             index,
             area_names,
+            area_tags,
             country_codes,
             region_groups,
-        }
+        })
     }
 }
 
@@ -625,12 +760,9 @@ impl<'a> Run<'a> {
             addresses: Some(ExternalSorter::new(&scratch, "addresses", &memory, budget)),
             streets: Some(ExternalSorter::new(&scratch, "streets", &memory, budget)),
             places: Some(ExternalSorter::new(&scratch, "places", &memory, budget)),
-            context_records: Some(ExternalSorter::new(
-                &scratch,
-                "context-records",
-                &memory,
-                (budget / 16).max(1),
-            )),
+            context_records: Some(context_sorter(&scratch, &memory, budget)),
+            town_votes: Some(Spool::create(&scratch, TOWN_VOTES)?),
+            town_votes_saved: Vec::new(),
             datasets: Datasets::default(),
             seq: 0,
             memory,
@@ -732,11 +864,22 @@ impl<'a> Run<'a> {
             places: sorter_of(sorters, "places", &scratch, &memory, budget)?,
             context_records: sorter_of(
                 sorters,
-                "context-records",
+                CONTEXT_RECORDS,
                 &scratch,
                 &memory,
-                (budget / 16).max(1),
+                context_share(budget),
             )?,
+            // The votes are read once the contexts exist, and not again.
+            town_votes: if state.contexts.is_none() {
+                Some(Spool::create(&scratch, TOWN_VOTES)?)
+            } else {
+                None
+            },
+            town_votes_saved: state
+                .town_votes
+                .iter()
+                .map(|part| SpoolFile::restore(&scratch, part))
+                .collect::<Result<Vec<_>>>()?,
             datasets: Datasets::from_names(state.datasets.clone()),
             seq: state.seq,
             memory,
@@ -799,7 +942,8 @@ impl<'a> Run<'a> {
                         contexts.boundary_ids.clone(),
                         contexts.country_ids.clone().into_iter().collect(),
                         contexts.settled.iter().copied().collect(),
-                    ));
+                        TownReach::Measured(contexts.town_reach.iter().copied().collect()),
+                    )?);
                 }
                 None => run.boundaries = Some(boundaries),
             }
@@ -1261,9 +1405,10 @@ impl<'a> Run<'a> {
         }
         self.build.absorb(places)?;
         drop((line_memory, line_at, lines, relations, batch_memory));
+        self.build.report.geometry_passes.boundary_shape_vertices = builder.vertices();
+        let mut boundaries = builder.finish()?;
+        self.merge_place_points(&mut boundaries)?;
         let passes = &mut self.build.report.geometry_passes;
-        passes.boundary_shape_vertices = builder.vertices();
-        let boundaries = builder.finish()?;
         passes.boundary_shape_bytes = boundaries.shapes().bytes();
         passes.boundary_heap_bytes = boundaries.heap_bytes() as u64;
         drop(held);
@@ -1284,6 +1429,52 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
+    /// Merges place points into the boundaries they name, dropping their own
+    /// records. Every point is matched before any merges, so a point can
+    /// join the boundary another point of its Wikidata item named, and each
+    /// boundary takes its point and item from its strongest link, whatever
+    /// order the points come in.
+    fn merge_place_points(&mut self, boundaries: &mut BoundarySet) -> Result<()> {
+        let mut links = boundaries.place_links();
+        if links.is_empty() {
+            return Ok(());
+        }
+        // The links grow with the points, so the budget holds them and spills the sorters for them.
+        let mut link_memory = Reservation::forced(&self.memory, links.heap_bytes());
+        let Some(points) = self.build.context_records.take() else {
+            return Ok(());
+        };
+        self.sorted
+            .insert("place_points".to_string(), sorter_report(&points));
+        let mut staged = Spool::<PendingRecord>::create(&self.scratch, "place-points")?;
+        for (at, pending) in points.finish()?.enumerate() {
+            let pending = pending?;
+            if let Some((layer, point)) = place_point(&pending) {
+                boundaries.match_place_point(&mut links, at as u64, layer, point);
+                link_memory.force_grow(links.heap_bytes().saturating_sub(link_memory.bytes()));
+            }
+            staged.write(&pending)?;
+        }
+        boundaries.group_place_points(&mut links);
+        let mut kept = context_sorter(&self.scratch, &self.memory, self.budget);
+        let mut merged = 0;
+        for (at, pending) in staged.into_reader()?.enumerate() {
+            let pending = pending?;
+            if place_point(&pending).is_some_and(|(_, point)| {
+                boundaries.merge_place_point(&mut links, at as u64, point)
+            }) {
+                merged += 1;
+            } else {
+                kept.push(pending)?;
+            }
+        }
+        boundaries.finish_place_merges(links);
+        drop(link_memory);
+        self.build.context_records = Some(kept);
+        self.build.report.accepted.place_points_merged = merged;
+        Ok(())
+    }
+
     /// Addresses from outside OSM join the OSM ones before they are
     /// ordered. The source is asked only now, knowing the countries the
     /// Pack covers.
@@ -1293,10 +1484,14 @@ impl<'a> Run<'a> {
             .boundaries
             .as_ref()
             .ok_or_else(|| missing("the boundaries"))?;
-        let files = match &self.options.addresses {
-            Some(source) => source.files(&boundaries.coverage())?,
-            None => Vec::new(),
+        let picked = match &self.options.addresses {
+            Some(source) => source.pick(&boundaries.coverage())?,
+            None => addresses::Picked::default(),
         };
+        for why in &picked.left_out {
+            self.options.observer.warned(why);
+        }
+        let files = picked.files;
         let import_bytes = files
             .iter()
             .map(addresses::AddressFile::bytes)
@@ -1333,29 +1528,39 @@ impl<'a> Run<'a> {
                 }
                 None => false,
             };
-            let imported = addresses::read_file(file, |record| {
-                progress.check()?;
-                if broken {
-                    return Ok(Some("source_outside_area"));
-                }
-                let Some(point) = point_lon_lat(&record.geometry) else {
-                    return Ok(Some("outside_extract"));
-                };
-                let [lon, lat] = point;
-                let inside = extracts.as_ref().is_none_or(|boxes| {
-                    boxes
-                        .iter()
-                        .any(|b| (b[0]..=b[2]).contains(&lon) && (b[1]..=b[3]).contains(&lat))
-                });
-                if !inside {
-                    return Ok(Some("outside_extract"));
-                }
-                if area.is_some_and(|area| !area(point)) {
-                    return Ok(Some("outside_area"));
-                }
-                build.push(Record::Address(record), None)?;
-                Ok(None)
-            })?;
+            let mut dataset = None;
+            let imported = addresses::read_file_prepared(
+                file,
+                |record| {
+                    progress.check()?;
+                    if broken {
+                        return Ok(Err("source_outside_area"));
+                    }
+                    let Some(point) = point_lon_lat(&record.geometry) else {
+                        return Ok(Err("outside_extract"));
+                    };
+                    let [lon, lat] = point;
+                    let inside = extracts.as_ref().is_none_or(|boxes| {
+                        boxes
+                            .iter()
+                            .any(|b| (b[0]..=b[2]).contains(&lon) && (b[1]..=b[3]).contains(&lat))
+                    });
+                    if !inside {
+                        return Ok(Err("outside_extract"));
+                    }
+                    if area.as_ref().is_some_and(|area| !area(point)) {
+                        return Ok(Err("outside_area"));
+                    }
+                    Ok(Ok(PendingAddress::new(&record, 0, 0)?))
+                },
+                |address| {
+                    // Given at the file's first address, as for OSM's. A
+                    // file whose rows are all left out names no dataset.
+                    let id = *dataset.get_or_insert_with(|| build.datasets.id(&file.dataset));
+                    build.push_address(address, id)?;
+                    Ok(None)
+                },
+            )?;
             progress.advance(imported.bytes);
             progress
                 .input(&file.path)
@@ -1397,10 +1602,8 @@ impl<'a> Run<'a> {
         let mut ordered = Spool::<PendingRecord>::create(&self.scratch, "context-ordered")?;
         let mut boundary_ids = vec![0; boundaries.len()];
         let mut country_ids = HashMap::new();
-        // The areas that are settlements by their own tags, and the
-        // settlement points that may name the area they lie in.
+        // The areas that are settlements by their own tags.
         let mut settled = HashSet::new();
-        let mut settlements = Vec::new();
         // Context records are the first the Pack holds.
         for (index, item) in context_records.finish()?.enumerate() {
             let item = item?;
@@ -1408,55 +1611,41 @@ impl<'a> Run<'a> {
             match &item.origin {
                 Some(ContextOrigin::Boundary(boundary)) => {
                     boundary_ids[*boundary as usize] = record_id;
+                    if boundaries.is_settled(*boundary as usize) {
+                        settled.insert(record_id);
+                    }
                 }
                 Some(ContextOrigin::DerivedCountry(code)) => {
                     country_ids.insert(code.clone(), record_id);
                 }
                 None => {}
             }
-            if let Body::Record(record) = &item.body
+            if let Some(ContextOrigin::Boundary(_)) = item.origin
+                && let Body::Record(record) = &item.body
                 && let Record::Place(_, place) = record.as_ref()
                 && street::is_settlement(&place.place_type)
             {
-                match item.origin {
-                    Some(ContextOrigin::Boundary(_)) => {
-                        settled.insert(record_id);
-                    }
-                    Some(ContextOrigin::DerivedCountry(_)) => {}
-                    None => settlements
-                        .extend(search_key(&place.name).zip(point_lon_lat(&place.geometry))),
-                }
+                settled.insert(record_id);
             }
             ordered.write(&item)?;
         }
-        let mut contexts = Contexts::derive(
+        let open = self
+            .build
+            .town_votes
+            .take()
+            .ok_or_else(|| missing("the towns the addresses name"))?;
+        let mut votes = std::mem::take(&mut self.build.town_votes_saved);
+        if open.written() > 0 {
+            votes.push(open.finish()?);
+        }
+        self.contexts = Some(Contexts::derive(
             boundaries,
             ordered.finish()?,
             boundary_ids,
             country_ids,
             settled,
-        );
-        // An admin area is a settlement too when a settlement of its name
-        // lies in it, as a town's boundary holds the town's point. A ward or a
-        // local board holds none of its name.
-        let found = settlements
-            .par_iter()
-            .filter_map(|(name, [lon, lat])| {
-                let locality = contexts
-                    .index
-                    .context_for_point(*lon, *lat, &Default::default())
-                    .admin_context
-                    .locality_record_id()?;
-                contexts
-                    .area_names
-                    .get(&locality)?
-                    .iter()
-                    .any(|area| search_key(area).as_ref() == Some(name))
-                    .then_some(locality)
-            })
-            .collect::<Vec<_>>();
-        contexts.settled.extend(found);
-        self.contexts = Some(contexts);
+            TownReach::Votes(votes),
+        )?);
         self.build.report.phases.context_record_write_ms = phase.elapsed().as_millis();
         Ok(())
     }
@@ -1621,7 +1810,10 @@ impl<'a> Run<'a> {
             let [lon, lat] = point_lon_lat(&record.geometry).ok_or_else(|| {
                 Error::BadGeometry(format!("postcode {} has no point", record.postcode))
             })?;
-            points.write(&PostcodePoint(record.postcode.clone(), [lon, lat]))?;
+            points.write(&NamedPoint {
+                name: record.postcode.clone(),
+                point: [lon, lat],
+            })?;
             let records = open(&mut self.build.records, "records")?;
             records.push(PendingRecord {
                 key: hilbert_key(quantize(lon)?, quantize(lat)?),
@@ -1644,6 +1836,7 @@ impl<'a> Run<'a> {
             ordered,
             index,
             area_names,
+            area_tags,
             country_codes,
             region_groups,
             ..
@@ -1661,6 +1854,7 @@ impl<'a> Run<'a> {
             &self.writer_options(),
         )?;
         writer.set_context_names(area_names);
+        writer.set_area_tags(area_tags);
         writer.set_country_codes(country_codes);
         writer.set_region_groups(region_groups);
         let mut sample = Sampler::default();
@@ -1688,7 +1882,7 @@ impl<'a> Run<'a> {
             .ok_or_else(|| missing("the postcode points"))?;
         let points = postcodes
             .into_reader()
-            .map(|point| point.map(|PostcodePoint(postcode, point)| (postcode, point)))
+            .map(|point| point.map(|NamedPoint { name, point }| (name, point)))
             .collect::<Result<Vec<_>>>()?;
         writer.set_postcode_areas(PostcodeAreas::new(points));
         let records = self
@@ -1802,6 +1996,20 @@ impl<'a> Run<'a> {
             .iter()
             .map(SpoolFile::state)
             .collect::<Vec<_>>();
+        // Votes cast since the last checkpoint close into a spool of their own.
+        if let Some(open) = &mut self.build.town_votes
+            && open.written() > 0
+        {
+            let next = Spool::create(&scratch, TOWN_VOTES)?;
+            let closed = std::mem::replace(open, next);
+            self.build.town_votes_saved.push(closed.finish()?);
+        }
+        let town_votes = self
+            .build
+            .town_votes_saved
+            .iter()
+            .map(SpoolFile::state)
+            .collect::<Vec<_>>();
         let input = match &mut self.input {
             Some(input) => {
                 let (state, input_files) = input.save(&scratch)?;
@@ -1823,6 +2031,7 @@ impl<'a> Run<'a> {
                 settled.sort_unstable();
                 settled
             },
+            town_reach: contexts.index.town_reach(),
         });
         if let (Some(sample), None) = (&self.sample, &self.sample_saved) {
             let mut file = ScratchFile::create(&scratch, "sample", "sample.bin")?;
@@ -1834,7 +2043,7 @@ impl<'a> Run<'a> {
         if let Some(sealing) = &self.sealing {
             files.extend(sealing.files());
         }
-        for state in &geometry {
+        for state in geometry.iter().chain(&town_votes) {
             files.extend(state.files(&scratch));
         }
         let boundaries = self.boundaries_saved.as_ref().map(SpoolFile::state);
@@ -1876,6 +2085,7 @@ impl<'a> Run<'a> {
             imports: self.imports.clone(),
             contexts,
             postcodes,
+            town_votes,
             sample: self
                 .sample_saved
                 .as_ref()
@@ -2063,6 +2273,34 @@ fn open<'s, T>(
         .ok_or_else(|| Error::Inconsistent(format!("the {label} sorter was read already")))
 }
 
+const CONTEXT_RECORDS: &str = "context-records";
+
+/// The context-record sorter gets a sixteenth of a share, since context records are few.
+fn context_share(budget: usize) -> usize {
+    (budget / 16).max(1)
+}
+
+/// The place a pending context record is, with its layer.
+fn place_point(pending: &PendingRecord) -> Option<(PlaceLayer, &PlaceRecord)> {
+    match &pending.body {
+        Body::Record(record) => match record.as_ref() {
+            Record::Place(layer, place) => Some((*layer, place)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn context_sorter(
+    scratch: &Arc<Scratch>,
+    memory: &Arc<Budget>,
+    budget: usize,
+) -> ExternalSorter<PendingRecord> {
+    ExternalSorter::new(scratch, CONTEXT_RECORDS, memory, context_share(budget))
+}
+
+const TOWN_VOTES: &str = "town-votes";
+
 /// A step ran before the one that makes what it needs.
 fn missing(what: &str) -> Error {
     Error::Inconsistent(format!("{what} is missing: a build step ran out of order"))
@@ -2084,6 +2322,12 @@ struct Build {
     places: Option<ExternalSorter<PendingNamed>>,
     /// Places: everything a context tuple can point at.
     context_records: Option<ExternalSorter<PendingRecord>>,
+    /// The towns the addresses name, which measure how far each town
+    /// mapped as a point reaches.
+    town_votes: Option<Spool<NamedPoint>>,
+    /// The votes of the checkpoints before, as the scans cast them. Their
+    /// order does not matter, as a town reaches as far as its farthest vote.
+    town_votes_saved: Vec<SpoolFile<NamedPoint>>,
     /// The datasets of the imported addresses.
     datasets: Datasets,
     seq: u64,
@@ -2110,11 +2354,7 @@ impl Build {
         }
         for item in ready {
             match item {
-                Ready::Address(mut address) => {
-                    address.seq = self.seq;
-                    self.seq += 1;
-                    open(&mut self.addresses, "addresses")?.push(address)?;
-                }
+                Ready::Address(address) => self.push_address(address, 0)?,
                 Ready::Record(record) => self.push(*record, None)?,
             }
         }
@@ -2132,18 +2372,30 @@ impl Build {
         open(&mut self.places, "places")?.push(PendingNamed::place(place, self.seq - 1)?)
     }
 
+    /// An address cut into its sort key off this thread, numbered as it
+    /// takes its place in input order.
+    fn push_address(&mut self, address: PendingAddress, dataset: u32) -> Result<()> {
+        let fields = address.fields();
+        for name in [fields.locality, fields.place].into_iter().flatten() {
+            self.town_votes
+                .as_mut()
+                .ok_or_else(|| missing("the towns the addresses name"))?
+                .write(&NamedPoint {
+                    name: name.to_string(),
+                    point: address.point,
+                })?;
+        }
+        self.seq += 1;
+        open(&mut self.addresses, "addresses")?.push(address.numbered(self.seq - 1, dataset))
+    }
+
     fn push(&mut self, record: Record, origin: Option<ContextOrigin>) -> Result<()> {
         if let Record::Address(address) = record {
             let dataset = match address.source.object_type {
                 ObjectType::Row => self.datasets.id(&address.source.dataset),
                 _ => 0,
             };
-            self.seq += 1;
-            return open(&mut self.addresses, "addresses")?.push(PendingAddress::new(
-                &address,
-                self.seq - 1,
-                dataset,
-            )?);
+            return self.push_address(PendingAddress::new(&address, 0, 0)?, dataset);
         }
         if let Record::Street(street) = record {
             self.seq += 1;
@@ -2632,6 +2884,19 @@ fn find_repeated_houses(
         houses.push(address?.house(at as u64))?;
     }
     let mut verdicts = ExternalSorter::new(scratch, "house-verdicts", memory, budget);
+    // Dropped rows find their file by dataset id, not by name. A planet
+    // build drops 332 million rows from 3,141 files. Scanning names per row
+    // costs 3.2e11 string comparisons on this one thread.
+    let import_of = datasets
+        .names()
+        .iter()
+        .map(|name| {
+            report
+                .imports
+                .iter()
+                .position(|import| import.dataset == *name)
+        })
+        .collect::<Vec<_>>();
     let mut kept: Vec<House> = Vec::new();
     for house in houses.finish()? {
         let house = house?;
@@ -2671,12 +2936,10 @@ fn find_repeated_houses(
             verdicts.push((at, DISPUTED))?;
         }
         verdicts.push((house.at, DROPPED))?;
-        let dataset = datasets.name(house.dataset)?;
-        if let Some(import) = report
-            .imports
-            .iter_mut()
-            .find(|import| import.dataset == dataset)
-        {
+        let import = *import_of
+            .get(house.dataset as usize)
+            .ok_or(Error::Decode("unknown address dataset"))?;
+        if let Some(import) = import.and_then(|at| report.imports.get_mut(at)) {
             if repeated {
                 import.duplicates += 1;
             } else {
@@ -2996,12 +3259,25 @@ fn write_ordered(
                                         ranked_ref.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
-                                let located = record_context(index, &record);
+                                let own = match &origin {
+                                    Some(ContextOrigin::Boundary(boundary)) => {
+                                        index.own_area(*boundary)
+                                    }
+                                    _ => None,
+                                };
+                                let located = record_context(index, &record, own);
                                 let country = located
                                     .as_ref()
                                     .and_then(|context| context.admin_context.country_record_id());
-                                let context: Option<RecordContext> = match origin {
-                                    Some(_) => None,
+                                // A country derived from regions has none around it.
+                                let context = match origin {
+                                    Some(ContextOrigin::DerivedCountry(_)) => None,
+                                    Some(ContextOrigin::Boundary(_)) => located
+                                        .map(|located| RecordContext {
+                                            enclosing: located.enclosing,
+                                            ..Default::default()
+                                        })
+                                        .filter(RecordContext::is_area_list),
                                     None => located,
                                 };
                                 ((record, context), country)
@@ -3119,9 +3395,11 @@ mod tests {
     use crate::{
         builder::progress::StageUnit,
         pack::{PointPrecision, Reader},
-        record::Record,
+        parse::lattice::dictionary::Dictionaries,
+        record::{PlaceLayer, Record},
         reverse::{GeocodeOptions, MatchKind, PackReverseGeocoder},
         search::{TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher},
+        util::temp::TempPath,
     };
 
     use super::{
@@ -3435,9 +3713,12 @@ mod tests {
     }
 
     impl AddressSource for RecordingSource {
-        fn files(&self, coverage: &addresses::Coverage) -> Result<Vec<addresses::AddressFile>> {
+        fn pick(&self, coverage: &addresses::Coverage) -> Result<addresses::Picked> {
             self.asked.lock().expect("lock").push(coverage.clone());
-            Ok(self.files.clone())
+            Ok(addresses::Picked {
+                files: self.files.clone(),
+                left_out: Vec::new(),
+            })
         }
     }
 
@@ -3764,6 +4045,68 @@ mod tests {
             kept(&["openaddresses:lots:row:3", "openaddresses:register:row:1"]),
             [true],
             "one record of 30, disputed"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A dropped row counts on the first file of its dataset, whatever ids
+    /// the datasets got. A file with no address takes none, and a second
+    /// file of a dataset adds to the first one's counts.
+    #[test]
+    fn a_dropped_row_counts_on_the_first_file_of_its_dataset() {
+        let dir = temp_dir("dropped-row-file");
+        let input = dir.join("town.osm.pbf");
+        write_pbf(&input, &town());
+        let file = |name: &str, dataset: &str, rows: &str| {
+            let path = dir.join(format!("{name}.csv"));
+            fs::write(&path, format!("LON,LAT,NUMBER,STREET,CITY\n{rows}")).expect("csv");
+            addresses::AddressFile {
+                dataset: format!("openaddresses:{dataset}"),
+                path,
+                entry: None,
+                area: None,
+            }
+        };
+        let report = build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            addresses: Some(Arc::new(addresses::AddressFiles(vec![
+                file("empty", "empty", "-79.40,43.600,,King Street,Toronto\n"),
+                file(
+                    "lots",
+                    "lots",
+                    "-79.40,43.600,20,King Street,Toronto\n\
+                     -79.40,43.604,20,King Street,Toronto\n\
+                     -79.40,43.600,30,King Street,Toronto\n",
+                ),
+                file(
+                    "register",
+                    "register",
+                    "-79.40,43.604,30,King Street,Toronto\n",
+                ),
+                file(
+                    "lots-again",
+                    "lots",
+                    "-79.40,43.600,20,King Street,Toronto\n",
+                ),
+            ]))),
+            ..BuildOsmOptions::default()
+        })
+        .expect("build");
+
+        let counts = report
+            .imports
+            .iter()
+            .map(|import| (import.dataset.as_str(), import.duplicates, import.disputes))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            counts,
+            [
+                ("openaddresses:empty", 0, 0),
+                ("openaddresses:lots", 2, 0),
+                ("openaddresses:register", 0, 1),
+                ("openaddresses:lots", 0, 0),
+            ]
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -4929,6 +5272,112 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// France in the planet has levels no table row names above its
+    /// communes (3, France métropolitaine; 5, Collectivité européenne
+    /// d'Alsace). A street is still labelled and found by its commune, not by
+    /// the arrondissement named for the commune that is its seat.
+    #[test]
+    fn a_french_street_is_labelled_and_found_by_its_commune() {
+        let dir = temp_dir("french-communes");
+        let input = dir.join("france.osm.pbf");
+        let mut nodes = vec![
+            node(1, 2.5, 2.5, &[]),
+            node(2, 2.5, 2.501, &[]),
+            node(3, 3.5, 3.5, &[]),
+            node(4, 3.5, 3.501, &[]),
+            // Each commune's point names it, as in OSM.
+            node(5, 2.6, 2.6, &[("place", "city"), ("name", "Poitiers")]),
+            node(6, 3.6, 3.6, &[("place", "village"), ("name", "Ligugé")]),
+        ];
+        let mut ways = Vec::new();
+        let mut relations = Vec::new();
+        // Admin level, the corners of its square, its tags.
+        type Area<'a> = (&'a str, f64, f64, &'a [(&'a str, &'a str)]);
+        let areas: [Area; 9] = [
+            (
+                "2",
+                0.0,
+                10.0,
+                &[("name", "France"), ("ISO3166-1:alpha2", "FR")],
+            ),
+            ("3", 0.5, 9.5, &[("name", "France métropolitaine")]),
+            (
+                "4",
+                1.0,
+                5.0,
+                &[("name", "Nouvelle-Aquitaine"), ("ISO3166-2", "FR-NAQ")],
+            ),
+            (
+                "5",
+                6.0,
+                9.0,
+                &[("name", "Collectivité européenne d'Alsace")],
+            ),
+            ("6", 1.5, 4.5, &[("name", "Vienne"), ("ISO3166-2", "FR-86")]),
+            ("7", 2.0, 4.0, &[("name", "Poitiers")]),
+            ("8", 2.1, 2.9, &[("name", "Poitiers")]),
+            ("8", 3.1, 3.9, &[("name", "Ligugé")]),
+            ("8", 6.5, 7.5, &[("name", "Strasbourg")]),
+        ];
+        for (index, (level, low, high, tags)) in areas.into_iter().enumerate() {
+            let id = 100 + 10 * index as i64;
+            nodes.extend([
+                node(id, low, low, &[]),
+                node(id + 1, low, high, &[]),
+                node(id + 2, high, high, &[]),
+                node(id + 3, high, low, &[]),
+            ]);
+            ways.push(way(id, &[id, id + 1, id + 2, id + 3, id], &[]));
+            let mut tags = tags.to_vec();
+            tags.extend([("boundary", "administrative"), ("admin_level", level)]);
+            relations.push(relation(id, &[(id, "outer")], &tags));
+        }
+        let road = [("highway", "residential"), ("name", "Grande Rue")];
+        ways.extend([way(700, &[1, 2], &road), way(701, &[3, 4], &road)]);
+        write_pbf(&input, &[nodes, ways, relations]);
+        build(&dir.join("pack"), &input, None);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let mut streets = reader
+            .records_json_by_layer("street", 0)
+            .expect("streets")
+            .into_iter()
+            .map(|street| {
+                (
+                    street["id"].as_str().expect("id").to_string(),
+                    street["label"].as_str().expect("label").to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        streets.sort();
+        assert_eq!(
+            streets,
+            [
+                (
+                    "osm:way:700".to_string(),
+                    "Grande Rue, Poitiers".to_string()
+                ),
+                ("osm:way:701".to_string(), "Grande Rue, Ligugé".to_string()),
+            ]
+        );
+        let searcher = TextSearcher::open(dir.join("pack")).expect("searcher");
+        let found = searcher
+            .search(&TextSearchOptions {
+                query: "Grande Rue, Poitiers".to_string(),
+                limit: 1,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            })
+            .expect("search")
+            .into_iter()
+            .map(|hit| hit.record.id)
+            .collect::<Vec<_>>();
+        assert_eq!(found, ["osm:way:700"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn spilling_to_disk_builds_the_same_pack() {
         let dir = temp_dir("spill");
@@ -5400,15 +5849,742 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Every record and the context of each, in Pack order.
+    /// The ward is a way and a relation of one outline, so only the
+    /// tie-break orders them. An area lists the
+    /// larger areas only, whatever lies around its point, which for a hook
+    /// shape is not in the area at all.
+    #[test]
+    fn a_pack_lists_the_areas_a_record_lies_in_with_their_raw_tags() {
+        let dir = TempPath::new("build-enclosing");
+        fs::create_dir_all(&dir).expect("dir");
+        let input = dir.join("enclosing.osm.pbf");
+        let mut blocks = town();
+        let corners = [
+            (43.55, -79.55),
+            (43.55, -79.25),
+            (43.8, -79.25),
+            (43.8, -79.55),
+        ];
+        let nodes = (2001..)
+            .zip(corners)
+            .map(|(id, (lat, lon))| node(id, lat, lon, &[]));
+        blocks[1].extend(nodes);
+        let south = [("addr:housenumber", "7"), ("addr:street", "King Street")];
+        blocks[1].push(node(2010, 43.52, -79.4, &south));
+        let village = [("place", "village"), ("name", "Lonely")];
+        blocks[1].push(node(2011, 10.0, 10.0, &village));
+        let city = [
+            ("place", "city"),
+            ("boundary", "administrative"),
+            ("name", "Metro"),
+        ];
+        blocks[2].push(way(700, &[2001, 2002, 2003, 2004, 2001], &city));
+        // The centroid of the hook lies in its hollow, in the pocket, which is
+        // larger than the hook yet not around it.
+        let hook = [
+            (43.85, -79.95),
+            (43.85, -79.75),
+            (43.87, -79.75),
+            (43.87, -79.93),
+        ];
+        let hook = [
+            &hook[..],
+            &[
+                (43.93, -79.93),
+                (43.93, -79.75),
+                (43.95, -79.75),
+                (43.95, -79.95),
+            ],
+        ]
+        .concat();
+        let pocket = [
+            (43.871, -79.929),
+            (43.871, -79.751),
+            (43.929, -79.751),
+            (43.929, -79.929),
+        ];
+        for (way_id, first, level, name, ring) in [
+            (710, 3000, "9", "Hook", &hook[..]),
+            (711, 3100, "10", "Pocket", &pocket[..]),
+        ] {
+            let ids = (first..).take(ring.len()).collect::<Vec<_>>();
+            blocks[1].extend(
+                ids.iter()
+                    .zip(ring)
+                    .map(|(id, (lat, lon))| node(*id, *lat, *lon, &[])),
+            );
+            let tags = [
+                ("boundary", "administrative"),
+                ("admin_level", level),
+                ("name", name),
+            ];
+            blocks[2].push(way(way_id, &[&ids[..], &ids[..1]].concat(), &tags));
+        }
+        write_pbf(&input, &blocks);
+        build(&dir.join("pack"), &input, None);
+        let pack = Reader::open(dir.join("pack")).expect("reader");
+
+        let id = |source: &str| pack.find_by_source_id(source).unwrap().expect(source);
+        let [hook, pocket] = ["way:710", "way:711"].map(|source| id(&format!("osm:{source}")));
+        let [toronto, metro, ontario] =
+            ["relation:900", "way:700", "relation:901"].map(|source| id(&format!("osm:{source}")));
+        let (king, south, bay) = (id("osm:node:1"), id("osm:node:2010"), id("osm:way:602"));
+        let (ward, ward_relation) = (id("osm:way:605"), id("osm:relation:902"));
+        let context = pack.boundary_context(king).unwrap().expect("context");
+        // The place=city area is the town; the tiered locality lies inside it.
+        assert_eq!(context.admin_context.locality_record_id(), Some(metro));
+        assert_eq!(
+            context.admin_context.get(PlaceLayer::SubLocality),
+            Some(toronto)
+        );
+        // The country is derived from the region's code and shares its source id.
+        let canada = context.admin_context.country_record_id().expect("country");
+
+        let lists = [
+            (king, vec![toronto, metro, ontario, canada]),
+            (south, vec![toronto, ontario, canada]),
+            (
+                bay,
+                vec![ward_relation, ward, toronto, metro, ontario, canada],
+            ),
+            (toronto, vec![metro, ontario, canada]),
+            (metro, vec![ontario, canada]),
+            (canada, vec![]),
+            (hook, vec![ontario, canada]),
+            (pocket, vec![ontario, canada]),
+        ];
+        for (record, list) in lists {
+            assert_eq!(pack.enclosing_areas(record).unwrap(), list, "{record}");
+        }
+        // Metro is King's town, so the parser knows it; a place outside every area keeps its own.
+        let dictionaries = Dictionaries::open(pack.container()).expect("dictionaries");
+        assert_eq!(dictionaries.areas("metro"), [metro as u32]);
+        assert_eq!(dictionaries.areas("lonely"), [id("osm:node:2011") as u32]);
+        let admin = Some("administrative");
+        for (area, tags) in [
+            (toronto, Some(AreaTags::of(None, admin, Some("8")))),
+            (metro, Some(AreaTags::of(Some("city"), admin, None))),
+            (canada, None),
+        ] {
+            assert_eq!(pack.area_tags(area).unwrap(), tags, "{area}");
+            assert!(pack.boundary_context(area).unwrap().is_none(), "{area}");
+        }
+    }
+
+    /// Square areas and points, written as one extract.
+    struct Map {
+        nodes: Vec<TestElement>,
+        ways: Vec<TestElement>,
+        relations: Vec<TestElement>,
+        next: i64,
+    }
+
+    impl Map {
+        fn new() -> Self {
+            Self {
+                nodes: Vec::new(),
+                ways: Vec::new(),
+                relations: Vec::new(),
+                next: 1,
+            }
+        }
+
+        fn id(&mut self) -> i64 {
+            self.next += 1;
+            self.next
+        }
+
+        fn point(&mut self, lat: f64, lon: f64, tags: &[(&'static str, &'static str)]) -> i64 {
+            let id = self.id();
+            self.nodes.push(node(id, lat, lon, tags));
+            id
+        }
+
+        /// A closed way around `[south, west, north, east]`, and the ids of
+        /// its ring, which another area may be drawn over.
+        fn area(
+            &mut self,
+            [south, west, north, east]: [f64; 4],
+            tags: &[(&'static str, &'static str)],
+        ) -> Vec<i64> {
+            let ring = [(south, west), (south, east), (north, east), (north, west)]
+                .map(|(lat, lon)| self.point(lat, lon, &[]));
+            let ring = [&ring[..], &ring[..1]].concat();
+            self.over(&ring, tags);
+            ring
+        }
+
+        /// A relation of id `id` around `bounds`, for a rule that names it.
+        fn relation(&mut self, id: i64, bounds: [f64; 4], tags: &[(&'static str, &'static str)]) {
+            self.area(bounds, &[]);
+            let TestElement::Way { id: outer, .. } = self.ways.last().expect("way") else {
+                unreachable!("an area is a way");
+            };
+            self.relations
+                .push(relation(id, &[(*outer, "outer")], tags));
+        }
+
+        fn over(&mut self, ring: &[i64], tags: &[(&'static str, &'static str)]) {
+            let id = self.id();
+            self.ways.push(way(id, ring, tags));
+        }
+
+        fn build(self, name: &str) -> (TempPath, Reader) {
+            let dir = TempPath::new(name);
+            fs::create_dir_all(&dir).expect("dir");
+            let input = dir.join("map.osm.pbf");
+            write_pbf(&input, &[self.nodes, self.ways, self.relations]);
+            build(&dir.join("pack"), &input, None);
+            let pack = Reader::open(dir.join("pack")).expect("reader");
+            (dir, pack)
+        }
+    }
+
+    fn admin(level: &'static str, name: &'static str) -> [(&'static str, &'static str); 3] {
+        [
+            ("boundary", "administrative"),
+            ("admin_level", level),
+            ("name", name),
+        ]
+    }
+
+    fn country(name: &'static str, code: &'static str) -> [(&'static str, &'static str); 4] {
+        let [boundary, level, name] = admin("2", name);
+        [boundary, level, name, ("ISO3166-1:alpha2", code)]
+    }
+
+    /// The name in each tier of a record's context, outermost first.
+    fn tiers(pack: &Reader, node: i64) -> Vec<(PlaceLayer, String)> {
+        let record = pack
+            .find_by_source_id(&format!("osm:node:{node}"))
+            .unwrap()
+            .expect("record");
+        let context = pack.boundary_context(record).unwrap().expect("context");
+        PlaceLayer::ALL
+            .into_iter()
+            .filter_map(|tier| {
+                let area = context.admin_context.get(tier)?;
+                Some((tier, pack.context_record(area).unwrap()?.name))
+            })
+            .collect()
+    }
+
+    fn named(tiers: &[(PlaceLayer, &str)]) -> Vec<(PlaceLayer, String)> {
+        tiers
+            .iter()
+            .map(|(tier, name)| (*tier, name.to_string()))
+            .collect()
+    }
+
+    fn house(map: &mut Map, lat: f64, lon: f64) -> i64 {
+        map.point(
+            lat,
+            lon,
+            &[("addr:housenumber", "10"), ("addr:street", "High Street")],
+        )
+    }
+
+    /// A town mapped only as a point is the town of the houses around it,
+    /// as far as the addresses that name it. The borough holding it is a
+    /// city by its own tags too, and yields to the city it is part of, which
+    /// is better known.
+    #[test]
+    fn a_town_mapped_as_a_point_is_the_locality() {
+        let mut map = Map::new();
+        map.area([50.0, -2.0, 53.0, 1.0], &country("United Kingdom", "GB"));
+        map.area([50.5, -1.5, 52.5, 0.5], &admin("4", "England"));
+        map.area([51.3, -0.5, 51.7, 0.3], &admin("5", "Greater London"));
+        map.area(
+            [51.49, -0.16, 51.52, -0.11],
+            &admin("8", "City of Westminster"),
+        );
+        map.point(
+            51.497,
+            -0.137,
+            &[("place", "city"), ("name", "City of Westminster")],
+        );
+        // Admin level table ranks the City of London's level 6 at locality.
+        map.relation(
+            51800,
+            [51.51, -0.11, 51.52, -0.08],
+            &admin("6", "City of London"),
+        );
+        map.point(
+            51.507,
+            -0.128,
+            &[
+                ("place", "city"),
+                ("name", "London"),
+                ("name:de", "London"),
+                ("name:fr", "Londres"),
+                ("name:ru", "Лондон"),
+                ("wikidata", "Q84"),
+            ],
+        );
+        map.point(
+            51.536,
+            -0.103,
+            &[
+                ("addr:housenumber", "1"),
+                ("addr:street", "Upper Street"),
+                ("addr:city", "London"),
+            ],
+        );
+        let downing = house(&mut map, 51.5034, -0.1276);
+        let (_dir, pack) = map.build("town-dot");
+        assert_eq!(
+            tiers(&pack, downing),
+            named(&[
+                (PlaceLayer::Country, "United Kingdom"),
+                (PlaceLayer::Region, "England"),
+                (PlaceLayer::District, "Greater London"),
+                (PlaceLayer::Locality, "London"),
+                (PlaceLayer::SubLocality, "City of Westminster"),
+            ])
+        );
+    }
+
+    /// Of two villages mapped as points, a house by one lies in that one,
+    /// though the other is better known.
+    #[test]
+    fn a_house_by_a_village_point_is_in_that_village() {
+        let mut map = Map::new();
+        map.area([50.0, -2.0, 53.0, 1.0], &country("United Kingdom", "GB"));
+        map.area([50.5, -1.5, 52.5, 0.5], &admin("4", "England"));
+        map.point(51.0, -1.0, &[("place", "village"), ("name", "Ashby")]);
+        map.point(
+            51.0,
+            -0.98,
+            &[
+                ("place", "village"),
+                ("name", "Bourne"),
+                ("name:de", "Bourne"),
+                ("wikidata", "Q1"),
+            ],
+        );
+        let farm = house(&mut map, 51.0005, -0.9995);
+        let (_dir, pack) = map.build("town-villages");
+        assert_eq!(
+            tiers(&pack, farm),
+            named(&[
+                (PlaceLayer::Country, "United Kingdom"),
+                (PlaceLayer::Region, "England"),
+                (PlaceLayer::Locality, "Ashby"),
+            ])
+        );
+    }
+
+    /// A village point is the town of a house in an extract that holds a
+    /// region but no country boundary, where the country is only inferred.
+    #[test]
+    fn a_village_point_names_a_house_when_the_country_is_inferred() {
+        let mut map = Map::new();
+        map.area(
+            [42.0, -85.0, 49.0, -75.0],
+            &[
+                ("boundary", "administrative"),
+                ("admin_level", "4"),
+                ("name", "Ontario"),
+                ("ISO3166-2", "CA-ON"),
+            ],
+        );
+        map.point(45.0, -80.0, &[("place", "village"), ("name", "Ashby")]);
+        map.point(45.0, -79.9, &[("place", "village"), ("name", "Bourne")]);
+        let farm = house(&mut map, 45.0005, -80.0005);
+        let (_dir, pack) = map.build("town-inferred-country");
+        assert!(
+            tiers(&pack, farm).contains(&(PlaceLayer::Locality, "Ashby".to_string())),
+            "{:?}",
+            tiers(&pack, farm)
+        );
+    }
+
+    /// An extract with no area boundary still has its village points.
+    #[test]
+    fn a_village_point_names_a_house_in_an_extract_with_no_boundary() {
+        let mut map = Map::new();
+        map.point(51.0, -1.0, &[("place", "village"), ("name", "Ashby")]);
+        map.point(51.0, -0.9, &[("place", "village"), ("name", "Bourne")]);
+        let farm = house(&mut map, 51.0005, -0.9995);
+        let (_dir, pack) = map.build("town-no-boundary");
+        assert_eq!(
+            tiers(&pack, farm),
+            named(&[(PlaceLayer::Locality, "Ashby")])
+        );
+    }
+
+    /// A city whose boundary sits in a tier above `locality` is the town of
+    /// the houses and streets in it, once, and its boroughs lie below it.
+    #[test]
+    fn a_city_boundary_above_the_locality_tier_is_the_locality() {
+        let mut map = Map::new();
+        map.area([47.0, 9.0, 50.0, 13.0], &country("Deutschland", "DE"));
+        map.area([47.5, 10.0, 49.5, 12.5], &admin("4", "Bayern"));
+        map.area([47.8, 11.0, 48.5, 12.3], &admin("5", "Oberbayern"));
+        map.area([48.06, 11.36, 48.25, 11.72], &admin("6", "München"));
+        map.area([48.13, 11.57, 48.15, 11.6], &admin("9", "Altstadt-Lehel"));
+        map.point(48.137, 11.575, &[("place", "city"), ("name", "München")]);
+        // Type-word name only, so not the city though smaller and holding its point.
+        map.area(
+            [48.1365, 11.574, 48.1372, 11.5752],
+            &admin("11", "Stadt München"),
+        );
+        let marienplatz = house(&mut map, 48.1374, 11.5755);
+        let ends = [11.57, 11.574].map(|lon| map.point(48.139, lon, &[]));
+        map.ways.push(way(
+            9000,
+            &ends,
+            &[("highway", "residential"), ("name", "Kaufingerstraße")],
+        ));
+        let (_dir, pack) = map.build("town-city-district");
+        let street = pack
+            .find_by_source_id("osm:way:9000")
+            .unwrap()
+            .expect("street");
+        assert_eq!(
+            pack.record_json(street).unwrap()["locality"],
+            "München",
+            "a street is named by its town"
+        );
+        assert_eq!(
+            tiers(&pack, marienplatz),
+            named(&[
+                (PlaceLayer::Country, "Deutschland"),
+                (PlaceLayer::Region, "Bayern"),
+                (PlaceLayer::SubRegion, "Oberbayern"),
+                (PlaceLayer::Locality, "München"),
+                (PlaceLayer::SubLocality, "Altstadt-Lehel"),
+            ])
+        );
+    }
+
+    /// A borough and its county are drawn over the same ground inside the
+    /// city. Both move below it and want one tier, which the finer level
+    /// takes, and the county stays in the list of areas the house lies in.
+    #[test]
+    fn a_borough_and_its_county_inside_a_city_keep_the_borough() {
+        let mut map = Map::new();
+        map.area([40.0, -75.0, 42.0, -73.0], &country("United States", "US"));
+        map.area([40.2, -74.8, 41.8, -73.2], &admin("4", "New York"));
+        map.area(
+            [40.5, -74.3, 40.95, -73.7],
+            &[("place", "city"), ("name", "City of New York")],
+        );
+        let ring = map.area([40.57, -74.04, 40.74, -73.83], &admin("6", "Kings County"));
+        map.over(&ring, &admin("7", "Brooklyn"));
+
+        let parkway = house(&mut map, 40.6712, -73.9636);
+        let (_dir, pack) = map.build("town-borough");
+        assert_eq!(
+            tiers(&pack, parkway),
+            named(&[
+                (PlaceLayer::Country, "United States"),
+                (PlaceLayer::Region, "New York"),
+                (PlaceLayer::Locality, "City of New York"),
+                (PlaceLayer::SubLocality, "Brooklyn"),
+            ])
+        );
+        let record = pack
+            .find_by_source_id(&format!("osm:node:{parkway}"))
+            .unwrap()
+            .expect("record");
+        let names = pack
+            .enclosing_areas(record)
+            .unwrap()
+            .into_iter()
+            .map(|area| pack.context_record(area).unwrap().expect("area").name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"Kings County".to_string()), "{names:?}");
+    }
+
+    /// A city district the tiers put in `locality` lies inside the city area
+    /// around it, so the city is the town and the district moves below it,
+    /// under the okrug it lies in.
+    #[test]
+    fn a_district_inside_a_city_area_lies_below_the_city() {
+        let mut map = Map::new();
+        map.area([54.0, 36.0, 57.0, 39.0], &country("Россия", "RU"));
+        map.area([55.4, 37.1, 56.0, 38.0], &admin("4", "Москва"));
+        map.area(
+            [55.57, 37.3, 55.92, 37.9],
+            &[("place", "city"), ("name", "Москва")],
+        );
+        map.area(
+            [55.7, 37.7, 55.85, 37.85],
+            &admin("5", "Восточный административный округ"),
+        );
+        map.area([55.78, 37.75, 55.8, 37.8], &admin("8", "район Измайлово"));
+        let boulevard = house(&mut map, 55.795, 37.79);
+        let (_dir, pack) = map.build("town-district");
+        let context = tiers(&pack, boulevard);
+        let at = |tier| {
+            context
+                .iter()
+                .find(|(held, _)| *held == tier)
+                .map(|(_, name)| name.as_str())
+        };
+        assert_eq!(at(PlaceLayer::Region), Some("Москва"));
+        assert_eq!(at(PlaceLayer::Locality), Some("Москва"));
+        assert_eq!(
+            at(PlaceLayer::SubLocality),
+            Some("Восточный административный округ")
+        );
+        assert_eq!(at(PlaceLayer::Neighbourhood), Some("район Измайлово"));
+    }
+
+    /// A district lies inside its okrug though it holds the okrug's own
+    /// inner point, as one of the parts an area is made of does.
+    #[test]
+    fn a_district_holding_its_okrugs_inner_point_still_lies_inside_it() {
+        let mut map = Map::new();
+        map.area([54.0, 36.0, 57.0, 39.0], &country("Россия", "RU"));
+        map.area([55.4, 37.1, 56.0, 38.0], &admin("4", "Москва"));
+        map.area(
+            [55.57, 37.3, 55.92, 37.9],
+            &[("place", "city"), ("name", "Москва")],
+        );
+        map.area(
+            [55.7, 37.7, 55.85, 37.85],
+            &admin("5", "Восточный административный округ"),
+        );
+        map.area(
+            [55.76, 37.76, 55.8, 37.8],
+            &admin("8", "район Соколиная Гора"),
+        );
+        let house = house(&mut map, 55.775, 37.775);
+        let (_dir, pack) = map.build("town-district-centre");
+        let context = tiers(&pack, house);
+        let at = |tier| {
+            context
+                .iter()
+                .find(|(held, _)| *held == tier)
+                .map(|(_, name)| name.as_str())
+        };
+        assert_eq!(at(PlaceLayer::Locality), Some("Москва"), "{context:?}");
+        assert_eq!(
+            at(PlaceLayer::SubLocality),
+            Some("Восточный административный округ"),
+            "{context:?}"
+        );
+        assert_eq!(
+            at(PlaceLayer::Neighbourhood),
+            Some("район Соколиная Гора"),
+            "{context:?}"
+        );
+    }
+
+    /// A city whose tiers already name it keeps its context, and a commune
+    /// holding a hamlet's point stays the town, as a point counts only where
+    /// the tiers name no town.
+    #[test]
+    fn a_town_the_tiers_name_keeps_its_context() {
+        let mut map = Map::new();
+        map.area([42.0, -5.0, 51.0, 8.0], &country("France", "FR"));
+        map.area([48.1, 1.4, 49.2, 3.6], &admin("4", "Île-de-France"));
+        map.area([48.81, 2.22, 48.91, 2.47], &admin("6", "Paris"));
+        map.area([48.815, 2.224, 48.902, 2.469], &admin("8", "Paris"));
+        map.point(48.8567, 2.3508, &[("place", "city"), ("name", "Paris")]);
+        map.area(
+            [48.85, 2.35, 48.862, 2.369],
+            &admin("9", "Paris 4e Arrondissement"),
+        );
+        let rivoli = house(&mut map, 48.8553, 2.3601);
+        map.area([47.85, -1.7, 47.9, -1.62], &admin("8", "Pancé"));
+        map.point(47.88, -1.66, &[("place", "hamlet"), ("name", "La Touche")]);
+        let farm = house(&mut map, 47.8818, -1.6613);
+        let (_dir, pack) = map.build("town-tiered");
+        assert_eq!(
+            tiers(&pack, rivoli),
+            named(&[
+                (PlaceLayer::Country, "France"),
+                (PlaceLayer::Region, "Île-de-France"),
+                (PlaceLayer::District, "Paris"),
+                (PlaceLayer::Locality, "Paris"),
+                (PlaceLayer::Neighbourhood, "Paris 4e Arrondissement"),
+            ])
+        );
+        assert_eq!(
+            tiers(&pack, farm),
+            named(&[
+                (PlaceLayer::Country, "France"),
+                (PlaceLayer::Locality, "Pancé"),
+            ])
+        );
+    }
+
+    /// A district named for a town only by the town's local nickname holds
+    /// no town. The town stays a point of its own, inside the district.
+    #[test]
+    fn a_district_named_like_a_town_nickname_is_no_town() {
+        let mut map = Map::new();
+        map.area([-47.5, 166.0, -34.0, 179.0], &country("New Zealand", "NZ"));
+        map.area([-46.8, 169.0, -45.9, 170.3], &admin("4", "Otago"));
+        map.area([-46.7, 169.2, -46.0, 170.2], &admin("6", "Clutha District"));
+        map.point(
+            -46.2378,
+            169.7399,
+            &[
+                ("place", "town"),
+                ("name", "Balclutha"),
+                ("loc_name", "Clutha"),
+            ],
+        );
+        map.point(
+            -46.30,
+            169.70,
+            &[("place", "village"), ("name", "Stirling")],
+        );
+        let road = house(&mut map, -46.239, 169.742);
+        let (_dir, pack) = map.build("town-nickname");
+        let context = tiers(&pack, road);
+        assert!(
+            context.contains(&(PlaceLayer::Locality, "Balclutha".to_string())),
+            "{context:?}"
+        );
+        assert!(
+            !context.contains(&(PlaceLayer::Locality, "Clutha District".to_string())),
+            "{context:?}"
+        );
+    }
+
+    /// A district named for the town it is run from, which holds the
+    /// district's other towns too, is no town; and a town point lies in no
+    /// other town point, however far that town reaches.
+    #[test]
+    fn a_district_named_for_its_seat_is_no_town() {
+        let mut map = Map::new();
+        map.area([-47.5, 166.0, -34.0, 179.0], &country("New Zealand", "NZ"));
+        map.area([-44.6, 170.6, -43.9, 171.5], &admin("4", "Canterbury"));
+        map.area([-44.5, 170.8, -44.0, 171.4], &admin("6", "Timaru District"));
+        map.point(-44.396, 171.254, &[("place", "town"), ("name", "Timaru")]);
+        let temuka = map.point(-44.244, 171.278, &[("place", "town"), ("name", "Temuka")]);
+        let seadown = map.point(-44.33, 171.25, &[("place", "village"), ("name", "Seadown")]);
+        map.point(
+            -44.33,
+            171.2,
+            &[
+                ("addr:housenumber", "1"),
+                ("addr:street", "Main North Road"),
+                ("addr:city", "Timaru"),
+            ],
+        );
+        let near = house(&mut map, -44.397, 171.255);
+        let (_dir, pack) = map.build("town-seat");
+        assert_eq!(
+            tiers(&pack, near),
+            named(&[
+                (PlaceLayer::Country, "New Zealand"),
+                (PlaceLayer::Region, "Canterbury"),
+                (PlaceLayer::District, "Timaru District"),
+                (PlaceLayer::Locality, "Timaru"),
+            ])
+        );
+        for town in [temuka, seadown] {
+            let context = tiers(&pack, town);
+            assert!(
+                !context
+                    .iter()
+                    .any(|(tier, _)| *tier == PlaceLayer::Locality),
+                "{context:?}"
+            );
+        }
+    }
+
+    /// A state named like a hamlet in it is no town, as it holds bigger
+    /// towns too.
+    #[test]
+    fn a_state_named_like_a_hamlet_in_it_is_no_town() {
+        let mut map = Map::new();
+        map.area([47.0, 9.0, 50.0, 13.0], &country("Deutschland", "DE"));
+        map.area([47.5, 10.0, 49.5, 12.9], &admin("4", "Bayern"));
+        map.area([47.7, 12.4, 47.9, 12.7], &admin("8", "Ruhpolding"));
+        map.point(47.794, 12.534, &[("place", "hamlet"), ("name", "Bayern")]);
+        map.point(
+            47.761,
+            12.645,
+            &[("place", "village"), ("name", "Ruhpolding")],
+        );
+        map.point(48.137, 11.575, &[("place", "city"), ("name", "München")]);
+        let farm = house(&mut map, 47.795, 12.535);
+        let outside = house(&mut map, 48.5, 11.0);
+        let (_dir, pack) = map.build("town-state-hamlet");
+        assert_eq!(
+            tiers(&pack, farm),
+            named(&[
+                (PlaceLayer::Country, "Deutschland"),
+                (PlaceLayer::Region, "Bayern"),
+                (PlaceLayer::Locality, "Ruhpolding"),
+            ])
+        );
+        let context = tiers(&pack, outside);
+        assert!(
+            !context.contains(&(PlaceLayer::Locality, "Bayern".to_string())),
+            "{context:?}"
+        );
+    }
+
+    /// A city drawn as an area counts against the state named like a hamlet
+    /// as a city point does.
+    #[test]
+    fn a_state_named_like_a_hamlet_in_it_is_no_town_with_the_city_an_area() {
+        let mut map = Map::new();
+        map.area([47.0, 9.0, 50.0, 13.0], &country("Deutschland", "DE"));
+        map.area([47.5, 10.0, 49.5, 12.9], &admin("4", "Bayern"));
+        map.area([48.0, 11.4, 48.3, 11.7], &admin("8", "München"));
+        map.point(47.794, 12.534, &[("place", "hamlet"), ("name", "Bayern")]);
+        map.point(48.137, 11.575, &[("place", "city"), ("name", "München")]);
+        let outside = house(&mut map, 48.5, 11.0);
+        let (_dir, pack) = map.build("town-state-hamlet-city-area");
+        let context = tiers(&pack, outside);
+        assert!(
+            !context.contains(&(PlaceLayer::Locality, "Bayern".to_string())),
+            "{context:?}"
+        );
+    }
+
+    /// A village drawn inside the municipality the tiers put in `locality`
+    /// stays below it, as the municipality is the town its addresses name.
+    /// The village a merged municipality grew from holds its own point.
+    #[test]
+    fn a_village_inside_the_tiered_town_stays_below_it() {
+        let mut map = Map::new();
+        map.area(
+            [49.5, 2.5, 51.5, 6.4],
+            &country("België / Belgique / Belgien", "BE"),
+        );
+        map.area([50.6, 2.5, 51.4, 5.9], &admin("4", "Vlaanderen"));
+        map.area([50.73, 3.43, 50.8, 3.58], &admin("8", "Kluisbergen"));
+        map.area([50.73, 3.47, 50.8, 3.58], &admin("9", "Kwaremont"));
+        map.point(
+            50.755,
+            3.525,
+            &[("place", "village"), ("name", "Kwaremont")],
+        );
+        let kraaistraat = house(&mut map, 50.756, 3.526);
+        let (_dir, pack) = map.build("town-inside-tiered");
+        assert_eq!(
+            tiers(&pack, kraaistraat),
+            named(&[
+                (PlaceLayer::Country, "België / Belgique / Belgien"),
+                (PlaceLayer::Region, "Vlaanderen"),
+                (PlaceLayer::Locality, "Kluisbergen"),
+                (PlaceLayer::SubLocality, "Kwaremont"),
+            ])
+        );
+    }
+
+    /// Every record and the context of each, in Pack order, with the areas
+    /// each lies in and its own tags.
     fn records_and_contexts(pack: &Path) -> Vec<(serde_json::Value, Option<RecordContext>)> {
         let reader = Reader::open(pack).expect("reader");
         (0..reader.manifest().record_count)
             .map(|id| {
-                (
-                    reader.record_json(id).expect("record"),
-                    reader.boundary_context(id).expect("context"),
-                )
+                let record = serde_json::json!({
+                    "record": reader.record_json(id).expect("record"),
+                    "enclosing": reader.enclosing_areas(id).expect("areas"),
+                    "tags": reader.area_tags(id).expect("tags"),
+                });
+                (record, reader.boundary_context(id).expect("context"))
             })
             .collect()
     }
@@ -5585,5 +6761,578 @@ mod tests {
             .count();
         assert_eq!(generations, 1, "the stopped build's generation is gone");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Seattle's relation labels its city node, and Bellevue's shares its
+    /// node's Wikidata item: each becomes one record at its node's point.
+    #[test]
+    fn cities_merge_with_their_label_or_wikidata_node() {
+        let dir = temp_dir("two-cities");
+        let input = dir.join("cities.osm.pbf");
+        let city = |name, item| {
+            [
+                ("boundary", "administrative"),
+                ("admin_level", "8"),
+                ("name", name),
+                ("wikidata", item),
+            ]
+        };
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(
+                        10,
+                        0.2,
+                        0.3,
+                        &[
+                            ("place", "city"),
+                            ("name", "Seattle"),
+                            ("alt_name", "Emerald City"),
+                            ("name:lut", "dᶻidᶻəlal̓ič"),
+                        ],
+                    ),
+                    node(
+                        11,
+                        2.4,
+                        2.6,
+                        &[
+                            ("place", "city"),
+                            ("name", "Bellevue"),
+                            ("wikidata", "Q214164"),
+                        ],
+                    ),
+                    node(100, 0.0, 0.0, &[]),
+                    node(101, 0.0, 1.0, &[]),
+                    node(102, 1.0, 1.0, &[]),
+                    node(103, 1.0, 0.0, &[]),
+                    node(110, 2.0, 2.0, &[]),
+                    node(111, 2.0, 3.0, &[]),
+                    node(112, 3.0, 3.0, &[]),
+                    node(113, 3.0, 2.0, &[]),
+                ],
+                vec![
+                    way(100, &[100, 101, 102, 103, 100], &[]),
+                    way(110, &[110, 111, 112, 113, 110], &[]),
+                ],
+                vec![
+                    TestElement::Relation {
+                        id: 900,
+                        members: vec![(100, "outer")],
+                        nodes: vec![(10, "label")],
+                        tags: city("Seattle", "Q5083").to_vec(),
+                    },
+                    relation(901, &[(110, "outer")], &city("Bellevue", "Q214164")),
+                ],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.place_points_merged, 2);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let mut cities = reader
+            .records_json_by_layer("locality", 0)
+            .expect("cities")
+            .into_iter()
+            .map(|city| {
+                (
+                    city["id"].as_str().expect("id").to_string(),
+                    city["geometry"]["coordinates"].clone(),
+                    city["alt_names"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        cities.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            cities,
+            [
+                (
+                    "osm:relation:900".to_string(),
+                    serde_json::json!([0.3, 0.2]),
+                    serde_json::json!(["Emerald City", "dᶻidᶻəlal̓ič"]),
+                ),
+                (
+                    "osm:relation:901".to_string(),
+                    serde_json::json!([2.6, 2.4]),
+                    serde_json::Value::Null,
+                ),
+            ]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A county's relation may name its seat as both `label` and
+    /// `admin_centre`, but the seat is a town of its own and stays separate.
+    #[test]
+    fn a_countys_seat_stays_its_own_place() {
+        let dir = temp_dir("county-seat");
+        let input = dir.join("county.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(10, 0.5, 0.5, &[("place", "town"), ("name", "Kent")]),
+                    node(100, 0.0, 0.0, &[]),
+                    node(101, 0.0, 1.0, &[]),
+                    node(102, 1.0, 1.0, &[]),
+                    node(103, 1.0, 0.0, &[]),
+                ],
+                vec![way(100, &[100, 101, 102, 103, 100], &[])],
+                vec![TestElement::Relation {
+                    id: 900,
+                    members: vec![(100, "outer")],
+                    nodes: vec![(10, "label"), (10, "admin_centre")],
+                    tags: vec![
+                        ("boundary", "administrative"),
+                        ("admin_level", "6"),
+                        ("name", "King County"),
+                    ],
+                }],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.place_points_merged, 0);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        for id in ["osm:node:10", "osm:relation:900"] {
+            assert!(
+                reader.find_by_source_id(id).expect("lookup").is_some(),
+                "{id}"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A suburb tagged with its city's Wikidata item is on another layer, and
+    /// a city node far outside the boundary must not be pulled in by a
+    /// mistagged item: both stay separate.
+    #[test]
+    fn a_shared_item_merges_only_on_its_layer_and_within_bounds() {
+        let dir = temp_dir("shared-item");
+        let input = dir.join("bellevue.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(
+                        10,
+                        0.5,
+                        0.5,
+                        &[
+                            ("place", "suburb"),
+                            ("name", "Downtown Bellevue"),
+                            ("wikidata", "Q214164"),
+                        ],
+                    ),
+                    node(
+                        11,
+                        5.0,
+                        5.0,
+                        &[
+                            ("place", "city"),
+                            ("name", "Bellevue"),
+                            ("wikidata", "Q214164"),
+                        ],
+                    ),
+                    node(100, 0.0, 0.0, &[]),
+                    node(101, 0.0, 1.0, &[]),
+                    node(102, 1.0, 1.0, &[]),
+                    node(103, 1.0, 0.0, &[]),
+                ],
+                vec![way(100, &[100, 101, 102, 103, 100], &[])],
+                vec![relation(
+                    900,
+                    &[(100, "outer")],
+                    &[
+                        ("boundary", "administrative"),
+                        ("admin_level", "8"),
+                        ("name", "Bellevue"),
+                        ("wikidata", "Q214164"),
+                    ],
+                )],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.place_points_merged, 0);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        for id in ["osm:node:10", "osm:node:11", "osm:relation:900"] {
+            assert!(
+                reader.find_by_source_id(id).expect("lookup").is_some(),
+                "{id}"
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Ballard has no label or item, so the suburb node of its name inside it
+    /// merges and lends it its item. A Ballard node outside it, and a
+    /// differently named node inside, stay separate.
+    #[test]
+    fn a_place_node_merges_into_the_boundary_of_its_name_around_it() {
+        let dir = temp_dir("merge-by-name");
+        let input = dir.join("ballard.osm.pbf");
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(
+                        10,
+                        0.5,
+                        0.5,
+                        &[
+                            ("place", "suburb"),
+                            ("name", "Ballard"),
+                            ("wikidata", "Q3428047"),
+                        ],
+                    ),
+                    node(11, 5.0, 5.0, &[("place", "suburb"), ("name", "Ballard")]),
+                    node(
+                        12,
+                        0.6,
+                        0.6,
+                        &[("place", "neighbourhood"), ("name", "Loyal Heights")],
+                    ),
+                    node(100, 0.0, 0.0, &[]),
+                    node(101, 0.0, 1.0, &[]),
+                    node(102, 1.0, 1.0, &[]),
+                    node(103, 1.0, 0.0, &[]),
+                    node(200, -1.0, -1.0, &[]),
+                    node(201, -1.0, 6.0, &[]),
+                    node(202, 6.0, 6.0, &[]),
+                    node(203, 6.0, -1.0, &[]),
+                ],
+                vec![
+                    way(
+                        100,
+                        &[100, 101, 102, 103, 100],
+                        &[
+                            ("boundary", "administrative"),
+                            ("admin_level", "10"),
+                            ("name", "Ballard"),
+                        ],
+                    ),
+                    way(200, &[200, 201, 202, 203, 200], &[]),
+                ],
+                vec![relation(
+                    900,
+                    &[(200, "outer")],
+                    &[
+                        ("boundary", "administrative"),
+                        ("admin_level", "8"),
+                        ("name", "Seattle"),
+                    ],
+                )],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.place_points_merged, 1);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let mut places = reader
+            .records_json_by_layer("neighbourhood", 0)
+            .expect("places")
+            .into_iter()
+            .map(|place| {
+                (
+                    place["id"].as_str().expect("id").to_string(),
+                    place["geometry"]["coordinates"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        places.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            places,
+            [
+                ("osm:node:11".to_string(), serde_json::json!([5.0, 5.0])),
+                ("osm:node:12".to_string(), serde_json::json!([0.6, 0.6])),
+                ("osm:way:100".to_string(), serde_json::json!([0.5, 0.5])),
+            ]
+        );
+        let ballard = reader
+            .find_by_source_id("osm:way:100")
+            .expect("lookup")
+            .expect("Ballard");
+        assert_eq!(
+            reader.records().wikidata(ballard).expect("wikidata"),
+            Some(3428047)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A boundary that absorbs a town node is a settlement, so streets inside
+    /// it take the town's name rather than the district's.
+    #[test]
+    fn a_boundary_that_absorbs_a_town_node_is_a_settlement() {
+        let dir = temp_dir("labelled-town");
+        let input = dir.join("town.osm.pbf");
+        let admin = |level, name| {
+            vec![
+                ("boundary", "administrative"),
+                ("admin_level", level),
+                ("name", name),
+            ]
+        };
+        write_pbf(
+            &input,
+            &[
+                vec![
+                    node(10, 0.75, 0.75, &[("place", "town"), ("name", "Kingston")]),
+                    node(20, 0.7, 0.7, &[]),
+                    node(21, 0.7, 0.701, &[]),
+                    node(100, 0.0, 0.0, &[]),
+                    node(101, 0.0, 1.0, &[]),
+                    node(102, 1.0, 1.0, &[]),
+                    node(103, 1.0, 0.0, &[]),
+                    node(110, 0.6, 0.6, &[]),
+                    node(111, 0.6, 0.9, &[]),
+                    node(112, 0.9, 0.9, &[]),
+                    node(113, 0.9, 0.6, &[]),
+                ],
+                vec![
+                    way(100, &[100, 101, 102, 103, 100], &[]),
+                    way(110, &[110, 111, 112, 113, 110], &[]),
+                    way(
+                        700,
+                        &[20, 21],
+                        &[("highway", "residential"), ("name", "Main Street")],
+                    ),
+                ],
+                vec![
+                    relation(900, &[(100, "outer")], &admin("6", "Auckland")),
+                    TestElement::Relation {
+                        id: 910,
+                        members: vec![(110, "outer")],
+                        nodes: vec![(10, "label")],
+                        tags: admin("8", "Kingston"),
+                    },
+                ],
+            ],
+        );
+        let report = build(&dir.join("pack"), &input, None);
+        assert_eq!(report.accepted.place_points_merged, 1);
+
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        let labels = reader
+            .records_json_by_layer("street", 0)
+            .expect("streets")
+            .into_iter()
+            .map(|street| street["label"].as_str().expect("label").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["Main Street, Kingston"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The corners of a unit square from `west`, as nodes `first` to `first + 3`,
+    /// and the closed way `first` over them.
+    fn unit_square(first: i64, west: f64) -> (Vec<TestElement>, TestElement) {
+        let corners = [
+            (west, 0.0),
+            (west, 1.0),
+            (west + 1.0, 1.0),
+            (west + 1.0, 0.0),
+        ];
+        let nodes = (first..)
+            .zip(corners)
+            .map(|(id, (lon, lat))| node(id, lat, lon, &[]))
+            .collect();
+        let ring = [first, first + 1, first + 2, first + 3, first];
+        (nodes, way(first, &ring, &[]))
+    }
+
+    /// Builds the town nodes and the town boundaries, one a unit square
+    /// from each given west edge, and opens the Pack.
+    fn merged_towns(
+        name: &str,
+        towns: Vec<TestElement>,
+        boundaries: Vec<(f64, TestElement)>,
+    ) -> (PathBuf, BuilderReport, Reader) {
+        let dir = temp_dir(name);
+        let input = dir.join("towns.osm.pbf");
+        let (mut nodes, mut ways) = (towns, Vec::new());
+        for (at, (west, _)) in boundaries.iter().enumerate() {
+            let (corners, ring) = unit_square(100 + 10 * at as i64, *west);
+            nodes.extend(corners);
+            ways.push(ring);
+        }
+        let relations = boundaries
+            .into_iter()
+            .map(|(_, relation)| relation)
+            .collect();
+        write_pbf(&input, &[nodes, ways, relations]);
+        let report = build(&dir.join("pack"), &input, None);
+        let reader = Reader::open(dir.join("pack")).expect("reader");
+        (dir, report, reader)
+    }
+
+    fn town_boundary(
+        id: i64,
+        ring: i64,
+        label: Option<i64>,
+        tags: &[(&'static str, &'static str)],
+    ) -> TestElement {
+        TestElement::Relation {
+            id,
+            members: vec![(ring, "outer")],
+            nodes: label.map(|node| (node, "label")).into_iter().collect(),
+            tags: [("boundary", "administrative"), ("admin_level", "8")]
+                .iter()
+                .chain(tags)
+                .copied()
+                .collect(),
+        }
+    }
+
+    /// The point and Wikidata item of the record `id`.
+    fn point_and_item(reader: &Reader, id: &str) -> (serde_json::Value, Option<u32>) {
+        let record = reader.find_by_source_id(id).expect("lookup").expect(id);
+        let point = reader
+            .records_json_by_layer("locality", 0)
+            .expect("towns")
+            .into_iter()
+            .find(|town| town["id"] == id)
+            .expect("a town")["geometry"]["coordinates"]
+            .clone();
+        (point, reader.records().wikidata(record).expect("wikidata"))
+    }
+
+    /// One Wikidata item can be two disjoint boundaries. A point of the item
+    /// whose name neither boundary has merges into the one whose box holds it.
+    #[test]
+    fn a_place_node_merges_into_the_boundary_of_its_item_that_holds_it() {
+        let (dir, report, reader) = merged_towns(
+            "merge-by-item-of-two",
+            vec![node(
+                10,
+                0.5,
+                2.5,
+                &[
+                    ("place", "town"),
+                    ("name", "Springfield Centre"),
+                    ("wikidata", "Q100"),
+                ],
+            )],
+            vec![
+                (
+                    0.0,
+                    town_boundary(
+                        900,
+                        100,
+                        None,
+                        &[("name", "Springfield"), ("wikidata", "Q100")],
+                    ),
+                ),
+                (
+                    2.0,
+                    town_boundary(
+                        910,
+                        110,
+                        None,
+                        &[("name", "Springfield East"), ("wikidata", "Q100")],
+                    ),
+                ),
+            ],
+        );
+        assert_eq!(report.accepted.place_points_merged, 1);
+        assert_eq!(
+            point_and_item(&reader, "osm:relation:910").0,
+            serde_json::json!([2.5, 0.5])
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A point that names the boundary brings its item, and another point of
+    /// that item inside the boundary joins it too, whichever comes first.
+    #[test]
+    fn a_place_node_joins_the_boundary_another_node_of_its_item_named() {
+        // Points match in spatial order, so swapping the places swaps which is matched first.
+        let town = |id, lat, name| {
+            node(
+                id,
+                lat,
+                lat,
+                &[("place", "town"), ("name", name), ("wikidata", "Q100")],
+            )
+        };
+        for (name, towns) in [
+            (
+                "merge-by-item-alpha-first",
+                vec![town(10, 0.3, "Alpha"), town(11, 0.6, "Beta")],
+            ),
+            (
+                "merge-by-item-beta-first",
+                vec![town(10, 0.3, "Beta"), town(11, 0.6, "Alpha")],
+            ),
+        ] {
+            let (dir, report, reader) = merged_towns(
+                name,
+                towns,
+                vec![(0.0, town_boundary(900, 100, None, &[("name", "Alpha")]))],
+            );
+            assert_eq!(report.accepted.place_points_merged, 2, "{name}");
+            assert_eq!(
+                point_and_item(&reader, "osm:relation:900").1,
+                Some(100),
+                "{name}"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A boundary keeps its own Wikidata item, and takes its point from its
+    /// strongest link. A boundary with no item takes the item of its
+    /// strongest link, whichever point comes first.
+    #[test]
+    fn a_boundary_takes_its_strongest_links_point_and_keeps_its_own_item() {
+        let town = |id, lon, name, item| {
+            node(
+                id,
+                0.5,
+                lon,
+                &[("place", "town"), ("name", name), ("wikidata", item)],
+            )
+        };
+        // Points arrive in their build's order, so each layout puts the name
+        // match and the `label` node the other way round.
+        for (name, label_at, named_at) in [
+            ("merge-label-item-east", 2.5, 2.3),
+            ("merge-label-item-west", 2.3, 2.5),
+        ] {
+            let (dir, report, reader) = merged_towns(
+                name,
+                vec![
+                    town(10, 0.5, "Kingston", "Q200"),
+                    town(20, named_at, "Hastings", "Q300"),
+                    town(21, label_at, "Hastings Town", "Q400"),
+                ],
+                vec![
+                    (
+                        0.0,
+                        town_boundary(
+                            900,
+                            100,
+                            Some(10),
+                            &[("name", "Kingston"), ("wikidata", "Q100")],
+                        ),
+                    ),
+                    (
+                        2.0,
+                        town_boundary(910, 110, Some(21), &[("name", "Hastings")]),
+                    ),
+                ],
+            );
+            assert_eq!(report.accepted.place_points_merged, 3, "{name}");
+            assert_eq!(
+                point_and_item(&reader, "osm:relation:900"),
+                (serde_json::json!([0.5, 0.5]), Some(100)),
+                "{name}"
+            );
+            assert_eq!(
+                point_and_item(&reader, "osm:relation:910"),
+                (serde_json::json!([label_at, 0.5]), Some(400)),
+                "{name}"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 }

@@ -1,3 +1,36 @@
+open-geocode
+Copyright 2026 Abhigyaan Jha and the open-geocode contributors
+https://github.com/open-geocode-rs/open-geocode
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Code contributed before the switch to the Apache License, Version 2.0 was
+licensed under the MIT License below, which still applies to it:
+
+MIT License
+
+Copyright (c) 2026 open-geocode contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+========================================================================
+
 open-geocode includes data from the projects below, under their licences.
 The Rust crates open-geocode is built from, and their licenses, are listed in
 THIRD-PARTY-LICENSES, which ships beside this file.
@@ -57,6 +90,40 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+========================================================================
+iD tagging schema
+https://github.com/openstreetmap/id-tagging-schema
+Preset names, terms and translations, field labels (catalog/categories.json)
+========================================================================
+
+ISC License
+
+Copyright (c) iD Contributors
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+
+========================================================================
+Organic Maps
+https://github.com/organicmaps/organicmaps
+Category groups and their translations (catalog/categories.json, from data/categories.txt)
+========================================================================
+
+Copyright 2020 My.com B.V. (Mail.Ru Group)
+Copyright 2020-2026 Organic Maps Contributors
+
+Licensed under the Apache License, Version 2.0. The full text is under
+Google libaddressinput below.
 
 ========================================================================
 Google libaddressinput

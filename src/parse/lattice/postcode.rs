@@ -8,7 +8,7 @@
 
 use std::sync::OnceLock;
 
-use regex::RegexSet;
+use regex::{RegexSet, RegexSetBuilder};
 
 use super::CountryCode;
 
@@ -16,6 +16,12 @@ use super::CountryCode;
 const POSTCODES: &str = include_str!("data/postcodes.tsv");
 /// The most tokens a postcode spans once normalized ("sw1a 1aa", "1234 ab").
 pub const MAX_TOKENS: usize = 3;
+/// Room for the set's lazy DFA cache, per thread. The crate builds a lazy
+/// DFA only when its cache can hold the minimum the reverse NFA asks, and the
+/// Unicode classes of every pattern make that 2.9 MB. Under the default 2 MiB
+/// it builds none, and every span runs on the PikeVM, about 70 times slower,
+/// on every query with a digit. The cache grows only as far as it is used.
+const DFA_CACHE_BYTES: usize = 8 << 20;
 
 /// Every country's postcode pattern, matched in one pass.
 #[derive(Debug)]
@@ -44,7 +50,10 @@ impl Table {
             .unzip();
         Self {
             countries,
-            patterns: RegexSet::new(patterns).expect("vendored postcode patterns compile"),
+            patterns: RegexSetBuilder::new(patterns)
+                .dfa_size_limit(DFA_CACHE_BYTES)
+                .build()
+                .expect("vendored postcode patterns compile"),
         }
     }
 
@@ -78,6 +87,8 @@ impl Table {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     fn codes(table: &Table, text: &str) -> Vec<String> {
@@ -114,6 +125,38 @@ mod tests {
         // Some patterns match plain words (Bermuda's "AB 12" also matches
         // "king"), which is why the parser tries only spans with a digit.
         assert!(table.matches("toronto").is_empty());
+    }
+
+    /// The PikeVM the set falls back to without room for its lazy DFA is
+    /// measured against, as the clock alone would make the test depend on
+    /// the machine.
+    #[test]
+    fn the_table_matches_on_its_lazy_dfa() {
+        let table = Table::global();
+        let fallback = RegexSet::new(table.patterns.patterns()).expect("patterns compile");
+        let spans = [
+            "75008", "1234 ab", "1234ab", "sw1a 1aa", "m5v1m9", "8366", "1224060", "34", "34 r",
+        ];
+        let fastest = |set: &RegexSet| {
+            (0..5)
+                .map(|_| {
+                    let start = Instant::now();
+                    for span in spans {
+                        std::hint::black_box(set.matches(span));
+                    }
+                    start.elapsed()
+                })
+                .min()
+                .expect("five runs")
+        };
+        // The first runs build the lazy DFA's states.
+        fastest(&table.patterns);
+        fastest(&fallback);
+        let (dfa, pike_vm) = (fastest(&table.patterns), fastest(&fallback));
+        assert!(
+            pike_vm > dfa * 10,
+            "the table took {dfa:?}, the PikeVM {pike_vm:?}"
+        );
     }
 
     #[test]

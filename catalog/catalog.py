@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Build catalog/regions.json, the region catalog the og CLI embeds.
+"""Build catalog/regions.json, the region catalog the og CLI embeds, and the
+place and category tables beside it.
 
 Each upstream is pinned the way a submodule pins a commit: `update` fetches
 it, writes a trimmed snapshot to catalog/upstream/ and records the snapshot's
@@ -7,9 +8,12 @@ sha256 in catalog/sources.lock.json. `generate` is offline: it reads only the
 snapshots and catalog/curation.toml, so two runs give byte-identical output.
 `check` regenerates in memory and fails if anything drifted.
 
-    python -I catalog/catalog.py update geofabrik|openaddresses|overture|all
+    python -I catalog/catalog.py update geofabrik|openaddresses|overture|id-tagging-schema|id-tagging-schema-words|organicmaps|all
     python -I catalog/catalog.py generate
     python -I catalog/catalog.py check
+    python -I catalog/catalog.py moved
+
+`moved` lists the Geofabrik links that moved since the pin.
 
 `generate` and `check` need only the standard library. `update overture`
 needs the packages in catalog/requirements.txt.
@@ -26,6 +30,7 @@ CURATION = os.path.join(CATALOG, "curation.toml")
 REGIONS = os.path.join(CATALOG, "regions.json")
 LICENCES = os.path.join(CATALOG, "licences.json")
 PLACES = os.path.join(CATALOG, "places.json")
+CATEGORIES = os.path.join(CATALOG, "categories.json")
 
 GEOFABRIK_INDEX = "https://download.geofabrik.de/index-v1-nogeom.json"
 GEOFABRIK_SHAPES = "https://download.geofabrik.de/index-v1.json"
@@ -36,11 +41,15 @@ OA_DATA = "https://batch.openaddresses.io/api/data"
 OA_JOB = "https://batch.openaddresses.io/api/job/{}"
 ID_SCHEMA_PACKAGE = "https://registry.npmjs.org/@openstreetmap/id-tagging-schema/latest"
 ID_SCHEMA_PRESETS = "https://cdn.jsdelivr.net/npm/@openstreetmap/id-tagging-schema@{}/dist/presets.min.json"
+ID_SCHEMA_TRANSLATIONS = "https://cdn.jsdelivr.net/npm/@openstreetmap/id-tagging-schema@{}/dist/translations/{}.min.json"
+OM_HEAD = "https://api.github.com/repos/organicmaps/organicmaps/commits/master"
+OM_CATEGORIES = "https://raw.githubusercontent.com/organicmaps/organicmaps/{}/data/categories.txt"
 OVERTURE_BUCKET = "overturemaps-us-west-2"
 OVERTURE_LIST = "https://overturemaps-us-west-2.s3.amazonaws.com/?list-type=2&prefix={}&delimiter=/"
 OVERTURE_THEMES = (("places", "places", "place"), ("addresses", "addresses", "address"))
 
-SNAPSHOTS = {name: f"upstream/{name}.json" for name in ("geofabrik", "openaddresses", "overture", "id-tagging-schema")}
+SNAPSHOTS = {name: f"upstream/{name}.json" for name in ("geofabrik", "openaddresses", "overture", "id-tagging-schema",
+                                                       "id-tagging-schema-words", "organicmaps")}
 KINDS = ("world", "continent", "country", "subregion", "group")
 USER_AGENT = "og-catalog (https://github.com/nexa-ca/open-geocode)"
 SIZE_CHANGE = 0.20
@@ -142,6 +151,12 @@ def load_snapshot(name):
 
 # --- Update: Geofabrik --------------------------------------------------
 
+def iso_codes(value):
+    """ISO codes of an index entry as a list. The index's format names a list;
+    since November 2026 the index sends them joined by commas (`HT,DO`)."""
+    return [c.strip() for c in value.split(",")] if isinstance(value, str) else list(value)
+
+
 def update_geofabrik(lock):
     raw = request(GEOFABRIK_INDEX)[1]
     features = [f["properties"] for f in json.loads(raw)["features"]]
@@ -160,9 +175,9 @@ def update_geofabrik(lock):
         pbf = f["urls"]["pbf"]
         entry = dict(id=f["id"], parent=f.get("parent"), name=f["name"], pbf=pbf)
         if f.get("iso3166-1:alpha2"):
-            entry["iso3166_1"] = f["iso3166-1:alpha2"]
+            entry["iso3166_1"] = iso_codes(f["iso3166-1:alpha2"])
         if f.get("iso3166-2"):
-            entry["iso3166_2"] = f["iso3166-2"]
+            entry["iso3166_2"] = iso_codes(f["iso3166-2"])
         entry.update(bytes=sizes[pbf]["bytes"], updated=sizes[pbf]["updated"])
         regions.append(entry)
     planet = sizes[PLANET]
@@ -269,6 +284,99 @@ def update_id_tagging_schema(lock):
         rows[pid] = row
     text = snapshot_text(dict(source=url, version=version), "presets", rows)
     pin(lock, "id-tagging-schema", text, package=ID_SCHEMA_PACKAGE, version=version, fetched=now())
+
+
+GROUP_FIELDS = ("cuisine", "sport")
+
+
+def inherited(presets, pid, prop):
+    """A preset's `fields` or `moreFields`, from the nearest ancestor when it states none, as iD reads them."""
+    while pid:
+        if prop in presets.get(pid, {}):
+            return presets[pid][prop]
+        pid = pid.rpartition("/")[0]
+    return []
+
+
+def update_id_tagging_schema_words(lock):
+    # The presets snapshot's version, so words and tags describe the same presets.
+    version = lock["id-tagging-schema"]["version"]
+    presets = get_json(ID_SCHEMA_PRESETS.format(version))
+    languages = sorted(get_json(ID_SCHEMA_TRANSLATIONS.format(version, "index")))
+    log(f"id-tagging-schema-words {version}: {len(languages)} languages")
+    with ThreadPoolExecutor(8) as pool:
+        translations = dict(zip(languages, pool.map(
+            lambda lang: get_json(ID_SCHEMA_TRANSLATIONS.format(version, lang))[lang].get("presets", {}), languages)))
+    # Words of searchable places, and of each bare key preset ("shop") to name its key's group.
+    places = {pid for pid, p in json.loads(places_text())["presets"].items() if not p.get("never")}
+    rows, labels = {}, {field: {} for field in GROUP_FIELDS}
+    for lang, block in translations.items():
+        for field in GROUP_FIELDS:
+            label = block.get("fields", {}).get(field, {}).get("label", "").strip()
+            if label:
+                labels[field][lang] = label
+    for pid, preset in sorted(presets.items()):
+        if pid.startswith("@") or not preset.get("tags") or (pid not in places and "/" in pid):
+            continue
+        fields = set(inherited(presets, pid, "fields")) | set(inherited(presets, pid, "moreFields"))
+        words = {}
+        for lang, block in translations.items():
+            entry = block.get("presets", {}).get(pid)
+            if not entry:
+                continue
+            # Built files hold lists; the source format also allows a separated string.
+            terms, aliases = entry.get("terms", []), entry.get("aliases", [])
+            terms = terms.split(",") if isinstance(terms, str) else terms
+            aliases = aliases.split("\n") if isinstance(aliases, str) else aliases
+            name = (entry.get("name") or "").strip() or None
+            rest = list(dict.fromkeys(w.strip() for w in aliases + terms if w.strip() and w.strip() != name))
+            if name or rest:
+                words[lang] = [name] + rest
+        rows[pid] = dict(add_tags=preset.get("addTags", {}), fields=[f for f in GROUP_FIELDS if f in fields], words=words)
+    meta = dict(source=ID_SCHEMA_TRANSLATIONS.format(version, "{}"), version=version, languages=languages,
+                field_labels=labels)
+    text = snapshot_text(meta, "presets", rows)
+    pin(lock, "id-tagging-schema-words", text, version=version, fetched=now())
+
+
+# --- Update: map category groups ----------------------------------------
+
+def category_groups(text):
+    """The `@group` blocks of a categories.txt and the types that name each group.
+
+    Blocks end at a blank line. A group block starts `@name`; a type block
+    starts `type|type|@group`, and only its group references are kept.
+    """
+    groups, members = {}, {}
+    for block in text.split("\n\n"):
+        lines = [ln for ln in block.split("\n") if ln.strip() and not ln.startswith("#")]
+        if not lines:
+            continue
+        head, rest = lines[0].strip(), lines[1:]
+        if head.startswith("@"):
+            words = {}
+            for ln in rest:
+                lang, _, synonyms = ln.partition(":")
+                words[lang.strip()] = [w.strip() for w in synonyms.split("|") if w.strip()]
+            groups[head[1:]] = words
+            continue
+        parts = head.split("|")
+        for ref in (p[1:] for p in parts if p.startswith("@")):
+            members.setdefault(ref, []).extend(p for p in parts if not p.startswith("@"))
+    unknown = sorted(set(members) - set(groups))
+    if unknown:
+        raise SystemExit(f"organicmaps: types name undefined groups {', '.join(unknown)}")
+    return {name: dict(types=sorted(set(members.get(name, []))), words=groups[name]) for name in sorted(groups)}
+
+
+def update_organicmaps(lock):
+    commit = get_json(OM_HEAD)["sha"]
+    url = OM_CATEGORIES.format(commit)
+    groups = category_groups(request(url)[1].decode("utf-8"))
+    log(f"organicmaps {commit[:12]}: {len(groups)} groups")
+    text = snapshot_text(dict(source=url, commit=commit), "groups", groups)
+    pin(lock, "organicmaps", text, repository="https://github.com/organicmaps/organicmaps", commit=commit,
+        file="data/categories.txt", licence="Apache-2.0", fetched=now())
 
 
 # --- Update: Overture ---------------------------------------------------
@@ -475,6 +583,19 @@ def above(code, region_codes):
     return any("-" in c and code == ancestry_code(c) for c in region_codes)
 
 
+def region_folder(url):
+    """The folder a Geofabrik extract lives in, `europe/germany` for
+    `europe/germany/germany-latest.osm.pbf`. Region ids and parents are read
+    from it, so a link of any other shape stops the generator rather than
+    renaming regions."""
+    path = url[len(GEOFABRIK_PREFIX):] if url.startswith(GEOFABRIK_PREFIX) else ""
+    folder, _, file = path.rpartition("/")
+    if not folder or file != folder.rpartition("/")[2] + PBF_SUFFIX:
+        raise SystemExit(f"geofabrik: unexpected download url {url}; "
+                         f"want {GEOFABRIK_PREFIX}<folder>/<name>/<name>{PBF_SUFFIX}")
+    return folder
+
+
 def build(geofabrik, openaddresses, overture, curation, lock):
     """The catalog and the list of unresolved findings."""
     unresolved = list(curation.problems)
@@ -483,10 +604,7 @@ def build(geofabrik, openaddresses, overture, curation, lock):
     continents = [c for c in curation.continents if c in tops]
 
     def our_id(r):
-        path = r["pbf"][len(GEOFABRIK_PREFIX):]
-        if not r["pbf"].startswith(GEOFABRIK_PREFIX) or not path.endswith(PBF_SUFFIX):
-            raise SystemExit(f"geofabrik: {r['id']} has an unexpected download url {r['pbf']}")
-        path = path[:-len(PBF_SUFFIX)]
+        path = region_folder(r["pbf"])
         first, _, rest = path.partition("/")
         return rest if rest and first in continents else path
 
@@ -502,14 +620,14 @@ def build(geofabrik, openaddresses, overture, curation, lock):
     iso_set, covers = curation.tables["iso"], curation.tables["covers"]
     kinds, parents = curation.tables["kind"], curation.tables["parent"]
 
-    paths = {r["pbf"][len(GEOFABRIK_PREFIX):-len(PBF_SUFFIX)]: ids[rid] for rid, r in upstream.items()}
+    paths = {region_folder(r["pbf"]): ids[rid] for rid, r in upstream.items()}
     regions = {}
     for rid, r in upstream.items():
         ours = ids[rid]
         parent = ids[r["parent"]] if r["parent"] else None
-        # The download path is the parent of record: the index gives US states
+        # The download folder is the parent of record: the index gives US states
         # north-america as parent although they live under us/.
-        prefix = r["pbf"][len(GEOFABRIK_PREFIX):-len(PBF_SUFFIX)].rpartition("/")[0]
+        prefix = region_folder(r["pbf"]).rpartition("/")[0]
         if prefix in paths and paths[prefix] != parent:
             parent = paths[prefix]
         if ours in parents:
@@ -653,7 +771,7 @@ def build(geofabrik, openaddresses, overture, curation, lock):
     for ours in sorted(regions):
         reg, r = regions[ours], regions[ours]["up"]
         out.append(entry(ours, reg["name"], reg["kind"], reg["parent"], reg["iso"], reg["aliases"],
-                         dict(url=r["pbf"], bytes=r["bytes"], updated=r["updated"])))
+                         dict(id=r["id"], url=r["pbf"], bytes=r["bytes"], updated=r["updated"])))
 
     pins = dict(geofabrik=lock["geofabrik"]["fetched"][:10])
     if openaddresses:
@@ -680,11 +798,49 @@ def print_unresolved(unresolved):
             log(f"  {item}")
 
 
+LICENCE_TERMS = ("permitted", "restricted")
+
+
+def licence_decisions(datasets):
+    """curation.toml [licences]: licence texts read by hand, by source path,
+    each pinned to the sha256 of the text read. The build judges every other
+    text by its own rules (src/licences.rs). A decision whose text upstream
+    changed stops the generator, so a stale reading never decides new terms."""
+    with open(CURATION, "rb") as f:
+        curation = tomllib.load(f).get("licences", {})
+    texts = {}
+    for d in datasets:
+        lic = d.get("license") or {}
+        if lic.get("name"):
+            texts.setdefault(d["source"], set()).add(lic["name"])
+    decisions, problems = {}, []
+    for terms in LICENCE_TERMS:
+        table = curation.get(terms, {})
+        if table and not str(table.get("why", "")).strip():
+            problems.append(f"curation: [licences.{terms}] has no why")
+        for source, pin in table.get("set", {}).items():
+            if source in decisions:
+                problems.append(f"curation: {source} is decided twice in [licences]")
+                continue
+            read = [text for text in sorted(texts.get(source, ())) if sha256(text.encode("utf-8"))[:len(pin)] == pin]
+            if not read:
+                problems.append(f"curation: [licences.{terms}] {source}: no licence text of it hashes to {pin}; "
+                                f"read its text again and pin the new hash")
+                continue
+            decisions[source] = dict(terms=terms, text=read[0])
+    if problems:
+        raise SystemExit("\n".join(problems))
+    return dict(sorted(decisions.items()))
+
+
 def licences_text():
     """The license of each OpenAddresses data set that states one, by source and
-    name, for the Pack to credit the data sets an answer comes from."""
+    name, for the Pack to credit the data sets an answer comes from, and the
+    licence texts read by hand, for the build to judge them by."""
+    datasets = load_snapshot("openaddresses")["datasets"]
+    decisions = licence_decisions(datasets)
     rows = []
-    for d in load_snapshot("openaddresses")["datasets"]:
+    for d in datasets:
         lic = d.get("license")
         if not lic:
             continue
@@ -692,7 +848,7 @@ def licences_text():
                    attribution=lic.get("attribution"), attribution_name=lic.get("attribution_name"))
         rows.append({k: v for k, v in row.items() if v not in (None, "")})
     rows.sort(key=lambda r: (r["source"], r["name"]))
-    return snapshot_text(dict(source=SNAPSHOTS["openaddresses"]), "datasets", rows)
+    return snapshot_text(dict(source=SNAPSHOTS["openaddresses"], decisions=decisions), "datasets", rows)
 
 
 def places_text():
@@ -743,6 +899,147 @@ def places_text():
     return snapshot_text(meta, "presets", dict(sorted(rows.items())))
 
 
+# Keys every place of a kind carries, so a group of them says nothing.
+UNGROUPED_KEYS = ("amenity", "building")
+# The format allows an emoji code (U+1F6B0) as a synonym; nobody types one.
+EMOJI_CODE = "U+"
+
+
+def category_tag(pid, tags):
+    """The category a place of this preset is indexed under, as words. `amenity pharmacy`,
+    or the key alone for a preset of any value."""
+    key = pid.split("/")[0]
+    value = tags.get(key, "*")
+    return key if value == "*" else f"{key} {value}"
+
+
+def fold(word):
+    return " ".join(word.lower().split())
+
+
+def map_word(word):
+    """A synonym as a word, or as [word, minimum prefix length] when a leading digit sets one."""
+    if len(word) > 1 and word[0] in "123456789":
+        return [fold(word[1:]), int(word[0])]
+    return fold(word)
+
+
+def categories_text(places_json):
+    """The text of catalog/categories.json. The words that name each searchable place preset,
+    in every language its sources have, and the groups that gather presets under one word ("food").
+
+    Presets are a list, so groups and names point at them by index. Only names and
+    group words are kept, every language in one map: terms and aliases reach wider
+    ("coffee" is a restaurant term) and are not searched, and og never asks which
+    language a word is from. A regional name (en-AU "Pharmacy" for a chemist) is kept
+    apart, so the language's own name outranks it. Words keep case folded only; og
+    normalizes them as it normalizes search text when it loads them.
+    Returns the text, the presets with no English word, and a coverage report."""
+    presets = {pid: p for pid, p in json.loads(places_json)["presets"].items() if not p.get("never")}
+    words = load_snapshot("id-tagging-schema-words")
+    groups_snapshot = load_snapshot("organicmaps")
+    lock = load_lock()
+    if words is None or groups_snapshot is None:
+        raise SystemExit("no category snapshots; run `update id-tagging-schema-words` and `update organicmaps` first")
+    if words["version"] != lock["id-tagging-schema"]["version"]:
+        raise SystemExit(f"id-tagging-schema-words is {words['version']}, presets are "
+                         f"{lock['id-tagging-schema']['version']}; run `update id-tagging-schema-words`")
+    rows = words["presets"]
+    order = sorted(presets)
+    index = {pid: i for i, pid in enumerate(order)}
+
+    def names(pid):
+        return {lang: [fold(w[0])] for lang, w in rows.get(pid, {}).get("words", {}).items() if w[0]}
+
+    groups = {}
+    member = {pid: [] for pid in order}
+
+    def join(group, pid, group_words):
+        if group_words and pid in member:
+            groups.setdefault(group, group_words)
+            if group not in member[pid]:
+                member[pid].append(group)
+
+    for pid in order:
+        row = rows.get(pid, {})
+        for key in sorted((set(presets[pid]["tags"]) | set(row.get("add_tags", {}))) - set(UNGROUPED_KEYS)):
+            join(f"key:{key}", pid, names(key))
+        for field in row.get("fields", []):
+            join(f"field:{field}", pid, {lang: [fold(label)] for lang, label in words["field_labels"][field].items()})
+    by_tag = {}
+    for pid in order:
+        by_tag.setdefault(category_tag(pid, presets[pid]["tags"]), []).append(pid)
+    for name, group in groups_snapshot["groups"].items():
+        group_words = {lang: [map_word(w) for w in ws if not w.startswith(EMOJI_CODE)]
+                       for lang, ws in group["words"].items()}
+        group_words = {lang: ws for lang, ws in group_words.items() if ws}
+        for kind in group["types"]:
+            parts = kind.split("-")
+            # A type below a value maps only to the preset of that exact path; its parent's
+            # presets would claim more than the type means.
+            targets = by_tag.get(" ".join(parts), []) if len(parts) <= 2 else [p for p in ["/".join(parts)] if p in member]
+            for pid in targets:
+                join(f"group:{name}", pid, group_words)
+    group_order = sorted(groups)
+    group_index = {g: i for i, g in enumerate(group_order)}
+
+    by_lang = {"names": {}, "terms": {}}
+    for pid in order:
+        for lang, ws in rows.get(pid, {}).get("words", {}).items():
+            for kind, w in [("names", ws[0])] + [("terms", t) for t in ws[1:]]:
+                if w:
+                    targets = by_lang[kind].setdefault(lang, {}).setdefault(fold(w), [])
+                    if index[pid] not in targets:
+                        targets.append(index[pid])
+    no_english = [pid for pid in order if not rows.get(pid, {}).get("words", {}).get("en")]
+
+    preset_lines = [line([pid, category_tag(pid, presets[pid]["tags"]),
+                          sorted(group_index[g] for g in member[pid])]) for pid in order]
+    def merged_group(by_language):
+        # A word some language types short keeps the fewest letters any gives it.
+        least = {}
+        for ws in by_language.values():
+            for w in ws:
+                word, chars = (w[0], w[1]) if isinstance(w, list) else (w, None)
+                known = least.get(word)
+                if word not in least or (chars is not None and (known is None or chars < known)):
+                    least[word] = chars
+        return [[w, n] if n is not None else w for w, n in sorted(least.items())]
+
+    group_lines = [line([g, merged_group(groups[g])]) for g in group_order]
+    names = by_lang["names"]
+    def regional(lang):
+        return "-" in lang and lang.split("-", 1)[0] in names
+    def merged_names(keep):
+        merged = {}
+        for lang in names:
+            if keep(lang):
+                for word, targets in names[lang].items():
+                    merged.setdefault(word, set()).update(targets)
+        return ",\n".join(f"{json.dumps(w, ensure_ascii=False)}:{line(sorted(t))}" for w, t in sorted(merged.items()))
+
+    pins = {"id-tagging-schema": words["version"], "category-groups": groups_snapshot["commit"][:12]}
+    text = ('{"schema":2,\n"pins":' + line(pins)
+            + ',\n"presets":[\n' + ",\n".join(preset_lines)
+            + '\n],\n"groups":[\n' + ",\n".join(group_lines)
+            + '\n],\n"names":{\n' + merged_names(lambda lang: not regional(lang))
+            + '\n},\n"regional":{\n' + merged_names(regional) + "\n}}\n")
+
+    def with_words(lang):
+        return sum(1 for pid in order if rows.get(pid, {}).get("words", {}).get(lang))
+
+    def with_name(lang):
+        return sum(1 for pid in order if (rows.get(pid, {}).get("words", {}).get(lang) or [None])[0])
+
+    grouped = sum(1 for pid in order if member[pid])
+    languages = len(set(by_lang["names"]) | set(by_lang["terms"]))
+    report = [f"categories: {len(order)} searchable presets, {len(groups)} groups, {languages} languages",
+              f"  words in en {with_words('en')}, nl {with_words('nl')}, de {with_words('de')}, fr {with_words('fr')}",
+              f"  a name in en {with_name('en')}, nl {with_name('nl')}, de {with_name('de')}, fr {with_name('fr')}",
+              f"  {len(order) - grouped} presets in no group"]
+    return text, no_english, report
+
+
 def cmd_generate(_):
     text, unresolved = generate_text()
     if unresolved:
@@ -756,6 +1053,13 @@ def cmd_generate(_):
     places = places_text()
     write(PLACES, places)
     log(f"wrote {os.path.relpath(PLACES, ROOT)}: {len(places.encode('utf-8'))} bytes")
+    categories, no_english, report = categories_text(places)
+    log("\n".join(report))
+    if no_english:
+        log(f"{len(no_english)} searchable presets have no English word: {', '.join(no_english)}")
+        return 1
+    write(CATEGORIES, categories)
+    log(f"wrote {os.path.relpath(CATEGORIES, ROOT)}: {len(categories.encode('utf-8'))} bytes")
     return 0
 
 
@@ -777,7 +1081,14 @@ def cmd_check(_):
     if current != text:
         log("catalog/regions.json is not what `generate` produces; run it and commit the result")
         failed = True
-    for path, text in ((LICENCES, licences_text()), (PLACES, places_text())):
+    places = places_text()
+    categories, no_english, report = categories_text(places)
+    log("\n".join(report))
+    if no_english:
+        log(f"{len(no_english)} searchable presets have no English word: {', '.join(no_english)}; "
+            "run `update id-tagging-schema-words` if they are new places")
+        failed = True
+    for path, text in ((LICENCES, licences_text()), (PLACES, places), (CATEGORIES, categories)):
         current = read_bytes(path).decode("utf-8") if os.path.exists(path) else None
         if current != text:
             log(f"{os.path.relpath(path, ROOT)} is not what `generate` produces; run it and commit the result")
@@ -803,6 +1114,8 @@ def review(before, after):
         a, b = old[rid], new[rid]
         if a["name"] != b["name"]:
             lines.append(f"renamed {rid}: {a['name']!r} -> {b['name']!r}")
+        if a["osm"]["url"] != b["osm"]["url"]:
+            lines.append(f"moved {rid}: {a['osm']['url']} -> {b['osm']['url']}")
         if a["osm"]["bytes"] and abs(b["osm"]["bytes"] - a["osm"]["bytes"]) / a["osm"]["bytes"] > SIZE_CHANGE:
             lines.append(f"osm size {rid}: {a['osm']['bytes']} -> {b['osm']['bytes']} bytes")
     return lines or ["no region changes"]
@@ -812,8 +1125,13 @@ def cmd_update(args):
     lock = load_lock()
     started = time.time()
     steps = {"geofabrik": update_geofabrik, "openaddresses": update_openaddresses,
-             "overture": update_overture, "id-tagging-schema": update_id_tagging_schema}
-    for name in (steps if args.source == "all" else [args.source]):
+             "overture": update_overture, "id-tagging-schema": update_id_tagging_schema,
+             "id-tagging-schema-words": update_id_tagging_schema_words, "organicmaps": update_organicmaps}
+    names = list(steps) if args.source == "all" else [args.source]
+    # Words follow the presets snapshot's version, so a new version brings its words.
+    if args.source == "id-tagging-schema":
+        names.append("id-tagging-schema-words")
+    for name in names:
         step = time.time()
         steps[name](lock)
         save_lock(lock)
@@ -827,8 +1145,31 @@ def cmd_update(args):
         return 1
     write(REGIONS, text)
     write(LICENCES, licences_text())
-    write(PLACES, places_text())
+    places = places_text()
+    write(PLACES, places)
+    categories, no_english, report = categories_text(places)
+    log("\n".join(report))
+    if no_english:
+        log(f"{len(no_english)} searchable presets have no English word: {', '.join(no_english)}")
+        return 1
+    write(CATEGORIES, categories)
     log(f"wrote catalog/regions.json: {len(text.encode('utf-8'))} bytes in {time.time() - started:.0f}s")
+    return 0
+
+
+def moved_links(pinned, live):
+    """Lines for the regions whose link moved, appeared or went away between
+    two ids-to-link maps. Sizes change every day, so only links are compared."""
+    return [f"{rid}: {pinned.get(rid, 'not pinned')} -> {live.get(rid, 'gone')}"
+            for rid in sorted(set(pinned) | set(live)) if pinned.get(rid) != live.get(rid)]
+
+
+def cmd_moved(_):
+    """Regions whose link moved, appeared or went away upstream since the pin."""
+    pinned = {r["id"]: r["pbf"] for r in load_snapshot("geofabrik")["regions"]}
+    live = {f["properties"]["id"]: f["properties"]["urls"]["pbf"] for f in get_json(GEOFABRIK_INDEX)["features"]}
+    for line in moved_links(pinned, live):
+        print(line)
     return 0
 
 
@@ -836,10 +1177,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
     up = sub.add_parser("update", help="fetch an upstream, pin it and regenerate")
-    up.add_argument("source", choices=["geofabrik", "openaddresses", "overture", "id-tagging-schema", "all"])
+    up.add_argument("source", choices=["geofabrik", "openaddresses", "overture", "id-tagging-schema",
+                                       "id-tagging-schema-words", "organicmaps", "all"])
     up.set_defaults(run=cmd_update)
-    sub.add_parser("generate", help="build regions.json, licences.json and places.json from the pinned snapshots").set_defaults(run=cmd_generate)
-    sub.add_parser("check", help="fail if regions.json, licences.json, places.json or a snapshot drifted").set_defaults(run=cmd_check)
+    sub.add_parser("generate", help="build regions.json, licences.json, places.json and categories.json from the pinned snapshots").set_defaults(run=cmd_generate)
+    sub.add_parser("check", help="fail if a generated file or a snapshot drifted").set_defaults(run=cmd_check)
+    sub.add_parser("moved", help="list Geofabrik links that moved since the pin").set_defaults(run=cmd_moved)
     a = p.parse_args()
     sys.exit(a.run(a))
 

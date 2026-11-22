@@ -13,13 +13,17 @@ use rstar::{AABB, RTree, RTreeObject};
 use crate::{
     builder::report::BuilderReport,
     context::{AdminContextTuple, CONTEXT_FLAG_AMBIGUOUS_ADMIN, RecordContext, TierSet},
+    enclosing::AreaTags,
     pack::RecordId,
     parse::lattice::CountryCode,
     record::{
         Layer, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, Prominence, Record,
-        SourceProvenance, point_geometry,
+        SourceProvenance, place_rank, point_geometry,
     },
-    util::text::normalize_for_compare,
+    util::{
+        geo::{EARTH_RADIUS_M, point_lon_lat},
+        text::normalize_for_compare,
+    },
 };
 
 use super::{
@@ -27,6 +31,7 @@ use super::{
     containment::{ShapeRef, ShapeWriter, Shapes, encode_shape},
     place::place_layer,
     poi::{PoiCandidate, outline},
+    street::is_settlement,
     tags::{OsmTags, alternate_names, item, name_tags, prominence},
 };
 
@@ -49,6 +54,8 @@ const BOUNDARY_TAG_KEYS: [&str; 10] = [
 pub(crate) struct BoundaryRelationStub {
     pub object_id: i64,
     pub members: Vec<BoundaryRelationMember>,
+    /// The node its relation's `label` member references.
+    pub label: Option<i64>,
     pub tags: BTreeMap<String, String>,
 }
 
@@ -85,6 +92,89 @@ pub(crate) struct BoundaryIndex {
     boundaries: Vec<AcceptedBoundary>,
     tree: RTree<BoundaryBox>,
     shapes: Arc<Shapes>,
+    /// The towns mapped only as a point, which a record near one may lie in.
+    dots: RTree<TownDot>,
+}
+
+/// A town mapped only as a point, a city, town, village or hamlet node that
+/// merged into no boundary.
+#[derive(Debug, Clone)]
+pub(crate) struct TownDot {
+    pub(crate) record_id: RecordId,
+    pub(crate) point: [f64; 2],
+    pub(crate) name: String,
+    pub(crate) settlement: Settlement,
+    /// How far the town names the points around it (see
+    /// [`super::towns::measure_reach`]).
+    pub(crate) reach_m: f64,
+    /// The country it lies in, so a town never names a point across a border.
+    country: Option<RecordId>,
+}
+
+impl TownDot {
+    pub(crate) fn new(
+        record_id: RecordId,
+        point: [f64; 2],
+        name: String,
+        settlement: Settlement,
+    ) -> Self {
+        Self {
+            record_id,
+            point,
+            name,
+            settlement,
+            reach_m: 0.0,
+            country: None,
+        }
+    }
+}
+
+/// How important a settlement is as the town a record lies in, by its kind
+/// ([`place_rank`]) and how well known it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Settlement {
+    pub(crate) rank: u8,
+    pub(crate) prominence: Prominence,
+}
+
+impl Settlement {
+    /// The more important of two, the first when they are alike.
+    pub(crate) fn max(self, other: Self) -> Self {
+        if other.cmp_importance(self).is_lt() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// `Less` when `self` is the more important.
+    fn cmp_importance(self, other: Self) -> Ordering {
+        self.rank
+            .cmp(&other.rank)
+            .then(other.prominence.cmp(&self.prominence))
+    }
+}
+
+/// How much the town envelope outgrows its reach, so rounding never drops a point at the edge.
+const ENVELOPE_SLACK: f64 = 1.000_001;
+
+/// A town point is found by the points its reach holds.
+impl RTreeObject for TownDot {
+    type Envelope = AABB<[f64; 2]>;
+
+    fn envelope(&self) -> Self::Envelope {
+        let [lon, lat] = self.point;
+        // The spherical cap of the reach, as `haversine_m` measures, widened a hair for rounding.
+        let angle = self.reach_m / EARTH_RADIUS_M * ENVELOPE_SLACK;
+        let tall = angle.to_degrees();
+        let (south, north) = ((lat - tall).max(-90.0), (lat + tall).min(90.0));
+        // A cap that holds a pole spans every longitude.
+        if lat.abs() + tall >= 90.0 {
+            return AABB::from_corners([-180.0, south], [180.0, north]);
+        }
+        let wide = (angle.sin() / lat.to_radians().cos()).asin().to_degrees();
+        AABB::from_corners([lon - wide, south], [lon + wide, north])
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -115,6 +205,10 @@ struct AcceptedBoundary {
     bounds: Rect<f64>,
     shape: ShapeRef,
     area: f64,
+    interior_point: Option<[f64; 2]>,
+    /// The settlement it is, when its own `place` tag, a town node merged
+    /// into it or a town point of its name inside it makes it one.
+    town: Option<Settlement>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,21 +241,34 @@ struct BuiltBoundary {
     /// `CA-ON`. Kept whatever tier the boundary is ranked at, which for a
     /// country with many levels need not be the region tier.
     subdivision_code: Option<String>,
+    area_tags: AreaTags,
     /// Where its shape lies in the shape file; nothing until it is written.
     shape: ShapeRef,
     bounds: Rect<f64>,
     area: f64,
     representative_point: [f64; 2],
+    /// A point inside the outline; the representative point of a C-shaped
+    /// area lies outside it.
+    interior_point: Option<[f64; 2]>,
     /// Whether every outer way closed into a ring. A relation one of whose
     /// rings is left open, such as Russia's mainland, keeps the rings that
     /// closed (Kaliningrad) and covers only them.
     rings_closed: bool,
+    /// A town, city or other settlement node was merged into it.
+    settled: bool,
+    /// The [`place_rank`] of the most important town node merged into it.
+    town: Option<u8>,
+    /// Names gained from merged place points. They go on this boundary's own
+    /// record only; as area names of every record inside it they'd bloat the text index.
+    point_names: Vec<String>,
 }
 
 #[derive(Clone)]
 pub(crate) struct BoundaryCandidate {
     source_object_type: ObjectType,
     source_object_id: i64,
+    /// The node its relation's `label` member references.
+    label: Option<i64>,
     boundary: BuiltBoundary,
 }
 
@@ -219,6 +326,7 @@ impl BoundaryBuilder {
                     candidate: BoundaryCandidate {
                         source_object_type: ObjectType::Way,
                         source_object_id: way.object_id,
+                        label: None,
                         boundary,
                     },
                     block,
@@ -244,6 +352,7 @@ impl BoundaryBuilder {
                         candidate: BoundaryCandidate {
                             source_object_type: ObjectType::Relation,
                             source_object_id: stub.object_id,
+                            label: stub.label,
                             boundary,
                         },
                         block,
@@ -315,10 +424,19 @@ impl BoundaryCandidate {
                 .iter()
                 .map(String::capacity)
                 .sum::<usize>()
+            + boundary.point_names.capacity() * std::mem::size_of::<String>()
+            + boundary
+                .point_names
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
             + text(&boundary.place_type)
             + text(&boundary.designation)
             + text(&boundary.inferred_country_code)
             + text(&boundary.subdivision_code)
+            + text(&boundary.area_tags.admin_level)
+            + text(&boundary.area_tags.boundary)
+            + text(&boundary.area_tags.place)
     }
 }
 
@@ -379,7 +497,12 @@ impl BoundarySet {
                     boundary.layer,
                     PlaceRecord {
                         name: boundary.name.clone(),
-                        alt_names: boundary.alt_names.clone(),
+                        alt_names: boundary
+                            .alt_names
+                            .iter()
+                            .chain(&boundary.point_names)
+                            .cloned()
+                            .collect(),
                         place_type: match (boundary.admin_level, &boundary.place_type) {
                             (Some(level), _) => format!("admin_level:{level}"),
                             (None, Some(place)) => place.clone(),
@@ -400,6 +523,161 @@ impl BoundarySet {
             ));
         }
         records
+    }
+
+    /// What can link a place point to a boundary: its `label` node, its
+    /// Wikidata item, or its name, each at the boundary's layer.
+    pub(crate) fn place_links(&mut self) -> PlaceLinks {
+        let mut links = PlaceLinks {
+            labels: HashMap::new(),
+            items: HashMap::new(),
+            names: HashMap::new(),
+            matched: HashMap::new(),
+            brought: HashMap::new(),
+            waiting: Vec::new(),
+            strongest: vec![None; self.candidates.len()],
+            lookup_bytes: 0,
+            brought_list_bytes: 0,
+        };
+        for (index, candidate) in self.candidates.iter_mut().enumerate() {
+            let layer = candidate.boundary.layer;
+            if let Some(label) = candidate.label.take() {
+                links.labels.entry((label, layer)).or_insert(index);
+            }
+            if let Some(item) = candidate.boundary.wikidata {
+                links.items.entry((item, layer)).or_default().push(index);
+            }
+            links
+                .names
+                .entry((normalize_for_compare(&candidate.boundary.name), layer))
+                .or_default()
+                .push(index);
+        }
+        links.lookup_bytes = links.measure_lookups();
+        links
+    }
+
+    /// Finds the boundary the place point at position `at` names, if any.
+    /// Nothing merges until every point is matched, so no match depends on
+    /// the order the points arrive in.
+    pub(crate) fn match_place_point(
+        &self,
+        links: &mut PlaceLinks,
+        at: u64,
+        layer: PlaceLayer,
+        place: &PlaceRecord,
+    ) {
+        let found = links.find(
+            layer,
+            place,
+            |index, point| self.holds(index, point),
+            |index, point| covers_point(&self.shapes, &self.candidates[index].boundary, point),
+        );
+        match (found, place.wikidata) {
+            (Some((index, link)), item) => {
+                links.matched.insert(at, (index, link));
+                if let Some(item) = item {
+                    let list = links.brought.entry((item, layer)).or_default();
+                    let capacity = list.capacity();
+                    list.push(index);
+                    links.brought_list_bytes +=
+                        (list.capacity() - capacity) * std::mem::size_of::<usize>();
+                }
+            }
+            (None, Some(item)) => {
+                if let Some(point) = point_lon_lat(&place.geometry) {
+                    links.waiting.push((at, item, layer, point));
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// Matches the points that named no boundary to one a point of their
+    /// Wikidata item named, when its box holds them: one item is one place,
+    /// whichever of its points the boundary was matched by.
+    pub(crate) fn group_place_points(&self, links: &mut PlaceLinks) {
+        for (at, item, layer, point) in std::mem::take(&mut links.waiting) {
+            let held = links.brought.get(&(item, layer)).and_then(|boundaries| {
+                boundaries
+                    .iter()
+                    .filter(|&&index| self.holds(index, point))
+                    .min()
+                    .copied()
+            });
+            if let Some(index) = held {
+                links.matched.insert(at, (index, PlaceLink::Item));
+            }
+        }
+    }
+
+    /// Merges the place point at position `at` into the boundary it was
+    /// matched to, if any. The boundary takes its names, fame and settlement
+    /// now, and its point and item once every point is in
+    /// ([`Self::finish_place_merges`]).
+    pub(crate) fn merge_place_point(
+        &mut self,
+        links: &mut PlaceLinks,
+        at: u64,
+        place: &PlaceRecord,
+    ) -> bool {
+        let Some(&(index, link)) = links.matched.get(&at) else {
+            return false;
+        };
+        let boundary = &mut self.candidates[index].boundary;
+        // The strongest link wins, so a `label` node beats a name or Wikidata
+        // match; of equal links, the first.
+        if links.strongest[index].is_none_or(|held| held.link < link)
+            && let Some(point) = point_lon_lat(&place.geometry)
+        {
+            links.strongest[index] = Some(Strongest {
+                link,
+                point,
+                item: place.wikidata,
+            });
+        }
+        for name in std::iter::once(&place.name).chain(&place.alt_names) {
+            let folded = name.to_lowercase();
+            let known = std::iter::once(&boundary.name)
+                .chain(&boundary.alt_names)
+                .chain(&boundary.point_names)
+                .any(|known| known.to_lowercase() == folded);
+            if !known {
+                boundary.point_names.push(name.clone());
+            }
+        }
+        boundary.prominence = boundary.prominence.max(place.prominence);
+        boundary.settled |= is_settlement(&place.place_type);
+        if let Some(rank) = town_rank(&place.place_type) {
+            boundary.town = Some(boundary.town.map_or(rank, |held| held.min(rank)));
+        }
+        true
+    }
+
+    /// Gives each boundary the point of the place point its strongest link
+    /// came from, and that point's Wikidata item when the boundary has none.
+    /// A boundary's own item names the boundary. A `label` node's item often
+    /// names something else: the settlement inside a commune, the district a
+    /// cadastral quarter shares its name with, or a historical region.
+    pub(crate) fn finish_place_merges(&mut self, links: PlaceLinks) {
+        for (candidate, strongest) in self.candidates.iter_mut().zip(links.strongest) {
+            if let Some(Strongest { point, item, .. }) = strongest {
+                candidate.boundary.representative_point = point;
+                candidate.boundary.wikidata = candidate.boundary.wikidata.or(item);
+            }
+        }
+    }
+
+    /// Whether boundary `index`'s box holds `point`.
+    fn holds(&self, index: usize, [lon, lat]: [f64; 2]) -> bool {
+        let bounds = self.candidates[index].boundary.bounds;
+        let (min, max) = (bounds.min(), bounds.max());
+        (min.x..=max.x).contains(&lon) && (min.y..=max.y).contains(&lat)
+    }
+
+    /// Whether a town, city or other settlement node was merged into boundary `index`.
+    pub(crate) fn is_settled(&self, index: usize) -> bool {
+        self.candidates[index].boundary.settled
     }
 
     /// Names of the records admin context tuples can point at, by record id:
@@ -430,6 +708,17 @@ impl BoundarySet {
             ))
         });
         boundaries.chain(countries).collect()
+    }
+
+    pub(crate) fn area_tags(
+        &self,
+        boundary_record_ids: &[RecordId],
+    ) -> BTreeMap<RecordId, AreaTags> {
+        self.candidates
+            .iter()
+            .zip(boundary_record_ids)
+            .map(|(candidate, record_id)| (*record_id, candidate.boundary.area_tags.clone()))
+            .collect()
     }
 
     /// What the boundaries cover: the countries whose own boundary is
@@ -572,11 +861,24 @@ impl BoundarySet {
                     layer: boundary.layer,
                     tiers: boundary_tiers(&boundary),
                     area: boundary.area,
+                    interior_point: boundary.interior_point,
                     bounds: boundary.bounds,
                     inferred_country_record_id: boundary
                         .inferred_country_code
                         .as_deref()
                         .and_then(|code| country_record_ids.get(code).copied()),
+                    town: [
+                        boundary.town,
+                        boundary.place_type.as_deref().and_then(town_rank),
+                        boundary.area_tags.place.as_deref().and_then(town_rank),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .map(|rank| Settlement {
+                        rank,
+                        prominence: boundary.prominence,
+                    }),
                     name: boundary.name,
                     admin_level: boundary.admin_level,
                     source_object_type: candidate.source_object_type,
@@ -592,7 +894,11 @@ impl BoundarySet {
 /// Admin context for a record, from the boundaries covering its display point.
 /// Values the source data states (an `addr:city`, a place's own name) win ties
 /// between overlapping boundaries.
-pub(crate) fn record_context(index: &BoundaryIndex, record: &Record) -> Option<RecordContext> {
+pub(crate) fn record_context(
+    index: &BoundaryIndex,
+    record: &Record,
+    own: Option<OwnArea>,
+) -> Option<RecordContext> {
     let [lon, lat] = record.display_point()?;
     let source = match record {
         Record::Address(record) => SourceContext {
@@ -628,7 +934,7 @@ pub(crate) fn record_context(index: &BoundaryIndex, record: &Record) -> Option<R
         },
         Record::Street(_) | Record::Postcode(_) => SourceContext::default(),
     };
-    Some(index.context_for_point(lon, lat, &source))
+    Some(index.context_around(lon, lat, &source, own))
 }
 
 pub(crate) fn boundary_tags(tags: &BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -661,7 +967,88 @@ impl BoundaryIndex {
             boundaries,
             tree: RTree::bulk_load(boxes),
             shapes,
+            dots: RTree::new(),
         }
+    }
+
+    /// Learns the towns the boundaries alone do not say. These are the areas
+    /// a town point of their name lies in, with that point's rank, and the
+    /// town points that lie in no area of their name.
+    pub(crate) fn add_towns(
+        &mut self,
+        named: impl IntoIterator<Item = (RecordId, Settlement)>,
+        dots: Vec<TownDot>,
+    ) {
+        let at = self
+            .boundaries
+            .iter()
+            .enumerate()
+            .map(|(index, boundary)| (boundary.record_id, index))
+            .collect::<HashMap<_, _>>();
+        for (record_id, settlement) in named {
+            if let Some(boundary) = at.get(&record_id).map(|index| &mut self.boundaries[*index]) {
+                boundary.town = Some(
+                    boundary
+                        .town
+                        .map_or(settlement, |held| held.max(settlement)),
+                );
+            }
+        }
+        let dots = dots
+            .into_iter()
+            .map(|mut dot| {
+                let [lon, lat] = dot.point;
+                let covered = self.covered(lon, lat);
+                dot.country = country_of(&best_of_each_tier(&covered, &SourceContext::default()).0);
+                dot
+            })
+            .collect();
+        self.dots = RTree::bulk_load(dots);
+    }
+
+    /// The reach of each town point, in whole metres, by its record id, as
+    /// a checkpoint saves it.
+    pub(crate) fn town_reach(&self) -> Vec<(RecordId, u32)> {
+        let mut reach = self
+            .dots
+            .iter()
+            .map(|dot| (dot.record_id, dot.reach_m as u32))
+            .collect::<Vec<_>>();
+        reach.sort_unstable();
+        reach
+    }
+
+    /// The settlement areas, by record id, with their rank and inner point.
+    pub(crate) fn settlement_areas(&self) -> impl Iterator<Item = (RecordId, u8, [f64; 2])> + '_ {
+        self.boundaries.iter().filter_map(|boundary| {
+            Some((
+                boundary.record_id,
+                boundary.town?.rank,
+                boundary.interior_point?,
+            ))
+        })
+    }
+
+    /// The areas under the country at a point.
+    pub(crate) fn areas_at(&self, lon: f64, lat: f64) -> impl Iterator<Item = RecordId> + '_ {
+        self.covered(lon, lat)
+            .into_iter()
+            .filter(|boundary| boundary.layer > PlaceLayer::Country)
+            .map(|boundary| boundary.record_id)
+    }
+
+    /// The smallest area under the country at a point that `holds` accepts.
+    pub(crate) fn smallest_area_at(
+        &self,
+        lon: f64,
+        lat: f64,
+        holds: impl Fn(RecordId) -> bool,
+    ) -> Option<RecordId> {
+        self.covered(lon, lat)
+            .into_iter()
+            .filter(|boundary| boundary.layer > PlaceLayer::Country && holds(boundary.record_id))
+            .min_by(|left, right| left.area.total_cmp(&right.area))
+            .map(|boundary| boundary.record_id)
     }
 
     pub(crate) fn context_for_point(
@@ -670,59 +1057,481 @@ impl BoundaryIndex {
         lat: f64,
         source_context: &SourceContext<'_>,
     ) -> RecordContext {
-        if self.boundaries.is_empty() || !lon.is_finite() || !lat.is_finite() {
+        self.context_around(lon, lat, source_context, None)
+    }
+
+    /// The area and inner point of the boundary a [`ContextOrigin::Boundary`]
+    /// record was made from.
+    pub(crate) fn own_area(&self, origin: u32) -> Option<OwnArea> {
+        self.boundaries
+            .get(usize::try_from(origin).ok()?)
+            .map(|boundary| OwnArea {
+                area: boundary.area,
+                point: boundary.interior_point,
+            })
+    }
+
+    /// [`Self::context_for_point`], for a record made from an area of its own:
+    /// `enclosing` lists the areas around a point inside `own`, larger than
+    /// it. The point of the record is a centroid, which can lie outside its
+    /// outline, in the hole of a ring or a bay of a C, inside areas that it
+    /// does not lie in.
+    pub(crate) fn context_around(
+        &self,
+        lon: f64,
+        lat: f64,
+        source_context: &SourceContext<'_>,
+        own: Option<OwnArea>,
+    ) -> RecordContext {
+        if (self.boundaries.is_empty() && self.dots.size() == 0)
+            || !lon.is_finite()
+            || !lat.is_finite()
+        {
             return RecordContext::default();
         }
 
-        let envelope = AABB::from_point([lon, lat]);
-        let mut covered = Vec::new();
-        for boundary_box in self.tree.locate_in_envelope_intersecting(envelope) {
-            let boundary = &self.boundaries[boundary_box.boundary_id];
-            if self.shapes.covers(boundary.shape, lon, lat) {
-                covered.push(boundary);
-            }
-        }
-
-        // One pass over the covering boundaries, keeping the best of each
-        // tier, rather than one filtering pass per tier: this runs for every
-        // record of the build, and a pass per tier allocated a vector for
-        // each of the ten even though all but two or three are empty.
-        let mut flags = 0;
-        let mut best: [Option<&AcceptedBoundary>; PlaceLayer::ALL.len()] = Default::default();
-        for boundary in &covered {
-            let slot = &mut best[boundary.layer as usize];
-            match slot {
-                Some(held) => {
-                    flags |= CONTEXT_FLAG_AMBIGUOUS_ADMIN;
-                    if compare_boundary(boundary.layer, boundary, held, source_context).is_lt() {
-                        *slot = Some(boundary);
-                    }
-                }
-                None => *slot = Some(boundary),
-            }
-        }
-
-        // Each tier takes the best boundary ranked into it, and a boundary
-        // that is more than one thing is set under each: it stays one entry
-        // of the chain carrying both tiers.
-        let mut tuple =
-            AdminContextTuple::from_tiers(PlaceLayer::ALL.into_iter().flat_map(|tier| {
-                best[tier as usize].into_iter().flat_map(move |boundary| {
-                    boundary.tiers.iter().map(|at| (at, boundary.record_id))
-                })
-            }));
-        if tuple.country_record_id().is_none()
-            && let Some(country) = best[PlaceLayer::Region as usize]
-                .and_then(|region| region.inferred_country_record_id)
-        {
-            tuple.set(PlaceLayer::Country, country);
-        }
-
+        let at = self.covering(lon, lat, source_context);
+        let around = own
+            .and_then(|own| own.point)
+            .filter(|point| *point != [lon, lat])
+            .map(|[lon, lat]| self.covering(lon, lat, source_context));
+        let (covered, derived_country) = match around {
+            Some(around) => (around.covered, around.derived_country),
+            None => (at.covered, at.derived_country),
+        };
         RecordContext {
-            admin_context: tuple,
-            flags,
+            admin_context: at.tuple,
+            flags: at.flags,
+            enclosing: enclosing(covered, derived_country, own.map(|own| own.area)),
         }
     }
+
+    fn covered(&self, lon: f64, lat: f64) -> Vec<&AcceptedBoundary> {
+        let envelope = AABB::from_point([lon, lat]);
+        self.tree
+            .locate_in_envelope_intersecting(envelope)
+            .map(|boundary_box| &self.boundaries[boundary_box.boundary_id])
+            .filter(|boundary| self.shapes.covers(boundary.shape, lon, lat))
+            .collect()
+    }
+
+    fn covering(&self, lon: f64, lat: f64, source_context: &SourceContext<'_>) -> Covering<'_> {
+        let covered = self.covered(lon, lat);
+        let (best, flags) = best_of_each_tier(&covered, source_context);
+        let mut tuple = match self.town(&covered, &best, source_context, [lon, lat]) {
+            Some(town) => self.around_town(&town, &covered, &best, source_context),
+            None => tiered(&best),
+        };
+        let mut derived_country = None;
+        if tuple.country_record_id().is_none()
+            && let Some(country) = inferred_country(&best)
+        {
+            tuple.set(PlaceLayer::Country, country);
+            derived_country = Some(country);
+        }
+
+        Covering {
+            covered,
+            tuple,
+            flags,
+            derived_country,
+        }
+    }
+
+    /// The town a point lies in, when the tiers alone do not hold it in
+    /// `locality`. The settlement areas around the point no smaller than the
+    /// area the tiers put in `locality` compete, and so do the town points
+    /// whose reach holds it, in its country, where the tiers put no boundary
+    /// in `locality`, so a commune that holds a hamlet's point stays the town.
+    /// A town point is the town of no other town point. The best area and
+    /// the best point are found apart (see [`Candidate`]), then the one the
+    /// source names wins, else the more important, else the area.
+    fn town<'a>(
+        &'a self,
+        covered: &[&'a AcceptedBoundary],
+        best: &Best<'a>,
+        source_context: &SourceContext<'_>,
+        [lon, lat]: [f64; 2],
+    ) -> Option<Town<'a>> {
+        let named = |name: &str| {
+            source_context
+                .locality
+                .is_some_and(|locality| same_text(locality, name))
+        };
+        let tiered = best[PlaceLayer::Locality as usize];
+        // Merged municipality stays the town over the village it grew from.
+        let areas = covered
+            .iter()
+            .filter(|boundary| tiered.is_none_or(|tiered| boundary.area >= tiered.area))
+            .filter_map(|boundary| {
+                Some(Candidate {
+                    town: Town::Area(boundary),
+                    named: named(&boundary.name),
+                    settlement: boundary.town?,
+                    size: boundary.area,
+                })
+            });
+        // Town points are towns themselves, never inside another (Te Awamutu, Hamilton).
+        let is_dot = |dot: &TownDot| {
+            dot.point == [lon, lat] && source_context.place.is_some_and(|place| place == dot.name)
+        };
+        let mut reaching = match tiered {
+            Some(_) => Vec::new(),
+            None => self.dots_reaching(lon, lat, best).collect::<Vec<_>>(),
+        };
+        if reaching.iter().any(|(dot, _)| is_dot(dot)) {
+            reaching.clear();
+        }
+        let dots = reaching.into_iter().map(|(dot, share)| Candidate {
+            town: Town::Dot(dot),
+            named: named(&dot.name),
+            settlement: dot.settlement,
+            size: share,
+        });
+        let town = [
+            areas.min_by(Candidate::cmp_alike),
+            dots.min_by(Candidate::cmp_alike),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by(Candidate::cmp_across)?
+        .town;
+        (tiered.map(|tiered| tiered.record_id) != Some(town.record_id())).then_some(town)
+    }
+
+    /// The town points whose reach holds a point, in the country the point
+    /// lies in, with the share of its reach each lies away.
+    fn dots_reaching<'a>(
+        &'a self,
+        lon: f64,
+        lat: f64,
+        best: &Best<'_>,
+    ) -> impl Iterator<Item = (&'a TownDot, f64)> {
+        let country = country_of(best);
+        // An envelope past the antimeridian holds the point a full turn over.
+        [lon, lon + 360.0, lon - 360.0]
+            .into_iter()
+            .flat_map(move |turned| {
+                self.dots
+                    .locate_in_envelope_intersecting(AABB::from_point([turned, lat]))
+            })
+            .filter(move |dot| dot.country == country)
+            .filter_map(move |dot| {
+                let distance =
+                    crate::spatial_index::haversine_m(lon, lat, dot.point[0], dot.point[1]);
+                let share = distance / dot.reach_m;
+                (share <= 1.0).then_some((dot, share))
+            })
+    }
+
+    /// Whether `inner` lies inside `outer`, as `outer` covers a point inside
+    /// `inner` and `inner` is the smaller and not drawn over the same
+    /// ground. Two areas each covering the other's inner point, the smaller
+    /// more than half the size of the larger, are drawn over the same
+    /// ground, such as a borough and its county, and lie inside neither. The
+    /// inner point of a municipality lies in one of the villages it is made
+    /// of, which is still a part of it.
+    fn lies_inside(&self, inner: &AcceptedBoundary, outer: &AcceptedBoundary) -> bool {
+        let covers = |area: &AcceptedBoundary, point: Option<[f64; 2]>| {
+            point.map(|[lon, lat]| self.shapes.covers(area.shape, lon, lat))
+        };
+        match (
+            covers(outer, inner.interior_point),
+            covers(inner, outer.interior_point),
+        ) {
+            (Some(outer_holds), Some(inner_holds)) => {
+                outer_holds
+                    && inner.area < outer.area
+                    && (!inner_holds || inner.area * 2.0 < outer.area)
+            }
+            _ => inner.area < outer.area,
+        }
+    }
+
+    /// The context of a point around its town. The country, the region and
+    /// the areas whose tier agrees with their size keep their tiers. The town
+    /// takes `locality`. An area the tiers put on the wrong side of the town
+    /// moves to a free tier on its own side, nearer the town the fewer of the
+    /// other moving areas lie between. A Moscow district inside the city
+    /// moves below it, the county around a village above it. Areas wanting one
+    /// tier keep one, by [`compare_side_by_side`]; the others stay in the
+    /// chain the Pack stores.
+    fn around_town<'a>(
+        &self,
+        town: &Town<'_>,
+        covered: &[&'a AcceptedBoundary],
+        best: &Best<'_>,
+        source_context: &SourceContext<'_>,
+    ) -> AdminContextTuple {
+        let mut slots: Best<'a> = Default::default();
+        let keep = |slots: &mut Best<'a>, tier: PlaceLayer, boundary: &'a AcceptedBoundary| {
+            let slot = &mut slots[tier as usize];
+            if slot
+                .is_none_or(|held| compare_boundary(tier, boundary, held, source_context).is_lt())
+            {
+                *slot = Some(boundary);
+            }
+        };
+        let (mut above, mut inside) = (Vec::new(), Vec::new());
+        for boundary in covered {
+            if boundary.record_id == town.record_id() {
+                continue;
+            }
+            let layer = boundary.layer;
+            match town.is_inside(boundary) {
+                _ if layer <= PlaceLayer::Region || boundary.admin_level.is_none() => {
+                    keep(&mut slots, layer, boundary);
+                }
+                Some(false) if layer >= PlaceLayer::Locality => above.push(*boundary),
+                Some(true) if layer <= PlaceLayer::Locality => inside.push(*boundary),
+                _ => keep(&mut slots, layer, boundary),
+            }
+        }
+        for (movers, tiers, outward) in [(above, ABOVE_TOWN, true), (inside, INSIDE_TOWN, false)] {
+            // How many other moving areas lie between each and the town.
+            let depth = |boundary: &AcceptedBoundary| {
+                movers
+                    .iter()
+                    .filter(|other| {
+                        if outward {
+                            self.lies_inside(other, boundary)
+                        } else {
+                            self.lies_inside(boundary, other)
+                        }
+                    })
+                    .count()
+            };
+            let mut depths = movers
+                .iter()
+                .map(|boundary| (depth(boundary), *boundary))
+                .collect::<Vec<_>>();
+            depths.sort_by_key(|(depth, _)| *depth);
+            let free = tiers
+                .into_iter()
+                .filter(|tier| slots[*tier as usize].is_none())
+                .collect::<Vec<_>>();
+            let mut groups = depths.chunk_by(|(left, _), (right, _)| left == right);
+            for tier in free {
+                let Some(group) = groups.next() else { break };
+                slots[tier as usize] = group
+                    .iter()
+                    .map(|(_, boundary)| *boundary)
+                    .min_by(|left, right| compare_side_by_side(tier, left, right, source_context));
+            }
+        }
+        let mut tuple = AdminContextTuple::from_tiers(
+            PlaceLayer::ALL
+                .into_iter()
+                .flat_map(|tier| slots[tier as usize].map(|boundary| (tier, boundary.record_id))),
+        );
+        if let Town::Area(area) = town {
+            for tier in area.tiers.iter() {
+                if tier <= PlaceLayer::Region
+                    && best[tier as usize].map(|held| held.record_id) == Some(area.record_id)
+                {
+                    tuple.set(tier, area.record_id);
+                }
+            }
+        }
+        tuple.set(PlaceLayer::Locality, town.record_id());
+        tuple
+    }
+}
+
+/// Orders areas wanting one tier of which neither lies inside the other, the
+/// best first. The one the source names wins. Areas drawn over the same
+/// ground, such as a borough and its county, are the same size, so the finer
+/// level of the two counts as the smaller; else the smaller wins.
+fn compare_side_by_side(
+    tier: PlaceLayer,
+    left: &AcceptedBoundary,
+    right: &AcceptedBoundary,
+    source_context: &SourceContext<'_>,
+) -> Ordering {
+    let named = |boundary: &AcceptedBoundary| {
+        source_value_for_layer(tier, source_context)
+            .is_some_and(|value| same_text(value, &boundary.name))
+    };
+    named(right)
+        .cmp(&named(left))
+        .then(right.admin_level.cmp(&left.admin_level))
+        .then_with(|| compare_boundary(tier, left, right, source_context))
+}
+
+/// A settlement a point may lie in, as [`BoundaryIndex::town`] weighs it.
+/// Each order puts the one the source names first.
+struct Candidate<'a> {
+    town: Town<'a>,
+    named: bool,
+    settlement: Settlement,
+    /// An area's size, or the share of its reach a town point lies away.
+    size: f64,
+}
+
+impl Candidate<'_> {
+    /// Of two areas, or two town points, the more important kind, then the
+    /// smaller area or the point whose reach the point lies furthest inside:
+    /// a village drawn inside a city is part of the city. How well known
+    /// each is says nothing here. A house by one village's point is in that
+    /// village, whatever the next village is called in other languages.
+    fn cmp_alike(left: &Self, right: &Self) -> Ordering {
+        right
+            .named
+            .cmp(&left.named)
+            .then(left.settlement.rank.cmp(&right.settlement.rank))
+            .then(left.size.total_cmp(&right.size))
+            .then(left.town.record_id().cmp(&right.town.record_id()))
+    }
+
+    /// The best area against the best point, the more important first, then
+    /// the area. A borough that is a city by its own tags yields to the city
+    /// point inside it, which is better known.
+    fn cmp_across(left: &Self, right: &Self) -> Ordering {
+        right
+            .named
+            .cmp(&left.named)
+            .then(left.settlement.cmp_importance(right.settlement))
+            .then(left.town.is_dot().cmp(&right.town.is_dot()))
+    }
+}
+
+/// The best covering boundary ranked into each tier, and whether any tier was
+/// wanted by two.
+///
+/// One pass over the covering boundaries, keeping the best of each tier,
+/// rather than one filtering pass per tier: this runs for every record of
+/// the build, and a pass per tier allocated a vector for each of the ten even
+/// though all but two or three are empty.
+fn best_of_each_tier<'a>(
+    covered: &[&'a AcceptedBoundary],
+    source_context: &SourceContext<'_>,
+) -> (Best<'a>, u16) {
+    let mut flags = 0;
+    let mut best: Best<'a> = Default::default();
+    for boundary in covered {
+        let slot = &mut best[boundary.layer as usize];
+        match slot {
+            Some(held) => {
+                flags |= CONTEXT_FLAG_AMBIGUOUS_ADMIN;
+                if compare_boundary(boundary.layer, boundary, held, source_context).is_lt() {
+                    *slot = Some(boundary);
+                }
+            }
+            None => *slot = Some(boundary),
+        }
+    }
+    (best, flags)
+}
+
+/// The best boundary of each tier, by tier.
+type Best<'a> = [Option<&'a AcceptedBoundary>; PlaceLayer::ALL.len()];
+
+/// Each tier takes the best boundary ranked into it, and a boundary that is
+/// more than one thing is set under each: it stays one entry of the chain
+/// carrying both tiers.
+fn tiered(best: &Best<'_>) -> AdminContextTuple {
+    AdminContextTuple::from_tiers(PlaceLayer::ALL.into_iter().flat_map(|tier| {
+        best[tier as usize]
+            .into_iter()
+            .flat_map(move |boundary| boundary.tiers.iter().map(|at| (at, boundary.record_id)))
+    }))
+}
+
+/// The town a point lies in, where its tiers did not put it.
+enum Town<'a> {
+    Area(&'a AcceptedBoundary),
+    Dot(&'a TownDot),
+}
+
+impl Town<'_> {
+    fn record_id(&self) -> RecordId {
+        match self {
+            Self::Area(area) => area.record_id,
+            Self::Dot(dot) => dot.record_id,
+        }
+    }
+
+    fn is_dot(&self) -> bool {
+        matches!(self, Self::Dot(_))
+    }
+
+    /// Whether `unit` lies inside the town, by area against an area and by
+    /// [`place_rank`] against a point, which has none.
+    fn is_inside(&self, unit: &AcceptedBoundary) -> Option<bool> {
+        match self {
+            Self::Area(area) => Some(unit.area < area.area),
+            Self::Dot(dot) => unit_rank(unit).map(|rank| rank >= dot.settlement.rank),
+        }
+    }
+}
+
+/// The tiers between the region and the town, nearest the town first, and
+/// those inside the town, nearest first.
+const ABOVE_TOWN: [PlaceLayer; 3] = [
+    PlaceLayer::SubDistrict,
+    PlaceLayer::District,
+    PlaceLayer::SubRegion,
+];
+const INSIDE_TOWN: [PlaceLayer; 3] = [
+    PlaceLayer::SubLocality,
+    PlaceLayer::Neighbourhood,
+    PlaceLayer::SubNeighbourhood,
+];
+
+/// A unit's [`place_rank`]: twice its admin level.
+fn unit_rank(unit: &AcceptedBoundary) -> Option<u8> {
+    unit.admin_level.map(|level| level.saturating_mul(2))
+}
+
+/// The [`place_rank`] of a settlement a record's town can be. Its parts
+/// (`suburb`, `quarter`) and the areas above a town (`municipality`) are not.
+pub(crate) fn town_rank(place_type: &str) -> Option<u8> {
+    TOWN_KINDS
+        .contains(&place_type)
+        .then(|| place_rank(place_type))
+        .flatten()
+}
+
+/// The kinds of settlement a record's town can be.
+const TOWN_KINDS: [&str; 4] = ["city", "town", "village", "hamlet"];
+
+/// The record of an area that a record was made from, as far as its list of
+/// enclosing areas is concerned.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OwnArea {
+    area: f64,
+    point: Option<[f64; 2]>,
+}
+
+struct Covering<'a> {
+    covered: Vec<&'a AcceptedBoundary>,
+    tuple: AdminContextTuple,
+    flags: u16,
+    derived_country: Option<RecordId>,
+}
+
+/// The covering areas, smallest first, and only those larger than
+/// `larger_than`.
+fn enclosing(
+    mut covered: Vec<&AcceptedBoundary>,
+    derived_country: Option<RecordId>,
+    larger_than: Option<f64>,
+) -> Vec<RecordId> {
+    // Size orders them; it does not prove one lies in the next. Ties break
+    // on the source object so one input gives one order.
+    let source = |boundary: &AcceptedBoundary| {
+        let object_type = source_type_rank(boundary.source_object_type);
+        (object_type, boundary.source_object_id)
+    };
+    covered.sort_by(|left, right| {
+        (left.area.total_cmp(&right.area)).then_with(|| source(left).cmp(&source(right)))
+    });
+    covered.retain(|boundary| larger_than.is_none_or(|own| boundary.area > own));
+    covered
+        .iter()
+        .map(|boundary| boundary.record_id)
+        .chain(derived_country)
+        .collect()
 }
 
 /// Whether the tags make an area records can lie in: an admin boundary, or
@@ -739,11 +1548,27 @@ pub(crate) fn relation_member_role(value: &str) -> Option<BoundaryMemberRole> {
     }
 }
 
+pub(crate) fn is_label_role(value: &str) -> bool {
+    normalize_for_compare(value) == "label"
+}
+
 pub(crate) fn required_boundary_way_ids(relations: &[BoundaryRelationStub]) -> HashSet<i64> {
     relations
         .iter()
         .flat_map(|relation| relation.members.iter().map(|member| member.way_id))
         .collect()
+}
+
+/// The country a region names when no boundary is the country.
+fn inferred_country(best: &Best<'_>) -> Option<RecordId> {
+    best[PlaceLayer::Region as usize].and_then(|region| region.inferred_country_record_id)
+}
+
+/// The country boundary of a point, else the one its region names, so a town and the points it names agree.
+fn country_of(best: &Best<'_>) -> Option<RecordId> {
+    best[PlaceLayer::Country as usize]
+        .map(|country| country.record_id)
+        .or_else(|| inferred_country(best))
 }
 
 /// Region boundaries whose ISO 3166-2 code names a country that has no
@@ -943,11 +1768,18 @@ fn built(
             designation,
             inferred_country_code: country_code_from_tags(tags, layer),
             subdivision_code: subdivision_code_from_tags(tags, layer),
+            area_tags: AreaTags::from_osm(tags),
             shape: ShapeRef::default(),
             bounds,
             area: geometry.unsigned_area(),
             representative_point,
+            interior_point: geometry
+                .interior_point()
+                .map(|point| [point.x(), point.y()]),
             rings_closed,
+            settled: false,
+            town: None,
+            point_names: Vec::new(),
         },
         block,
     ))
@@ -1207,6 +2039,44 @@ struct Want {
     stated: bool,
 }
 
+/// The level of a country that anchors the locality tier, the tier an
+/// address query matches a town on. It is the outermost level the table
+/// calls a city, else the outermost below the district -- Australia's level
+/// 9 is tagged a suburb and is still the town an address names, and without
+/// an anchor an Australian Pack answers no structured query at all.
+fn anchor_level(levels: &BTreeMap<u8, Want>) -> Option<u8> {
+    levels
+        .iter()
+        .find(|(_, want)| want.layer == Some(PlaceLayer::Locality))
+        .or_else(|| {
+            levels
+                .iter()
+                .find(|(_, want)| want.layer.is_none_or(|layer| layer > PlaceLayer::District))
+        })
+        .map(|(level, _)| *level)
+}
+
+/// The levels above a country's anchor that give up a tier of their own,
+/// when more levels lie above the anchor than tiers above `locality_at`.
+/// They are the outermost of the levels that claim no tier, as many as it
+/// takes.
+/// France in the planet has 3 (France métropolitaine) and 5 (Collectivité
+/// européenne d'Alsace), which no table row names, beside 2, 4, 6 and 7
+/// above its communes. Without this its arrondissements took the locality
+/// tier and the communes the one below.
+fn folded_levels(levels: &BTreeMap<u8, Want>, locality_at: usize) -> BTreeSet<u8> {
+    let Some(anchor) = anchor_level(levels) else {
+        return BTreeSet::new();
+    };
+    let above = levels.range(..anchor).count();
+    levels
+        .range(..anchor)
+        .filter(|(_, want)| want.layer.is_none())
+        .take(above.saturating_sub(locality_at))
+        .map(|(level, _)| *level)
+        .collect()
+}
+
 /// Layers that admin boundaries are ranked into, outermost first. `Place` is
 /// left out: it belongs to place nodes, not to administrative boundaries.
 const ADMIN_LAYER_ORDER: [PlaceLayer; 9] = PlaceLayer::ADMIN;
@@ -1313,22 +2183,14 @@ fn assign_layers_by_containment(
     // chain keeps the outermost of the pair rather than dropping it.
     const LOCALITY_AT: usize = 5;
     let mut assigned: BTreeMap<(CountryId, u8), PlaceLayer> = BTreeMap::new();
-    for (country, levels) in &wanted {
-        // One level of each country anchors the locality tier, the tier an
-        // address query matches a town on. It is the outermost level the
-        // table calls a city, else the outermost below the district --
-        // Australia's level 9 is tagged a suburb and is still the town an
-        // address names, and without an anchor an Australian Pack answers no
-        // structured query at all.
-        let anchor = levels
+    for (country, all_levels) in &wanted {
+        let folded = folded_levels(all_levels, LOCALITY_AT);
+        let levels = &all_levels
             .iter()
-            .find(|(_, want)| want.layer == Some(PlaceLayer::Locality))
-            .or_else(|| {
-                levels
-                    .iter()
-                    .find(|(_, want)| want.layer.is_none_or(|layer| layer > PlaceLayer::District))
-            })
-            .map(|(level, _)| *level);
+            .filter(|(level, _)| !folded.contains(level))
+            .map(|(level, want)| (*level, *want))
+            .collect::<BTreeMap<_, _>>();
+        let anchor = anchor_level(levels);
         let anchor_index = anchor.and_then(|level| levels.keys().position(|at| *at == level));
 
         let mut next = 0usize;
@@ -1381,6 +2243,17 @@ fn assign_layers_by_containment(
             .min(innermost);
             assigned.insert((*country, level), ADMIN_LAYER_ORDER[at]);
             next = at + 1;
+        }
+        // Folded level shares the tier inside it. Smaller boundary wins a tier
+        // (`compare_boundary`), so Nouvelle-Aquitaine beats France métropolitaine.
+        for &level in &folded {
+            if let Some(layer) = levels
+                .range(level..)
+                .next()
+                .and_then(|(inner, _)| assigned.get(&(*country, *inner)).copied())
+            {
+                assigned.insert((*country, level), layer);
+            }
         }
     }
 
@@ -1713,6 +2586,120 @@ fn source_type_rank(object_type: ObjectType) -> u8 {
     }
 }
 
+/// How a place point names a boundary, weakest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PlaceLink {
+    Name,
+    Item,
+    Label,
+}
+
+/// Lookups from a place point to the boundary it names, all keyed by layer so
+/// that a city node labelling its county stays a separate city, and what
+/// matching found.
+pub(crate) struct PlaceLinks {
+    labels: HashMap<(i64, PlaceLayer), usize>,
+    /// Every boundary of each item and layer: one item can be several
+    /// disjoint boundaries.
+    items: HashMap<(u32, PlaceLayer), Vec<usize>>,
+    /// The boundaries of each normalized name and layer.
+    names: HashMap<(String, PlaceLayer), Vec<usize>>,
+    /// The boundary each matched point names and how, by the point's position.
+    matched: HashMap<u64, (usize, PlaceLink)>,
+    /// The boundaries matched points of each item and layer named.
+    brought: HashMap<(u32, PlaceLayer), Vec<usize>>,
+    /// Points with an item that named no boundary: position, item, layer, point.
+    waiting: Vec<(u64, u32, PlaceLayer, [f64; 2])>,
+    /// Each boundary's strongest link merged so far.
+    strongest: Vec<Option<Strongest>>,
+    /// Heap of the lookups above, which stay as built.
+    lookup_bytes: usize,
+    /// Heap the lists inside `brought` hold.
+    brought_list_bytes: usize,
+}
+
+/// The strongest link merged into a boundary, with the point and the
+/// Wikidata item of the place point it came from.
+#[derive(Debug, Clone, Copy)]
+struct Strongest {
+    link: PlaceLink,
+    point: [f64; 2],
+    item: Option<u32>,
+}
+
+/// Heap a hash table of `map`'s capacity holds, its control bytes included.
+fn table_bytes<K, V>(map: &HashMap<K, V>) -> usize {
+    map.capacity() * 8 / 7 * (std::mem::size_of::<(K, V)>() + 1)
+}
+
+impl PlaceLinks {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.labels.is_empty() && self.items.is_empty() && self.names.is_empty()
+    }
+
+    /// Heap the lookups hold, which matching does not change.
+    fn measure_lookups(&self) -> usize {
+        let word = std::mem::size_of::<usize>();
+        table_bytes(&self.labels)
+            + table_bytes(&self.items)
+            + self
+                .items
+                .values()
+                .map(|list| list.capacity() * word)
+                .sum::<usize>()
+            + table_bytes(&self.names)
+            + self
+                .names
+                .iter()
+                .map(|((name, _), list)| name.capacity() + list.capacity() * word)
+                .sum::<usize>()
+            + self.strongest.capacity() * std::mem::size_of::<Option<Strongest>>()
+    }
+
+    /// Heap the links hold now, outside the memory budget unless a caller
+    /// reserves it: the lookups, and what matching has found so far.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.lookup_bytes
+            + table_bytes(&self.matched)
+            + table_bytes(&self.brought)
+            + self.brought_list_bytes
+            + self.waiting.capacity() * std::mem::size_of::<(u64, u32, PlaceLayer, [f64; 2])>()
+    }
+
+    /// The boundary a place point names, and how. An `admin_centre` member doesn't
+    /// count: a county's centre is a town in its own right.
+    fn find(
+        &self,
+        layer: PlaceLayer,
+        place: &PlaceRecord,
+        holds: impl Fn(usize, [f64; 2]) -> bool,
+        covers: impl Fn(usize, [f64; 2]) -> bool,
+    ) -> Option<(usize, PlaceLink)> {
+        let label = (place.source.object_type == ObjectType::Node)
+            .then(|| self.labels.get(&(place.source.object_id, layer)))
+            .flatten();
+        if let Some(index) = label {
+            return Some((*index, PlaceLink::Label));
+        }
+        let point = point_lon_lat(&place.geometry)?;
+        // Within the box only, so a mistagged Wikidata item can't pull in a
+        // distant point, and of an item's boundaries the one whose box holds it.
+        let item = place
+            .wikidata
+            .and_then(|item| self.items.get(&(item, layer)))
+            .and_then(|boundaries| boundaries.iter().find(|&&index| holds(index, point)));
+        if let Some(&index) = item {
+            return Some((index, PlaceLink::Item));
+        }
+        // Names repeat, so a name only matches a boundary that contains the point.
+        self.names
+            .get(&(normalize_for_compare(&place.name), layer))?
+            .iter()
+            .find(|&&index| covers(index, point))
+            .map(|&index| (index, PlaceLink::Name))
+    }
+}
+
 /// A part of a [`BoundarySet`] as a checkpoint saves it.
 pub(crate) enum SetItem {
     Candidate(Box<BoundaryCandidate>),
@@ -1804,6 +2791,7 @@ impl crate::extsort::Spill for SetItem {
                 put_opt_str(out, boundary.designation.as_deref());
                 put_opt_str(out, boundary.inferred_country_code.as_deref());
                 put_opt_str(out, boundary.subdivision_code.as_deref());
+                boundary.area_tags.put(out);
                 put_u64(out, boundary.shape.offset);
                 put_u64(out, boundary.shape.bytes);
                 let (min, max) = (boundary.bounds.min(), boundary.bounds.max());
@@ -1812,6 +2800,21 @@ impl crate::extsort::Spill for SetItem {
                     .chain(boundary.representative_point)
                 {
                     out.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+                put_u64(out, boundary.point_names.len() as u64);
+                for name in &boundary.point_names {
+                    put_str(out, name);
+                }
+                out.push(u8::from(boundary.settled));
+                out.push(boundary.town.map_or(0, |rank| rank.saturating_add(1)));
+                match boundary.interior_point {
+                    Some(point) => {
+                        out.push(1);
+                        for value in point {
+                            out.extend_from_slice(&value.to_bits().to_le_bytes());
+                        }
+                    }
+                    None => out.push(0),
                 }
                 out.push(u8::from(boundary.rings_closed));
             }
@@ -1867,6 +2870,7 @@ impl crate::extsort::Spill for SetItem {
                 let designation = get_opt_string(input)?;
                 let inferred_country_code = get_opt_string(input)?;
                 let subdivision_code = get_opt_string(input)?;
+                let area_tags = AreaTags::get(input)?;
                 let shape = ShapeRef {
                     offset: get_u64(input)?,
                     bytes: get_u64(input)?,
@@ -1876,14 +2880,32 @@ impl crate::extsort::Spill for SetItem {
                     *value = super::checkpoint::get_f64(input)?;
                 }
                 let [min_x, min_y, max_x, max_y, area, lon, lat] = values;
-                let rings_closed = match get_u8(input)? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(Error::Decode("a saved boundary's ring flag is not 0 or 1")),
+                let point_names = (0..get_u64(input)?)
+                    .map(|_| get_string(input))
+                    .collect::<crate::error::Result<Vec<_>>>()?;
+                let flag = |input: &mut &[u8], what| match get_u8(input)? {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    _ => Err(Error::Decode(what)),
                 };
+                let settled = flag(input, "a saved boundary's settled flag is not 0 or 1")?;
+                let town = get_u8(input)?.checked_sub(1);
+                let interior_point = if flag(
+                    input,
+                    "a saved boundary's interior point flag is not 0 or 1",
+                )? {
+                    Some([
+                        super::checkpoint::get_f64(input)?,
+                        super::checkpoint::get_f64(input)?,
+                    ])
+                } else {
+                    None
+                };
+                let rings_closed = flag(input, "a saved boundary's ring flag is not 0 or 1")?;
                 Self::Candidate(Box::new(BoundaryCandidate {
                     source_object_type,
                     source_object_id,
+                    label: None,
                     boundary: BuiltBoundary {
                         layer: boundary_layer,
                         admin_level,
@@ -1896,11 +2918,16 @@ impl crate::extsort::Spill for SetItem {
                         designation,
                         inferred_country_code,
                         subdivision_code,
+                        area_tags,
                         shape,
                         bounds: Rect::new((min_x, min_y), (max_x, max_y)),
                         area,
                         representative_point: [lon, lat],
+                        interior_point,
                         rings_closed,
+                        settled,
+                        town,
+                        point_names,
                     },
                 }))
             }
@@ -1948,6 +2975,54 @@ fn object_type_of(code: u8) -> crate::error::Result<ObjectType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dot_with_reach(point: [f64; 2], reach_m: f64) -> TownDot {
+        let mut dot = TownDot::new(
+            1,
+            point,
+            "Ashby".to_string(),
+            Settlement {
+                rank: 2,
+                prominence: Prominence::default(),
+            },
+        );
+        dot.reach_m = reach_m;
+        dot
+    }
+
+    fn reaches(dot: TownDot, [lon, lat]: [f64; 2]) -> bool {
+        let mut index = test_index(Vec::new());
+        index.add_towns(Vec::new(), vec![dot]);
+        index.dots_reaching(lon, lat, &Default::default()).count() == 1
+    }
+
+    /// A point a hair under the reach, due north, is still a candidate.
+    #[test]
+    fn a_town_reaches_a_point_due_north_at_its_reach() {
+        assert!(reaches(dot_with_reach([0.0, 0.0], 11_120.0), [0.0, 0.1]));
+    }
+
+    /// A degree of longitude shrinks to nothing at the pole.
+    #[test]
+    fn a_town_near_the_pole_reaches_across_it() {
+        assert!(reaches(
+            dot_with_reach([0.0, 89.95], 20_000.0),
+            [170.0, 89.95]
+        ));
+    }
+
+    /// Longitude wraps at the antimeridian.
+    #[test]
+    fn a_town_reaches_across_the_antimeridian() {
+        assert!(reaches(
+            dot_with_reach([179.99, 0.0], 5_000.0),
+            [-179.99, 0.0]
+        ));
+        assert!(reaches(
+            dot_with_reach([-179.99, 0.0], 5_000.0),
+            [179.99, 0.0]
+        ));
+    }
 
     #[test]
     fn exact_polygon_chooses_real_boundary_after_bbox_overlap() {
@@ -2080,10 +3155,13 @@ mod tests {
         for rings_closed in [false, true] {
             let mut boundary = test_boundary(PlaceLayer::Region);
             boundary.rings_closed = rings_closed;
+            boundary.interior_point = rings_closed.then_some([0.5, -0.25]);
+            let interior_point = boundary.interior_point;
             let mut bytes = Vec::new();
             SetItem::Candidate(Box::new(BoundaryCandidate {
                 source_object_type: ObjectType::Relation,
                 source_object_id: 60189,
+                label: None,
                 boundary,
             }))
             .encode(&mut bytes);
@@ -2092,11 +3170,13 @@ mod tests {
                 panic!("not a candidate");
             };
             assert_eq!(read.boundary.rings_closed, rings_closed);
+            assert_eq!(read.boundary.interior_point, interior_point);
         }
         let mut bytes = Vec::new();
         SetItem::Candidate(Box::new(BoundaryCandidate {
             source_object_type: ObjectType::Relation,
             source_object_id: 60189,
+            label: None,
             boundary: test_boundary(PlaceLayer::Region),
         }))
         .encode(&mut bytes);
@@ -2110,6 +3190,142 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn a_saved_boundary_keeps_what_its_merged_points_gave_it() {
+        use crate::extsort::Spill;
+        for settled in [false, true] {
+            let mut boundary = test_boundary(PlaceLayer::Locality);
+            boundary.settled = settled;
+            boundary.point_names = vec!["Emerald City".to_string()];
+            let mut bytes = Vec::new();
+            SetItem::Candidate(Box::new(BoundaryCandidate {
+                source_object_type: ObjectType::Relation,
+                source_object_id: 237_385,
+                label: None,
+                boundary,
+            }))
+            .encode(&mut bytes);
+            let SetItem::Candidate(read) = SetItem::decode(&mut bytes.as_slice()).expect("decode")
+            else {
+                panic!("not a candidate");
+            };
+            assert_eq!(read.boundary.settled, settled);
+            assert_eq!(read.boundary.point_names, ["Emerald City"]);
+        }
+    }
+
+    /// A merged point's names are added to the boundary's record, not to the
+    /// area names of the records inside it.
+    #[test]
+    fn a_merged_points_names_are_the_records_not_the_areas() {
+        let scratch = test_scratch();
+        let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
+        let vertex = |node_id, lon, lat| Vertex { node_id, lat, lon };
+        let ring = vec![
+            vertex(1, 0.0, 0.0),
+            vertex(2, 1.0, 0.0),
+            vertex(3, 1.0, 1.0),
+            vertex(4, 0.0, 1.0),
+            vertex(1, 0.0, 0.0),
+        ];
+        builder
+            .add_relations(
+                &[BoundaryRelationStub {
+                    object_id: 900,
+                    members: vec![BoundaryRelationMember {
+                        way_id: 500,
+                        role: BoundaryMemberRole::Outer,
+                    }],
+                    label: Some(10),
+                    tags: boundary_tags(&BTreeMap::from([
+                        ("boundary".to_string(), "administrative".to_string()),
+                        ("admin_level".to_string(), "8".to_string()),
+                        ("name".to_string(), "Seattle".to_string()),
+                    ])),
+                }],
+                |_| Ok(Some(ring.clone())),
+            )
+            .expect("relations");
+        let mut set = builder.finish().expect("boundaries");
+        let mut links = set.place_links();
+        let point = PlaceRecord {
+            name: "Seattle".to_string(),
+            alt_names: vec!["Emerald City".to_string()],
+            place_type: "city".to_string(),
+            geometry: point_geometry(0.3, 0.2),
+            source: SourceProvenance::osm(ObjectType::Node, 10),
+            prominence: Prominence::default(),
+            wikidata: None,
+        };
+        set.match_place_point(&mut links, 0, PlaceLayer::Locality, &point);
+        set.group_place_points(&mut links);
+        assert!(set.merge_place_point(&mut links, 0, &point));
+        set.finish_place_merges(links);
+
+        let places = set.place_records(&mut BuilderReport::default());
+        let Record::Place(_, seattle) = &places[0].1 else {
+            panic!("a boundary is a place");
+        };
+        assert_eq!(seattle.alt_names, ["Emerald City"]);
+        assert_eq!(
+            set.context_names(&[7], &HashMap::new()),
+            HashMap::from([(7, vec!["Seattle".to_string()])])
+        );
+    }
+
+    /// The links' heap grows with the points matched, so a build can reserve it.
+    #[test]
+    fn place_links_count_the_points_they_hold() {
+        let scratch = test_scratch();
+        let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
+        let vertex = |node_id, lon, lat| Vertex { node_id, lat, lon };
+        let ring = vec![
+            vertex(1, 0.0, 0.0),
+            vertex(2, 1.0, 0.0),
+            vertex(3, 1.0, 1.0),
+            vertex(4, 0.0, 1.0),
+            vertex(1, 0.0, 0.0),
+        ];
+        builder
+            .add_relations(
+                &[BoundaryRelationStub {
+                    object_id: 900,
+                    members: vec![BoundaryRelationMember {
+                        way_id: 500,
+                        role: BoundaryMemberRole::Outer,
+                    }],
+                    label: None,
+                    tags: boundary_tags(&BTreeMap::from([
+                        ("boundary".to_string(), "administrative".to_string()),
+                        ("admin_level".to_string(), "8".to_string()),
+                        ("name".to_string(), "Seattle".to_string()),
+                    ])),
+                }],
+                |_| Ok(Some(ring.clone())),
+            )
+            .expect("relations");
+        let mut set = builder.finish().expect("boundaries");
+        let mut links = set.place_links();
+        let empty = links.heap_bytes();
+        let point = |name: &str, item| PlaceRecord {
+            name: name.to_string(),
+            alt_names: Vec::new(),
+            place_type: "city".to_string(),
+            geometry: point_geometry(0.3, 0.2),
+            source: SourceProvenance::osm(ObjectType::Node, 10),
+            prominence: Prominence::default(),
+            wikidata: Some(item),
+        };
+        let points = 10_000u64;
+        for at in 0..points {
+            let name = if at % 2 == 0 { "Seattle" } else { "Elsewhere" };
+            set.match_place_point(&mut links, at, PlaceLayer::Locality, &point(name, 1));
+        }
+        // A matched point costs a table slot and a waiting one a list entry, 8 B or more each.
+        let grown = links.heap_bytes() - empty;
+        assert!(grown >= points as usize * 8, "{grown}");
     }
 
     fn test_boundary(layer: PlaceLayer) -> BuiltBoundary {
@@ -2131,13 +3347,18 @@ mod tests {
             designation: None,
             inferred_country_code: None,
             subdivision_code: None,
+            area_tags: AreaTags::default(),
             representative_point: representative_point(&geometry).expect("point"),
+            interior_point: None,
             shape: ShapeRef::default(),
             bounds: geometry.bounding_rect().expect("bounds"),
             area: geometry.unsigned_area(),
             prominence: Default::default(),
             wikidata: None,
             rings_closed: true,
+            settled: false,
+            town: None,
+            point_names: Vec::new(),
         }
     }
 
@@ -2379,6 +3600,30 @@ mod tests {
         assert_eq!(layers[&4], PlaceLayer::Region);
     }
 
+    /// France in the planet has levels no table row names (3, France
+    /// métropolitaine; 5, Collectivité européenne d'Alsace) beside the ones
+    /// a row names. Its communes (8) are still its towns, and the outermost
+    /// unnamed level shares the regions' tier.
+    #[test]
+    fn a_country_with_unnamed_outer_levels_keeps_its_town_the_locality() {
+        use PlaceLayer::*;
+
+        assert_eq!(
+            layers_for_levels_in(Some("fr"), &[2, 3, 4, 5, 6, 7, 8, 9, 10]),
+            BTreeMap::from([
+                (2, Country),
+                (3, Region),
+                (4, Region),
+                (5, SubRegion),
+                (6, District),
+                (7, SubDistrict),
+                (8, Locality),
+                (9, SubLocality),
+                (10, Neighbourhood),
+            ])
+        );
+    }
+
     #[test]
     fn keeps_the_subdivision_code_of_a_province_ranked_below_the_region_tier() {
         let tags = BTreeMap::from([("ISO3166-2".to_string(), "ca-on".to_string())]);
@@ -2390,15 +3635,24 @@ mod tests {
     }
 
     /// Ten levels for nine tiers, as a Pack of Canada with every level from 2
-    /// to 11 has: the deepest two share the innermost tier.
+    /// to 11 has: 3, which no table row names, shares the tier inside it, so
+    /// the town keeps the locality tier and the innermost level the last.
     #[test]
     fn a_country_deeper_than_the_tiers_ends_on_the_innermost() {
         let levels = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
         let layers = layers_for_levels_in(Some("ca"), &levels);
         assert_eq!(layers.len(), levels.len(), "every level keeps a tier");
         assert_eq!(layers[&2], PlaceLayer::Country);
+        assert_eq!(
+            (layers[&3], layers[&4]),
+            (PlaceLayer::Region, PlaceLayer::Region)
+        );
+        assert_eq!(layers[&8], PlaceLayer::Locality);
         let innermost = *ADMIN_LAYER_ORDER.last().expect("tiers");
-        assert_eq!((layers[&10], layers[&11]), (innermost, innermost));
+        assert_eq!(
+            (layers[&10], layers[&11]),
+            (PlaceLayer::Neighbourhood, innermost)
+        );
         let tiers = levels.iter().map(|level| layers[level]).collect::<Vec<_>>();
         assert!(
             tiers.windows(2).all(|pair| pair[0] <= pair[1]),
@@ -2485,6 +3739,7 @@ mod tests {
             candidates.push(BoundaryCandidate {
                 source_object_type: ObjectType::Relation,
                 source_object_id: index as i64 + 1,
+                label: None,
                 boundary: BuiltBoundary {
                     layer: admin_level_layer(level).expect("layer"),
                     admin_level: Some(level),
@@ -2497,13 +3752,18 @@ mod tests {
                         .map(str::to_ascii_uppercase)
                         .or_else(|| (level <= 2).then(|| "AU".to_string())),
                     subdivision_code: None,
+                    area_tags: AreaTags::default(),
                     representative_point: representative_point(&geometry).expect("point"),
+                    interior_point: None,
                     shape,
                     bounds,
                     area,
                     prominence: Default::default(),
                     wikidata: None,
                     rings_closed: true,
+                    settled: false,
+                    town: None,
+                    point_names: Vec::new(),
                 },
             });
         }
@@ -2618,11 +3878,13 @@ mod tests {
             BoundaryRelationStub {
                 object_id: 100,
                 members: members(&[1, 2]),
+                label: None,
                 tags: tags("Ontario", "CA-ON"),
             },
             BoundaryRelationStub {
                 object_id: 101,
                 members: members(&[1, 3]),
+                label: None,
                 tags: tags("Broken", "CA-QC"),
             },
         ];
@@ -2713,6 +3975,8 @@ mod tests {
             source_object_type: ObjectType::Relation,
             source_object_id: record_id as i64,
             area: geometry.unsigned_area(),
+            interior_point: None,
+            town: None,
             bounds: geometry.bounding_rect().expect("bounds"),
             shape: ShapeRef::default(),
         }

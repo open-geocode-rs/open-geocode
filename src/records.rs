@@ -1426,6 +1426,18 @@ impl Reader {
         Ok(Prominence::from_byte(get_u8(fields)?, get_u8(fields)?))
     }
 
+    /// A POI's category (`amenity:pharmacy`); none for the other layers.
+    /// Reads no geometry, so a nearest walk can test thousands.
+    pub fn poi_category_is(&self, id: RecordId, accept: impl Fn(&str) -> bool) -> Result<bool> {
+        let entry = self.body(id)?;
+        let (header, mut fields) = (entry.header, entry.fields);
+        if header.layer != Layer::Poi {
+            return Ok(false);
+        }
+        self.string_field(header.strings, &mut fields)?;
+        Ok(accept(self.string_field(header.strings, &mut fields)?))
+    }
+
     /// A place's `place_type`; none for the other layers. Reads no geometry.
     pub fn place_type(&self, id: RecordId) -> Result<Option<String>> {
         let entry = self.body(id)?;

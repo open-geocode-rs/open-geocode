@@ -42,6 +42,11 @@ provincia de
 departamento de
 estado de
 municipio de
+# et: a town, a small borough, a borough and a village
+linn
+alevik
+alev
+küla
 # fr
 région
 département de

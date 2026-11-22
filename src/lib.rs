@@ -4,11 +4,13 @@ pub mod batch;
 pub mod bench;
 pub mod builder;
 pub mod calibration;
+pub mod categories;
 pub mod confidence;
 pub mod container;
 pub mod context;
 #[cfg(test)]
 mod contract_tests;
+pub mod enclosing;
 pub mod error;
 pub mod extsort;
 pub mod geocode_bench;

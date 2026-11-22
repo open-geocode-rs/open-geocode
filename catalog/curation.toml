@@ -19,6 +19,9 @@
 #   accept_names   Upstream names flagged by the generator that are fine as they are.
 #   places         Which iD tagging schema presets make a named object a place:
 #                  catalog/places.json is generated from them.
+#   licences       OpenAddresses licence texts read by hand where the build's rules
+#                  (src/licences.rs) would judge them wrongly, keyed by source
+#                  path and pinned to the sha256 of the text read.
 
 [continents]
 why = "Geofabrik's top-level extracts with no parent. Russia is also top level upstream but is a country, see parent.transcontinental."
@@ -547,3 +550,18 @@ ids = [
 why = "A named house or block of flats is no place people look up: the Netherlands holds about 19,500 named buildings of the generic presets. One linked to Wikidata is known beyond its street."
 ids = ["building"]
 
+# --- OpenAddresses licences ---------------------------------------------
+
+[licences.permitted]
+why = "Their text holds words the build reads as a restriction, yet grants use, change and redistribution, commercial use included."
+
+[licences.permitted.set]
+"ee/countrywide" = "0c3fa8662d65"  # "use the data for commercial or non-commercial purposes and redistribute data"
+"us/mi/semcog" = "56179bd2ba12"  # "royalty-free license to use, reproduce, modify, distribute", with its copyright notice
+"us/nm/statewide" = "618bbcfde088"  # "public domain and may be copied without permission"
+
+[licences.restricted]
+why = "Their text forbids serving the rows in a Pack without a phrase the build's rules catch."
+
+[licences.restricted.set]
+"us/ne/omaha" = "3ec100951b62"  # "Any distribution of the data must be accompanied by the End User Agreement in unaltered form"

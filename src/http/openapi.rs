@@ -67,7 +67,7 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
                        Reverse results carry a `distance_m`.\n\n\
                        Errors are RFC 9457 problem documents (`application/problem+json`). \
                        Branch on `error_code`. `title` and `detail` are prose and may change.",
-        license(name = "MIT", identifier = "MIT"),
+        license(name = "Apache-2.0", identifier = "Apache-2.0"),
     ),
     servers(
         (url = "http://127.0.0.1:8080",

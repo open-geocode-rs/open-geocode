@@ -194,8 +194,10 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
         let over_share = self.reservation.bytes() + needed > share;
         if over_share || !self.reservation.reservation().try_grow(needed) {
             // Spill when the share is used up, or when the pool is full and
-            // the buffer is big enough to be worth a run.
-            if over_share || self.reservation.bytes() >= share / MIN_RUN_FRACTION {
+            // the buffer is big enough to be worth a run. Worth counts items
+            // held, not capacity reserved ahead. One growth step of large
+            // items would otherwise cut a run after its first item.
+            if over_share || self.buffered_bytes() >= share / MIN_RUN_FRACTION {
                 self.spill()?;
                 (growth, needed) = self.needed(heap, share);
             }
@@ -219,6 +221,12 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
         self.buffer.push(item);
         self.items += 1;
         Ok(())
+    }
+
+    /// Bytes of the buffered items, without capacity reserved for later ones.
+    fn buffered_bytes(&self) -> usize {
+        let spare = (self.buffer.capacity() - self.buffer.len()) * std::mem::size_of::<T>();
+        self.reservation.bytes().saturating_sub(spare)
     }
 
     /// Items the buffer must grow by to take one more item, and the bytes that
@@ -1104,6 +1112,48 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
+    /// Runs a sorter writes for `items` while a buffer that cannot spill
+    /// holds the whole pool.
+    fn runs_beside_a_full_pool<T: Spill + Ord + Send + Sync + Clone + std::fmt::Debug + 'static>(
+        name: &str,
+        items: &[T],
+    ) -> u64 {
+        let scratch = scratch(name);
+        let budget = Budget::new(64 << 20);
+        let _node_store = Reservation::forced(&budget, 64 << 20);
+        let mut sorter = ExternalSorter::new(&scratch, "items", &budget, usize::MAX);
+        for item in items {
+            sorter.push(item.clone()).expect("push");
+        }
+        let finished = sorter.finish().expect("finish");
+        let runs = scratch.owner("items").traffic().runs;
+        let mut expected = items.to_vec();
+        expected.sort();
+        assert_eq!(sorted(finished), expected);
+        runs
+    }
+
+    #[test]
+    fn a_full_pool_still_fills_a_buffer_before_each_run() {
+        // A 16 MiB floor share buffers 6 MiB, and a full pool cuts a run at
+        // a sixteenth of it. That is 24,576 pairs a run, not one.
+        assert_eq!(
+            runs_beside_a_full_pool("full-pool", &pseudo_random(100_000)),
+            5
+        );
+    }
+
+    #[test]
+    fn a_full_pool_counts_items_held_not_capacity_reserved() {
+        let items = (0..10_000u64)
+            .rev()
+            .map(|key| Wide { key, pad: [0; 63] })
+            .collect::<Vec<_>>();
+        // 768 items a run. The first growth step reserves 1,024 at once,
+        // more than a sixteenth of the buffer.
+        assert_eq!(runs_beside_a_full_pool("full-pool-wide", &items), 14);
+    }
+
     #[test]
     fn a_finished_spilled_sorter_holds_only_read_buffers() {
         let scratch = scratch("finished");
@@ -1278,6 +1328,26 @@ mod tests {
         scratch
             .reserve(&scratch.owner("records"), 1_000)
             .expect("fits");
+    }
+
+    /// An item as large as a named feature, 512 bytes in memory.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct Wide {
+        key: u64,
+        pad: [u64; 63],
+    }
+
+    impl Spill for Wide {
+        fn encode(&self, out: &mut Vec<u8>) {
+            put_u64(out, self.key);
+        }
+
+        fn decode(input: &mut &[u8]) -> Result<Self> {
+            Ok(Self {
+                key: get_u64(input)?,
+                pad: [0; 63],
+            })
+        }
     }
 
     /// Text compressing better at higher zstd levels than at level 1.

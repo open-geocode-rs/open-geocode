@@ -690,6 +690,17 @@ pub(crate) fn other_forms(word: &str) -> Vec<String> {
     forms
 }
 
+/// Records write either form, "N 34TH ST" or "North 34th Street".
+pub(crate) fn forms_both_ways(word: &str) -> Vec<String> {
+    let mut forms = other_forms(word);
+    for form in abbreviations::abbreviations().short_forms(word) {
+        if !form.contains(' ') && !forms.contains(form) {
+            forms.push(form.clone());
+        }
+    }
+    forms
+}
+
 /// The one full form the parser's abbreviation tables give `word`, the
 /// first in order when they give several ("tce" is "terrace"); `None` for
 /// a word that abbreviates nothing.

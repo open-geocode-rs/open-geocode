@@ -18,6 +18,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use md5::{Digest, Md5};
 use open_geocode::builder::BuildCancelled;
+use serde::Deserialize;
 use ureq::{Agent, ResponseExt, http::Response};
 
 use crate::format;
@@ -25,8 +26,18 @@ use crate::format;
 const CHUNK_BYTES: usize = 1 << 20;
 /// How long a download may receive nothing before it is given up as stalled.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the index body may take to arrive once its headers are in.
+const INDEX_BODY_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(60)
+};
 /// How often a download waiting for data looks at its cancel flag.
 const POLL: Duration = Duration::from_millis(200);
+/// Geofabrik's list of every extract it serves and where each one is now.
+pub(crate) const GEOFABRIK_INDEX: &str = "https://download.geofabrik.de/index-v1-nogeom.json";
+/// How many times a request is repeated after a timeout or a 5xx answer.
+const RETRIES: u32 = 3;
 
 fn agent() -> &'static Agent {
     static AGENT: OnceLock<Agent> = OnceLock::new();
@@ -42,6 +53,41 @@ fn agent() -> &'static Agent {
             .build()
             .into()
     })
+}
+
+/// The wait before retry number `attempt` (from 0), doubling each time.
+fn backoff(attempt: u32) -> Duration {
+    let first = if cfg!(test) {
+        Duration::from_millis(1)
+    } else {
+        Duration::from_secs(1)
+    };
+    first * 2u32.pow(attempt)
+}
+
+/// A timeout or a server error may pass. A 404 or any other answer will not,
+/// so it is never repeated.
+fn is_transient(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::Timeout(_) => true,
+        ureq::Error::StatusCode(status) => *status >= 500,
+        _ => false,
+    }
+}
+
+/// Runs `request` and repeats it, with a growing wait, while it fails with a
+/// timeout or a 5xx answer.
+fn retrying<T>(mut request: impl FnMut() -> Result<T, ureq::Error>) -> Result<T, ureq::Error> {
+    let mut attempt = 0;
+    loop {
+        match request() {
+            Err(error) if attempt < RETRIES && is_transient(&error) => {
+                thread::sleep(backoff(attempt));
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
 }
 
 /// A file on a server, as its headers describe it.
@@ -84,6 +130,56 @@ pub(crate) fn state_timestamp(url: &str) -> Result<i64> {
         .with_context(|| format!("{url} names no timestamp"))
 }
 
+/// Geofabrik's index, read for where each extract is now. A link stored
+/// beforehand goes stale when Geofabrik moves an extract, the index does not.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Index {
+    features: Vec<Feature>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Feature {
+    properties: Properties,
+}
+
+#[derive(Debug, Deserialize)]
+struct Properties {
+    id: String,
+    urls: Urls,
+}
+
+#[derive(Debug, Deserialize)]
+struct Urls {
+    pbf: String,
+}
+
+impl Index {
+    pub(crate) fn fetch(url: &str) -> Result<Self> {
+        // Only the index gets a body limit, extract downloads keep their idle timeout.
+        retrying(|| {
+            agent()
+                .get(url)
+                .config()
+                .timeout_recv_body(Some(INDEX_BODY_TIMEOUT))
+                .build()
+                .call()
+        })
+        .with_context(|| format!("failed to reach {url}"))?
+        .body_mut()
+        .read_json()
+        .with_context(|| format!("failed to read {url}"))
+    }
+
+    /// The download link of the extract the index calls `id`.
+    pub(crate) fn link(&self, id: &str) -> Result<&str> {
+        self.features
+            .iter()
+            .find(|feature| feature.properties.id == id)
+            .map(|feature| feature.properties.urls.pbf.as_str())
+            .with_context(|| format!("Geofabrik's index has no region {id}"))
+    }
+}
+
 /// An extract where its server keeps it now, and the MD5 sum published
 /// beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,15 +194,11 @@ pub(crate) struct Published {
 /// and the download both use that one URL, so for a dated file a new
 /// snapshot published between them cannot split them.
 pub(crate) fn published(url: &str) -> Result<Published> {
-    let response = agent()
-        .head(url)
-        .call()
-        .with_context(|| format!("failed to reach {url}"))?;
+    let response =
+        retrying(|| agent().head(url).call()).with_context(|| format!("failed to reach {url}"))?;
     let url = response.get_uri().to_string();
     let md5_url = format!("{url}.md5");
-    let text = agent()
-        .get(&md5_url)
-        .call()
+    let text = retrying(|| agent().get(&md5_url).call())
         .with_context(|| format!("failed to reach {md5_url}"))?
         .body_mut()
         .read_to_string()
@@ -202,20 +294,25 @@ fn fetch(
     cancel: &AtomicBool,
     progress: &mut impl FnMut(u64, Option<u64>),
 ) -> Result<Fetched> {
-    let mut request = agent()
-        .get(url)
-        .config()
-        .http_status_as_error(false)
-        .build();
-    if let Some((have, version)) = resume {
-        // Without the same version the server sends the whole file again.
-        request = request
-            .header("Range", format!("bytes={have}-"))
-            .header("If-Range", version);
-    }
-    let response = request
-        .call()
-        .with_context(|| format!("failed to download {url}"))?;
+    let response = retrying(|| {
+        let mut request = agent()
+            .get(url)
+            .config()
+            .http_status_as_error(false)
+            .build();
+        if let Some((have, version)) = resume {
+            // Without the same version the server sends the whole file again.
+            request = request
+                .header("Range", format!("bytes={have}-"))
+                .header("If-Range", version);
+        }
+        let response = request.call()?;
+        match response.status().as_u16() {
+            status if status >= 500 => Err(ureq::Error::StatusCode(status)),
+            _ => Ok(response),
+        }
+    })
+    .with_context(|| format!("failed to download {url}"))?;
     let length = header(&response, "content-length").and_then(|value| value.parse::<u64>().ok());
     // `bytes 100-199/200` for a part, `bytes */200` for a range past the end.
     let range = header(&response, "content-range").and_then(|value| {
@@ -370,16 +467,34 @@ mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
         net::TcpListener,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, atomic::AtomicUsize},
     };
 
     use super::*;
 
-    /// What a route answers: a body, or a redirect to a path or a full URL.
+    /// What a route answers: a body, a redirect to a path or a full URL, or an
+    /// error status.
     #[derive(Clone)]
     enum Answer {
         Body(Vec<u8>),
         Redirect(String),
+        /// An error status with no body.
+        Status(u16),
+        /// Each answer once, in order, and the last one from then on.
+        Sequence(Vec<Answer>),
+        /// A 200 whose headers promise more body than is ever sent, then silence.
+        Stall(Vec<u8>),
+    }
+
+    impl Answer {
+        /// The answer for this request. A sequence moves on to its next one.
+        fn next(&mut self) -> Answer {
+            match self {
+                Answer::Sequence(answers) if answers.len() > 1 => answers.remove(0),
+                Answer::Sequence(answers) => answers[0].clone(),
+                other => other.clone(),
+            }
+        }
     }
 
     /// A local HTTP server whose routes a test can change while it runs.
@@ -387,6 +502,7 @@ mod tests {
     struct Server {
         base: String,
         routes: Arc<Mutex<Vec<(String, Answer)>>>,
+        asked: Arc<Mutex<Vec<String>>>,
     }
 
     impl Server {
@@ -395,6 +511,8 @@ mod tests {
             let base = format!("http://{}", listener.local_addr().unwrap());
             let routes: Arc<Mutex<Vec<(String, Answer)>>> = Arc::default();
             let served = Arc::clone(&routes);
+            let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+            let record = Arc::clone(&asked);
             thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { return };
@@ -410,16 +528,21 @@ mod tests {
                             break;
                         }
                     }
+                    record.lock().unwrap().push(format!("{method} {path}"));
                     let answer = served
                         .lock()
                         .unwrap()
-                        .iter()
+                        .iter_mut()
                         .find(|(route, _)| *route == path)
-                        .map(|(_, answer)| answer.clone());
+                        .map(|(_, answer)| answer.next());
                     let (head, body) = match answer {
                         Some(Answer::Body(body)) => (
                             format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n", body.len()),
                             body,
+                        ),
+                        Some(Answer::Status(status)) => (
+                            format!("HTTP/1.1 {status} Error\r\ncontent-length: 0\r\n"),
+                            Vec::new(),
                         ),
                         Some(Answer::Redirect(to)) => (
                             format!(
@@ -427,7 +550,18 @@ mod tests {
                             ),
                             Vec::new(),
                         ),
-                        None => (
+                        Some(Answer::Stall(sent)) => {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                sent.len() + 1000
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(&sent);
+                            let _ = stream.flush();
+                            thread::sleep(Duration::from_secs(10));
+                            continue;
+                        }
+                        Some(Answer::Sequence(_)) | None => (
                             "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n".to_string(),
                             Vec::new(),
                         ),
@@ -438,7 +572,20 @@ mod tests {
                     }
                 }
             });
-            Self { base, routes }
+            Self {
+                base,
+                routes,
+                asked,
+            }
+        }
+
+        /// How many requests the path has had.
+        fn requests(&self, path: &str) -> usize {
+            let asked = self.asked.lock().unwrap();
+            asked
+                .iter()
+                .filter(|line| line.ends_with(&format!(" {path}")))
+                .count()
         }
 
         fn route(&self, path: &str, answer: Answer) {
@@ -616,5 +763,214 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(result.unwrap(), old);
+    }
+
+    const INDEX: &str = include_str!("fixtures/geofabrik-index.json");
+
+    /// A fake Geofabrik. Its index lists Monaco, which `/europe/monaco-latest.osm.pbf`
+    /// redirects to a dated file, and its sum is served beside that file.
+    fn geofabrik(monaco: &[u8]) -> Server {
+        let server = Server::start();
+        server.route(
+            "/index-v1-nogeom.json",
+            Answer::Body(INDEX.replace("{base}", &server.base).into_bytes()),
+        );
+        server.route(
+            "/europe/monaco-latest.osm.pbf",
+            Answer::Redirect("/europe/monaco-261109.osm.pbf".into()),
+        );
+        server.route(
+            "/europe/monaco-261109.osm.pbf",
+            Answer::Body(monaco.to_vec()),
+        );
+        server.route(
+            "/europe/monaco-261109.osm.pbf.md5",
+            md5_file(&md5_hex(monaco), "monaco-261109.osm.pbf"),
+        );
+        server
+    }
+
+    /// What `og build` does for a region: the index's link, the sum, the
+    /// download and the check. The file's bytes, or why it failed.
+    fn build_download(server: &Server, id: &str) -> Result<Vec<u8>> {
+        let index = Index::fetch(&server.url("/index-v1-nogeom.json"))?;
+        let published = published(index.link(id)?)?;
+        // One folder per call, since the tests run side by side.
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let call = CALLS.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("og-net-{}-{call}", std::process::id()));
+        let path = dir.join("region.osm.pbf");
+        let result =
+            download(&published, &path, &AtomicBool::new(false), |_, _| {}).and_then(|partial| {
+                check_md5(&partial, &published.md5, &AtomicBool::new(false), |_| {})?;
+                Ok(fs::read(&partial)?)
+            });
+        let _ = fs::remove_dir_all(&dir);
+        result
+    }
+
+    #[test]
+    fn a_region_is_found_in_the_index_downloaded_and_checked() {
+        let server = geofabrik(b"monaco 261109");
+
+        assert_eq!(build_download(&server, "monaco").unwrap(), b"monaco 261109");
+    }
+
+    #[test]
+    fn a_region_whose_extract_moved_is_found_where_the_index_says() {
+        let server = geofabrik(b"monaco 261109");
+        let moved = md5_hex(b"monaco, moved");
+        server.route(
+            "/index-v1-nogeom.json",
+            Answer::Body(
+                INDEX
+                    .replace(
+                        "{base}/europe/monaco-latest",
+                        "{base}/europe/moved/monaco-latest",
+                    )
+                    .replace("{base}", &server.base)
+                    .into_bytes(),
+            ),
+        );
+        server.route(
+            "/europe/moved/monaco-latest.osm.pbf",
+            Answer::Body(b"monaco, moved".to_vec()),
+        );
+        server.route(
+            "/europe/moved/monaco-latest.osm.pbf.md5",
+            md5_file(&moved, "monaco-latest.osm.pbf"),
+        );
+
+        assert_eq!(build_download(&server, "monaco").unwrap(), b"monaco, moved");
+    }
+
+    #[test]
+    fn a_region_the_index_does_not_have_is_an_error_naming_it() {
+        let server = geofabrik(b"monaco 261109");
+
+        let error = build_download(&server, "atlantis").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Geofabrik's index has no region atlantis"
+        );
+    }
+
+    #[test]
+    fn an_index_names_iso_codes_as_a_list_or_joined_by_commas() {
+        let server = geofabrik(b"monaco 261109");
+        let index = Index::fetch(&server.url("/index-v1-nogeom.json")).unwrap();
+
+        assert_eq!(
+            index.link("monaco").unwrap(),
+            server.url("/europe/monaco-latest.osm.pbf")
+        );
+        assert_eq!(
+            index.link("haiti-and-domrep").unwrap(),
+            server.url("/central-america/haiti-and-domrep-latest.osm.pbf")
+        );
+    }
+
+    #[test]
+    fn a_missing_extract_fails_at_once_naming_its_url_and_is_not_retried() {
+        let server = geofabrik(b"monaco 261109");
+        server.route("/europe/monaco-261109.osm.pbf.md5", Answer::Status(404));
+
+        let error = build_download(&server, "monaco").unwrap_err();
+
+        assert_eq!(
+            format!("{error:#}"),
+            format!(
+                "failed to reach {}: http status: 404",
+                server.url("/europe/monaco-261109.osm.pbf.md5")
+            )
+        );
+        assert_eq!(server.requests("/europe/monaco-261109.osm.pbf.md5"), 1);
+    }
+
+    #[test]
+    fn a_server_that_answers_503_twice_is_retried_until_it_answers() {
+        let server = geofabrik(b"monaco 261109");
+        let busy = || Answer::Status(503);
+        let index = INDEX.replace("{base}", &server.base).into_bytes();
+        server.route(
+            "/index-v1-nogeom.json",
+            Answer::Sequence(vec![busy(), busy(), Answer::Body(index)]),
+        );
+        server.route(
+            "/europe/monaco-261109.osm.pbf.md5",
+            Answer::Sequence(vec![
+                busy(),
+                busy(),
+                md5_file(&md5_hex(b"monaco 261109"), "monaco-261109.osm.pbf"),
+            ]),
+        );
+        server.route(
+            "/europe/monaco-261109.osm.pbf",
+            Answer::Sequence(vec![
+                busy(),
+                busy(),
+                Answer::Body(b"monaco 261109".to_vec()),
+            ]),
+        );
+
+        assert_eq!(build_download(&server, "monaco").unwrap(), b"monaco 261109");
+        assert_eq!(server.requests("/index-v1-nogeom.json"), 3);
+        assert_eq!(server.requests("/europe/monaco-261109.osm.pbf.md5"), 3);
+    }
+
+    #[test]
+    fn an_index_that_stalls_after_its_headers_is_given_up_on() {
+        let server = Server::start();
+        server.route("/index.json", Answer::Stall(br#"{"features": ["#.to_vec()));
+        let started = Instant::now();
+
+        let error = Index::fetch(&server.url("/index.json")).unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(5), "{error:#}");
+        assert!(format!("{error:#}").contains("timeout"), "{error:#}");
+    }
+
+    #[test]
+    fn a_server_that_keeps_answering_503_is_given_up_on_after_the_retries() {
+        let server = geofabrik(b"monaco 261109");
+        server.route("/europe/monaco-261109.osm.pbf.md5", Answer::Status(503));
+
+        let error = build_download(&server, "monaco").unwrap_err();
+
+        assert!(format!("{error:#}").contains("503"), "{error:#}");
+        assert_eq!(
+            server.requests("/europe/monaco-261109.osm.pbf.md5"),
+            1 + RETRIES as usize
+        );
+    }
+
+    #[test]
+    fn a_timeout_and_a_5xx_are_retried_and_nothing_else() {
+        assert!(is_transient(&ureq::Error::Timeout(
+            ureq::Timeout::RecvResponse
+        )));
+        assert!(is_transient(&ureq::Error::StatusCode(503)));
+        assert!(!is_transient(&ureq::Error::StatusCode(404)));
+        assert!(!is_transient(&ureq::Error::StatusCode(429)));
+        assert!(!is_transient(&ureq::Error::HostNotFound));
+    }
+
+    #[test]
+    fn a_file_that_does_not_match_its_sum_is_refused() {
+        let server = geofabrik(b"monaco 261109");
+        server.route(
+            "/europe/monaco-261109.osm.pbf",
+            Answer::Body(b"monaco, damaged".to_vec()),
+        );
+
+        let error = build_download(&server, "monaco").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its published checksum"),
+            "{error:#}"
+        );
     }
 }
