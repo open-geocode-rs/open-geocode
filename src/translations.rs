@@ -24,8 +24,10 @@
 //! street text entries u64 | 2 * entries + 1 offsets u32 | heap, texts
 //!             alternating local name and translation
 //! street verts entries u64 | entries + 1 offsets u32 | heap, each entry
-//!             up to 8 lon,lat i32 LE pairs; entries in the same order
-//!             as street text
+//!             the way as lon,lat i32 LE pairs, simplified to within 20 m
+//!             and at most 64 pairs; a pair of i32::MIN marks a missing node
+//!             and ends a run, no segment crosses it; entries in the same
+//!             order as street text
 //! ```
 
 use std::{
@@ -66,9 +68,15 @@ use crate::{
 };
 
 pub const SECTION: &str = "names/lang";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const IO_BUFFER_BYTES: usize = 1 << 20;
-const MAX_VERTICES: usize = 8;
+/// The most vertices kept for one way, run breaks included.
+const MAX_VERTICES: usize = 64;
+/// How far the kept line may stray from the way: far below the distance a
+/// house sits at, so simplifying never changes which way is nearest.
+const SIMPLIFY_TOLERANCE_M: f64 = 20.0;
+/// Marks a missing node: no coordinate is this far west and south.
+const BREAK: [i32; 2] = [i32::MIN; 2];
 
 // A house usually sits within 1.5 km of its way.
 const MAX_STREET_DISTANCE_M: f64 = 1500.0;
@@ -176,21 +184,22 @@ impl Spill for IdRow {
     }
 }
 
-/// A street way as the scan saw it: its sampled nodes are ids, not yet
-/// coordinates.
+/// A street way as the scan saw it: its nodes are ids, not yet coordinates.
+/// `translated` holds one text per language, empty where the way has none.
 #[derive(Debug)]
 struct PendingStreet {
-    language: u32,
     name: String,
-    translated: String,
+    translated: Vec<String>,
     refs: Vec<i64>,
 }
 
 impl Spill for PendingStreet {
     fn encode(&self, out: &mut Vec<u8>) {
-        put_u64(out, u64::from(self.language));
         put_str(out, &self.name);
-        put_str(out, &self.translated);
+        put_u64(out, self.translated.len() as u64);
+        for text in &self.translated {
+            put_str(out, text);
+        }
         put_u64(out, self.refs.len() as u64);
         for id in &self.refs {
             put_i64(out, *id);
@@ -198,16 +207,18 @@ impl Spill for PendingStreet {
     }
 
     fn decode(input: &mut &[u8]) -> Result<Self> {
-        let language = get_u32(input)?;
         let name = get_string(input)?;
-        let translated = get_string(input)?;
+        let languages = usize::try_from(get_u64(input)?)?;
+        let mut translated = Vec::with_capacity(languages.min(MAX_VERTICES));
+        for _ in 0..languages {
+            translated.push(get_string(input)?);
+        }
         let count = usize::try_from(get_u64(input)?)?;
-        let mut refs = Vec::with_capacity(count.min(MAX_VERTICES));
+        let mut refs = Vec::with_capacity(count.min(1 << 10));
         for _ in 0..count {
             refs.push(get_i64(input)?);
         }
         Ok(Self {
-            language,
             name,
             translated,
             refs,
@@ -215,14 +226,21 @@ impl Spill for PendingStreet {
     }
 
     fn resident_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.name.len() + self.translated.len() + self.refs.len() * 8
+        std::mem::size_of::<Self>()
+            + self.name.len()
+            + self
+                .translated
+                .iter()
+                .map(|text| text.len() + std::mem::size_of::<String>())
+                .sum::<usize>()
+            + self.refs.len() * 8
     }
 }
 
-/// A street way with the coordinates of its sampled nodes. `translated` is
-/// empty when the way has no other name in the language: the row still
-/// competes on distance, so a nearer way with no translation is not skipped
-/// for a farther one that has it.
+/// A street way of one language with the kept vertices of its line.
+/// `translated` is empty when the way has no other name in the language: the
+/// row still competes on distance, so a nearer way with no translation is
+/// not skipped for a farther one that has it.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct StreetRow {
     language: u32,
@@ -343,37 +361,116 @@ fn count_element(element: Element<'_>, languages: &[String], out: &mut BlockName
     if !street {
         return;
     }
-    let refs = refs.as_deref().unwrap_or(&[]);
-    let sampled = samples(refs.len())
-        .into_iter()
-        .map(|at| refs[at])
-        .collect::<Vec<_>>();
     // Every language keeps a row so a nearer untranslated way still wins; rows
     // no translated street shares a name with are dropped after the scan.
     let mut translated = vec![String::new(); languages.len()];
     for (index, value) in translations {
         translated[index] = value;
     }
-    for (index, value) in translated.into_iter().enumerate() {
-        out.streets.push(PendingStreet {
-            language: index as u32,
-            name: name.clone(),
-            translated: value,
-            refs: sampled.clone(),
-        });
+    out.streets.push(PendingStreet {
+        name,
+        translated,
+        refs: refs.unwrap_or_default(),
+    });
+}
+
+/// The line of a way as stored: the coordinates of its nodes in order, cut
+/// into runs where a node is missing from the extract, each run simplified.
+/// Joining across a gap would put a segment where there may be no road.
+fn line_vertices(coords: &[Option<[i32; 2]>]) -> Vec<[i32; 2]> {
+    let runs = coords
+        .split(Option::is_none)
+        .map(|run| run.iter().flatten().copied().collect::<Vec<_>>())
+        .filter(|run| !run.is_empty())
+        .collect::<Vec<_>>();
+    let mut tolerance = SIMPLIFY_TOLERANCE_M;
+    loop {
+        let mut line = Vec::new();
+        for run in &runs {
+            if !line.is_empty() {
+                line.push(BREAK);
+            }
+            line.extend(simplify(run, tolerance));
+        }
+        // A way still too long at any tolerance is one with many gaps.
+        if line.len() <= MAX_VERTICES || tolerance > 1e7 {
+            return line;
+        }
+        tolerance *= 2.0;
     }
 }
 
-/// Up to eight evenly spaced indices, first and last included.
-fn samples(len: usize) -> Vec<usize> {
-    if len == 0 {
-        return Vec::new();
+/// Douglas-Peucker: the points of `run` that keep the line within
+/// `tolerance_m` of the original, first and last included.
+fn simplify(run: &[[i32; 2]], tolerance_m: f64) -> Vec<[i32; 2]> {
+    if run.len() <= 2 {
+        return run.to_vec();
     }
-    let count = MAX_VERTICES.min(len);
-    let last = len - 1;
-    (0..count)
-        .map(|step| step * last / (count - 1).max(1))
+    let points = run
+        .iter()
+        .map(|[lon, lat]| [f64::from(*lon) / 1e7, f64::from(*lat) / 1e7])
+        .collect::<Vec<_>>();
+    let mut keep = vec![false; run.len()];
+    keep[0] = true;
+    keep[run.len() - 1] = true;
+    let mut stack = vec![(0, run.len() - 1)];
+    while let Some((first, last)) = stack.pop() {
+        let mut farthest = (0.0, first);
+        for at in first + 1..last {
+            let distance = crate::spatial_index::point_segment_distance_m(
+                points[at][0],
+                points[at][1],
+                points[first],
+                points[last],
+            );
+            if distance > farthest.0 {
+                farthest = (distance, at);
+            }
+        }
+        if farthest.0 > tolerance_m {
+            keep[farthest.1] = true;
+            stack.push((first, farthest.1));
+            stack.push((farthest.1, last));
+        }
+    }
+    run.iter()
+        .zip(keep)
+        .filter_map(|(point, keep)| keep.then_some(*point))
         .collect()
+}
+
+/// How far `lon, lat` is from the stored line, in metres: the nearest
+/// segment, or the nearest vertex of a run that is a single node.
+fn distance_to_line(vertices: &[u8], lon: f64, lat: f64) -> f64 {
+    let mut best = f64::INFINITY;
+    let mut previous: Option<[f64; 2]> = None;
+    let mut run = 0usize;
+    let lone = |previous: Option<[f64; 2]>, run: usize, best: f64| match previous {
+        Some(point) if run == 1 => best.min(haversine_m(lon, lat, point[0], point[1])),
+        _ => best,
+    };
+    for chunk in vertices.as_chunks::<8>().0 {
+        let [a, b, c, d, e, f, g, h] = *chunk;
+        let (x, y) = (
+            i32::from_le_bytes([a, b, c, d]),
+            i32::from_le_bytes([e, f, g, h]),
+        );
+        if [x, y] == BREAK {
+            best = lone(previous, run, best);
+            previous = None;
+            run = 0;
+            continue;
+        }
+        let point = [f64::from(x) / 1e7, f64::from(y) / 1e7];
+        if let Some(start) = previous {
+            best = best.min(crate::spatial_index::point_segment_distance_m(
+                lon, lat, start, point,
+            ));
+        }
+        previous = Some(point);
+        run += 1;
+    }
+    lone(previous, run, best)
 }
 
 fn too_big(language: &str) -> Error {
@@ -622,8 +719,10 @@ fn scan_input<'a>(
                 ids.push(row)?;
             }
             for street in names.streets {
-                if !street.translated.is_empty() {
-                    translated_names[street.language as usize].insert(street.name.clone());
+                for (index, value) in street.translated.iter().enumerate() {
+                    if !value.is_empty() {
+                        translated_names[index].insert(street.name.clone());
+                    }
                 }
                 pending.write(&street)?;
             }
@@ -637,10 +736,21 @@ fn scan_input<'a>(
     })
 }
 
-/// Place the streets of one input that can change an answer: those with a
+/// The languages whose row of `street` can change an answer: those with a
 /// translation, and those sharing a name with a translated street of the same
 /// language, which must keep their local name when they are nearer. Any other
-/// street can never change the answer, so it stores no vertices.
+/// row can never change the answer, so it stores no vertices.
+fn kept_languages<'a>(
+    street: &'a PendingStreet,
+    translated_names: &'a [HashSet<String>],
+) -> impl Iterator<Item = usize> + 'a {
+    (0..street.translated.len()).filter(move |language| {
+        !street.translated[*language].is_empty()
+            || translated_names[*language].contains(&street.name)
+    })
+}
+
+/// Place the streets of one input that some language keeps.
 fn place_input(
     scanned: Scanned<'_>,
     env: &Env<'_>,
@@ -651,9 +761,7 @@ fn place_input(
     let mut kept = Spool::<PendingStreet>::create(env.scratch, "translation-kept")?;
     for street in scanned.pending {
         let street = street?;
-        if street.translated.is_empty()
-            && !translated_names[street.language as usize].contains(&street.name)
-        {
+        if kept_languages(&street, translated_names).next().is_none() {
             continue;
         }
         nodes.mark(&street.refs)?;
@@ -676,18 +784,20 @@ fn place_input(
     )?;
     for street in kept.into_reader()? {
         let street = street?;
-        let vertices = street
+        let coords = street
             .refs
             .iter()
-            .filter_map(|id| locations.get(*id))
-            .map(|at| [at.lon_e7, at.lat_e7])
-            .collect();
-        streets.push(StreetRow {
-            language: street.language,
-            name: street.name,
-            translated: street.translated,
-            vertices,
-        })?;
+            .map(|id| locations.get(*id).map(|at| [at.lon_e7, at.lat_e7]))
+            .collect::<Vec<_>>();
+        let vertices = line_vertices(&coords);
+        for language in kept_languages(&street, translated_names) {
+            streets.push(StreetRow {
+                language: language as u32,
+                name: street.name.clone(),
+                translated: street.translated[language].clone(),
+                vertices: vertices.clone(),
+            })?;
+        }
     }
     Ok(())
 }
@@ -930,33 +1040,7 @@ impl Translations {
             let Some(vertices) = table.text(bytes, 2, index) else {
                 continue;
             };
-            let coords: Vec<(f64, f64)> = vertices
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|chunk| {
-                    (
-                        f64::from(i32::from_le_bytes(chunk[0..4].try_into().unwrap())) / 1e7,
-                        f64::from(i32::from_le_bytes(chunk[4..8].try_into().unwrap())) / 1e7,
-                    )
-                })
-                .collect();
-            let mut distance = f64::INFINITY;
-            if coords.len() == 1 {
-                distance = haversine_m(lon, lat, coords[0].0, coords[0].1);
-            } else {
-                for pair in coords.windows(2) {
-                    let d = crate::spatial_index::point_segment_distance_m(
-                        lon,
-                        lat,
-                        [pair[0].0, pair[0].1],
-                        [pair[1].0, pair[1].1],
-                    );
-                    if d < distance {
-                        distance = d;
-                    }
-                }
-            }
+            let distance = distance_to_line(vertices, lon, lat);
             if distance > MAX_STREET_DISTANCE_M {
                 continue;
             }
@@ -1385,6 +1469,75 @@ mod tests {
             translations.street_near("es", "Carrer Major", -0.37, 39.488),
             Some("Calle Mayor"),
             "the midpoint lies on the way even though every vertex is far"
+        );
+    }
+
+    #[test]
+    fn a_missing_node_does_not_join_the_nodes_on_either_side() {
+        // Node 2 is not in the extract. Joining 1 to 3 would put a street
+        // through the midpoint, 2 km from both nodes.
+        let block = vec![
+            node(1, 39.47, -0.37, &[]),
+            node(3, 39.506, -0.37, &[]),
+            street(1, &[1, 2, 3], "Carrer Major", "Calle Mayor"),
+        ];
+        let translations = built(&[block], &["es"]);
+        assert_eq!(
+            translations.street_near("es", "Carrer Major", -0.37, 39.488),
+            None,
+            "no segment crosses the gap"
+        );
+        assert_eq!(
+            translations.street_near("es", "Carrer Major", -0.37, 39.4701),
+            Some("Calle Mayor"),
+            "a node that is there still places the street"
+        );
+    }
+
+    #[test]
+    fn a_bend_is_kept_so_the_chord_across_it_is_not_a_street() {
+        // 50 nodes north, then 50 east, 0.5 km apart: an L whose corner lies
+        // between the eight evenly spaced nodes an earlier format kept.
+        let mut block = Vec::new();
+        let mut refs = Vec::new();
+        for index in 0..100i64 {
+            let (lat, lon) = if index < 50 {
+                (39.47 + index as f64 * 0.005, -0.37)
+            } else {
+                (39.47 + 49.0 * 0.005, -0.37 + (index - 49) as f64 * 0.0065)
+            };
+            block.push(node(index + 1, lat, lon, &[]));
+            refs.push(index + 1);
+        }
+        block.push(street(1, &refs, "Carrer Major", "Calle Mayor"));
+        let translations = built(&[block], &["es"]);
+        // The middle of the chord from node 43 to node 57, 1.9 km from the L.
+        assert_eq!(
+            translations.street_near("es", "Carrer Major", -0.34725, 39.6975),
+            None
+        );
+        assert_eq!(
+            translations.street_near("es", "Carrer Major", -0.37, 39.6975),
+            Some("Calle Mayor")
+        );
+    }
+
+    #[test]
+    fn a_line_keeps_its_bends_and_drops_the_points_between() {
+        let metres = |north: f64| (north / 111_000.0 * 1e7) as i32;
+        let corner = [0, metres(5000.0)];
+        let mut coords = (0..=50)
+            .map(|step| Some([0, metres(f64::from(step) * 100.0)]))
+            .collect::<Vec<_>>();
+        coords.extend((1..=50).map(|step| Some([metres(f64::from(step) * 100.0), corner[1]])));
+        let line = line_vertices(&coords);
+        assert_eq!(line.len(), 3, "start, corner, end: {line:?}");
+        assert_eq!(line[1], corner);
+
+        let gap = [Some([0, 0]), None, Some([0, metres(1000.0)])];
+        assert_eq!(
+            line_vertices(&gap),
+            vec![[0, 0], BREAK, [0, metres(1000.0)]]
         );
     }
 
