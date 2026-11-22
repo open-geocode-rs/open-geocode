@@ -2106,6 +2106,58 @@ async fn a_short_line_and_an_unknown_show_are_the_errors_here_writes() {
 }
 
 #[tokio::test]
+async fn batch_column_sources_number_the_same_records() {
+    let pack = pack("batch-column-source-numbering");
+    let router = pack.router();
+    let jobs = "/compat/here/v7/batch/jobs";
+    let records = "10 King Street\n10 King Street|tz\n10 King Street|unknown";
+    for (columns, input) in [
+        ("", format!("q|show\n{records}")),
+        ("?inputColumns=q%7Cshow", records.to_string()),
+    ] {
+        let uri = format!("{jobs}{columns}");
+        let created = send(&router, "POST", &uri, Some(("text/plain", &input))).await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
+        let created = created.json();
+        let id = created["id"].as_str().expect("id");
+        assert_eq!(finished(&router, id).await["status"], "completed");
+        let errors = get(&router, &format!("{jobs}/{id}/errors")).await.text();
+        let errors = errors.lines().skip(1).collect::<Vec<_>>();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        let illegal_line = errors[0].strip_prefix("InputLine_1|999|").expect(errors[0]);
+        let illegal_line = serde_json::from_str::<Value>(illegal_line).expect("JSON");
+        assert_eq!(illegal_line["recordId"], "InputLine_1");
+        let illegal_show = errors[1].strip_prefix("3|400|").expect(errors[1]);
+        let illegal_show = serde_json::from_str::<Value>(illegal_show).expect("JSON");
+        assert_eq!(illegal_show["requestId"], "rid-1-3");
+        let results = get(&router, &format!("{jobs}/{id}/results")).await.text();
+        assert!(
+            results
+                .lines()
+                .nth(1)
+                .is_some_and(|line| line.starts_with("2|")),
+            "{results}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_batch_numbers_query_records_without_counting_empty_lines() {
+    let pack = pack("batch-query-numbering");
+    let router = pack.router();
+    let id = finished_job(&router, "\nq=10+King+Street\n\nq=20+Queen+Street").await;
+    let results = get(&router, &format!("/compat/here/v7/batch/jobs/{id}/results"))
+        .await
+        .text();
+    let ids = results
+        .lines()
+        .skip(1)
+        .map(|line| line.split('|').next().expect("record id"))
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["1", "2"], "{results}");
+}
+
+#[tokio::test]
 async fn batch_errors_take_the_batch_shape() {
     let pack = pack("batch-errors");
     let router = pack.router();

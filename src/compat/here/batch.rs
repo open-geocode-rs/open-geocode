@@ -912,7 +912,8 @@ impl Reader<'_> {
             .input_columns
             .as_deref()
             .map(|header| Layout::Delimited(columns(cells(header, self.plan.input_delimiter))));
-        let mut number = 0usize;
+        let mut record_number = 0usize;
+        let mut first_line = true;
         let mut line = Vec::new();
         loop {
             line.clear();
@@ -933,18 +934,20 @@ impl Reader<'_> {
             if total > max_bytes {
                 return Err(Refusal::TooLarge);
             }
-            number += 1;
-            if number == 1 && line.starts_with("\u{feff}".as_bytes()) {
-                line.drain(..3);
+            if first_line {
+                first_line = false;
+                if line.starts_with("\u{feff}".as_bytes()) {
+                    line.drain(..3);
+                }
             }
             while matches!(line.last(), Some(b'\n' | b'\r')) {
                 line.pop();
             }
             let text = String::from_utf8_lossy(&line).into_owned();
+            if text.trim().is_empty() {
+                continue;
+            }
             if layout.is_none() {
-                if text.trim().is_empty() {
-                    continue;
-                }
                 let query = !text.contains(self.plan.input_delimiter) && text.contains('=');
                 if query {
                     layout = Some(Layout::Query);
@@ -956,18 +959,12 @@ impl Reader<'_> {
                     continue;
                 }
             }
-            if text.trim().is_empty() {
-                continue;
-            }
             let layout = layout.as_ref().unwrap_or(&Layout::Query);
             let broken = too_long
                 || text.chars().count() > MAX_LINE_CHARS
                 || std::str::from_utf8(&line).is_err();
-            // HERE numbers the input's records, the header line not counted.
-            let record_number = match layout {
-                Layout::Delimited(_) => number - 1,
-                Layout::Query => number,
-            };
+            // Only an inline layout consumes a header from the upload.
+            record_number += 1;
             self.record(layout, record_number, &text, broken)
                 .map_err(|error| Refusal::Unreadable(error.to_string()))?;
             if self.intake.items > self.max_items {
@@ -2650,6 +2647,29 @@ mod tests {
                 "{stopped} {deleted} {last:?}"
             );
         }
+    }
+
+    #[test]
+    fn errors_written_as_objects_still_download_as_json() {
+        use super::super::tests::pack;
+        use crate::limits::Limits;
+
+        let pack = pack("saved-batch-errors");
+        let state = pack.state(Limits::DEFAULT);
+        let meta = meta(false, false);
+        fs::create_dir_all(store_dir(&state)).expect("HERE job store");
+        fs::write(
+            file(&state, &meta.id, "rejects"),
+            r#"{"recId":"1","code":400,"message":{"status":400,"title":"Illegal input"}}"#,
+        )
+        .expect("saved reject");
+
+        let mut output = Vec::new();
+        write_errors(&state, &meta, &mut output).expect("error report");
+        assert_eq!(
+            std::str::from_utf8(&output).expect("text"),
+            "recId|errorCode|errorMessage\n1|400|{\"status\":400,\"title\":\"Illegal input\"}\n"
+        );
     }
 
     #[test]
