@@ -1,4 +1,4 @@
-from . import fetch, unzip
+from . import derived_path, fetch, unzip
 
 ARCHIVE = "jp_abr_residential.csv.zip"
 CSV = "jp_abr_residential.csv"
@@ -24,16 +24,17 @@ SOURCE = {
 
 def download(cache):
     archive, _ = fetch(SOURCE["url"], cache / ARCHIVE)
-    unzip(archive, cache / "csv", keep=lambda name: name == CSV)
     return [archive], RELEASE
 
 
 def query(files):
-    csv = files[0].parent / "csv" / CSV
+    archive = files[0]
+    csv = unzip(archive, derived_path(archive, "csv"), keep=lambda name: name == CSV) / CSV
+    csv = csv.as_posix().replace("'", "''")
     return f"""
         select id, lon as x, lat as y, 'EPSG:6668' as crs,
                number as house_number, concat(street, koaza) as road,
                regexp_replace(postcode, '^([0-9]{{3}})([0-9]{{4}})$', '\\1-\\2') as postcode,
                city, pref as state
-        from read_csv('{csv.as_posix()}', header=true, all_varchar=true)
+        from read_csv('{csv}', delim=',', quote='"', escape='"', header=true, all_varchar=true)
     """
