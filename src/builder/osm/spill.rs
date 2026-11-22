@@ -204,11 +204,15 @@ pub(crate) struct PendingAddress {
     pub building: Option<Box<Building>>,
 }
 
-/// Whether `text` is written in capitals alone, as some imported address
-/// files write every street: it has letters, and none of them is small.
 pub(crate) fn in_capitals(text: &str) -> bool {
-    let mut letters = text.chars().filter(|c| c.is_alphabetic());
-    letters.clone().count() > 1 && !letters.any(char::is_lowercase)
+    let mut uppercase = 0;
+    for c in text.chars() {
+        if c.is_lowercase() {
+            return false;
+        }
+        uppercase += usize::from(c.is_uppercase());
+    }
+    uppercase > 1
 }
 
 /// The components a street order key holds, borrowed from it.
@@ -238,7 +242,6 @@ impl<'a> Fields<'a> {
             .get(CELL_KEY_LEN..)
             .ok_or(Error::Decode("address sort key is truncated"))?;
         get_order_text(&mut input)?;
-        get_u8(&mut input)?;
         get_u8(&mut input)?;
         let mut texts = [None; 6];
         for text in &mut texts {
@@ -347,9 +350,6 @@ impl PendingAddress {
         // Addresses stating a postcode first: the street's postcodes are all
         // known by the time its addresses without one come out.
         order.push(u8::from(address.postcode.is_none()));
-        // Then the addresses writing their street in mixed case: the street's
-        // spelling is known by the time those in capitals alone come out.
-        order.push(u8::from(address.street.as_deref().is_some_and(in_capitals)));
         for field in [
             &address.street,
             &address.place,
@@ -731,22 +731,22 @@ pub(crate) struct PlacedAddress {
 /// What an address is lent from the others of its street: the postcodes
 /// they state, when it states none, and their spelling of its street, when
 /// it writes the street in capitals alone.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Lent {
     pub postcodes: Vec<String>,
-    pub street: Option<String>,
+    pub spellings: Vec<String>,
 }
 
 impl Spill for Lent {
     fn encode(&self, out: &mut Vec<u8>) {
         put_strs(out, &self.postcodes);
-        put_opt_str(out, self.street.as_deref());
+        put_strs(out, &self.spellings);
     }
 
     fn decode(input: &mut &[u8]) -> Result<Self> {
         Ok(Self {
             postcodes: get_strings(input)?,
-            street: get_opt_string(input)?,
+            spellings: get_strings(input)?,
         })
     }
 }
@@ -2420,11 +2420,11 @@ mod tests {
         }
         round_trip(&Lent {
             postcodes: vec!["M5V 1A1".into(), "M5V 2B2".into()],
-            street: None,
+            spellings: Vec::new(),
         });
         round_trip(&Lent {
             postcodes: Vec::new(),
-            street: Some("Piazza della Repubblica".into()),
+            spellings: vec!["Piazza della Repubblica".into()],
         });
     }
 

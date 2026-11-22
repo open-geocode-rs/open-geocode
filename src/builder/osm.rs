@@ -778,10 +778,10 @@ impl<'a> Run<'a> {
             if let Some(book) = &addresses.book {
                 run.address_book = Some(BookFile::restore(&scratch, book)?);
             }
-            if let Some((book, postcodes)) = &addresses.placed {
+            if let Some((book, lent)) = &addresses.placed {
                 run.books = Some(AddressBook {
                     addresses: BookFile::restore(&scratch, book)?,
-                    postcodes: BookFile::restore(&scratch, postcodes)?,
+                    lent: BookFile::restore(&scratch, lent)?,
                     datasets: Datasets::from_names(state.datasets.clone()),
                 });
             }
@@ -1657,7 +1657,7 @@ impl<'a> Run<'a> {
             .contexts
             .as_ref()
             .ok_or_else(|| missing("the contexts"))?;
-        let lent = Book::create(&self.scratch, "street-postcodes")?;
+        let lent = Book::create(&self.scratch, "street-lending")?;
         let records = open(&mut self.build.records, "records")?;
         let seq = &mut self.build.seq;
         let (postcodes, book, lent) = match self.address_book.take() {
@@ -1707,7 +1707,7 @@ impl<'a> Run<'a> {
         };
         self.books = Some(AddressBook {
             addresses: book,
-            postcodes: lent.finish()?,
+            lent: lent.finish()?,
             datasets: Datasets::from_names(self.build.datasets.names().to_vec()),
         });
         let report = &mut self.build.report;
@@ -1935,10 +1935,10 @@ impl<'a> Run<'a> {
         if let Some(books) = &mut self.books {
             addresses.placed = Some((
                 books.addresses.state(&scratch)?,
-                books.postcodes.state(&scratch)?,
+                books.lent.state(&scratch)?,
             ));
             files.extend(books.addresses.files());
-            files.extend(books.postcodes.files());
+            files.extend(books.lent.files());
         }
         let geometry = self
             .geometry_saved
@@ -2353,16 +2353,8 @@ struct AddressRuns<'a> {
     seq: &'a mut u64,
     index: &'a BoundaryIndex,
     country_codes: &'a HashMap<RecordId, CountryCode>,
-    street: postcode::Street,
     postcodes: postcode::Accumulator,
-    /// The postcodes lent to each street, and the street key and position
-    /// of the last street's.
-    lent: Book<Lent>,
-    /// The street key, what was lent and where, of the last lending.
-    lent_street: Option<(Vec<u8>, Lent, u64)>,
-    /// The street key of the last address writing its street in mixed
-    /// case, and that spelling.
-    spelling: Option<(Vec<u8>, String)>,
+    lending: StreetLending,
     /// Where the addresses not yet in an address book are written as they
     /// are placed.
     book: Option<Book<PendingAddress>>,
@@ -2388,11 +2380,8 @@ impl<'a> AddressRuns<'a> {
             seq,
             index,
             country_codes,
-            street: postcode::Street::default(),
             postcodes: postcode::Accumulator::default(),
-            lent,
-            lent_street: None,
-            spelling: None,
+            lending: StreetLending::new(lent),
             book,
             batch: Vec::new(),
             group: None,
@@ -2419,7 +2408,8 @@ impl<'a> AddressRuns<'a> {
         Option<Book<PendingAddress>>,
     )> {
         self.place_batch()?;
-        Ok((self.postcodes, self.lent, self.book))
+        self.lending.close_street()?;
+        Ok((self.postcodes, self.lending.book, self.book))
     }
 
     fn place_batch(&mut self) -> Result<()> {
@@ -2472,45 +2462,7 @@ impl<'a> AddressRuns<'a> {
             let (_, key, country) = self.group.as_ref().expect("a group has a start");
             let (key, country) = (*key, *country);
             let fields = address.fields();
-            let street_key = address.street_key();
-            let street = fields.street.and_then(|street| {
-                if !spill::in_capitals(street) {
-                    if self
-                        .spelling
-                        .as_ref()
-                        .is_none_or(|(held, _)| held[..] != *street_key)
-                    {
-                        self.spelling = Some((street_key.to_vec(), street.to_string()));
-                    }
-                    return None;
-                }
-                self.spelling
-                    .as_ref()
-                    .filter(|(held, spelling)| {
-                        held[..] == *street_key && spelling.to_lowercase() == street.to_lowercase()
-                    })
-                    .map(|(_, spelling)| spelling.clone())
-            });
-            let lending = Lent {
-                postcodes: self
-                    .street
-                    .lend(street_key, &fields)
-                    .map(<[String]>::to_vec)
-                    .unwrap_or_default(),
-                street,
-            };
-            let lent = if lending == Lent::default() {
-                None
-            } else {
-                Some(match &self.lent_street {
-                    Some((held, same, at)) if held[..] == *street_key && *same == lending => *at,
-                    _ => {
-                        let at = self.lent.push(lending.clone())?;
-                        self.lent_street = Some((street_key.to_vec(), lending, at));
-                        at
-                    }
-                })
-            };
+            let lent = self.lending.offer(address.street_key(), &fields)?;
             self.postcodes
                 .accept(country, fields.postcode, address.point);
             let (at, disputed) = match shelved {
@@ -2535,11 +2487,78 @@ impl<'a> AddressRuns<'a> {
     }
 }
 
+struct StreetLending {
+    book: Book<Lent>,
+    key: Vec<u8>,
+    postcodes: postcode::Street,
+    spellings: BTreeSet<String>,
+    lend_postcodes: bool,
+    lend_spellings: bool,
+}
+
+impl StreetLending {
+    fn new(book: Book<Lent>) -> Self {
+        Self {
+            book,
+            key: Vec::new(),
+            postcodes: postcode::Street::default(),
+            spellings: BTreeSet::new(),
+            lend_postcodes: false,
+            lend_spellings: false,
+        }
+    }
+
+    fn offer(&mut self, key: &[u8], fields: &spill::Fields<'_>) -> Result<Option<u64>> {
+        if self.key != key {
+            self.close_street()?;
+            self.key.clear();
+            self.key.extend_from_slice(key);
+        }
+        let postcode = self.postcodes.lends_to(fields);
+        let spelling = fields.street.is_some_and(|name| {
+            if spill::in_capitals(name) {
+                return true;
+            }
+            if !self.spellings.contains(name) {
+                self.spellings.insert(name.to_owned());
+            }
+            false
+        });
+        self.lend_postcodes |= postcode;
+        self.lend_spellings |= spelling;
+        // Spelling can come from a later row. Reserve one entry for the whole
+        // street so postcode-first order and bounded address batches stay intact.
+        Ok((postcode || spelling).then(|| self.book.next_position()))
+    }
+
+    fn close_street(&mut self) -> Result<()> {
+        let postcodes = std::mem::take(&mut self.postcodes).postcodes;
+        let spellings = std::mem::take(&mut self.spellings);
+        let lend_postcodes = std::mem::take(&mut self.lend_postcodes);
+        let lend_spellings = std::mem::take(&mut self.lend_spellings);
+        if lend_postcodes || lend_spellings {
+            self.book.push(Lent {
+                postcodes: if lend_postcodes {
+                    postcodes
+                } else {
+                    Vec::new()
+                },
+                spellings: if lend_spellings {
+                    spellings.into_iter().collect()
+                } else {
+                    Vec::new()
+                },
+            })?;
+        }
+        Ok(())
+    }
+}
+
 /// The addresses in street order and the postcodes lent to their streets,
 /// read back as the records standing for them are written.
 struct AddressBook {
     addresses: BookFile<PendingAddress>,
-    postcodes: BookFile<Lent>,
+    lent: BookFile<Lent>,
     datasets: Datasets,
 }
 
@@ -2549,15 +2568,15 @@ impl AddressBook {
     /// chunk it needs is read once.
     fn records(&self, batch: Vec<PendingRecord>) -> Result<Vec<Record>> {
         let mut address_chunks = Vec::new();
-        let mut postcode_chunks = Vec::new();
+        let mut lending_chunks = Vec::new();
         for pending in &batch {
             if let Body::Address(placed) = &pending.body {
                 address_chunks.push(BookFile::<PendingAddress>::chunk_of(placed.at));
-                postcode_chunks.extend(placed.lent.map(BookFile::<Lent>::chunk_of));
+                lending_chunks.extend(placed.lent.map(BookFile::<Lent>::chunk_of));
             }
         }
         let addresses = read_chunks(&self.addresses, address_chunks)?;
-        let postcodes = read_chunks(&self.postcodes, postcode_chunks)?;
+        let lending = read_chunks(&self.lent, lending_chunks)?;
         batch
             .into_par_iter()
             .map(|pending| {
@@ -2569,11 +2588,23 @@ impl AddressBook {
                             BookFile::pick(chunk, placed.at)?.record(&self.datasets)?;
                         record.disputed = placed.disputed;
                         if let Some(at) = placed.lent {
-                            let chunk = &postcodes[&BookFile::<Lent>::chunk_of(at)];
+                            let chunk = &lending[&BookFile::<Lent>::chunk_of(at)];
                             let lent = BookFile::pick(chunk, at)?;
-                            record.street_postcodes.clone_from(&lent.postcodes);
-                            if let Some(street) = &lent.street {
-                                record.address.street = Some(street.clone());
+                            if record.address.postcode.is_none() {
+                                record.street_postcodes.clone_from(&lent.postcodes);
+                            }
+                            if let Some(street) = record.address.street.as_mut()
+                                && !lent.spellings.is_empty()
+                                && spill::in_capitals(street)
+                            {
+                                let lowercase = street.to_lowercase();
+                                if let Some(spelling) = lent
+                                    .spellings
+                                    .iter()
+                                    .find(|spelling| spelling.to_lowercase() == lowercase)
+                                {
+                                    street.clone_from(spelling);
+                                }
                             }
                         }
                         Record::Address(record)
@@ -3960,10 +3991,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// One source placing one house at several points a few hundred metres
-    /// apart, as Japan's land ministry does a lot cut by a road, repeats
-    /// the house: one record, not disputed. Two sources placing it so
-    /// apart still dispute it.
     #[test]
     fn an_address_in_capitals_takes_the_spelling_its_street_writes() {
         let dir = temp_dir("street-spelling");
@@ -3972,9 +3999,12 @@ mod tests {
         let path = dir.join("register.csv");
         fs::write(
             &path,
-            "LON,LAT,NUMBER,STREET,CITY\n\
-             -79.40,43.600,40,KING STREET,Toronto\n\
-             -79.40,43.601,42,QUEEN STREET,Toronto\n",
+            "LON,LAT,NUMBER,STREET,CITY,POSTCODE\n\
+             -79.40,43.600,40,KING STREET,Toronto,\n\
+             -79.40,43.601,42,QUEEN STREET,Toronto,\n\
+             -79.40,43.601,50,ELM STREET,Toronto,M5G 1H2\n\
+             -79.40,43.601,52,Elm Street,Toronto,\n\
+             -79.40,43.601,54,ELM ST,Toronto,\n",
         )
         .expect("csv");
         build_osm_pack(&BuildOsmOptions {
@@ -3992,29 +4022,31 @@ mod tests {
         })
         .expect("build");
         let reader = Reader::open(dir.join("pack")).expect("reader");
-        let mut streets = reader
-            .records_json_by_layer("address", 0)
-            .expect("addresses")
-            .into_iter()
-            .filter(|address| {
-                address["id"]
-                    .as_str()
-                    .is_some_and(|id| id.contains("register"))
-            })
-            .map(|address| {
-                address["address"]["street"]
-                    .as_str()
-                    .expect("street")
-                    .to_string()
-            })
-            .collect::<Vec<_>>();
-        streets.sort();
-        // King Street takes the spelling OSM's addresses on it write. No
-        // address on Queen Street writes it otherwise, so it stays.
-        assert_eq!(streets, ["King Street", "QUEEN STREET"]);
+        for (row, (street, postcodes)) in [
+            ("King Street", &["M5V 1A1"][..]),
+            ("QUEEN STREET", &[][..]),
+            ("Elm Street", &[][..]),
+            ("Elm Street", &["M5G 1H2"][..]),
+            ("ELM ST", &["M5G 1H2"][..]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("openaddresses:register:row:{}", row + 1);
+            let record = reader.find_by_source_id(&id).expect("lookup").expect(&id);
+            let Record::Address(address) = reader.records().record(record).expect("record") else {
+                panic!("{id} is an address");
+            };
+            assert_eq!(address.address.street.as_deref(), Some(street), "{id}");
+            assert_eq!(address.street_postcodes, postcodes, "{id}");
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// One source placing one house at several points a few hundred metres
+    /// apart, as Japan's land ministry does a lot cut by a road, repeats
+    /// the house: one record, not disputed. Two sources placing it so
+    /// apart still dispute it.
     #[test]
     fn a_house_one_source_places_apart_is_repeated_not_disputed() {
         let dir = temp_dir("one-source-apart");
@@ -6756,7 +6788,8 @@ mod tests {
              -79.40005,43.60003,10,KING ST,Toronto,M5V 1A1\n\
              -79.4003,43.6003,16,King Street,Toronto,M5V 1A1\n\
              -79.40,43.604,10,King Street,Toronto,M5V 1A1\n\
-             -79.45,43.65,3,Queen Street,Toronto,\n",
+             -79.45,43.65,3,QUEEN STREET,Toronto,M5V 2B1\n\
+             -79.45,43.65,5,Queen Street,Toronto,\n",
         )
         .expect("csv");
         BuildOsmOptions {
@@ -6870,6 +6903,36 @@ mod tests {
             );
             let _ = fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn an_older_checkpoint_is_refused_and_kept() {
+        let dir = temp_dir("old-checkpoint");
+        let options = BuildOsmOptions {
+            pack: dir.join("pack"),
+            ..resumable_inputs(&dir)
+        };
+        fail_before(&options, Step::Contexts);
+        let found = resume::find(&options.pack).expect("find");
+        let manifest = found[0].manifest();
+        let mut prior: Manifest<State> =
+            serde_json::from_slice(&fs::read(&manifest).expect("read")).expect("manifest");
+        prior.format = FORMAT_VERSION - 1;
+        let bytes = serde_json::to_vec(&prior).expect("serialize");
+        fs::write(&manifest, &bytes).expect("write");
+
+        let failure = build_osm_pack(&BuildOsmOptions {
+            leftover: Leftover::Resume,
+            ..options
+        })
+        .expect_err("old checkpoint is refused");
+        let expected = format!(
+            "checkpoint of format {}, not {FORMAT_VERSION}",
+            prior.format
+        );
+        assert!(failure.to_string().contains(&expected), "{failure}");
+        assert_eq!(fs::read(&manifest).expect("checkpoint kept"), bytes);
+        fs::remove_dir_all(dir).expect("remove fixture");
     }
 
     #[test]
