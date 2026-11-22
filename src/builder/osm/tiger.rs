@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
     io::{self, Cursor, Read},
     path::Path,
@@ -147,9 +147,69 @@ const STREET_JOIN_M: f64 = 20.0;
 const MAX_COUNTY_ARCHIVE_BYTES: u64 = 128 << 20;
 const MAX_COUNTY_ENTRY_BYTES: u64 = 512 << 20;
 
+pub(super) fn counties_for_pack(path: &Path, cache: &Path) -> Result<BTreeSet<String>> {
+    let reader = pack::Reader::open(path)?;
+    let states = reader.tiger_states();
+    if states.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let spatial = spatial_index::Reader::open(reader.container(), reader.records().clone())?;
+    const NAME: &str = "tl_2026_us_county";
+    const URL: &str = "https://www2.census.gov/geo/tiger/TIGER2026/COUNTY/tl_2026_us_county.zip";
+    let bad = |error: String| Error::BadInput(format!("TIGER {NAME}: {error}"));
+    let bytes = cached_archive(cache, NAME, URL, MAX_COUNTY_ARCHIVE_BYTES, |bytes| {
+        zip::ZipArchive::new(Cursor::new(bytes))
+            .map(drop)
+            .map_err(|error| bad(error.to_string()))
+    })?;
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| bad(error.to_string()))?;
+    let geometry = shapefile::ShapeReader::new(zip_entry(
+        &mut archive,
+        NAME,
+        "shp",
+        MAX_COUNTY_ENTRY_BYTES,
+    )?)
+    .map_err(|error| bad(error.to_string()))?;
+    let attributes = dbase::Reader::new(zip_entry(
+        &mut archive,
+        NAME,
+        "dbf",
+        MAX_COUNTY_ENTRY_BYTES,
+    )?)
+    .map_err(|error| bad(error.to_string()))?;
+    drop(archive);
+    let mut source = shapefile::Reader::new(geometry, attributes);
+    let mut counties = BTreeSet::new();
+    // Census county equivalents need no matching OSM administrative record.
+    for row in source.iter_shapes_and_records_as::<shapefile::Polygon, dbase::Record>() {
+        let (shape, row) = row.map_err(|error| bad(error.to_string()))?;
+        let code = dbf_text(&row, "GEOID")
+            .filter(|code| code.len() == 5 && code.bytes().all(|byte| byte.is_ascii_digit()))
+            .ok_or_else(|| bad("invalid county GEOID".into()))?;
+        if !states.contains(&code[..2]) {
+            continue;
+        }
+        let bbox = shape.bbox();
+        // A road within the TIGER join tolerance may sit across the boundary.
+        const PAD: f64 = 0.002;
+        let bounds = [
+            (bbox.min.x - PAD).max(-180.0),
+            (bbox.min.y - PAD).max(-90.0),
+            (bbox.max.x + PAD).min(180.0),
+            (bbox.max.y + PAD).min(90.0),
+        ];
+        if spatial.has_spatial_data_in_box(bounds)? {
+            counties.insert(code.to_string());
+        }
+    }
+    Ok(counties)
+}
+
 pub(super) fn add_ranges(
     sealed: &mut pack::SealedPack,
     cache: &Path,
+    counties: &BTreeSet<String>,
     progress: &crate::builder::progress::Progress,
 ) -> Result<Vec<(&'static str, u64)>> {
     let (ranges, block_sides, zip_sides) = {
@@ -158,7 +218,7 @@ pub(super) fn add_ranges(
         let mut ranges = Vec::new();
         let mut block_sides = Vec::new();
         let mut zip_sides = Vec::new();
-        for county in pack.tiger_counties() {
+        for county in counties {
             progress.check()?;
             let name = format!("tl_2026_{county}_addrfeat");
             let url = format!("https://www2.census.gov/geo/tiger/TIGER2026/ADDRFEAT/{name}.zip");
@@ -566,6 +626,7 @@ fn county_faces(cache: &Path, county: &str) -> Result<HashMap<u64, Face>> {
 pub(super) fn add_zcta(
     sealed: &mut pack::SealedPack,
     cache: &Path,
+    counties: &BTreeSet<String>,
     progress: &crate::builder::progress::Progress,
 ) -> Result<u64> {
     use geo::Contains;
@@ -574,7 +635,7 @@ pub(super) fn add_zcta(
         let pack = pack::Reader::open(sealed.path())?;
         let spatial = spatial_index::Reader::open(pack.container(), pack.records().clone())?;
         let mut codes = Vec::new();
-        for county in pack.tiger_counties() {
+        for county in counties {
             let name = format!("tl_2026_{county}_faces");
             let url = format!("https://www2.census.gov/geo/tiger/TIGER2026/FACES/{name}.zip");
             let bad = |error: String| Error::BadInput(format!("TIGER {name}: {error}"));

@@ -2277,7 +2277,9 @@ impl<'a> Run<'a> {
         crate::structured::add_to(&mut sealed)?;
         crate::ids::add_to(&mut sealed)?;
         if self.options.tiger {
-            let sections = tiger::add_ranges(&mut sealed, &self.options.pack, &self.progress)?;
+            let counties = tiger::counties_for_pack(&sealed.path(), &self.options.pack)?;
+            let sections =
+                tiger::add_ranges(&mut sealed, &self.options.pack, &counties, &self.progress)?;
             if !sections.is_empty() {
                 self.build
                     .report
@@ -2314,7 +2316,8 @@ impl<'a> Run<'a> {
                     stats.sections.insert(section.to_string(), bytes);
                 }
             }
-            let bytes = tiger::add_zcta(&mut sealed, &self.options.pack, &self.progress)?;
+            let bytes =
+                tiger::add_zcta(&mut sealed, &self.options.pack, &counties, &self.progress)?;
             if bytes > 0 {
                 stats
                     .sections

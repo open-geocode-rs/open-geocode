@@ -1529,14 +1529,6 @@ impl Reader {
             .collect()
     }
 
-    pub(crate) fn tiger_counties(&self) -> std::collections::BTreeSet<&str> {
-        self.census_codes
-            .values()
-            .map(String::as_str)
-            .filter(|code| code.len() == 5)
-            .collect()
-    }
-
     pub(crate) fn census_code(&self, record_id: RecordId) -> Option<&str> {
         self.census_codes.get(&record_id).map(String::as_str)
     }

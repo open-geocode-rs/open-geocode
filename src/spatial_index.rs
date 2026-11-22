@@ -490,6 +490,31 @@ impl Tree {
         u64::from_le_bytes(id)
     }
 
+    fn intersects(&self, bounds: BoundingBox) -> bool {
+        let Some(root) = self.levels.len().checked_sub(1) else {
+            return false;
+        };
+        let mut pending = vec![(root, 0)];
+        while let Some((level, node)) = pending.pop() {
+            let (start, _) = self.levels[level];
+            let bbox = self.bbox(start + node);
+            if bbox[0] > bounds[2]
+                || bounds[0] > bbox[2]
+                || bbox[1] > bounds[3]
+                || bounds[1] > bbox[3]
+            {
+                continue;
+            }
+            if level == 0 {
+                return true;
+            }
+            let (_, count) = self.levels[level - 1];
+            let children = node * NODE_SIZE..((node + 1) * NODE_SIZE).min(count);
+            pending.extend(children.map(|child| (level - 1, child)));
+        }
+        false
+    }
+
     /// Items whose boxes lie within `radius_m` of the point, nearest box
     /// first, each with a lower bound on its distance.
     fn nearest(&self, lon: f64, lat: f64, radius_m: f64) -> Nearest<'_> {
@@ -710,6 +735,17 @@ impl Reader {
             context: Tree::open(container, CONTEXT)?,
             records,
         })
+    }
+
+    pub(crate) fn has_spatial_data_in_box(&self, bounds: [f64; 4]) -> Result<bool> {
+        let [west, south, east, north] = bounds;
+        let quantized = [
+            quantize(west)?,
+            quantize(south)?,
+            quantize(east)?,
+            quantize(north)?,
+        ];
+        Ok(self.lines.intersects(quantized) || self.blocks.intersects(quantized))
     }
 
     pub(crate) fn address_points_in_box(
