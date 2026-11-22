@@ -1257,10 +1257,9 @@ impl<'a> Run<'a> {
             .ok_or_else(|| missing("the node store"))?;
         input.kept_blobs.sort_unstable();
         input.kept_blobs.dedup();
-        // Boundary geometry goes to the input's spool alone: held in memory
-        // across a planet's inputs it would outgrow any budget.
+        // Retaining a whole input's boundary vertices crowds the mapped node store.
         let mut input_members = HashSet::new();
-        let mut part = Vec::new();
+        let mut part = Spool::create(&self.scratch, "geometry")?;
         let build = &mut self.build;
         let read = for_each_block(
             &self.options.inputs[index],
@@ -1278,29 +1277,23 @@ impl<'a> Run<'a> {
                 for (way_id, line, found) in assembled.members {
                     if input_members.insert(way_id) {
                         resolution.resolved_node_refs += found;
-                        part.push(GeometryItem::Member(way_id, line));
+                        part.write(&GeometryItem::Member(way_id, line))?;
                     }
                 }
-                part.extend(
-                    assembled
-                        .entrances
-                        .into_iter()
-                        .map(|(node, kind)| GeometryItem::Entrance(node, kind)),
-                );
-                part.extend(
-                    assembled
-                        .output
-                        .boundary_ways
-                        .into_iter()
-                        .map(GeometryItem::Way),
-                );
+                for (node, kind) in assembled.entrances {
+                    part.write(&GeometryItem::Entrance(node, kind))?;
+                }
+                for way in assembled.output.boundary_ways {
+                    part.write(&GeometryItem::Way(way))?;
+                }
                 build.absorb(assembled.output.emitted)
             },
         )?;
         self.build.report.geometry_passes.way_read_bytes += read;
         self.build.report.phases.feature_emission_ms += phase.elapsed().as_millis();
         drop(input);
-        self.save_geometry(&part)
+        self.geometry_saved.push(part.finish()?);
+        Ok(())
     }
 
     /// Keep an input's part of the boundary geometry on disk until the
