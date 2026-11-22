@@ -14,6 +14,7 @@ mod home;
 mod job;
 mod net;
 mod regions;
+mod status;
 mod ui;
 
 use std::{
@@ -49,6 +50,7 @@ use app::App;
 use home::Home;
 use job::{BuildInput, BuildJob, BuildRequest};
 use regions::Region;
+use status::Status;
 
 /// mimalloc, counted, as the `open-geocode` binary has it: builds run on
 /// it, and the count lets a build's memory pool see the heap it does not
@@ -210,9 +212,9 @@ struct Flags {
     openaddresses: bool,
 }
 
-/// `og build`: the build the interface runs, with one line per step. Ctrl-C
-/// stops it, keeping its last checkpoint for `--resume`; a second one quits
-/// at once.
+/// `og build`: the build the interface runs, with a line per finished step
+/// and the running step's line below them. Ctrl-C stops it, keeping its
+/// last checkpoint for `--resume`; a second one quits at once.
 fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result<()> {
     let Flags {
         memory_budget_bytes,
@@ -270,6 +272,22 @@ fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result
                 .join("-"),
         ),
     };
+    for input in inputs.iter().filter(|input| input.download) {
+        let url = &input.region.osm.url;
+        // The catalog's size is from its snapshot, so the server's is asked.
+        // A server that does not answer fails the download itself, with
+        // the reason; here the catalog's size stands in, as in the picker.
+        let bytes = net::head(url)
+            .ok()
+            .and_then(|remote| remote.bytes)
+            .unwrap_or(input.region.osm.bytes);
+        eprintln!(
+            "Will download {} for {}, {}, from {url}",
+            regions::dataset_name(input.region.dataset()),
+            input.region.name,
+            format::bytes(bytes),
+        );
+    }
     let request = BuildRequest {
         inputs,
         pack,
@@ -291,28 +309,45 @@ fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result
     .context("failed to handle Ctrl-C")?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted)
         .context("failed to handle Ctrl-C")?;
+    let mut live = Status::new();
+    // Every line pads names to the widest, so the columns of all steps line
+    // up.
+    let name_width = job
+        .progress
+        .steps
+        .lock()
+        .expect("steps lock")
+        .iter()
+        .map(|step| step.object.chars().count())
+        .max()
+        .unwrap_or_default();
     let (mut printed, mut warned) = (0, 0);
     loop {
         {
             let warnings = job.progress.warnings.lock().expect("warnings lock");
             for warning in &warnings[warned..] {
-                eprintln!("warning: {warning}");
+                live.print(&format!("warning: {warning}"));
             }
             warned = warnings.len();
         }
         {
             let steps = job.progress.steps.lock().expect("steps lock");
             while let Some(step) = steps.get(printed).filter(|step| step.secs.is_some()) {
-                eprintln!(
-                    "{:<10} {:<18} {:>8}",
-                    step.did,
-                    step.object,
-                    format::duration(step.secs.unwrap_or_default())
-                );
+                live.print(&status::finished_line(step, name_width));
                 printed += 1;
+            }
+            let current = job.progress.current();
+            if let Some(step) = steps.get(current).filter(|step| step.running()) {
+                let readout = step.readout(job.progress.done());
+                live.update(
+                    current,
+                    step.started.map(|at| at.elapsed()).unwrap_or_default(),
+                    status::running_line(step, &readout, name_width),
+                );
             }
         }
         if let Some(outcome) = job.take() {
+            live.clear();
             let built = match outcome {
                 Err(error) if job::cancelled(&error) => {
                     eprintln!("Cancelled; the unfinished Pack was removed.");
