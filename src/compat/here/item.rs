@@ -78,6 +78,8 @@ struct Access {
 #[derive(Debug, Default, PartialEq, Deserialize)]
 struct Address {
     housenumber: Option<String>,
+    block: Option<String>,
+    subblock: Option<String>,
     unit: Option<String>,
     street: Option<String>,
     #[serde(default)]
@@ -135,6 +137,16 @@ impl Feature {
         let address = &common.address;
         let context = &common.context;
         let area = |area: &Option<api::ContextArea>| area.as_ref().map(Area::of);
+        let (block, subblock) =
+            if compat::country_code(context).or(address.country.as_deref()) == Some("JP") {
+                address
+                    .block_parts()
+                    .map_or((None, None), |(block, house)| {
+                        (Some(block.to_string()), house.map(str::to_string))
+                    })
+            } else {
+                (None, None)
+            };
         Self {
             geometry: Geometry { coordinates },
             properties: Properties {
@@ -145,6 +157,8 @@ impl Feature {
                 label: common.label.clone(),
                 address: Address {
                     housenumber: address.housenumber.clone(),
+                    block,
+                    subblock,
                     unit: address.unit.clone(),
                     // A US street in the postal abbreviation, as its label
                     // writes it.
@@ -296,6 +310,8 @@ pub(super) struct ContactInformation {
     www: Vec<ContactValue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     email: Vec<ContactValue>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    fax: Vec<ContactValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -305,7 +321,7 @@ struct ContactValue {
 
 impl ContactInformation {
     fn is_empty(&self) -> bool {
-        self.phone.is_empty() && self.www.is_empty() && self.email.is_empty()
+        self.phone.is_empty() && self.www.is_empty() && self.email.is_empty() && self.fax.is_empty()
     }
 
     /// og's contact as HERE's. OpenStreetMap separates several values of one
@@ -326,6 +342,7 @@ impl ContactInformation {
             phone: values(&contact.phone),
             www: values(&contact.website),
             email: values(&contact.email),
+            fax: values(&contact.fax),
         }
     }
 }
@@ -341,6 +358,10 @@ pub(super) struct ItemAddress {
     pub(super) country_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) state_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subblock: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -457,6 +478,10 @@ struct FieldScore {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     streets: Vec<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    district: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    place_name: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     house_number: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     postal_code: Option<f64>,
@@ -522,6 +547,7 @@ fn scoring(properties: &Properties) -> Option<Scoring> {
             house_number: field(matched.housenumber),
             postal_code: field(matched.postcode),
             unit: field(matched.unit),
+            ..FieldScore::default()
         },
     })
 }
@@ -794,6 +820,8 @@ fn address(properties: &Properties) -> ItemAddress {
         street: stated.street.clone().or_else(|| own(Layer::Street)),
         postal_code: stated.postcode.clone(),
         house_number: stated.housenumber.clone(),
+        block: stated.block.clone(),
+        subblock: stated.subblock.clone(),
         unit: stated.unit.clone(),
     }
 }
@@ -805,6 +833,32 @@ impl Item {
         if let (Some(center), Some(position)) = (center, self.position) {
             let meters = haversine_m(center.lng, center.lat, position.lng, position.lat);
             self.distance = Some(meters.round() as i64);
+        }
+        self
+    }
+
+    pub(super) fn with_name_scores(mut self, district: Option<&str>, query: Option<&str>) -> Self {
+        let equal = |got: &str, asked: &str| {
+            crate::util::text::normalize_for_compare(got)
+                == crate::util::text::normalize_for_compare(asked)
+        };
+        let district = self
+            .address
+            .district
+            .as_deref()
+            .zip(district)
+            .is_some_and(|(got, asked)| equal(got, asked));
+        let place =
+            self.result_type == "place" && query.is_some_and(|asked| equal(&self.title, asked));
+        if place && self.scoring.is_none() {
+            self.scoring = Some(Scoring {
+                query_score: 1.0,
+                field_score: FieldScore::default(),
+            });
+        }
+        if let Some(scoring) = &mut self.scoring {
+            scoring.field_score.district = district.then_some(1.0);
+            scoring.field_score.place_name = place.then_some(1.0);
         }
         self
     }
@@ -956,7 +1010,7 @@ impl Item {
         self.opening_hours = properties
             .opening_hours
             .as_deref()
-            .and_then(hours::parse)
+            .and_then(|value| hours::parse(value, properties.timezone.as_deref()))
             .map(|hours| hours.of_kind(kind))
             .into_iter()
             .collect();

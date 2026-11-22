@@ -73,6 +73,8 @@ const COUNTRY_CODES_SECTION: &str = "country_codes";
 const COUNTRY_CODES_VERSION: u32 = 1;
 const SUBDIVISION_CODES_SECTION: &str = "subdivision_codes";
 const SUBDIVISION_CODES_VERSION: u32 = 1;
+const CENSUS_CODES_SECTION: &str = "census_codes";
+const CENSUS_CODES_VERSION: u32 = 1;
 const PLATE_CODES_SECTION: &str = "plate_codes";
 const PLATE_CODES_VERSION: u32 = 1;
 const DEFAULT_LANGUAGES_SECTION: &str = "default_languages";
@@ -513,6 +515,7 @@ pub struct Writer {
     country_codes: Arc<HashMap<RecordId, CountryCode>>,
     subdivision_codes: HashMap<RecordId, String>,
     plate_codes: HashMap<RecordId, String>,
+    census_codes: HashMap<RecordId, String>,
     default_languages: HashMap<RecordId, String>,
     language_names: HashMap<RecordId, LanguageNames>,
     extents: Vec<(RecordId, Extent)>,
@@ -665,6 +668,7 @@ impl Writer {
             country_codes: Arc::default(),
             subdivision_codes: HashMap::new(),
             plate_codes: HashMap::new(),
+            census_codes: HashMap::new(),
             default_languages: HashMap::new(),
             language_names: HashMap::new(),
             extents: Vec::new(),
@@ -712,6 +716,10 @@ impl Writer {
     /// (`CA-ON`), by the area's id.
     pub fn set_subdivision_codes(&mut self, codes: HashMap<RecordId, String>) {
         self.subdivision_codes = codes;
+    }
+
+    pub(crate) fn set_census_codes(&mut self, codes: HashMap<RecordId, String>) {
+        self.census_codes = codes;
     }
 
     /// The vehicle plate code of each area record whose boundary states one
@@ -883,6 +891,7 @@ impl Writer {
             country_codes,
             subdivision_codes,
             plate_codes,
+            census_codes,
             default_languages,
             language_names,
             extents,
@@ -933,6 +942,13 @@ impl Writer {
             &area_codes_to_bytes(&plate_codes),
         )?;
         drop(plate_codes);
+        if !census_codes.is_empty() {
+            pack.add(
+                CENSUS_CODES_SECTION,
+                CENSUS_CODES_VERSION,
+                &area_codes_to_bytes(&census_codes),
+            )?;
+        }
         pack.add(
             DEFAULT_LANGUAGES_SECTION,
             DEFAULT_LANGUAGES_VERSION,
@@ -1329,12 +1345,19 @@ pub struct Reader {
     subdivision_codes: HashMap<RecordId, String>,
     /// The vehicle plate code of each area record that has one, by its id.
     plate_codes: HashMap<RecordId, String>,
+    census_codes: HashMap<RecordId, String>,
     /// The default language of each area record that states one, by its id.
     default_languages: HashMap<RecordId, String>,
     /// The names of each area record in other languages, by its id.
     language_names: HashMap<RecordId, LanguageNames>,
     extents: Extents,
     timezones: Timezones,
+    pub(crate) tiger_ranges: crate::tiger::Ranges,
+    pub(crate) tiger_blocks: crate::tiger::Blocks,
+    pub(crate) tiger_historical: crate::tiger::Blocks,
+    pub(crate) tiger_side_blocks: crate::tiger::Blocks,
+    pub(crate) tiger_side_zips: crate::tiger::Blocks,
+    pub(crate) tiger_zcta: crate::tiger::Blocks,
 }
 
 impl std::fmt::Debug for Reader {
@@ -1393,6 +1416,7 @@ impl Reader {
             }
         };
         let plate_codes = codes(PLATE_CODES_SECTION, PLATE_CODES_VERSION)?;
+        let census_codes = codes(CENSUS_CODES_SECTION, CENSUS_CODES_VERSION)?;
         let default_languages = codes(DEFAULT_LANGUAGES_SECTION, DEFAULT_LANGUAGES_VERSION)?;
         let language_names = if container.sections().contains_key(LANGUAGE_NAMES_SECTION) {
             language_names_from_bytes(
@@ -1411,6 +1435,13 @@ impl Reader {
         } else {
             Timezones::default()
         };
+        let tiger_ranges = crate::tiger::Ranges::open(&container)?;
+        let points = |section| crate::tiger::Blocks::open(&container, section);
+        let tiger_blocks = points(crate::tiger::BLOCKS_SECTION)?;
+        let tiger_historical = points(crate::tiger::HISTORICAL_SECTION)?;
+        let tiger_side_blocks = points(crate::tiger::SIDE_BLOCKS_SECTION)?;
+        let tiger_side_zips = points(crate::tiger::SIDE_ZIPS_SECTION)?;
+        let tiger_zcta = points(crate::tiger::ZCTA_SECTION)?;
         Ok(Self {
             path,
             container,
@@ -1421,10 +1452,17 @@ impl Reader {
             country_codes,
             subdivision_codes,
             plate_codes,
+            census_codes,
             default_languages,
             language_names,
             extents,
             timezones,
+            tiger_ranges,
+            tiger_blocks,
+            tiger_historical,
+            tiger_side_blocks,
+            tiger_side_zips,
+            tiger_zcta,
         })
     }
 
@@ -1466,6 +1504,26 @@ impl Reader {
     /// and for every record of a Pack sealed without subdivision codes.
     pub fn subdivision_code(&self, record_id: RecordId) -> Option<&str> {
         self.subdivision_codes.get(&record_id).map(String::as_str)
+    }
+
+    pub(crate) fn tiger_states(&self) -> std::collections::BTreeSet<&str> {
+        self.census_codes
+            .values()
+            .map(String::as_str)
+            .filter(|code| code.len() == 2)
+            .collect()
+    }
+
+    pub(crate) fn tiger_counties(&self) -> std::collections::BTreeSet<&str> {
+        self.census_codes
+            .values()
+            .map(String::as_str)
+            .filter(|code| code.len() == 5)
+            .collect()
+    }
+
+    pub(crate) fn census_code(&self, record_id: RecordId) -> Option<&str> {
+        self.census_codes.get(&record_id).map(String::as_str)
     }
 
     /// The vehicle plate code of an area record (`SIM` of Rhein-Hunsrück),
@@ -1989,6 +2047,7 @@ mod tests {
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: Vec::new(),
                 number: number.to_string(),
                 street: Some(street.to_string()),

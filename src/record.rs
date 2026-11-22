@@ -336,6 +336,8 @@ pub struct Contact {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     #[schema(example = "hello@queenbakery.example")]
     pub email: Option<String>,
+    #[serde(skip)]
+    pub(crate) fax: Option<String>,
 }
 
 impl Contact {
@@ -345,10 +347,20 @@ impl Contact {
         website: Option<String>,
         email: Option<String>,
     ) -> Option<Self> {
-        (phone.is_some() || website.is_some() || email.is_some()).then_some(Self {
+        Self::with_fax(phone, website, email, None)
+    }
+
+    pub(crate) fn with_fax(
+        phone: Option<String>,
+        website: Option<String>,
+        email: Option<String>,
+        fax: Option<String>,
+    ) -> Option<Self> {
+        (phone.is_some() || website.is_some() || email.is_some() || fax.is_some()).then_some(Self {
             phone,
             website,
             email,
+            fax,
         })
     }
 }
@@ -627,6 +639,8 @@ impl From<PlaceLayer> for Layer {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AddressComponents {
     pub number: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_number_len: Option<std::num::NonZeroU16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub street: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

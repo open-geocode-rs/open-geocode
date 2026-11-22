@@ -516,6 +516,7 @@ mod tests {
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 number: "10".into(),
                 street: Some("King Street West".into()),
                 place: None,

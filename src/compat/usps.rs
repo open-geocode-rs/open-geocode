@@ -9,6 +9,14 @@
 
 use crate::road::direction_of;
 
+pub(crate) fn zip_plus_four(postcode: &str) -> Option<(&str, &str)> {
+    let (zip, plus_four) = postcode.split_once('-')?;
+    let digits = |part: &str, length: usize| {
+        part.len() == length && part.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    (digits(zip, 5) && digits(plus_four, 4)).then_some((zip, plus_four))
+}
+
 /// How a product writes the address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Style {

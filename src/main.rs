@@ -214,6 +214,10 @@ enum PackCommand {
         #[arg(long)]
         openaddresses_non_commercial: bool,
 
+        /// Enrich U.S. results with TIGER address ranges and Census codes.
+        #[arg(long)]
+        tiger: bool,
+
         /// Add the address points of a file: OpenAddresses GeoJSON, one
         /// feature per line, or CSV with LON, LAT, NUMBER and STREET columns,
         /// gzipped or not. `DATASET=PATH` names the dataset its records
@@ -640,6 +644,7 @@ async fn main() -> Result<()> {
             openaddresses,
             openaddresses_zip,
             openaddresses_non_commercial,
+            tiger,
             address_files,
             qrank,
             timezones,
@@ -659,6 +664,7 @@ async fn main() -> Result<()> {
                 addresses,
                 qrank,
                 timezones,
+                tiger,
                 memory_budget_bytes: memory_budget_mb
                     .map(|mb| usize::try_from(mb << 20))
                     .transpose()

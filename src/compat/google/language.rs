@@ -55,6 +55,11 @@ impl<'a> Language<'a> {
         compat::place_language(self.pack, place)
     }
 
+    pub(super) fn reference_point(&self, id: RecordId) -> Option<(f64, f64)> {
+        let (_, lon, lat) = self.pack.records().point(id).ok()?;
+        Some((lon, lat))
+    }
+
     fn held(&self, record_id: Option<RecordId>) -> Option<String> {
         let (held, _) = self
             .pack

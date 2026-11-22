@@ -221,15 +221,22 @@ impl PackReverseGeocoder {
         // Each result is labelled by its own areas, in a context of its own.
         let fresh = || (Context::default(), Vec::<RecordId>::new());
         let found = match layer {
-            Layer::Address => self
-                .spatial
-                .address_candidates(lon, lat, options.radius_m, limit)?
-                .iter()
-                .map(|candidate| {
+            Layer::Address => {
+                let mut found = self
+                    .spatial
+                    .address_candidates(lon, lat, options.radius_m, limit)?
+                    .iter()
+                    .map(|candidate| {
+                        let (mut context, mut ids) = fresh();
+                        self.address_at(options, candidate, &mut context, &mut ids)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if found.iter().all(Option::is_none) && limit > 0 {
                     let (mut context, mut ids) = fresh();
-                    self.address_at(options, candidate, &mut context, &mut ids)
-                })
-                .collect::<Result<Vec<_>>>()?,
+                    found.push(self.tiger_estimate(options, &mut context, &mut ids)?);
+                }
+                found
+            }
             Layer::Poi => self
                 .spatial
                 .poi_candidates(lon, lat, options.radius_m, limit)?
@@ -248,15 +255,22 @@ impl PackReverseGeocoder {
                     self.street_at(options, candidate, &mut context, &mut ids)
                 })
                 .collect::<Result<Vec<_>>>()?,
-            Layer::Interpolation => self
-                .spatial
-                .segment_candidates(lon, lat, Layer::Interpolation, options.radius_m, limit)?
-                .iter()
-                .map(|candidate| {
+            Layer::Interpolation => {
+                let mut found = self
+                    .spatial
+                    .segment_candidates(lon, lat, Layer::Interpolation, options.radius_m, limit)?
+                    .iter()
+                    .map(|candidate| {
+                        let (mut context, mut ids) = fresh();
+                        self.estimated_at(options, candidate, &mut context, &mut ids)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if found.iter().all(Option::is_none) && limit > 0 {
                     let (mut context, mut ids) = fresh();
-                    self.estimated_at(options, candidate, &mut context, &mut ids)
-                })
-                .collect::<Result<Vec<_>>>()?,
+                    found.push(self.tiger_estimate(options, &mut context, &mut ids)?);
+                }
+                found
+            }
             Layer::Country
             | Layer::District
             | Layer::Locality
@@ -303,7 +317,12 @@ impl PackReverseGeocoder {
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<Option<GeocodeResult>> {
         match layer {
-            Layer::Address => self.explicit_address(options, context, context_record_ids),
+            Layer::Address => {
+                if let Some(result) = self.explicit_address(options, context, context_record_ids)? {
+                    return Ok(Some(result));
+                }
+                self.tiger_estimate(options, context, context_record_ids)
+            }
             Layer::Interpolation => self.estimated_address(options, context, context_record_ids),
             Layer::Street => self.nearest_street(options, context, context_record_ids),
             Layer::Poi => self.nearest_poi(options, context, context_record_ids),
@@ -392,7 +411,93 @@ impl PackReverseGeocoder {
                 return Ok(Some(result));
             }
         }
-        Ok(None)
+        self.tiger_estimate(options, context, context_record_ids)
+    }
+
+    fn tiger_estimate(
+        &self,
+        options: GeocodeOptions,
+        context: &mut Context,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<Option<GeocodeResult>> {
+        if self.pack.tiger_ranges.is_empty() {
+            return Ok(None);
+        }
+        let radius = options.radius_m.min(40.0);
+        // Looking farther than the nearest street could put someone across
+        // a junction on a different road to fetch a range.
+        let Some(candidate) = self
+            .spatial
+            .segment_candidates(options.lon, options.lat, Layer::Street, radius, 1)?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let Some(left) = self
+            .spatial
+            .left_of_line(&candidate, options.lon, options.lat)?
+        else {
+            return Ok(None);
+        };
+        let mut ranges = self
+            .pack
+            .tiger_ranges
+            .for_street(candidate.record_id)
+            .filter_map(|range| {
+                let is_left = left == (range.start < range.end);
+                if is_left != (range.side == b'L') {
+                    return None;
+                }
+                Some((range, range.number_at(candidate.fraction)?))
+            });
+        let Some((range, number)) = ranges.next() else {
+            return Ok(None);
+        };
+        if ranges.next().is_some() {
+            return Ok(None);
+        }
+        let Some(street) = self.pack.street(candidate.record_id)? else {
+            return Ok(None);
+        };
+        let Some([lon, lat]) = self.spatial.point_along_line(
+            candidate.record_id,
+            range.fraction(number).unwrap_or(candidate.fraction),
+        )?
+        else {
+            return Ok(None);
+        };
+        let distance = crate::road::planar_m([options.lon, options.lat], [lon, lat]);
+        if distance > radius {
+            return Ok(None);
+        }
+        self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
+        context.street = Some(street.name.clone());
+        context.postcode = range.postcode().or_else(|| {
+            self.pack
+                .tiger_side_zips
+                .postcode(range.side_key(range.side))
+        });
+        self.enrich_context(options, context, context_record_ids)?;
+        Ok(Some(GeocodeResult {
+            match_kind: MatchKind::EstimatedAddress,
+            label: compose_label(&format!("{number} {}", street.name), context),
+            primary_record_id: Some(candidate.record_id),
+            id: Some(range.id(number)),
+            layer: Some(Layer::Interpolation.as_str().into()),
+            distance_m: Some(distance),
+            point: Some(Point {
+                lon,
+                lat,
+                precision: PointPrecision::Estimated,
+            }),
+            context: context.clone(),
+            evidence: Evidence {
+                street_record_id: Some(candidate.record_id),
+                context_record_ids: context_record_ids.clone(),
+                ..Evidence::default()
+            },
+        }))
     }
 
     /// The estimated address of `candidate`, a range found near the point,
@@ -1055,6 +1160,7 @@ mod tests {
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: Vec::new(),
                 number: "10".to_string(),
                 street: Some("Queen Street".to_string()),

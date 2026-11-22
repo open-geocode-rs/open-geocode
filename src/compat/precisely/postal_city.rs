@@ -102,7 +102,21 @@ struct PredictionLocation {
 
 fn prediction(feature: &Feature, kind: Kind) -> Prediction {
     let candidate = feature.candidate(Product::Geocode);
-    let address = candidate.address;
+    let mut address = candidate.address;
+    if address
+        .country
+        .as_ref()
+        .and_then(|country| country.iso_alpha3_code)
+        == Some("USA")
+        && let Some(county) = &mut address.admin2
+        && county.short_name.is_none()
+        && let Some(name) = &county.long_name
+    {
+        let short = crate::compat::without_kind(name);
+        if short != *name && !short.is_empty() {
+            county.short_name = Some(short);
+        }
+    }
     let own = |name: &str| AdminField {
         long_name: Some(name.to_string()),
         short_name: None,

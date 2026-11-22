@@ -16,6 +16,7 @@ use crate::{
     api::{Common, ForwardCollection, ReverseCollection},
     categories,
     compat::{Args, VendorError, decode_id, native},
+    pack::Reader,
     record::Contact,
     runtime::AppState,
 };
@@ -57,8 +58,15 @@ struct Poi {
     /// The canonical ids of those kinds, as `list/category` gives them.
     #[serde(skip_serializing_if = "Option::is_none")]
     poi_category_ids: Option<Vec<&'static str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_ids: Option<ExternalIds>,
     #[serde(skip_serializing_if = "Metadata::is_empty")]
     metadata: Metadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ExternalIds {
+    wikidata: String,
 }
 
 /// What og knows of how to reach a place and when it is open.
@@ -107,7 +115,7 @@ struct Placed {
     distance: Option<f64>,
 }
 
-fn described(found: Found) -> (Described, Placed, Poi) {
+fn described(found: Found, pack: &Reader) -> (Described, Placed, Poi) {
     let common = found.common;
     let translated = Translated::of(Api::SearchBox, found);
     let kinds = common.category.as_deref().and_then(category::kinds);
@@ -115,6 +123,11 @@ fn described(found: Found) -> (Described, Placed, Poi) {
     // `secondary_address` layer Search Box has no counterpart of.
     let context = Context {
         secondary_address: None,
+        block: (crate::compat::country_code(&common.context).or(common.address.country.as_deref())
+            == Some("JP"))
+        .then(|| common.address.block_parts())
+        .flatten()
+        .map(|(block, _)| super::Area::named(None, block)),
         ..translated.context
     };
     (
@@ -140,6 +153,12 @@ fn described(found: Found) -> (Described, Placed, Poi) {
             brand: translated.brand.map(|brand| vec![brand]),
             poi_category: kinds.clone().map(|(names, _)| names),
             poi_category_ids: kinds.map(|(_, ids)| ids),
+            external_ids: common
+                .record_id
+                .and_then(|id| pack.records().wikidata(id).ok().flatten())
+                .map(|item| ExternalIds {
+                    wikidata: format!("Q{item}"),
+                }),
             metadata: Metadata::of(common),
         },
     )
@@ -199,13 +218,14 @@ impl Collection {
         features: impl Iterator<Item = Found<'a>>,
         types: Option<&Types>,
         credits: &[crate::api::Attribution],
+        pack: &Reader,
     ) -> Self {
         Self {
             kind: "FeatureCollection",
             features: features
                 .filter(|found| admitted(types, found.common))
                 .map(|found| {
-                    let (described, placed, poi) = described(found);
+                    let (described, placed, poi) = described(found, pack);
                     Feature {
                         kind: "Feature",
                         geometry: Geometry::point(found.coordinates),
@@ -221,19 +241,25 @@ impl Collection {
         }
     }
 
-    pub(super) fn forward(collection: &ForwardCollection, types: Option<&Types>) -> Self {
+    pub(super) fn forward(
+        collection: &ForwardCollection,
+        types: Option<&Types>,
+        pack: &Reader,
+    ) -> Self {
         Self::of(
             collection.features.iter().map(Found::forward),
             types,
             &collection.geocoding.attribution,
+            pack,
         )
     }
 
-    fn reverse(collection: &ReverseCollection, types: Option<&Types>) -> Self {
+    fn reverse(collection: &ReverseCollection, types: Option<&Types>, pack: &Reader) -> Self {
         Self::of(
             collection.features.iter().map(Found::reverse),
             types,
             &collection.geocoding.attribution,
+            pack,
         )
     }
 }
@@ -391,7 +417,7 @@ pub(super) async fn suggest(
         .iter()
         .filter(|feature| admitted(types.as_ref(), &feature.properties.common))
         .map(|feature| {
-            let (mut described, placed, poi) = described(Found::forward(feature));
+            let (mut described, placed, poi) = described(Found::forward(feature), state.pack());
             // Every suggestion states where it lies, empty for a place og
             // finds in no area.
             described.place_formatted.get_or_insert_default();
@@ -426,7 +452,7 @@ pub(super) async fn retrieve(
     if collection.features.is_empty() {
         return Err(not_found());
     }
-    Ok(Json(Collection::forward(&collection, None)))
+    Ok(Json(Collection::forward(&collection, None, state.pack())))
 }
 
 /// Search by text (Mapbox Search Box v1)
@@ -467,7 +493,11 @@ pub(super) async fn forward(
     }
     .map_err(failed)?;
     asked.keep(&mut collection);
-    Ok(Json(Collection::forward(&collection, types.as_ref())))
+    Ok(Json(Collection::forward(
+        &collection,
+        types.as_ref(),
+        state.pack(),
+    )))
 }
 
 /// Reverse geocode a point (Mapbox Search Box v1)
@@ -502,5 +532,9 @@ pub(super) async fn reverse(
     if let Some(limit) = limit {
         collection.features.truncate(limit);
     }
-    Ok(Json(Collection::reverse(&collection, types.as_ref())))
+    Ok(Json(Collection::reverse(
+        &collection,
+        types.as_ref(),
+        state.pack(),
+    )))
 }

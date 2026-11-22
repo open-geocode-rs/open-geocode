@@ -139,6 +139,7 @@ pub(super) fn pack(name: &str) -> TestPack {
         zone: None,
     });
     let king = AddressComponents {
+        block_number_len: None,
         areas: Vec::new(),
         number: "10".to_string(),
         street: Some("King Street".to_string()),
@@ -1495,7 +1496,7 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
         .map(|id| -> &'static str { Box::leak(id.to_string().into_boxed_str()) });
     let hours = properties["opening_hours"]
         .as_str()
-        .and_then(super::hours::parse)
+        .and_then(|value| super::hours::parse(value, properties["timezone"].as_str()))
         .map(|hours| hours.of_kind(kind))
         .filter(|_| details);
     assert_eq!(

@@ -536,6 +536,7 @@ fn address(
         disputed: false,
         street_postcodes: Vec::new(),
         address: AddressComponents {
+            block_number_len: None,
             number,
             street: Some(street),
             place: None,

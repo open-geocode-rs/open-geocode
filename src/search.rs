@@ -41,8 +41,9 @@ use crate::{
     },
     rank::{Ranker, Signals},
     record::{
-        AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS, Layer, ObjectType,
-        PlaceLayer, PoiRecord, Prominence, Record, place_rank,
+        AddressComponents, AddressRecord, DERIVED_FROM_ADDRESS_RECORDS,
+        InterpolationAddressComponents, Layer, ObjectType, PlaceLayer, PoiRecord, Prominence,
+        Record, place_rank,
     },
     records::{dequantize, quantize},
     road,
@@ -3439,6 +3440,31 @@ impl TextSearcher {
                         });
                     }
                 }
+                if found.is_empty() && !self.pack.tiger_ranges.is_empty() && plan.unit.is_none() {
+                    let mut estimates = Vec::new();
+                    for spot in &spots {
+                        if let Some(street) =
+                            self.street_answer(&searcher, spot, &street_ranking, &mut keep)?
+                            && let Some(hit) = self.tiger_estimate(&street, &ranking)?
+                            && keep(&hit)?
+                        {
+                            estimates.push(hit);
+                        }
+                    }
+                    if let [hit] = estimates.as_slice()
+                        && let Some(point) = hit.record.point
+                    {
+                        found.push(StructuredFound {
+                            hit: hit.clone(),
+                            point: [point.lon, point.lat],
+                            support: most,
+                            form: FORM_INTERPOLATION,
+                            reading: index,
+                            entry,
+                            lever: lever | LEVER_G,
+                        });
+                    }
+                }
                 if found.is_empty()
                     && let Some(hit) = self.structured_neighbour(plan, &ranking, &best_docs)?
                     && keep(&hit)?
@@ -5039,12 +5065,31 @@ impl TextSearcher {
                 .map(str::trim)
                 .filter(|layer| !layer.is_empty())
                 .is_none_or(|layer| layer == Layer::Address.as_str());
-        if estimated
-            && let Some(estimate) =
-                self.place_between_neighbours(plan, pass, &ranking, &areas, &filters)?
-            && keep(&estimate)?
-        {
-            candidates.insert(0, estimate);
+        if estimated {
+            let neighbouring = self
+                .place_between_neighbours(plan, pass, &ranking, &areas, &filters)?
+                .map_or(Ok(None), |hit| {
+                    keep(&hit).map(|allowed| allowed.then_some(hit))
+                })?;
+            if let Some(hit) = neighbouring {
+                candidates.insert(0, hit);
+            } else if !self.pack.tiger_ranges.is_empty() && plan.unit.is_none() {
+                let mut unique = None;
+                for street in &candidates {
+                    if let Some(hit) = self.tiger_estimate(street, &ranking)?
+                        && keep(&hit)?
+                    {
+                        if unique.is_some() {
+                            unique = None;
+                            break;
+                        }
+                        unique = Some(hit);
+                    }
+                }
+                if let Some(hit) = unique {
+                    candidates.insert(0, hit);
+                }
+            }
         }
         self.judged(
             plan,
@@ -7147,6 +7192,97 @@ impl TextSearcher {
             ..Address::from(&interpolation.address)
         };
         Ok(true)
+    }
+
+    fn tiger_estimate(
+        &self,
+        street: &TextSearchHit,
+        ranking: &Ranking,
+    ) -> Result<Option<TextSearchHit>> {
+        let Some(number) = ranking.house_number else {
+            return Ok(None);
+        };
+        if street.record.layer != Layer::Street.as_str() {
+            return Ok(None);
+        }
+        if !tiger_street_written(&ranking.query_words.written, number, &street.record.name) {
+            return Ok(None);
+        }
+        let mut ranges = self
+            .pack
+            .tiger_ranges
+            .for_street(street.record_id)
+            .filter_map(|range| {
+                let fraction = range.fraction(number)?;
+                let postcode = range.postcode().or_else(|| {
+                    self.pack
+                        .tiger_side_zips
+                        .postcode(range.side_key(range.side))
+                });
+                if !ranking.postcode.exact.is_empty()
+                    && postcode
+                        .as_ref()
+                        .is_some_and(|zip| zip != &ranking.postcode.exact)
+                {
+                    return None;
+                }
+                Some((range, fraction, postcode))
+            });
+        let Some((range, fraction, postcode)) = ranges.next() else {
+            return Ok(None);
+        };
+        if ranges.next().is_some() {
+            return Ok(None);
+        }
+        let Some([lon, lat]) = self.spatial.point_along_line(street.record_id, fraction)? else {
+            return Ok(None);
+        };
+        let mut hit = street.clone();
+        let address = &hit.record.address;
+        let locality = self
+            .pack
+            .street(street.record_id)?
+            .and_then(|record| record.locality);
+        let region = self
+            .pack
+            .boundary_context(street.record_id)?
+            .and_then(|context| context.admin_context.get(PlaceLayer::Region))
+            .and_then(|id| self.pack.subdivision_code(id))
+            .and_then(|iso| iso.strip_prefix("US-"))
+            .map(str::to_string);
+        let components = InterpolationAddressComponents {
+            street: Some(hit.record.name.clone()),
+            locality: address.locality.clone().or(locality),
+            region: address.region.clone().or(region),
+            country: address.country.clone(),
+            postcode,
+            place: None,
+        };
+        let record = &mut hit.record;
+        record.id = range.id(number);
+        record.layer = Layer::Interpolation.as_str().into();
+        record.name = labels::estimated_address_name(number, &components)
+            .unwrap_or_else(|| format!("{number} {}", street.record.name));
+        record.label = labels::estimated_address_label(number, &components)
+            .unwrap_or_else(|| record.name.clone());
+        record.address = Address {
+            housenumber: Some(number.to_string()),
+            ..Address::from(&components)
+        };
+        record.point = Some(Point {
+            lon,
+            lat,
+            precision: PointPrecision::Estimated,
+        });
+        record.source = Source {
+            dataset: crate::tiger::DATASET.into(),
+            object_type: None,
+            object_id: None,
+            derived_from: None,
+            record_count: None,
+        };
+        hit.signals.house_level = true;
+        Ok(Some(hit))
     }
 
     /// A house number no record states or range holds, placed between the
@@ -9849,6 +9985,7 @@ struct QueryWords {
     /// As [`search_key`] writes them, and the words of the structured
     /// context.
     search: HashSet<String>,
+    written: String,
     /// As [`exact_key`] writes them.
     exact: HashSet<String>,
 }
@@ -9861,11 +9998,31 @@ impl QueryWords {
                 .map(str::to_string)
                 .collect()
         };
+        let written = search_key(query).unwrap_or_default();
         Self {
-            search: words(search_key(query)),
+            search: written.split_whitespace().map(str::to_string).collect(),
+            written,
             exact: words(exact_key(query)),
         }
     }
+}
+
+// A weaker reading can take a town as the street. A TIGER range needs
+// the street explicitly after the number before it may promote the hit.
+fn tiger_street_written(query: &str, number: u32, street: &str) -> bool {
+    let mut words = query.split_whitespace();
+    if !words.any(|word| word.parse::<u32>() == Ok(number)) {
+        return false;
+    }
+    let mut name = String::new();
+    let max = street.split_whitespace().count() + 2;
+    words.take(max).any(|word| {
+        if !name.is_empty() {
+            name.push(' ');
+        }
+        name.push_str(word);
+        road::same_road(&name, street)
+    })
 }
 
 /// The postcode a query names, to rank records by whether their own
@@ -18144,6 +18301,7 @@ mod tests {
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: Vec::new(),
                 number: number.to_string(),
                 street: Some(street.to_string()),

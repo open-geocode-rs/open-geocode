@@ -26,6 +26,74 @@ impl LatLng {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PlusCode {
+    global_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compound_code: Option<String>,
+}
+
+impl PlusCode {
+    pub(super) fn of(
+        [lon, lat]: [f64; 2],
+        context: Option<&crate::api::Context>,
+        language: &Language,
+    ) -> Self {
+        let global_code = global_plus_code(lon, lat);
+        let compound_code = context.and_then(|context| {
+            let town = context.locality.as_ref()?;
+            let country = context.country.as_ref()?;
+            let (town_lon, town_lat) = language.reference_point(town.record_id)?;
+            let lon_delta = (lon - town_lon + 180.0).rem_euclid(360.0) - 180.0;
+            // A four-character prefix can be recovered from a nearby reference
+            // point within 30% of its one-degree grid cell.
+            if lon_delta.abs().max((lat - town_lat).abs()) >= 0.3 {
+                return None;
+            }
+            let region = context
+                .region
+                .as_ref()
+                .map(|region| region_short(region.code.as_deref(), &region.name));
+            let country = country
+                .code
+                .as_deref()
+                .and_then(crate::iso::alpha3)
+                .unwrap_or(&country.name);
+            let label = [Some(town.name.as_str()), region.as_deref(), Some(country)]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("{} {label}", &global_code[4..]))
+        });
+        Self {
+            global_code,
+            compound_code,
+        }
+    }
+}
+
+fn global_plus_code(lon: f64, lat: f64) -> String {
+    const DIGITS: &[u8; 20] = b"23456789CFGHJMPQRVWX";
+    // Apply the origin offset in integer space so decimal grid edges do
+    // not move when a rounded degree offset is added.
+    const CELLS_PER_DEGREE: i64 = 8_000;
+    let cell = |degrees: f64| (degrees * CELLS_PER_DEGREE as f64).floor() as i64;
+    let lat_cell =
+        (cell(lat) + 90 * CELLS_PER_DEGREE).clamp(0, 180 * CELLS_PER_DEGREE - 1) as usize;
+    let lon_cell = (cell(lon) + 180 * CELLS_PER_DEGREE).rem_euclid(360 * CELLS_PER_DEGREE) as usize;
+    let mut code = String::with_capacity(11);
+    for divisor in [160_000, 8_000, 400, 20, 1] {
+        if divisor == 1 {
+            code.push('+');
+        }
+        code.push(DIGITS[lat_cell / divisor % 20].into());
+        code.push(DIGITS[lon_cell / divisor % 20].into());
+    }
+    code
+}
+
 /// Google's `Viewport`, the box `[west, south, east, north]` og holds. A
 /// box across the antimeridian keeps `west` greater than `east`, as Google
 /// writes one.
@@ -167,10 +235,13 @@ pub(super) struct Place {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) formatted_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) short_formatted_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) postal_address: Option<PostalAddress>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) address_components: Vec<AddressComponent>,
     pub(super) location: LatLng,
+    pub(super) plus_code: PlusCode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) viewport: Option<Viewport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -211,10 +282,6 @@ pub(super) struct Landmark {
     pub(super) display_name: LocalizedText,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) types: Vec<&'static str>,
-    /// `WITHIN` where the place lies inside the landmark's outline. Near,
-    /// Google's default, is left out, as Google leaves it out.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) spatial_relationship: Option<&'static str>,
     pub(super) straight_line_distance_meters: f64,
 }
 
@@ -243,9 +310,6 @@ impl AddressDescriptor {
                 let found = &feature.properties.common;
                 let [lon, lat] = feature.geometry.coordinates;
                 let place_id = encode_id(found);
-                let within = found.bbox.is_some_and(|[west, south, east, north]| {
-                    (west..=east).contains(&point[0]) && (south..=north).contains(&point[1])
-                });
                 Landmark {
                     name: format!("places/{place_id}"),
                     place_id,
@@ -254,7 +318,6 @@ impl AddressDescriptor {
                         language_code: language.of(found.record_id, &found.context),
                     },
                     types: Kind::of(found).types(),
-                    spatial_relationship: within.then_some("WITHIN"),
                     straight_line_distance_meters: crate::spatial_index::haversine_m(
                         point[0], point[1], lon, lat,
                     ),
@@ -287,6 +350,19 @@ impl Place {
         let id = encode_id(common);
         let kind = Kind::of(common);
         let (postal_address, formatted_address) = address_fields(common, language);
+        let short_formatted_address = formatted_address.as_deref().and_then(|address| {
+            let country = &common.context.country.as_ref()?.name;
+            let country = if is_us(common) {
+                "USA"
+            } else {
+                country.as_str()
+            };
+            address
+                .strip_suffix(country)?
+                .strip_suffix(", ")
+                .filter(|short| !short.is_empty())
+                .map(str::to_owned)
+        });
         Self {
             name: format!("places/{id}"),
             id,
@@ -297,9 +373,11 @@ impl Place {
             types: kind.types(),
             primary_type: kind.primary(),
             formatted_address,
+            short_formatted_address,
             postal_address,
             address_components: address_components(common, language),
             location: LatLng::of(coordinates),
+            plus_code: PlusCode::of(coordinates, Some(&common.context), language),
             viewport: Viewport::of(common.bbox),
             national_phone_number: phones(common).0,
             international_phone_number: phones(common).1,
@@ -307,7 +385,10 @@ impl Place {
                 .contact
                 .as_ref()
                 .and_then(|contact| contact.website.clone()),
-            regular_opening_hours: common.opening_hours.as_deref().and_then(hours::parse),
+            regular_opening_hours: common
+                .opening_hours
+                .as_deref()
+                .and_then(|value| hours::parse(value, common.timezone.as_deref())),
             time_zone: common.timezone.clone().map(|id| TimeZone { id }),
             utc_offset_minutes: common
                 .timezone
@@ -334,6 +415,7 @@ pub(super) struct GeocodeResult {
     pub(super) place: String,
     pub(super) place_id: String,
     pub(super) location: LatLng,
+    pub(super) plus_code: PlusCode,
     pub(super) granularity: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) formatted_address: Option<String>,
@@ -359,6 +441,7 @@ impl GeocodeResult {
             place: format!("places/{place_id}"),
             place_id,
             location: LatLng::of(coordinates),
+            plus_code: PlusCode::of(coordinates, Some(&common.context), language),
             granularity: granularity(common),
             formatted_address,
             postal_address,
@@ -415,9 +498,11 @@ impl PlaceView {
             types: kind.types(),
             formatted_address,
             postal_address,
-            // og holds only a point for a result without a box. One with a
-            // box may be a building or grounds, which og cannot tell apart.
-            structure_type: common.bbox.is_none().then_some("POINT"),
+            structure_type: if common.building.is_some() {
+                Some("BUILDING")
+            } else {
+                common.bbox.is_none().then_some("POINT")
+            },
             location: LatLng::of(coordinates),
             address_components: address_components(common, language),
         }
@@ -701,7 +786,15 @@ fn address_components(common: &Common, language: &Language) -> Vec<AddressCompon
         }
     }
     if let Some(postcode) = address.postcode.as_deref() {
-        components.push(component(postcode, &["postal_code"]));
+        if let Some((zip, extension)) = is_us(common)
+            .then(|| compat::usps::zip_plus_four(postcode))
+            .flatten()
+        {
+            components.push(component(zip, &["postal_code"]));
+            components.push(component(extension, &["postal_code_suffix"]));
+        } else {
+            components.push(component(postcode, &["postal_code"]));
+        }
     }
     components
 }
@@ -1232,5 +1325,22 @@ mod type_tests {
         ] {
             assert!(categories_of([google]).contains(&category), "{google}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::global_plus_code;
+
+    #[test]
+    fn plus_codes_follow_the_open_location_code_grid() {
+        assert_eq!(global_plus_code(8.0000625, 47.0000625), "8FVC2222+22");
+        assert_eq!(global_plus_code(-122.0846489, 37.4225883), "849VCWF8+24");
+        assert_eq!(global_plus_code(-159.936, -37.014), "43J2X3P7+CJ");
+        assert_eq!(global_plus_code(149.17, 58.66), "9RCFM56C+22");
+        assert_eq!(
+            global_plus_code(180.0, 90.0),
+            global_plus_code(-180.0, 90.0)
+        );
     }
 }

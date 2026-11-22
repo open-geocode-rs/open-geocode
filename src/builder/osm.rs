@@ -69,6 +69,7 @@ mod tags;
 
 #[cfg(test)]
 pub(crate) mod test_pbf;
+mod tiger;
 mod timezone;
 
 use std::{
@@ -205,6 +206,7 @@ pub struct BuildOsmOptions {
     /// Timezone boundaries, the GeoJSON of timezone-boundary-builder. With
     /// them a record carries the timezone it lies in.
     pub timezones: Option<PathBuf>,
+    pub tiger: bool,
 }
 
 impl Default for BuildOsmOptions {
@@ -224,6 +226,7 @@ impl Default for BuildOsmOptions {
             imported_rows: 0,
             qrank: None,
             timezones: None,
+            tiger: false,
         }
     }
 }
@@ -244,6 +247,7 @@ impl fmt::Debug for BuildOsmOptions {
             .field("addresses", &self.addresses)
             .field("qrank", &self.qrank)
             .field("timezones", &self.timezones)
+            .field("tiger", &self.tiger)
             .finish_non_exhaustive()
     }
 }
@@ -502,7 +506,7 @@ impl<'a> Run<'a> {
     /// A run from the first step, or from the last checkpoint of a build
     /// of the Pack that stopped, when `options.leftover` asks for that.
     fn start(options: &'a BuildOsmOptions, plan: BuildPlan) -> Result<Self> {
-        let fingerprint = Fingerprint::of(
+        let mut fingerprint = Fingerprint::of(
             &options.inputs,
             &options.input_sources,
             options
@@ -510,6 +514,7 @@ impl<'a> Run<'a> {
                 .as_ref()
                 .map(|source| format!("{source:?}")),
         )?;
+        fingerprint.tiger = options.tiger;
         match settle_leftovers(options)? {
             Some(found) => Self::resume(options, plan, fingerprint, &found),
             None => {
@@ -1762,8 +1767,20 @@ impl<'a> Run<'a> {
             Arc::clone(&self.scratch),
             &self.writer_options(),
         )?;
-        writer.set_context_names(area_names);
         writer.set_country_codes(country_codes);
+        if self.options.tiger
+            && subdivision_codes
+                .values()
+                .any(|code| code.starts_with("US-"))
+        {
+            let gazetteer = tiger::Gazetteer::load(&self.options.pack)?;
+            let codes = index.census_codes(&subdivision_codes, &area_names, &gazetteer);
+            if !codes.is_empty() {
+                writer.set_census_codes(codes);
+                self.build.report.datasets.push(tiger::DATASET.to_string());
+            }
+        }
+        writer.set_context_names(area_names);
         writer.set_subdivision_codes(subdivision_codes);
         writer.set_plate_codes(plate_codes);
         writer.set_default_languages(default_languages);
@@ -2117,6 +2134,51 @@ impl<'a> Run<'a> {
         let structured = Instant::now();
         crate::structured::add_to(&mut sealed)?;
         crate::ids::add_to(&mut sealed)?;
+        if self.options.tiger {
+            let sections = tiger::add_ranges(&mut sealed, &self.options.pack, &self.progress)?;
+            if !sections.is_empty() {
+                self.build
+                    .report
+                    .datasets
+                    .push(crate::tiger::DATASET.to_string());
+                if sections
+                    .iter()
+                    .any(|(name, _)| *name == crate::tiger::SIDE_BLOCKS_SECTION)
+                {
+                    self.build.report.datasets.push("tiger:2026:faces".into());
+                }
+                stats.sections.extend(
+                    sections
+                        .into_iter()
+                        .map(|(name, len)| (name.to_string(), len)),
+                );
+            }
+            for (historical, section, dataset) in [
+                (
+                    false,
+                    crate::tiger::BLOCKS_SECTION,
+                    crate::tiger::BLOCKS_DATASET,
+                ),
+                (
+                    true,
+                    crate::tiger::HISTORICAL_SECTION,
+                    "tiger:2010:tabblock10",
+                ),
+            ] {
+                let bytes =
+                    tiger::add_blocks(&mut sealed, &self.options.pack, &self.progress, historical)?;
+                if bytes > 0 {
+                    self.build.report.datasets.push(dataset.to_string());
+                    stats.sections.insert(section.to_string(), bytes);
+                }
+            }
+            let bytes = tiger::add_zcta(&mut sealed, &self.options.pack, &self.progress)?;
+            if bytes > 0 {
+                stats
+                    .sections
+                    .insert(crate::tiger::ZCTA_SECTION.into(), bytes);
+            }
+        }
         stats.bytes = sealed.bytes();
         self.progress.finish(BuildStage::StructuredIndex);
         let mut report = self.report();
@@ -5224,6 +5286,7 @@ mod tests {
             (
                 "osm:node:1".to_string(),
                 Some(crate::record::Contact {
+                    fax: None,
                     phone: Some("+31 20 555 0111".to_string()),
                     website: Some("https://Zanoli.example/".to_string()),
                     email: None,
@@ -5524,7 +5587,7 @@ mod tests {
             ("places/*", 3),
             ("plate_codes", 1),
             ("postcode_addresses", 1),
-            ("records/*", 14),
+            ("records/*", 15),
             ("spatial/*", 3),
             ("streets/*", 1),
             ("subdivision_codes", 1),

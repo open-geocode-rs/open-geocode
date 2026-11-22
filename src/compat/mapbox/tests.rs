@@ -157,6 +157,7 @@ fn write_pack() -> Pack {
         )
         .expect("postcode");
     let king = AddressComponents {
+        block_number_len: None,
         areas: Vec::new(),
         number: "10".to_string(),
         street: Some("King Street".to_string()),
@@ -208,6 +209,7 @@ fn write_pack() -> Pack {
                 }),
                 details: PoiDetails {
                     contact: Some(Contact {
+                        fax: None,
                         phone: Some("+1 416-555-0111".to_string()),
                         website: Some("https://queencafe.example/".to_string()),
                         email: Some("hello@queencafe.example".to_string()),
@@ -806,6 +808,16 @@ async fn geocoding_structured_input_is_og_structured_geocode() {
         );
     }
 
+    let (_, guessed_locality) = get(
+        &router,
+        "/compat/mapbox/search/geocode/v6/forward?address_line1=10%20King%20Street&locality=Unknown",
+    )
+    .await;
+    assert_eq!(
+        guessed_locality["features"][0]["properties"]["match_code"]["locality"],
+        "unmatched"
+    );
+
     // A country og has no data in is a hard filter, as Mapbox's code is.
     let (status, body) = get(
         &router,
@@ -1181,6 +1193,64 @@ async fn search_box_forward_picks_the_og_search_of_the_same_meaning() {
             })
             .collect::<Vec<_>>();
         assert_eq!(ids, expected, "{query}");
+    }
+}
+
+#[tokio::test]
+async fn search_box_forward_keeps_a_japanese_block_address() {
+    let pack = Pack(std::env::temp_dir().join(format!(
+        "open-geocode-compat-mapbox-jp-{}",
+        uuid::Uuid::new_v4()
+    )));
+    let mut writer = Writer::create(&pack.0).expect("writer");
+    writer
+        .write(
+            &AddressRecord {
+                address: AddressComponents {
+                    number: "10-1".to_string(),
+                    block_number_len: std::num::NonZeroU16::new(2),
+                    areas: vec!["丸の内".to_string(), "丸の内一丁目".to_string()],
+                    locality: Some("千代田区".to_string()),
+                    region: Some("東京都".to_string()),
+                    country: Some("JP".to_string()),
+                    street: None,
+                    place: None,
+                    unit: None,
+                    postcode: None,
+                },
+                building: None,
+                access: Vec::new(),
+                disputed: false,
+                street_postcodes: Vec::new(),
+                geometry: point_geometry(139.765, 35.681),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, 30),
+            }
+            .into(),
+            None,
+        )
+        .expect("address");
+    writer.finish().expect("finish");
+
+    let router = router(&pack);
+    let base = "/compat/mapbox/search/searchbox/v1/forward";
+    for (query, matches) in [
+        ("10-1 丸の内一丁目", true),
+        ("10-1 丸の内一丁目, 千代田区, 東京都", true),
+        ("10-2 丸の内一丁目", false),
+        ("10-1 丸の内二丁目", false),
+        ("10-1 丸の内一丁目, 港区", false),
+    ] {
+        let params = serde_urlencoded::to_string([("q", query)]).expect("query");
+        let (status, body) = get(&router, &format!("{base}?{params}")).await;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        let features = body["features"].as_array().expect("features");
+        assert_eq!(features.len(), usize::from(matches), "{query}");
+        if matches {
+            let properties = &features[0]["properties"];
+            assert_eq!(properties["feature_type"], "address", "{query}");
+            assert_eq!(properties["context"]["block"]["name"], "10", "{query}");
+        }
     }
 }
 
@@ -1663,4 +1733,20 @@ async fn filters_are_honoured_or_refused() {
         assert_eq!(status, expected, "{uri}");
         assert_eq!(body["message"], message, "{uri}");
     }
+}
+
+#[tokio::test]
+async fn searchbox_uses_the_external_id_the_record_holds() {
+    let pack = write_pack();
+    let router = router(&pack);
+    let (status, body) = get(
+        &router,
+        "/compat/mapbox/search/searchbox/v1/forward?q=Canada&types=country",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["features"][0]["properties"]["external_ids"]["wikidata"],
+        "Q16"
+    );
 }

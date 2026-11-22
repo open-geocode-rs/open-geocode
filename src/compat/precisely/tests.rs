@@ -129,6 +129,7 @@ fn write_pack(dir: &Path) {
         zone: None,
     });
     let address = AddressComponents {
+        block_number_len: None,
         areas: Vec::new(),
         number: "100".to_string(),
         street: Some("King Street West".to_string()),
@@ -579,8 +580,6 @@ fn restated(mut fields: Value) -> Value {
         "ADDRLINE_SHORT": "100 King Street West, Unit 5",
         "LASTLINE_SHORT": "ON, M5X 1A9",
         "CITY_SHORT": "Toronto",
-        "NAME_CITY": "Toronto",
-        "PREF_CITY": "Toronto",
         "NAME": "King",
         "NAME_SHORT": "King",
         "TYPE_SHORT": "Street",

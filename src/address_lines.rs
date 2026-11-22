@@ -287,6 +287,7 @@ mod tests {
             local_name: None,
             wikidata: None,
             plate_code: None,
+            census_code: None,
         })
     }
 

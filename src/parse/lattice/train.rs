@@ -2822,6 +2822,7 @@ mod tests {
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: areas.iter().map(|area| area.to_string()).collect(),
                 number: "10-8".into(),
                 street: street.map(str::to_string),
@@ -2913,6 +2914,7 @@ mod tests {
     #[test]
     fn stated_areas_chain_into_one_field() {
         let address = AddressComponents {
+            block_number_len: None,
             areas: vec!["西区".into(), "みなとみらい".into(), "3丁目".into()],
             number: "3-1".into(),
             street: None,

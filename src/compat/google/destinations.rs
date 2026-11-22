@@ -80,8 +80,6 @@ struct SearchDestinationsResponse {
 struct Destination {
     primary: PlaceView,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    containing_places: Vec<PlaceView>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     landmarks: Vec<Landmark>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     entrances: Vec<Entrance>,
@@ -122,7 +120,6 @@ impl Destination {
             .collect();
         Self {
             primary,
-            containing_places: Vec::new(),
             landmarks: Vec::new(),
             entrances,
             og_id: common.id.clone(),
@@ -130,8 +127,7 @@ impl Destination {
         }
     }
 
-    /// The places whose outline holds the destination, and the best known
-    /// of the others near it.
+    /// A bounding box alone cannot establish that a place contains the destination.
     async fn with_surroundings(
         mut self,
         state: &AppState,
@@ -148,37 +144,22 @@ impl Destination {
         .await
         .map_err(from_problem)?;
         let [lon, lat] = self.point;
-        let holds = |feature: &crate::api::ForwardFeature| {
-            feature
-                .properties
-                .common
-                .bbox
-                .is_some_and(|[west, south, east, north]| {
-                    (west..=east).contains(&lon) && (south..=north).contains(&lat)
-                })
-        };
         let english = language
             .code()
             .is_none_or(|code| code == "en" || code.starts_with("en-"));
-        for feature in &around {
+        for feature in around.iter().take(MAX_LANDMARKS) {
             let common = &feature.properties.common;
             let view = PlaceView::of(common, feature.geometry.coordinates, language);
-            if holds(feature) {
-                self.containing_places.push(view);
-            } else if self.landmarks.len() < MAX_LANDMARKS {
-                let [x, y] = feature.geometry.coordinates;
-                self.landmarks.push(Landmark {
-                    relational_description: english.then(|| LocalizedText {
-                        text: format!("Near {}", common.name),
-                        language_code: Some("en".to_string()),
-                    }),
-                    place: view,
-                    tags: ["ADDRESS"],
-                    straight_line_distance_meters: crate::spatial_index::haversine_m(
-                        lon, lat, x, y,
-                    ),
-                });
-            }
+            let [x, y] = feature.geometry.coordinates;
+            self.landmarks.push(Landmark {
+                relational_description: english.then(|| LocalizedText {
+                    text: format!("Near {}", common.name),
+                    language_code: Some("en".to_string()),
+                }),
+                place: view,
+                tags: ["ADDRESS"],
+                straight_line_distance_meters: crate::spatial_index::haversine_m(lon, lat, x, y),
+            });
         }
         Ok(self)
     }
@@ -220,9 +201,7 @@ pub(super) async fn search(
         };
         // The surroundings are a lookup of their own, so a mask that leaves
         // them out costs none.
-        let surroundings = ["landmarks", "containingPlaces"]
-            .iter()
-            .any(|field| FieldMask::asks(mask.as_ref(), &["destinations", field]));
+        let surroundings = FieldMask::asks(mask.as_ref(), &["destinations", "landmarks"]);
         let mut described = Vec::new();
         for destination in destinations {
             described.push(match surroundings {

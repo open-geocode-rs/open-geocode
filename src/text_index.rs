@@ -1816,6 +1816,7 @@ mod tests {
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: "1".to_string(),
                     street: Some(format!("Street {index}")),
@@ -1880,6 +1881,7 @@ mod tests {
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: Vec::new(),
                 number: "221B".to_string(),
                 street: Some("Baker Street".to_string()),
@@ -2004,6 +2006,7 @@ mod tests {
             name: "Tim Hortons".to_string(),
             category: "amenity:cafe".to_string(),
             address: Some(AddressComponents {
+                block_number_len: None,
                 areas: Vec::new(),
                 number: "123".to_string(),
                 street: Some("King Street West".to_string()),
@@ -2056,6 +2059,7 @@ mod tests {
         let plain = PoiRecord {
             name: "Walmer Road Parkette".to_string(),
             address: Some(AddressComponents {
+                block_number_len: None,
                 areas: Vec::new(),
                 number: "227".to_string(),
                 street: Some("Walmer Road".to_string()),

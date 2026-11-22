@@ -873,6 +873,7 @@ mod tests {
                     disputed: false,
                     street_postcodes: Vec::new(),
                     address: AddressComponents {
+                        block_number_len: None,
                         areas: Vec::new(),
                         number: "10".to_string(),
                         street: Some("King Street".to_string()),

@@ -12,6 +12,8 @@ use crate::compat::hours::{DAY_MINUTES, Week, Weekday};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct OpeningHours {
     pub(super) periods: Vec<Period>,
+    #[serde(rename = "openNow", skip_serializing_if = "Option::is_none")]
+    open_now: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -47,12 +49,14 @@ impl Point {
 }
 
 /// `value` as weekly periods, `None` when [`Week`] does not read it.
-pub(super) fn parse(value: &str) -> Option<OpeningHours> {
+pub(super) fn parse(value: &str, zone: Option<&str>) -> Option<OpeningHours> {
     let week = Week::parse(value)?;
+    let open_now = week.open_at(zone, jiff::Timestamp::now());
     if week.is_always_open() {
         // Google writes always open as one period opening on Sunday at
         // midnight with no close.
         return Some(OpeningHours {
+            open_now,
             periods: vec![Period {
                 open: Point::at(Weekday::Sunday, 0),
                 close: None,
@@ -69,7 +73,7 @@ pub(super) fn parse(value: &str) -> Option<OpeningHours> {
         })
         .collect::<Vec<_>>();
     periods.sort_by_key(|period| period.open);
-    Some(OpeningHours { periods })
+    Some(OpeningHours { periods, open_now })
 }
 
 #[cfg(test)]
@@ -80,7 +84,7 @@ mod tests {
     type At = (u8, u8, u8);
 
     fn periods(value: &str) -> Option<Vec<(At, Option<At>)>> {
-        parse(value).map(|hours| {
+        parse(value, None).map(|hours| {
             hours
                 .periods
                 .iter()

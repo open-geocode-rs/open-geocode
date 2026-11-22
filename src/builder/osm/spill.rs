@@ -226,6 +226,7 @@ pub(crate) struct Fields<'a> {
     pub country: Option<&'a str>,
     pub areas: Vec<&'a str>,
     pub number: &'a str,
+    pub block_number_len: Option<std::num::NonZeroU16>,
     pub unit: Option<&'a str>,
 }
 
@@ -261,9 +262,14 @@ impl<'a> Fields<'a> {
         let number =
             get_order_text(&mut input)?.ok_or(Error::Decode("address number is absent"))?;
         let unit = get_order_text(&mut input)?;
-        if !input.is_empty() {
-            return Err(Error::Decode("address sort key has trailing bytes"));
-        }
+        let block_number_len = if input.is_empty() {
+            None
+        } else {
+            let bytes = input
+                .try_into()
+                .map_err(|_| Error::Decode("invalid block number length"))?;
+            std::num::NonZeroU16::new(u16::from_be_bytes(bytes))
+        };
         Ok(Self {
             street,
             place,
@@ -274,12 +280,14 @@ impl<'a> Fields<'a> {
             areas,
             number,
             unit,
+            block_number_len,
         })
     }
 
     fn to_address(&self) -> AddressComponents {
         let owned = |value: Option<&str>| value.map(str::to_string);
         AddressComponents {
+            block_number_len: self.block_number_len,
             areas: self.areas.iter().map(|area| area.to_string()).collect(),
             number: self.number.to_string(),
             street: owned(self.street),
@@ -369,6 +377,9 @@ impl PendingAddress {
         order.extend_from_slice(&base.to_be_bytes());
         put_order_text(&mut order, Some(&address.number));
         put_order_text(&mut order, address.unit.as_deref());
+        if let Some(length) = address.block_number_len {
+            order.extend_from_slice(&length.get().to_be_bytes());
+        }
         Self {
             order,
             street_len,
@@ -1194,6 +1205,7 @@ fn record_heap_bytes(record: &Record) -> usize {
                             contact.and_then(|contact| contact.phone.as_ref()),
                             contact.and_then(|contact| contact.website.as_ref()),
                             contact.and_then(|contact| contact.email.as_ref()),
+                            contact.and_then(|contact| contact.fax.as_ref()),
                             details.opening_hours.as_ref(),
                         ]
                         .into_iter()
@@ -1341,6 +1353,7 @@ pub(super) fn encode_record(out: &mut Vec<u8>, record: &Record) {
                 contact.and_then(|contact| contact.phone.as_deref()),
                 contact.and_then(|contact| contact.website.as_deref()),
                 contact.and_then(|contact| contact.email.as_deref()),
+                contact.and_then(|contact| contact.fax.as_deref()),
                 record.opening_hours(),
             ] {
                 put_opt_str(out, value);
@@ -1444,7 +1457,8 @@ pub(super) fn decode_record(input: &mut &[u8]) -> Result<Record> {
                 name.map(|name| Brand { name, wikidata })
             },
             details: PoiDetails {
-                contact: Contact::stated(
+                contact: Contact::with_fax(
+                    get_opt_string(input)?,
                     get_opt_string(input)?,
                     get_opt_string(input)?,
                     get_opt_string(input)?,
@@ -1541,6 +1555,12 @@ fn encode_address(out: &mut Vec<u8>, address: &AddressComponents) {
         put_opt_str(out, value.as_deref());
     }
     put_strs(out, &address.areas);
+    put_u64(
+        out,
+        address
+            .block_number_len
+            .map_or(0, |length| u64::from(length.get())),
+    );
 }
 
 fn decode_address(input: &mut &[u8]) -> Result<AddressComponents> {
@@ -1552,6 +1572,10 @@ fn decode_address(input: &mut &[u8]) -> Result<AddressComponents> {
     let [street, place, unit, locality, region, postcode, country] = fields;
     Ok(AddressComponents {
         areas: get_strings(input)?,
+        block_number_len: std::num::NonZeroU16::new(
+            u16::try_from(get_u64(input)?)
+                .map_err(|_| Error::Decode("invalid block number length"))?,
+        ),
         number,
         street,
         place,
@@ -1875,6 +1899,7 @@ mod tests {
                 name: "Tim Hortons".into(),
                 category: "amenity:cafe".into(),
                 address: Some(AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: "123".into(),
                     street: Some("King Street West".into()),
@@ -2003,6 +2028,7 @@ mod tests {
                     disputed: false,
                     street_postcodes: Vec::new(),
                     address: AddressComponents {
+                        block_number_len: None,
                         areas: Vec::new(),
                         number: number.to_string(),
                         street: Some(street),
@@ -2043,6 +2069,7 @@ mod tests {
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: Vec::new(),
                 number: number.into(),
                 street: street.map(str::to_string),
@@ -2071,6 +2098,7 @@ mod tests {
             SourceProvenance::imported("openaddresses:ca", 12),
         );
         full.address = AddressComponents {
+            block_number_len: None,
             areas: vec!["Annex".into(), "Seaton Village".into()],
             number: "10/1367".into(),
             street: Some("King Street".into()),

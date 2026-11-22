@@ -918,6 +918,44 @@ impl RTreeObject for BoundaryBox {
 }
 
 impl BoundaryIndex {
+    pub(super) fn census_codes(
+        &self,
+        subdivisions: &HashMap<RecordId, String>,
+        area_names: &HashMap<RecordId, Vec<String>>,
+        gazetteer: &super::tiger::Gazetteer,
+    ) -> HashMap<RecordId, String> {
+        let mut codes: HashMap<_, _> = subdivisions
+            .iter()
+            .filter_map(|(&id, iso)| Some((id, gazetteer.states.get(iso)?.clone())))
+            .collect();
+        for county in &gazetteer.counties {
+            let context = self.context_for_point(county.lon, county.lat, &SourceContext::default());
+            let tuple = &context.admin_context;
+            let Some(state) = tuple
+                .get(PlaceLayer::Region)
+                .and_then(|id| subdivisions.get(&id))
+            else {
+                continue;
+            };
+            if state.strip_prefix("US-") != Some(county.state.as_str()) {
+                continue;
+            }
+            for tier in [PlaceLayer::District, PlaceLayer::SubRegion] {
+                let Some(id) = tuple.get(tier) else {
+                    continue;
+                };
+                if area_names.get(&id).is_some_and(|names| {
+                    names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&county.name))
+                }) {
+                    codes.insert(id, county.code.clone());
+                }
+            }
+        }
+        codes
+    }
+
     /// The timezone of each area that lies wholly in one, by record id, and
     /// how many areas there are.
     pub(crate) fn timezones(&self, zones: &Timezones) -> (Vec<(RecordId, u16)>, u64) {

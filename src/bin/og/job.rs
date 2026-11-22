@@ -139,6 +139,7 @@ pub(crate) struct BuildRequest {
     pub leftover: Leftover,
     /// Add the OpenAddresses points of the countries the Pack covers.
     pub openaddresses: bool,
+    pub tiger: bool,
 }
 
 /// A finished build.
@@ -523,6 +524,7 @@ fn run(
         } else {
             0
         },
+        tiger: request.tiger,
         ..BuildOsmOptions::default()
     };
     let plan = plan_osm_build(&options)?;

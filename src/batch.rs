@@ -1127,6 +1127,7 @@ mod tests {
                         disputed: false,
                         street_postcodes: Vec::new(),
                         address: AddressComponents {
+                            block_number_len: None,
                             areas: Vec::new(),
                             number: number.into(),
                             street: Some(street.into()),

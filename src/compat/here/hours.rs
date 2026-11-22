@@ -7,8 +7,7 @@ use serde::Serialize;
 
 use crate::compat::hours::{DAY_MINUTES, Span, Week, Weekday};
 
-/// HERE's `openingHours` entry. `isOpen` is left out: it is the hours at
-/// request time in the place's own zone, which og does not compute.
+/// HERE's `openingHours` entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct OpeningHours {
     /// The categories the hours are of. OpenStreetMap's hours are the
@@ -18,6 +17,8 @@ pub(super) struct OpeningHours {
     /// One line per group of days that share their hours, Monday first.
     text: Vec<String>,
     structured: Vec<Structured>,
+    #[serde(rename = "isOpen", skip_serializing_if = "Option::is_none")]
+    is_open: Option<bool>,
 }
 
 /// A category as hours and contacts name it.
@@ -62,8 +63,9 @@ fn names(day: Weekday) -> (&'static str, &'static str) {
 }
 
 /// `value` as HERE's opening hours, `None` when [`Week`] does not read it.
-pub(super) fn parse(value: &str) -> Option<OpeningHours> {
+pub(super) fn parse(value: &str, zone: Option<&str>) -> Option<OpeningHours> {
     let week = Week::parse(value)?;
+    let is_open = week.open_at(zone, jiff::Timestamp::now());
     // Days that share their spans are one line, ordered by their first day.
     let mut groups: Vec<(Vec<Weekday>, &[Span])> = Vec::new();
     for (day, spans) in week.days() {
@@ -108,6 +110,7 @@ pub(super) fn parse(value: &str) -> Option<OpeningHours> {
         categories: Vec::new(),
         text,
         structured,
+        is_open,
     })
 }
 
@@ -151,7 +154,7 @@ mod tests {
     use super::parse;
 
     fn hours(value: &str) -> Value {
-        parse(value).map_or(Value::Null, |hours| {
+        parse(value, None).map_or(Value::Null, |hours| {
             serde_json::to_value(hours).expect("JSON")
         })
     }

@@ -400,6 +400,7 @@ mod tests {
                     disputed: false,
                     street_postcodes: Vec::new(),
                     address: AddressComponents {
+                        block_number_len: None,
                         areas: Vec::new(),
                         number: index.to_string(),
                         street: Some("King Street".to_string()),

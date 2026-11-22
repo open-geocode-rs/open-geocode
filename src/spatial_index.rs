@@ -710,6 +710,47 @@ impl Reader {
         })
     }
 
+    pub(crate) fn address_points_in_box(
+        &self,
+        bounds: [f64; 4],
+        mut visit: impl FnMut(RecordId, [f64; 2]) -> Result<()>,
+    ) -> Result<()> {
+        let [west, south, east, north] = bounds;
+        let bbox = [
+            quantize(west)?,
+            quantize(south)?,
+            quantize(east)?,
+            quantize(north)?,
+        ];
+        let Some(root) = self.blocks.levels.len().checked_sub(1) else {
+            return Ok(());
+        };
+        let mut pending = vec![(root, 0)];
+        let overlaps = |box_: BoundingBox| {
+            box_[0] <= bbox[2] && bbox[0] <= box_[2] && box_[1] <= bbox[3] && bbox[1] <= box_[3]
+        };
+        while let Some((level, node)) = pending.pop() {
+            let (start, _) = self.blocks.levels[level];
+            if !overlaps(self.blocks.bbox(start + node)) {
+                continue;
+            }
+            if level == 0 {
+                self.records
+                    .block_points(self.blocks.id(node), |id, layer, lon, lat, _| {
+                        if layer == Layer::Address && overlaps([lon, lat, lon, lat]) {
+                            visit(id, [dequantize(lon), dequantize(lat)])?;
+                        }
+                        Ok(())
+                    })?;
+            } else {
+                let (_, count) = self.blocks.levels[level - 1];
+                let children = node * NODE_SIZE..((node + 1) * NODE_SIZE).min(count);
+                pending.extend(children.rev().map(|child| (level - 1, child)));
+            }
+        }
+        Ok(())
+    }
+
     pub fn point_candidates(
         &self,
         lon: f64,
@@ -966,6 +1007,61 @@ impl Reader {
             }
         }
         Ok(closest_candidates(candidates, limit))
+    }
+
+    pub(crate) fn project_on_line(
+        &self,
+        record_id: RecordId,
+        points: &[[f64; 2]],
+    ) -> Result<Option<Vec<(f64, f64)>>> {
+        let Some(line) = self.records.line(record_id)?.map(line_cache) else {
+            return Ok(None);
+        };
+        let total = line.total();
+        if total <= f64::EPSILON {
+            return Ok(None);
+        }
+        Ok(Some(
+            points
+                .iter()
+                .map(|&[lon, lat]| {
+                    line.segments
+                        .iter()
+                        .map(|segment| {
+                            let projected =
+                                project_to_segment_m(lon, lat, segment.start, segment.end);
+                            let along = segment.start_length
+                                + projected.t * (segment.end_length - segment.start_length);
+                            (along / total, projected.distance_m)
+                        })
+                        .min_by(|left, right| left.1.total_cmp(&right.1))
+                        .expect("nonempty line")
+                })
+                .collect(),
+        ))
+    }
+
+    pub(crate) fn left_of_line(
+        &self,
+        candidate: &SegmentCandidate,
+        lon: f64,
+        lat: f64,
+    ) -> Result<Option<bool>> {
+        let Some(line) = self.records.line(candidate.record_id)?.map(line_cache) else {
+            return Ok(None);
+        };
+        let at = candidate.fraction * line.total();
+        let Some(segment) = line.segments.iter().find(|segment| {
+            segment.start_length <= at
+                && at <= segment.end_length
+                && segment.end_length > segment.start_length
+        }) else {
+            return Ok(None);
+        };
+        let [sx, sy] = segment.start;
+        let [ex, ey] = segment.end;
+        let cross = (ex - sx) * (lat - sy) - (ey - sy) * (lon - sx);
+        Ok((candidate.distance_m >= 0.5 && cross != 0.0).then_some(cross > 0.0))
     }
 
     /// The point `fraction` of the way along a line record by length, the
@@ -1238,6 +1334,7 @@ mod tests {
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: Vec::new(),
                 number: "10".to_string(),
                 street: Some("King Street".to_string()),

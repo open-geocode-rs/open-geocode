@@ -956,6 +956,7 @@ fn write_pack(dir: &PathBuf) {
         zone: None,
     });
     let king = AddressComponents {
+        block_number_len: None,
         areas: Vec::new(),
         number: "10".to_string(),
         street: Some("King Street".to_string()),
@@ -1169,6 +1170,7 @@ fn write_geneva_pack(dir: &PathBuf) {
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: "1".to_string(),
                     street: Some("Rue du Rhône".to_string()),

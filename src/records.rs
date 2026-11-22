@@ -130,7 +130,8 @@ pub const SECTION_INDEX: &str = "records/index";
 pub const SECTION_BLOCKS: &str = "records/blocks";
 pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
-pub const RECORDS_VERSION: u32 = 14;
+pub const RECORDS_VERSION: u32 = 15;
+const PREVIOUS_RECORDS_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogueId {
@@ -170,6 +171,7 @@ const POI_ACCESS: u8 = 1 << 5;
 /// Bit of a POI's details byte. When set, the kinds of food it serves
 /// follow its entrances.
 const POI_CUISINE: u8 = 1 << 6;
+const POI_FAX: u8 = 1 << 7;
 /// Bit of an address's presence byte, past its seven strings. When set, a
 /// details byte follows its street's postcodes, saying which of its
 /// building's name and its entrances follow it, in that order.
@@ -180,6 +182,7 @@ const DETAIL_ACCESS: u8 = 1;
 const DETAIL_BUILDING: u8 = 2;
 /// Bit of an address's details byte: its building's name follows.
 const DETAIL_BUILDING_NAME: u8 = 4;
+const DETAIL_BLOCK_NUMBER: u8 = 8;
 const NUMBER_TEXT: u64 = 1;
 const NUMBER_UNIT: u64 = 2;
 const NUMBER_SHIFT: u32 = 2;
@@ -471,6 +474,7 @@ struct AddressRun {
     postcode: Option<String>,
     country: Option<String>,
     areas: Vec<String>,
+    block_number_len: Option<std::num::NonZeroU16>,
     street_postcodes: Vec<String>,
     building: Option<Building>,
     /// The imported dataset of the run, `None` for OSM addresses.
@@ -495,6 +499,7 @@ impl AddressRun {
             && self.postcode == address.postcode
             && self.country == address.country
             && self.areas == address.areas
+            && self.block_number_len == address.block_number_len
             && self.street_postcodes == record.street_postcodes
             && self.building == record.building
             // A continuation holds a number, a unit, a point and an id alone.
@@ -512,6 +517,7 @@ impl AddressRun {
         self.postcode.clone_from(&address.postcode);
         self.country.clone_from(&address.country);
         self.areas.clone_from(&address.areas);
+        self.block_number_len = address.block_number_len;
         self.street_postcodes.clone_from(&record.street_postcodes);
         self.building.clone_from(&record.building);
         match imported_dataset(record) {
@@ -860,11 +866,17 @@ impl Writer {
                 if name.is_some() {
                     details |= DETAIL_BUILDING_NAME;
                 }
+                if record.address.block_number_len.is_some() {
+                    details |= DETAIL_BLOCK_NUMBER;
+                }
                 if details != 0 {
                     out[present_at] |= ADDRESS_DETAILS;
                     out.push(details);
                     if let Some(name) = name {
                         put_u64(out, u64::from(self.strings.id(name)?));
+                    }
+                    if let Some(length) = record.address.block_number_len {
+                        put_u64(out, u64::from(length.get()));
                     }
                     if !record.access.is_empty() {
                         self.put_access(out, point, &record.access)?;
@@ -911,10 +923,18 @@ impl Writer {
                     out[details_at] |= POI_CUISINE;
                     self.put_strings(out, record.cuisine())?;
                 }
+                if let Some(fax) = contact.and_then(|contact| contact.fax.as_deref()) {
+                    out[details_at] |= POI_FAX;
+                    put_u64(out, u64::from(self.strings.id(fax)?));
+                }
                 match &record.address {
                     Some(address) => {
                         out.push(1);
-                        self.put_address(out, address)?;
+                        let present_at = self.put_address(out, address)?;
+                        if let Some(length) = address.block_number_len {
+                            out[present_at] |= ADDRESS_DETAILS;
+                            put_u64(out, u64::from(length.get()));
+                        }
                     }
                     None => out.push(0),
                 }
@@ -1203,11 +1223,20 @@ pub struct Reader {
 
 impl Reader {
     pub fn open(container: &Container) -> Result<Self> {
-        let index = container.section(SECTION_INDEX, RECORDS_VERSION)?;
-        let blocks = container.section(SECTION_BLOCKS, RECORDS_VERSION)?;
-        let strings = container.section(SECTION_STRINGS, RECORDS_VERSION)?;
+        let version = if container
+            .sections()
+            .get(SECTION_BLOCKS)
+            .is_some_and(|section| section.version == PREVIOUS_RECORDS_VERSION)
+        {
+            PREVIOUS_RECORDS_VERSION
+        } else {
+            RECORDS_VERSION
+        };
+        let index = container.section(SECTION_INDEX, version)?;
+        let blocks = container.section(SECTION_BLOCKS, version)?;
+        let strings = container.section(SECTION_STRINGS, version)?;
         let datasets = {
-            let bytes = container.section(SECTION_DATASETS, RECORDS_VERSION)?;
+            let bytes = container.section(SECTION_DATASETS, version)?;
             let mut input = bytes.as_slice();
             let count = get_u64(&mut input)?;
             if count > input.len() as u64 {
@@ -1313,9 +1342,10 @@ impl Reader {
         };
         Ok(match header.layer {
             Layer::Address => {
-                let (address, flagged) = self.entry_address(&entry, &mut fields)?;
+                let (mut address, flagged) = self.entry_address(&entry, &mut fields)?;
                 let street_postcodes = self.string_list(header.strings, &mut fields)?;
-                let (building, access) = self.entry_details(&entry, flagged, &mut fields)?;
+                let (building, access) =
+                    self.entry_details(&entry, flagged, &mut fields, &mut address)?;
                 Record::Address(AddressRecord {
                     building,
                     address,
@@ -1423,9 +1453,10 @@ impl Reader {
         let mut street_postcode = None;
         let (record_id, name, label) = match header.layer {
             Layer::Address => {
-                let (address, flagged) = self.entry_address(&entry, &mut fields)?;
+                let (mut address, flagged) = self.entry_address(&entry, &mut fields)?;
                 street_postcode = agreed_postcode(&self.string_list(header.strings, &mut fields)?);
-                (building, access) = self.entry_details(&entry, flagged, &mut fields)?;
+                (building, access) =
+                    self.entry_details(&entry, flagged, &mut fields, &mut address)?;
                 stated = Address::from(&address);
                 (
                     header.record_id(&self.datasets)?,
@@ -2117,11 +2148,14 @@ impl Reader {
         entry: &Entry<'_>,
         flagged: bool,
         fields: &mut &[u8],
+        address: &mut AddressComponents,
     ) -> Result<(Option<Building>, Vec<Entrance>)> {
         if !flagged {
             return Ok((None, Vec::new()));
         }
-        let (building, has_access) = self.details_field(entry.header.strings, fields)?;
+        let (building, has_access, block_number_len) =
+            self.details_field(entry.header.strings, fields)?;
+        address.block_number_len = block_number_len;
         let access = if has_access && entry.continued.is_none() {
             self.access_field(&entry.header, fields)?
         } else {
@@ -2136,7 +2170,7 @@ impl Reader {
         &self,
         strings: StringSegment,
         fields: &mut &[u8],
-    ) -> Result<(Option<Building>, bool)> {
+    ) -> Result<(Option<Building>, bool, Option<std::num::NonZeroU16>)> {
         let details = get_u8(fields)?;
         let building = if details & DETAIL_BUILDING == 0 {
             None
@@ -2149,7 +2183,11 @@ impl Reader {
                 },
             })
         };
-        Ok((building, details & DETAIL_ACCESS != 0))
+        let block = (details & DETAIL_BLOCK_NUMBER != 0)
+            .then(|| block_number_len(fields))
+            .transpose()?
+            .flatten();
+        Ok((building, details & DETAIL_ACCESS != 0, block))
     }
 
     fn access_field(&self, header: &Header, fields: &mut &[u8]) -> Result<Vec<Entrance>> {
@@ -2194,6 +2232,7 @@ impl Reader {
         let areas = self.string_list(strings, fields)?;
         Ok((
             AddressComponents {
+                block_number_len: None,
                 areas,
                 number,
                 street,
@@ -2253,9 +2292,18 @@ impl Reader {
         } else {
             Vec::new()
         };
+        let fax = (flags & POI_FAX != 0)
+            .then(|| self.string_field(strings, fields).map(str::to_string))
+            .transpose()?;
         let address = match get_u8(fields)? {
             0 => None,
-            _ => Some(self.address_components(strings, fields)?),
+            _ => {
+                let (mut address, flagged) = self.address_fields(strings, fields)?;
+                if flagged {
+                    address.block_number_len = block_number_len(fields)?;
+                }
+                Some(address)
+            }
         };
         Ok(PoiFields {
             name,
@@ -2266,7 +2314,7 @@ impl Reader {
             aliases,
             brand,
             details: PoiDetails {
-                contact: Contact::stated(phone, website, email),
+                contact: Contact::with_fax(phone, website, email, fax),
                 opening_hours,
                 extent,
                 access,
@@ -2535,6 +2583,13 @@ fn unit_id(fields: &mut &[u8]) -> Result<Option<u32>> {
 
 /// The bytes after an address body that is not continued: where the first
 /// address continuing it starts.
+fn block_number_len(fields: &mut &[u8]) -> Result<Option<std::num::NonZeroU16>> {
+    Ok(std::num::NonZeroU16::new(
+        u16::try_from(get_u64(fields)?)
+            .map_err(|_| Error::Decode("invalid block number length"))?,
+    ))
+}
+
 fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
     let tag = get_u8(&mut body)?;
     // The point, context, source, an imported row's dataset, and the number.
@@ -2562,6 +2617,9 @@ fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
         0
     };
     if details & DETAIL_BUILDING_NAME != 0 {
+        get_u64(&mut body)?;
+    }
+    if details & DETAIL_BLOCK_NUMBER != 0 {
         get_u64(&mut body)?;
     }
     if details & DETAIL_ACCESS != 0 {
@@ -2882,6 +2940,7 @@ mod tests {
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
+                    block_number_len: None,
                     areas: vec!["Old Toronto".into(), "Liberty Village".into()],
                     number: "10".into(),
                     street: None,
@@ -2937,6 +2996,7 @@ mod tests {
                 name: "Tim Hortons".into(),
                 category: "amenity:cafe".into(),
                 address: Some(AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: "123".into(),
                     street: Some("King Street West".into()),
@@ -3145,6 +3205,7 @@ mod tests {
                 disputed: false,
                 street_postcodes: postcodes.iter().map(|code| code.to_string()).collect(),
                 address: AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: (id * 2).to_string(),
                     street: Some(format!("Street {}", postcodes.len())),
@@ -3189,6 +3250,7 @@ mod tests {
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: number.into(),
                     street: Some("King Street".into()),
@@ -3257,6 +3319,7 @@ mod tests {
                 disputed: false,
                 street_postcodes: vec!["M5V 1A1".into()],
                 address: AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: number.into(),
                     street: Some("King Street".into()),
@@ -3367,6 +3430,7 @@ mod tests {
     fn a_poi_round_trips_the_contact_and_hours_it_states() {
         let text = |value: &str| Some(value.to_string());
         let full = Contact {
+            fax: None,
             phone: text("+1 416-555-0111"),
             website: text("https://queenbakery.example/"),
             email: text("hello@queenbakery.example"),

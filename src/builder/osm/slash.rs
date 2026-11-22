@@ -270,6 +270,7 @@ mod tests {
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 number: number.to_string(),
                 street: Some(street.to_string()),
                 place: None,

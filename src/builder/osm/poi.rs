@@ -178,6 +178,7 @@ fn place_preset(tags: &BTreeMap<String, String>, drawn: Drawn) -> Option<&'stati
 const PHONE_KEYS: &[&str] = &["phone", "contact:phone"];
 const WEBSITE_KEYS: &[&str] = &["website", "contact:website"];
 const EMAIL_KEYS: &[&str] = &["email", "contact:email"];
+const FAX_KEYS: &[&str] = &["contact:fax", "fax"];
 
 fn poi_category(tags: &BTreeMap<String, String>, drawn: Drawn) -> Option<String> {
     let preset = place_preset(tags, drawn)?;
@@ -496,10 +497,11 @@ fn merge(leader: &mut PoiRecord, member: PoiRecord) {
         theirs.contact.unwrap_or_default(),
     );
     leader.details = PoiDetails {
-        contact: Contact::stated(
+        contact: Contact::with_fax(
             ours.phone.or(other.phone),
             ours.website.or(other.website),
             ours.email.or(other.email),
+            ours.fax.or(other.fax),
         ),
         opening_hours: own.opening_hours.or(theirs.opening_hours),
         extent: own.extent.or(theirs.extent),
@@ -545,7 +547,7 @@ fn first_stated(
 /// mappers write "n/a" and "none" where a place has nothing.
 fn contact(tags: &BTreeMap<String, String>) -> Option<Contact> {
     let spaced = |value: &str| value.chars().any(char::is_whitespace);
-    Contact::stated(
+    Contact::with_fax(
         first_stated(tags, PHONE_KEYS, |value| {
             value.chars().any(char::is_numeric)
         }),
@@ -561,6 +563,7 @@ fn contact(tags: &BTreeMap<String, String>) -> Option<Contact> {
                     .split_once('@')
                     .is_some_and(|(name, host)| !name.is_empty() && !host.is_empty())
         }),
+        first_stated(tags, FAX_KEYS, |value| value.chars().any(char::is_numeric)),
     )
 }
 
@@ -583,7 +586,7 @@ pub(crate) fn poi_tags(
             matches!(
                 key.as_str(),
                 "wikidata" | "wikipedia" | "brand" | "brand:wikidata" | "opening_hours" | "ref"
-            ) || [PHONE_KEYS, WEBSITE_KEYS, EMAIL_KEYS]
+            ) || [PHONE_KEYS, WEBSITE_KEYS, EMAIL_KEYS, FAX_KEYS]
                 .iter()
                 .any(|keys| keys.contains(&key.as_str()))
                 || is_place_key(key)
@@ -818,6 +821,7 @@ mod tests {
 
     fn at(mut place: Place, number: &str, street: &str) -> Place {
         place.record.address = Some(AddressComponents {
+            block_number_len: None,
             number: number.to_string(),
             street: Some(street.to_string()),
             place: None,
@@ -1271,6 +1275,7 @@ mod tests {
     fn reached(phone: Option<&str>, website: Option<&str>, email: Option<&str>) -> PoiDetails {
         PoiDetails {
             contact: Some(Contact {
+                fax: None,
                 phone: phone.map(str::to_string),
                 website: website.map(str::to_string),
                 email: email.map(str::to_string),
@@ -1303,6 +1308,7 @@ mod tests {
             Some(PoiDetails {
                 access: Vec::new(),
                 contact: Some(Contact {
+                    fax: None,
                     phone: Some("+31 (0)50 123-4567".into()),
                     website: Some("HTTP://www.Shell.nl/Stations/".into()),
                     email: Some("Peize@Shell.nl".into()),

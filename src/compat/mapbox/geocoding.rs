@@ -99,6 +99,8 @@ struct MatchCode {
     street: &'static str,
     postcode: &'static str,
     place: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    locality: Option<&'static str>,
     region: &'static str,
     country: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,10 +112,9 @@ impl MatchCode {
     /// og's `match` of an address as Mapbox's `match_code`. A part the query
     /// does not state is `unmatched`, Mapbox's word for one not in the
     /// input, except a country og fills from where the address lies,
-    /// `inferred`. og judges no sub-city part, Mapbox's `locality`, so it
-    /// is not sent. A partial number is `plausible` only where it is
+    /// `inferred`. A partial number is `plausible` only where it is
     /// interpolated; any other partial part is not the one asked for.
-    fn of(found: QueryMatch, common: &Common) -> Self {
+    fn of(found: QueryMatch, common: &Common, asked_locality: Option<&str>) -> Self {
         let stated = |part: Option<PartMatch>| match part {
             Some(PartMatch::Matched) => "matched",
             Some(PartMatch::Partial | PartMatch::Unmatched) | None => "unmatched",
@@ -126,15 +127,31 @@ impl MatchCode {
             None if common.context.country.is_some() => "inferred",
             part => stated(part),
         };
+        let locality = asked_locality.map(|asked| {
+            let normalize = crate::util::text::normalize_for_compare;
+            if common.context.sublocality.as_ref().is_some_and(|area| {
+                let asked = normalize(asked);
+                normalize(&area.name) == asked
+                    || area
+                        .local_name
+                        .as_deref()
+                        .is_some_and(|name| normalize(name) == asked)
+            }) {
+                PartMatch::Matched
+            } else {
+                PartMatch::Unmatched
+            }
+        });
         Self {
             address_number,
             street: stated(found.street),
             postcode: stated(found.postcode),
             place: stated(found.locality),
+            locality: locality.map(|part| stated(Some(part))),
             region: stated(found.region),
             country,
             secondary_address: found.unit.map(|part| stated(Some(part))),
-            confidence: confidence(found, address_number),
+            confidence: confidence(found, address_number, locality),
         }
     }
 }
@@ -143,7 +160,11 @@ impl MatchCode {
 /// does not state did not change. A changed house number or region is
 /// `low`, as is a change to three or more of the others. Two are `medium`,
 /// one `high`, none `exact`. An interpolated number is not a change.
-fn confidence(found: QueryMatch, address_number: &str) -> &'static str {
+fn confidence(
+    found: QueryMatch,
+    address_number: &str,
+    locality: Option<PartMatch>,
+) -> &'static str {
     let changed = |part: Option<PartMatch>| part.is_some_and(|part| part != PartMatch::Matched);
     let number_changed = changed(found.housenumber) && address_number != "plausible";
     if number_changed || changed(found.region) {
@@ -155,6 +176,7 @@ fn confidence(found: QueryMatch, address_number: &str) -> &'static str {
         found.locality,
         found.postcode,
         found.country,
+        locality,
     ]
     .into_iter()
     .filter(|part| changed(*part))
@@ -203,6 +225,7 @@ struct Translation {
 #[derive(Clone, Copy)]
 struct Naming<'a> {
     codes: &'a [String],
+    locality: Option<&'a str>,
     /// Finds the record a stated postcode names.
     searcher: &'a crate::search::TextSearcher,
 }
@@ -332,7 +355,7 @@ impl Feature {
         let match_code = found
             .matched
             .filter(|_| translated.feature_type == "address")
-            .map(|matched| MatchCode::of(*matched, common));
+            .map(|matched| MatchCode::of(*matched, common, naming.locality));
         Ok(Self {
             kind: "Feature",
             id: translated.mapbox_id.clone(),
@@ -422,6 +445,7 @@ struct Plan {
     types: Option<Types>,
     /// `language`, checked as Mapbox checks it.
     languages: Vec<String>,
+    locality: Option<String>,
 }
 
 /// `language`, a comma-separated list of at most 20 unique language codes.
@@ -474,6 +498,7 @@ async fn answer(state: &AppState, plan: Plan) -> Result<Collection, crate::compa
     let types = plan.types.as_ref();
     let naming = Naming {
         codes: &plan.languages,
+        locality: plan.locality.as_deref(),
         searcher: state.searcher(),
     };
     let failed = |problem| Api::Geocoding.failed(problem);
@@ -670,6 +695,7 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
             lookup,
             types,
             languages,
+            locality: None,
         });
     }
     if !STRUCTURED.iter().any(|name| params.get(name).is_some()) {
@@ -726,6 +752,11 @@ fn forward_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
         lookup,
         types,
         languages,
+        locality: params
+            .get("locality")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
     })
 }
 
@@ -776,6 +807,7 @@ fn reverse_plan(params: &Params) -> Result<Plan, crate::compat::VendorError> {
         },
         types,
         languages,
+        locality: None,
     })
 }
 
@@ -841,7 +873,7 @@ pub(super) async fn batch(
         };
         checked.push(check(&state, plan.lookup)?);
         types.push(plan.types);
-        languages.push(plan.languages);
+        languages.push((plan.languages, plan.locality));
     }
 
     let Ok(permit) = Arc::clone(state.batch_slots()).try_acquire_owned() else {
@@ -865,9 +897,10 @@ pub(super) async fn batch(
     .map_err(|failed| Api::Geocoding.failed(Problem::from(failed)))?;
 
     let mut batch = Vec::with_capacity(answers.len());
-    for ((answer, types), codes) in answers.into_iter().zip(&types).zip(&languages) {
+    for ((answer, types), (codes, locality)) in answers.into_iter().zip(&types).zip(&languages) {
         let naming = Naming {
             codes,
+            locality: locality.as_deref(),
             searcher: state.searcher(),
         };
         batch.push(

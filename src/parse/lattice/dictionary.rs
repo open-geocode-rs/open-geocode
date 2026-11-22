@@ -1976,6 +1976,7 @@ mod tests {
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: "1".into(),
                     street: Some("Main Street".into()),
@@ -2030,6 +2031,7 @@ mod tests {
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: vec!["Liberty Village".into()],
                 number: "670".into(),
                 street: Some("King Street West".into()),

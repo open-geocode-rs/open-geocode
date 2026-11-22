@@ -664,6 +664,8 @@ pub(super) async fn by_place_id(
 #[serde(default, rename_all = "camelCase")]
 struct AutocompleteRequest {
     input: Option<String>,
+    #[serde(alias = "include_query_predictions")]
+    include_query_predictions: bool,
     #[serde(alias = "input_offset", deserialize_with = "proto_int")]
     input_offset: Option<i64>,
     #[serde(alias = "location_bias")]
@@ -706,8 +708,14 @@ struct AutocompleteResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Suggestion {
-    place_prediction: PlacePrediction,
+enum Suggestion {
+    PlacePrediction(PlacePrediction),
+    QueryPrediction(QueryPrediction),
+}
+
+#[derive(Debug, Serialize)]
+struct QueryPrediction {
+    text: FormattableText,
 }
 
 #[derive(Debug, Serialize)]
@@ -838,7 +846,7 @@ pub(super) async fn autocomplete(
         let found = native::autocomplete(&state, args)
             .await
             .map_err(from_problem)?;
-        let suggestions = found
+        let eligible = found
             .features
             .iter()
             .filter(|feature| {
@@ -847,11 +855,28 @@ pub(super) async fn autocomplete(
                     haversine_m(circle.center[0], circle.center[1], lon, lat) <= circle.radius
                 })
             })
-            .filter(|feature| admits(Kind::of(&feature.properties.common)))
-            .take(MAX_SUGGESTIONS)
-            .map(|feature| Suggestion {
-                place_prediction: prediction(feature, origin, &language),
+            .filter(|feature| admits(Kind::of(&feature.properties.common)));
+        let typed = input.trim().to_lowercase();
+        let query = request
+            .include_query_predictions
+            .then(|| {
+                eligible.clone().find_map(|feature| {
+                    let common = &feature.properties.common;
+                    let name = common.name.to_lowercase();
+                    (common.layer == crate::record::Layer::Poi
+                        && name.starts_with(&typed)
+                        && name.len() > typed.len())
+                    .then(|| QueryPrediction {
+                        text: plain(&common.name),
+                    })
+                })
             })
+            .flatten()
+            .filter(|_| countries.is_empty());
+        let suggestions = eligible
+            .take(MAX_SUGGESTIONS - usize::from(query.is_some()))
+            .map(|feature| Suggestion::PlacePrediction(prediction(feature, origin, &language)))
+            .chain(query.map(Suggestion::QueryPrediction))
             .collect();
         Ok(respond(
             &AutocompleteResponse { suggestions },

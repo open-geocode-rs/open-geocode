@@ -117,6 +117,10 @@ enum Command {
         /// token in OA_TOKEN.
         #[arg(long)]
         openaddresses: bool,
+
+        /// Enrich U.S. results with TIGER address ranges and Census codes.
+        #[arg(long)]
+        tiger: bool,
     },
     /// Serve a Pack's HTTP API.
     Serve {
@@ -147,6 +151,7 @@ fn main() -> Result<()> {
             fresh,
             download,
             openaddresses,
+            tiger,
         }) => {
             let memory_budget_bytes = memory_budget_mb
                 .map(|mb| usize::try_from(mb << 20))
@@ -167,6 +172,7 @@ fn main() -> Result<()> {
                     },
                     download,
                     openaddresses,
+                    tiger,
                 },
             )
         }
@@ -210,6 +216,7 @@ struct Flags {
     leftover: Leftover,
     download: bool,
     openaddresses: bool,
+    tiger: bool,
 }
 
 /// `og build`: the build the interface runs, with one line per step. Ctrl-C
@@ -223,6 +230,7 @@ fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result
         leftover,
         download,
         openaddresses,
+        tiger,
     } = flags;
     let tree = regions::tree();
     let mut picked: Vec<&'static Region> = Vec::new();
@@ -280,6 +288,7 @@ fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result
         force,
         leftover,
         openaddresses,
+        tiger,
     };
     let pack = request.pack.clone();
     let mut job = BuildJob::start(request, Arc::new(home));
@@ -579,6 +588,7 @@ mod tests {
                 force: false,
                 leftover: open_geocode::builder::Leftover::Refuse,
                 openaddresses: false,
+                tiger: false,
             },
             std::sync::Arc::new(home),
         ));

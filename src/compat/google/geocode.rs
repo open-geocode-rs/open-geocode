@@ -10,7 +10,7 @@ use serde::Serialize;
 use super::{
     LatLng, QueryParams, Viewport, field_mask, from_problem, invalid,
     language::Language,
-    model::{GeocodeResult, granularity},
+    model::{GeocodeResult, PlusCode, granularity},
     places::by_place_id,
     respond, run,
 };
@@ -20,9 +20,12 @@ use crate::{
 };
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GeocodeResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     results: Vec<GeocodeResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plus_code: Option<PlusCode>,
 }
 
 /// `GET /v4/geocode/address/{addressQuery}`.
@@ -98,7 +101,13 @@ async fn geocode_address(
             )
         })
         .collect();
-    Ok(respond(&GeocodeResponse { results }, mask.as_ref()))
+    Ok(respond(
+        &GeocodeResponse {
+            results,
+            plus_code: None,
+        },
+        mask.as_ref(),
+    ))
 }
 
 /// An address as Geocoding takes one, as one text or as postal parts.
@@ -298,7 +307,15 @@ async fn reverse(
         })
         .filter(|result| types.is_empty() || result.types.iter().any(|kind| types.contains(kind)))
         .collect();
-    Ok(respond(&GeocodeResponse { results }, mask.as_ref()))
+    let context = found
+        .features
+        .first()
+        .map(|feature| &feature.properties.common.context);
+    let plus_code = Some(PlusCode::of([lon, lat], context, &language));
+    Ok(respond(
+        &GeocodeResponse { results, plus_code },
+        mask.as_ref(),
+    ))
 }
 
 /// `GET /v4/geocode/places/{place}`, answered with one bare result and no

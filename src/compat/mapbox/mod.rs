@@ -684,6 +684,8 @@ struct Context<L> {
     #[serde(skip_serializing_if = "Option::is_none")]
     neighborhood: Option<L>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    block: Option<L>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     postcode: Option<L>,
     #[serde(skip_serializing_if = "Option::is_none")]
     locality: Option<L>,
@@ -704,6 +706,7 @@ impl<L> Default for Context<L> {
             secondary_address: None,
             street: None,
             neighborhood: None,
+            block: None,
             postcode: None,
             locality: None,
             place: None,
@@ -724,6 +727,7 @@ impl Context<Area> {
             secondary_address: self.secondary_address.map(named("secondary_address")),
             street: self.street.map(named("street")),
             neighborhood: self.neighborhood.map(named("neighborhood")),
+            block: self.block.map(named("block")),
             postcode: self.postcode.map(named("postcode")),
             locality: self.locality.map(named("locality")),
             place: self.place.map(named("place")),
@@ -742,6 +746,7 @@ impl Context<Area> {
             secondary_address: kept(self.secondary_address),
             street: kept(self.street),
             neighborhood: kept(self.neighborhood),
+            block: kept(self.block),
             postcode: kept(self.postcode),
             locality: kept(self.locality),
             place: kept(self.place),
@@ -757,6 +762,7 @@ impl Context<Area> {
             secondary_address: self.secondary_address.map(&layer),
             street: self.street.map(&layer),
             neighborhood: self.neighborhood.map(&layer),
+            block: self.block.map(&layer),
             postcode: self.postcode.map(&layer),
             locality: self.locality.map(&layer),
             place: self.place.map(&layer),

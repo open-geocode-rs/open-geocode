@@ -1122,6 +1122,7 @@ impl App {
                 // on from where a stopped build of it left off.
                 leftover: Leftover::Resume,
                 openaddresses: self.openaddresses && self.openaddresses_data().is_some(),
+                tiger: false,
             },
             Arc::clone(&self.home),
         ));

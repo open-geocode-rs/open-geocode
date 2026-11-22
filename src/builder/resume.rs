@@ -29,7 +29,7 @@ use crate::{
 };
 
 /// Checkpoint format, including the saved scratch files.
-pub const FORMAT_VERSION: u32 = 9;
+pub const FORMAT_VERSION: u32 = 10;
 /// Bytes of an input's start and end the fingerprint hashes: a PBF's header
 /// and its last blocks, enough to tell an extract from a newer one of the
 /// same size and time.
@@ -125,6 +125,8 @@ pub struct Fingerprint {
     /// The address source the build adds addresses from, as it describes
     /// itself, if any.
     pub addresses: Option<String>,
+    #[serde(default)]
+    pub tiger: bool,
     /// The address files it imported, once it has.
     pub imported: Vec<FileStamp>,
 }
@@ -145,6 +147,7 @@ impl Fingerprint {
                 .collect::<Result<_>>()?,
             input_sources: input_sources.to_vec(),
             addresses,
+            tiger: false,
             imported: Vec::new(),
         })
     }
@@ -187,6 +190,9 @@ impl Fingerprint {
                 self.addresses.as_deref().unwrap_or("nothing"),
                 now.addresses.as_deref().unwrap_or("nothing")
             ));
+        }
+        if self.tiger != now.tiger {
+            out.push("the --tiger option changed".into());
         }
         for file in &self.imported {
             match FileStamp::of(&file.path) {

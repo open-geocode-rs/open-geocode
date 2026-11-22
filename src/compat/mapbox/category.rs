@@ -324,7 +324,11 @@ pub(super) async fn search(
             .as_deref()
             .is_some_and(|category| categories::holds(&excluded, category))
     });
-    Ok(Json(searchbox::Collection::forward(&collection, None)))
+    Ok(Json(searchbox::Collection::forward(
+        &collection,
+        None,
+        state.pack(),
+    )))
 }
 
 /// `radius`, degrees around `proximity`, as metres.

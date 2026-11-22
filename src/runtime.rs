@@ -1893,6 +1893,7 @@ pub(crate) mod router_tests {
                     disputed: false,
                     street_postcodes: Vec::new(),
                     address: AddressComponents {
+                        block_number_len: None,
                         areas: Vec::new(),
                         number: "10".to_string(),
                         street: Some("King Street".to_string()),
@@ -2693,6 +2694,7 @@ pub(crate) mod router_tests {
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: "10".to_string(),
                     street: Some("King Street".to_string()),
@@ -2869,6 +2871,7 @@ pub(crate) mod router_tests {
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: "10".to_string(),
                     street: Some(street.to_string()),
@@ -3169,6 +3172,7 @@ pub(crate) mod router_tests {
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: "10".to_string(),
                     street: Some(street.to_string()),
@@ -3500,6 +3504,7 @@ pub(crate) mod router_tests {
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: number.to_string(),
                     street: Some(street.to_string()),
@@ -3738,6 +3743,7 @@ pub(crate) mod router_tests {
             )
         };
         let stated = |number: &str, street: &str| AddressComponents {
+            block_number_len: None,
             areas: Vec::new(),
             number: number.to_string(),
             street: Some(street.to_string()),
@@ -4079,6 +4085,7 @@ pub(crate) mod router_tests {
         writer.set_country_codes([(canada.0, code)].into_iter().collect());
         writer.set_context_names([canada, ontario, toronto].into_iter().collect());
         let address = AddressComponents {
+            block_number_len: None,
             areas: Vec::new(),
             number: "10".to_string(),
             street: Some("King Street West".to_string()),
@@ -4147,6 +4154,7 @@ pub(crate) mod router_tests {
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: number.to_string(),
                     street: Some("King Street".to_string()),

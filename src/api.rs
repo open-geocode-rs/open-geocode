@@ -198,6 +198,16 @@ pub enum PointType {
 /// Properties shared by forward and reverse results.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct Common {
+    #[serde(skip)]
+    pub(crate) tiger_range: Option<crate::tiger::Range>,
+    #[serde(skip)]
+    pub(crate) tiger_block: Option<String>,
+    #[serde(skip)]
+    pub(crate) tiger_block_2010: Option<String>,
+    #[serde(skip)]
+    pub(crate) tiger_block_left: Option<String>,
+    #[serde(skip)]
+    pub(crate) tiger_block_right: Option<String>,
     /// Stable ID from the source data, such as `osm:node:123`. Store it to
     /// find the record again: it outlives a Pack rebuild.
     pub id: String,
@@ -528,6 +538,8 @@ impl Accuracy {
 pub struct Address {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub housenumber: Option<String>,
+    #[serde(skip)]
+    pub(crate) block_number_len: Option<std::num::NonZeroU16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -572,6 +584,19 @@ pub struct StreetParts {
 }
 
 impl Address {
+    pub(crate) fn block_parts(&self) -> Option<(&str, Option<&str>)> {
+        let number = self.housenumber.as_deref()?;
+        let (block, house) = number.split_at_checked(usize::from(self.block_number_len?.get()))?;
+        if house.is_empty() {
+            Some((block, None))
+        } else {
+            Some((
+                block,
+                Some(house.strip_prefix('-').filter(|house| !house.is_empty())?),
+            ))
+        }
+    }
+
     /// Fills the parts read from `street`.
     pub fn with_parts(mut self) -> Self {
         self.street_parts = self
@@ -604,6 +629,7 @@ impl From<&AddressComponents> for Address {
     fn from(address: &AddressComponents) -> Self {
         Self {
             housenumber: stated(Some(&address.number)),
+            block_number_len: address.block_number_len,
             unit: stated(address.unit.as_deref()),
             street: stated(address.street.as_deref()),
             place: stated(address.place.as_deref()),
@@ -724,6 +750,8 @@ pub struct ContextArea {
     /// write one.
     #[serde(skip)]
     pub plate_code: Option<String>,
+    #[serde(skip)]
+    pub census_code: Option<String>,
 }
 
 impl Point {
@@ -876,6 +904,7 @@ impl<'a> Contexts<'a> {
                     local_name: None,
                     wikidata: self.pack.records().wikidata(record_id)?,
                     plate_code: self.pack.plate_code(record_id).map(str::to_string),
+                    census_code: self.pack.census_code(record_id).map(str::to_string),
                 })
             })
             .transpose()?;
@@ -1257,15 +1286,30 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
         };
         if result.match_kind == MatchKind::EstimatedAddress {
             let number = estimated_number(&result.label)?;
-            let interpolation = pack.interpolation(record_id)?.ok_or_else(|| {
-                Error::Inconsistent(format!("record {record_id} is not an interpolation"))
-            })?;
-            summary.name = labels::estimated_address_name(number, &interpolation.address)
-                .unwrap_or_else(|| format!("{number} {}", interpolation.name()));
-            summary.address = Address {
-                housenumber: Some(number.to_string()),
-                ..Address::from(&interpolation.address)
-            };
+            if result
+                .id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("derived:tiger:"))
+            {
+                summary.name = format!("{number} {}", summary.name);
+                summary.address.housenumber = Some(number.to_string());
+                summary.address.street.clone_from(&result.context.street);
+                summary
+                    .address
+                    .postcode
+                    .clone_from(&result.context.postcode);
+                summary.source.dataset = crate::tiger::DATASET.into();
+            } else {
+                let interpolation = pack.interpolation(record_id)?.ok_or_else(|| {
+                    Error::Inconsistent(format!("record {record_id} is not an interpolation"))
+                })?;
+                summary.name = labels::estimated_address_name(number, &interpolation.address)
+                    .unwrap_or_else(|| format!("{number} {}", interpolation.name()));
+                summary.address = Address {
+                    housenumber: Some(number.to_string()),
+                    ..Address::from(&interpolation.address)
+                };
+            }
         }
         if let Some(id) = &result.id {
             summary.id.clone_from(id);
@@ -1368,9 +1412,54 @@ fn common(
             summary.layer
         ))
     })?;
-    let address = summary.address.with_parts();
+    let tiger_range = if summary.source.dataset == crate::tiger::DATASET {
+        summary
+            .address
+            .housenumber
+            .as_deref()
+            .and_then(|number| number.parse().ok())
+            .and_then(|number| {
+                contexts
+                    .pack
+                    .tiger_ranges
+                    .for_street(record_id)
+                    .find(|range| range.id(number) == summary.id)
+            })
+    } else {
+        None
+    };
+    let mut address = summary.address.with_parts();
     let context = contexts.of(record_id)?;
+    let stored_address = layer == Layer::Address
+        && !summary.id.starts_with("derived:")
+        && accuracy != Accuracy::Interpolated;
+    if stored_address && address.postcode.is_none() && summary.street_postcode.is_none() {
+        address.postcode = contexts.pack.tiger_zcta.postcode(record_id);
+    }
+    let side = |direction| {
+        tiger_range.and_then(|range| {
+            contexts
+                .pack
+                .tiger_side_blocks
+                .code(range.side_key(direction))
+        })
+    };
+    let tiger_block = if stored_address {
+        contexts.pack.tiger_blocks.code(record_id)
+    } else {
+        tiger_range.and_then(|range| side(range.side))
+    };
+    let tiger_block_2010 = stored_address
+        .then(|| contexts.pack.tiger_historical.code(record_id))
+        .flatten();
+    let tiger_block_left = side(b'L');
+    let tiger_block_right = side(b'R');
     Ok(Common {
+        tiger_range,
+        tiger_block,
+        tiger_block_2010,
+        tiger_block_left,
+        tiger_block_right,
         id: summary.id,
         code: layer
             .is_context()
@@ -1641,6 +1730,7 @@ mod tests {
                     disputed: false,
                     street_postcodes: Vec::new(),
                     address: AddressComponents {
+                        block_number_len: None,
                         areas: Vec::new(),
                         number: "1".to_string(),
                         street: Some("Avenida de Mayo".to_string()),
@@ -1735,6 +1825,7 @@ mod tests {
     #[test]
     fn address_keeps_only_what_the_record_states() {
         let address = Address::from(&AddressComponents {
+            block_number_len: None,
             number: "12".to_string(),
             street: Some("King Street West".to_string()),
             place: None,

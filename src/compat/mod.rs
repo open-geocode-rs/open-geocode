@@ -614,6 +614,7 @@ pub(crate) mod native {
             .get("limit")
             .and_then(|limit| limit.parse::<usize>().ok())
             .filter(|limit| *limit > 0);
+        let query = args.get("q").map(str::to_owned);
         let (addresses, places) =
             tokio::join!(geocode(state, args.copied()), self::places(state, args));
         let (mut addresses, places) = match (addresses, places) {
@@ -623,7 +624,12 @@ pub(crate) mod native {
             (Err(_), Err(problem)) => return Err(problem),
         };
         let limit = limit.unwrap_or_else(|| addresses.features.len().max(places.len()));
-        addresses.features.retain(names_answer);
+        addresses.features.retain(|feature| {
+            names_answer(feature)
+                || query
+                    .as_deref()
+                    .is_some_and(|query| names_japanese_block_address(feature, query))
+        });
         let mut seen = addresses
             .features
             .iter()
@@ -665,6 +671,32 @@ pub(crate) mod native {
                 .iter()
                 .all(|part| *part != Some(PartMatch::Unmatched))
         })
+    }
+
+    fn names_japanese_block_address(feature: &ForwardFeature, query: &str) -> bool {
+        use crate::{record::Layer, util::text::normalize_for_compare};
+
+        let properties = &feature.properties;
+        let common = &properties.common;
+        let address = &common.address;
+        if common.layer != Layer::Address
+            || properties.fallback
+            || address.street.is_some()
+            || address.areas.is_empty()
+            || address.block_parts().is_none()
+            || super::country_code(&common.context).or(address.country.as_deref()) != Some("JP")
+        {
+            return false;
+        }
+
+        // Block addresses have no street, and the parser can read their neighbourhood as a locality.
+        let mut query_parts = query.split([',', '、', '，']).map(normalize_for_compare);
+        if query_parts.next().as_deref() != Some(normalize_for_compare(&common.name).as_str()) {
+            return false;
+        }
+        let mut qualifiers = common.label.split(',').skip(1).map(normalize_for_compare);
+        query_parts
+            .all(|part| !part.is_empty() && qualifiers.next().as_deref() == Some(part.as_str()))
     }
 
     pub(crate) async fn reverse(
@@ -1021,6 +1053,7 @@ mod tests {
             local_name: None,
             wikidata: None,
             plate_code: None,
+            census_code: None,
         })
     }
 
@@ -1331,6 +1364,7 @@ mod tests {
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: Vec::new(),
                 number: "1600".to_string(),
                 street: Some("Amphitheatre Parkway".to_string()),

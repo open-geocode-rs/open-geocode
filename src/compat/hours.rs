@@ -199,6 +199,24 @@ impl Week {
             .zip(self.days.iter().map(Vec::as_slice))
     }
 
+    pub(crate) fn open_at(&self, zone: Option<&str>, at: jiff::Timestamp) -> Option<bool> {
+        if self.is_always_open() {
+            return Some(true);
+        }
+        let local = at.to_zoned(jiff::tz::TimeZone::get(zone?).ok()?);
+        let day = usize::from(local.weekday().to_monday_zero_offset() as u8);
+        let minute = local.hour() as u16 * 60 + local.minute() as u16;
+        let includes = |spans: &[Span], minute| {
+            spans
+                .iter()
+                .any(|span| span.open <= minute && minute < span.close)
+        };
+        Some(
+            includes(&self.days[day], minute)
+                || includes(&self.days[(day + 6) % 7], minute + DAY_MINUTES),
+        )
+    }
+
     /// Whether the place never closes: open from midnight to midnight on
     /// every day.
     pub(crate) fn is_always_open(&self) -> bool {
@@ -271,6 +289,22 @@ mod tests {
     }
 
     const H: u16 = 60;
+
+    #[test]
+    fn open_status_uses_local_time_and_carries_overnight_spans() {
+        let week = Week::parse("Fr 22:00-02:00").expect("weekly hours");
+        let during = "2026-10-03T05:59:00Z".parse().expect("timestamp");
+        let end = "2026-10-03T06:00:00Z".parse().expect("timestamp");
+        assert_eq!(week.open_at(Some("America/New_York"), during), Some(true));
+        assert_eq!(week.open_at(Some("America/New_York"), end), Some(false));
+        assert_eq!(week.open_at(None, during), None);
+        assert_eq!(
+            Week::parse("24/7")
+                .expect("weekly hours")
+                .open_at(None, end),
+            Some(true)
+        );
+    }
 
     #[test]
     fn rules_set_their_days_and_a_later_rule_replaces_an_earlier_one() {

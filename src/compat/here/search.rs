@@ -319,6 +319,29 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
     collection
         .features
         .retain(|feature| item(&Feature::from(feature)).is_any_of(types.as_deref()));
+    if collection.features.is_empty()
+        && types.as_deref().is_some_and(|types| types == ["place"])
+        && request.qualified.fields().next().is_none()
+        && let Some(text) = request.q.as_deref()
+    {
+        let normalize = crate::util::text::normalize_for_compare;
+        let asked = normalize(text);
+        let args = Args::new()
+            .set("q", text)
+            .set("limit", request.limit.to_string())
+            .maybe("lang", og_lang(&params))
+            .maybe("focus", at.map(|point| point.og_point()))
+            .maybe(
+                "country",
+                (!request.countries.is_empty()).then(|| request.countries.join(",")),
+            );
+        let mut places = native::places(state, args).await.map_err(Gs7Error::of)?;
+        places.features.retain(|feature| {
+            feature.properties.common.layer == Layer::Poi
+                && normalize(&feature.properties.common.name) == asked
+        });
+        collection = places;
+    }
     crate::compat::best_matches(&mut collection.features);
     let parsing =
         shows(&params, "parsing").then(|| parsing(state, request.q.as_deref(), &request.qualified));
@@ -329,6 +352,7 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
             item(feature)
                 .distance_from(at)
                 .with_time_zone(feature, time_zone)
+                .with_name_scores(request.qualified.district.as_deref(), request.q.as_deref())
         })
         .take(limit)
         .map(|mut item| {

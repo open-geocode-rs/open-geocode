@@ -86,6 +86,9 @@ pub(crate) fn address_components(
     let place = tags.cleaned("addr:place");
     let block_scheme =
         block_number.is_some() || BLOCK_AREA_KEYS.into_iter().any(|key| tags.has(key));
+    let block_number_len = block_number
+        .as_ref()
+        .and_then(|block| std::num::NonZeroU16::new(u16::try_from(block.len()).ok()?));
     let number = match (block_number, house_number) {
         (Some(block), Some(house)) => format!("{block}-{house}"),
         (Some(block), None) => block,
@@ -103,6 +106,7 @@ pub(crate) fn address_components(
     }
 
     Ok(AddressComponents {
+        block_number_len,
         number,
         street,
         place,

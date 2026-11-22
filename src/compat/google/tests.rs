@@ -119,6 +119,7 @@ fn write_pack(dir: &Path) {
         zone: None,
     });
     let address = AddressComponents {
+        block_number_len: None,
         areas: vec!["Old Town".to_string(), "Market".to_string()],
         number: "10".to_string(),
         street: Some("King Street".to_string()),
@@ -177,6 +178,7 @@ fn write_pack(dir: &Path) {
                 brand: None,
                 details: Some(Box::new(PoiDetails {
                     contact: Some(Contact {
+                        fax: None,
                         phone: Some("+1 416-555-0111".to_string()),
                         website: Some("https://queenbakery.example/".to_string()),
                         email: Some("hello@queenbakery.example".to_string()),
@@ -287,6 +289,7 @@ fn bakery_place() -> Value {
         "types": ["bakery", "french_restaurant", "food", "store", "point_of_interest", "establishment"],
         "primaryType": "bakery",
         "formattedAddress": "12 King Street, Toronto, ON M5V 1A1, Canada",
+        "shortFormattedAddress": "12 King Street, Toronto, ON M5V 1A1",
         "postalAddress": {
             "regionCode": "CA",
             "postalCode": "M5V 1A1",
@@ -296,6 +299,7 @@ fn bakery_place() -> Value {
             "addressLines": ["12 King Street"],
         },
         "addressComponents": bakery_components(),
+        "plusCode": {"globalCode": "87M22X2W+22", "compoundCode": "2X2W+22 Toronto, ON, CAN"},
         "location": {"latitude": 43.0, "longitude": -79.005},
         "viewport": {
             "low": {"latitude": 42.9995, "longitude": -79.0051},
@@ -728,6 +732,7 @@ fn address_result() -> Value {
     json!({
         "place": format!("places/{id}"),
         "placeId": id,
+        "plusCode": {"globalCode": "87M32222+22", "compoundCode": "2222+22 Toronto, ON, CAN"},
         "location": {"latitude": 43.0, "longitude": -79.0},
         "granularity": "ROOFTOP",
         "viewport": {
@@ -878,7 +883,10 @@ async fn reverse_geocode_by_path_and_by_fields_with_filters() {
 
     let nothing = get(router, "/compat/google/v4/geocode/location/10,10").await;
     assert_eq!(nothing.status, StatusCode::OK);
-    assert_eq!(nothing.body, json!({}));
+    assert_eq!(
+        nothing.body,
+        json!({"plusCode": {"globalCode": "7F2G2222+22"}})
+    );
 
     for (uri, message) in [
         (
@@ -922,6 +930,7 @@ async fn place_geocoding_answers_one_bare_result() {
     for field in [
         "name",
         "id",
+        "shortFormattedAddress",
         "displayName",
         "primaryType",
         "internationalPhoneNumber",
@@ -1271,7 +1280,7 @@ async fn every_og_value_lands_in_its_google_slot() {
             assert_eq!(phone, &contact["phone"]);
             let hours = properties["opening_hours"]
                 .as_str()
-                .and_then(super::hours::parse);
+                .and_then(|value| super::hours::parse(value, properties["timezone"].as_str()));
             assert_eq!(
                 place["regularOpeningHours"],
                 serde_json::to_value(hours).expect("hours"),
@@ -1668,7 +1677,7 @@ fn address_destination() -> Value {
     let place = format!("places/{id}");
     let mut primary = address_result();
     let fields = primary.as_object_mut().expect("a result");
-    for field in ["granularity", "types", "viewport"] {
+    for field in ["granularity", "types", "viewport", "plusCode"] {
         fields.remove(field);
     }
     fields.insert("place".to_string(), json!(place));
@@ -1699,6 +1708,8 @@ fn bakery_destination() -> Value {
     for field in [
         "name",
         "id",
+        "shortFormattedAddress",
+        "plusCode",
         "viewport",
         "internationalPhoneNumber",
         "websiteUri",
@@ -2026,6 +2037,7 @@ fn us_fixture() -> Fixture {
         zone: None,
     });
     let address = AddressComponents {
+        block_number_len: None,
         areas: Vec::new(),
         number: "1600".to_string(),
         street: Some("Amphitheatre Parkway".to_string()),
@@ -2407,7 +2419,7 @@ async fn a_place_is_described_by_its_best_known_neighbours() {
         "{}",
         reply.body
     );
-    assert_eq!(landmarks[0]["spatialRelationship"], "WITHIN");
+    assert!(landmarks[0].get("spatialRelationship").is_none());
     assert!(landmarks[1].get("spatialRelationship").is_none());
     let distance = landmarks[1]["straightLineDistanceMeters"]
         .as_f64()
@@ -2432,10 +2444,9 @@ async fn a_place_is_described_by_its_best_known_neighbours() {
     assert!(plain.body.get("addressDescriptor").is_none());
 }
 
-/// A destination lists the places whose outline holds it, and the best known
-/// of the others near it, worded in English only.
+/// An extent alone cannot establish that a landmark contains the destination.
 #[tokio::test]
-async fn a_destination_lists_what_holds_it_and_what_stands_near_it() {
+async fn a_destination_does_not_infer_containment_from_an_extent() {
     let fixture = landmark_fixture();
     let router = &fixture.router;
     let cafe = encode_parts("osm:way:21", Some(Layer::Poi), "");
@@ -2446,18 +2457,13 @@ async fn a_destination_lists_what_holds_it_and_what_stands_near_it() {
     )
     .await;
     let destination = &reply.body["destinations"][0];
-    let holding = destination["containingPlaces"]
-        .as_array()
-        .expect("containing places")
-        .iter()
-        .map(|place| place["displayName"]["text"].clone())
-        .collect::<Vec<_>>();
-    assert_eq!(holding, [json!("Queen Mall")], "{}", reply.body);
+    assert!(destination.get("containingPlaces").is_none());
     let landmarks = destination["landmarks"].as_array().expect("landmarks");
-    assert_eq!(landmarks.len(), 1, "{}", reply.body);
-    assert_eq!(landmarks[0]["place"]["displayName"]["text"], "Corner Shop");
+    assert_eq!(landmarks.len(), 2, "{}", reply.body);
+    assert_eq!(landmarks[0]["place"]["displayName"]["text"], "Queen Mall");
+    assert_eq!(landmarks[1]["place"]["displayName"]["text"], "Corner Shop");
     assert_eq!(
-        landmarks[0]["relationalDescription"],
+        landmarks[1]["relationalDescription"],
         json!({"text": "Near Corner Shop", "languageCode": "en"})
     );
     assert_eq!(landmarks[0]["tags"], json!(["ADDRESS"]));

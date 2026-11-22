@@ -43,6 +43,16 @@ struct Geometry {
 
 #[derive(Debug, Deserialize)]
 struct Properties {
+    #[serde(skip)]
+    tiger_range: Option<crate::tiger::Range>,
+    #[serde(skip)]
+    tiger_block: Option<String>,
+    #[serde(skip)]
+    tiger_block_2010: Option<String>,
+    #[serde(skip)]
+    tiger_block_left: Option<String>,
+    #[serde(skip)]
+    tiger_block_right: Option<String>,
     id: String,
     layer: Layer,
     accuracy: Accuracy,
@@ -111,6 +121,7 @@ struct Context {
 struct Area {
     name: String,
     code: Option<String>,
+    census_code: Option<String>,
 }
 
 /// An area the result lies in or is: its name and ISO code.
@@ -143,11 +154,17 @@ impl Feature {
             area.as_ref().map(|area| Area {
                 name: area.name.clone(),
                 code: area.code.clone(),
+                census_code: area.census_code.clone(),
             })
         };
         Self {
             geometry: Geometry { coordinates },
             properties: Properties {
+                tiger_range: common.tiger_range,
+                tiger_block: common.tiger_block.clone(),
+                tiger_block_2010: common.tiger_block_2010.clone(),
+                tiger_block_left: common.tiger_block_left.clone(),
+                tiger_block_right: common.tiger_block_right.clone(),
                 id: common.id.clone(),
                 layer: common.layer,
                 accuracy: common.accuracy,
@@ -554,6 +571,20 @@ impl Feature {
             candidate
                 .custom_fields
                 .insert(REVERSE_DISTANCE_UNIT, "METERS".to_string());
+            if matches!(
+                self.properties.layer,
+                Layer::Address | Layer::Street | Layer::Interpolation
+            ) && candidate
+                .address
+                .country
+                .as_ref()
+                .and_then(|country| country.iso_alpha2_code.as_deref())
+                == Some("US")
+            {
+                candidate
+                    .custom_fields
+                    .insert("NEAREST_DIST", (distance_m / 0.3048).to_string());
+            }
         }
         candidate
     }
@@ -669,12 +700,14 @@ impl Feature {
         let accuracy = properties.accuracy.as_str();
         let is_street_line = matches!(layer, "address" | "interpolation" | "street");
         let area = |area: &Option<Area>| area.as_ref().map(|area| area.name.clone());
-        let (postal_code, postal_code_ext) = match address.postcode.as_deref() {
-            Some(postcode) => match zip_plus_four(postcode) {
-                Some((zip, plus_four)) => (Some(zip.to_string()), Some(plus_four.to_string())),
-                None => (Some(postcode.to_string()), None),
-            },
-            None => (None, None),
+        let zip_plus_four = address.postcode.as_deref().and_then(|postcode| {
+            (self.country_code() == Some("US"))
+                .then(|| usps::zip_plus_four(postcode))
+                .flatten()
+        });
+        let (postal_code, postal_code_ext) = match zip_plus_four {
+            Some((zip, extension)) => (Some(zip.to_string()), Some(extension.to_string())),
+            None => (address.postcode.clone(), None),
         };
         // The record states the region as its address writes it, often an
         // abbreviation (`NJ`); the area containing it has the full name.
@@ -808,6 +841,67 @@ impl Feature {
         if style == Style::Postal {
             self.restate_postal(&mut candidate, us.as_ref());
         }
+        for (key, value) in [
+            ("BLOCK", &properties.tiger_block),
+            ("BLOCK_2010", &properties.tiger_block_2010),
+            ("BLOCK_LEFT", &properties.tiger_block_left),
+            ("BLOCK_RIGHT", &properties.tiger_block_right),
+        ] {
+            if let Some(value) = value {
+                candidate.custom_fields.insert(key, value.clone());
+            }
+        }
+        if let Some(range) = properties.tiger_range {
+            let (low, high) = range.bounds();
+            candidate.custom_fields.extend([
+                ("SEGMENT_ID", range.line.to_string()),
+                ("LORANGE", low.to_string()),
+                ("HIRANGE", high.to_string()),
+                ("STREET_SIDE", char::from(range.side).to_string()),
+                ("RANGE_PARITY", range.parity().to_string()),
+                (
+                    "SEGMENT_DIRECTION",
+                    if range.from <= range.to { "F" } else { "R" }.into(),
+                ),
+            ]);
+            if properties.source.dataset == crate::tiger::DATASET {
+                candidate.custom_fields.insert("REC_TYPE", "T".into());
+            }
+        }
+        let context = &properties.context;
+        if let Some(state) = context
+            .region
+            .as_ref()
+            .and_then(|area| area.census_code.as_ref())
+        {
+            candidate.custom_fields.insert("STATE_FIPS", state.clone());
+        }
+        if let Some(county) = context
+            .district
+            .iter()
+            .chain(&context.subregion)
+            .find_map(|area| area.census_code.as_ref())
+        {
+            candidate.custom_fields.insert("COUNTY", county.clone());
+            candidate
+                .custom_fields
+                .insert("COUNTY_FIPS", county.clone());
+        }
+        if candidate
+            .address
+            .country
+            .as_ref()
+            .and_then(|country| country.iso_alpha2_code.as_deref())
+            == Some("US")
+            && let Some(zip) = candidate.address.postal_code.as_deref()
+            && let Some(extension) = candidate.address.postal_code_ext.as_deref()
+        {
+            candidate.custom_fields.extend([
+                ("ZIP4", extension.to_string()),
+                ("ZIP9", format!("{zip}{extension}")),
+                ("ZIP10", format!("{zip}-{extension}")),
+            ]);
+        }
         let holds = Holds::of(&candidate.address);
         candidate.explanation.address_match.description = describe(judged);
         if product == Product::Verify {
@@ -841,8 +935,7 @@ impl Feature {
 
     /// The parts of a postal answer its `customFields` restate, under the
     /// keys every Precisely example of geocode, verify, lookup and reverse
-    /// writes. og keeps one name for a town, so its short, postal and
-    /// preferred names are that one. og splits a street's type off only
+    /// writes. og splits a street's type off only
     /// after its name, so the type is always the one after it. og answers
     /// no intersection.
     fn restate_postal(&self, candidate: &mut Candidate, us: Option<&UsAddress>) {
@@ -859,9 +952,7 @@ impl Feature {
         let restated = [
             ("ADDRLINE_SHORT", address.formatted_street_address.clone()),
             ("LASTLINE_SHORT", address.formatted_location_address.clone()),
-            ("CITY_SHORT", city.clone()),
-            ("NAME_CITY", city.clone()),
-            ("PREF_CITY", city),
+            ("CITY_SHORT", city),
             ("NAME", name.clone()),
             ("NAME_SHORT", name),
             ("TYPE_SHORT", kind.clone().flatten()),
@@ -1171,15 +1262,6 @@ fn split_label(label: &str, name: &str, unit: Option<&str>) -> (String, Option<S
     } else {
         (name.to_string(), Some(rest.to_string()))
     }
-}
-
-/// A US ZIP+4 apart, as Precisely returns `postalCode` and `postalCodeExt`.
-fn zip_plus_four(postcode: &str) -> Option<(&str, &str)> {
-    let (zip, plus_four) = postcode.split_once('-')?;
-    let digits = |part: &str, length: usize| {
-        part.len() == length && part.bytes().all(|byte| byte.is_ascii_digit())
-    };
-    (digits(zip, 5) && digits(plus_four, 4)).then_some((zip, plus_four))
 }
 
 /// Precisely's `LocationType` for what og's point stands for. A named
@@ -1588,8 +1670,6 @@ mod tests {
                 ("ADDRLINE_SHORT", "350 JORDAN AVE"),
                 ("LASTLINE_SHORT", "MONTOURSVILLE, PA  17754"),
                 ("CITY_SHORT", "MONTOURSVILLE"),
-                ("NAME_CITY", "MONTOURSVILLE"),
-                ("PREF_CITY", "MONTOURSVILLE"),
                 ("NAME", "JORDAN"),
                 ("NAME_SHORT", "JORDAN"),
                 ("TYPE_SHORT", "AVE"),
@@ -1647,13 +1727,29 @@ mod tests {
     }
 
     #[test]
+    fn zip_aliases_require_a_source_zip_plus_four() {
+        let mut feature = jordan();
+        feature.properties.address.postcode = Some("17754-0042".into());
+        let fields = feature.candidate(Product::Geocode).custom_fields;
+        assert_eq!(fields["ZIP4"], "0042");
+        assert_eq!(fields["ZIP9"], "177540042");
+        assert_eq!(fields["ZIP10"], "17754-0042");
+        assert!(
+            !jordan()
+                .candidate(Product::Geocode)
+                .custom_fields
+                .contains_key("ZIP9")
+        );
+    }
+
+    #[test]
     fn a_zip_plus_four_comes_apart() {
-        assert_eq!(zip_plus_four("12180-8371"), Some(("12180", "8371")));
-        assert_eq!(zip_plus_four("12180"), None);
-        assert_eq!(zip_plus_four("1218-08371"), None);
-        assert_eq!(zip_plus_four("12180-837"), None);
-        assert_eq!(zip_plus_four("M5X 1A9"), None);
-        assert_eq!(zip_plus_four("ABCDE-FGHI"), None);
+        assert_eq!(usps::zip_plus_four("12180-8371"), Some(("12180", "8371")));
+        assert_eq!(usps::zip_plus_four("12180"), None);
+        assert_eq!(usps::zip_plus_four("1218-08371"), None);
+        assert_eq!(usps::zip_plus_four("12180-837"), None);
+        assert_eq!(usps::zip_plus_four("M5X 1A9"), None);
+        assert_eq!(usps::zip_plus_four("ABCDE-FGHI"), None);
     }
 
     #[test]
