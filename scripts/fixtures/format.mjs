@@ -25,10 +25,14 @@ const lines = (components, options) =>
 
 for await (const line of createInterface({ input: process.stdin })) {
   const { id, ...components } = JSON.parse(line);
-  const full = lines(components, { appendCountry: true });
+  // OpenCage's JP template orders fields for English.
+  const full = components.countryCode === 'JP'
+    ? lines({ ...components, countryCode: 'JP_ja', country: '日本' }, {})
+    : lines(components, { appendCountry: true });
   // Messy drops what people leave out of an address they type and shortens
   // what they shorten, by OpenCage's own abbreviation lists.
   const { postcode, state, state_code, country, countryCode, ...kept } = components;
-  const messy = lines({ ...kept, countryCode: borrowed(countryCode) }, { abbreviate: true });
+  const template = countryCode === 'JP' ? 'JP_ja' : borrowed(countryCode);
+  const messy = lines({ ...kept, countryCode: template }, { abbreviate: true });
   process.stdout.write(JSON.stringify({ id, full, messy }) + '\n');
 }
