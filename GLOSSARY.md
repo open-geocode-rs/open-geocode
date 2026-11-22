@@ -108,7 +108,7 @@ _Avoid_: candidates (alone), results
 
 **Budget**:
 How long one query may search, and how many searches it may run, before it answers with the best its pool holds.
-Readings run best first, so what the budget cuts off is what is least likely to answer.
+Readings run best first, each in its stated localities before any out of them, so what the budget cuts off is what is least likely to answer.
 _Avoid_: timeout, deadline
 
 **Agreement**:
