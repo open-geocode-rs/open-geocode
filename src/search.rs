@@ -577,10 +577,45 @@ impl TextSearcher {
     }
 
     pub fn search(&self, options: &TextSearchOptions) -> Result<Vec<TextSearchHit>> {
-        self.search_at(options, Depth::Query)
+        let mut hits = self.search_at(options, Depth::Query)?;
+        if self.places || !number_reading::allows_retry(options.layer.as_deref(), hits.iter()) {
+            return Ok(hits);
+        }
+        let Some(mut reading) = number_reading::address_variant(&options.query) else {
+            return Ok(hits);
+        };
+        let alternative = TextSearchOptions {
+            query: reading.query.clone(),
+            layer: Some(Layer::Address.as_str().to_owned()),
+            limit: DEFAULT_SEARCH_LIMIT,
+            ..options.clone()
+        };
+        let retry = self.search_at_with(
+            &alternative,
+            Depth::Retry,
+            |session, plan, postcode, hit| {
+                self.witness_number_reading(&mut reading, session, plan, postcode, hit)?;
+                Ok(true)
+            },
+        )?;
+        if let Some(hit) = reading.unique_confirmed(retry) {
+            hits.retain(|existing| existing.record_id != hit.record_id);
+            hits.insert(0, hit);
+            hits.truncate(effective_limit(options.limit));
+        }
+        Ok(hits)
     }
 
     fn search_at(&self, options: &TextSearchOptions, depth: Depth) -> Result<Vec<TextSearchHit>> {
+        self.search_at_with(options, depth, |_, _, _, _| Ok(true))
+    }
+
+    fn search_at_with(
+        &self,
+        options: &TextSearchOptions,
+        depth: Depth,
+        accept: impl FnMut(&Session, &QueryPlan, &QueryPostcode, &TextSearchHit) -> Result<bool>,
+    ) -> Result<Vec<TextSearchHit>> {
         let limit = effective_limit(options.limit);
         if limit == 0 {
             return Ok(Vec::new());
@@ -616,7 +651,7 @@ impl TextSearcher {
             Parses::All,
             None,
             Some(limit),
-            |_, _, _, _| Ok(true),
+            accept,
         )?;
         let mut hits = variants.hits;
         if depth == Depth::Query && !self.places && variants.numbered == Numbered::Yes {
@@ -656,7 +691,7 @@ impl TextSearcher {
         if !self.places && variants.numbered == Numbered::Yes {
             hits.retain(|hit| {
                 let parts = &hit.matched;
-                parts.country != Some(PartMatch::Unmatched)
+                !contradicts_country(parts.country, &variants.countries, hit.features.country)
                     && !(parts.region == Some(PartMatch::Unmatched)
                         && parts.postcode == Some(PartMatch::Unmatched))
             });
@@ -683,6 +718,37 @@ impl TextSearcher {
             stated_country(&options.countries, &mut hits);
         }
         Ok(hits)
+    }
+
+    fn witness_number_reading(
+        &self,
+        reading: &mut number_reading::AddressVariant,
+        session: &Session,
+        plan: &QueryPlan,
+        postcode: &QueryPostcode,
+        hit: &TextSearchHit,
+    ) -> Result<()> {
+        if !reading.could_add_witness(hit) {
+            return Ok(());
+        }
+        // Structured search can return a single representative of an address group.
+        let given = (!postcode.forms.is_empty()).then_some(postcode.exact.as_str());
+        let (_, localities) = self.localities_stated(plan, given)?;
+        let ranking = self.plan_ranking(plan, &QueryWords::default(), None, postcode.clone());
+        let (hits, _) = self.judged(
+            plan,
+            Scope::Scoped,
+            &ranking,
+            &localities,
+            &self.stated_places(&plan.context),
+            vec![hit.clone()],
+            session,
+            1,
+        )?;
+        if let Some(hit) = hits.first() {
+            reading.add_witness(hit);
+        }
+        Ok(())
     }
 
     fn address_with_numeric_street(
@@ -1134,14 +1200,40 @@ impl TextSearcher {
         &self,
         options: &AddressGeocodeOptions,
     ) -> Result<Option<AddressGeocodeHit>> {
+        let (query, hits) = self.geocode_address_candidates(options, None)?;
+        if number_reading::allows_retry(options.layer.as_deref(), hits.iter())
+            && let Some(mut reading) = number_reading::address_variant(&options.address)
+        {
+            let alternative = AddressGeocodeOptions {
+                address: reading.query.clone(),
+                layer: Some(Layer::Address.as_str().to_owned()),
+                limit: DEFAULT_SEARCH_LIMIT,
+                ..options.clone()
+            };
+            let (_, retry) = self.geocode_address_candidates(&alternative, Some(&mut reading))?;
+            if let Some(hit) = reading.unique_confirmed(retry) {
+                return Ok(Some(AddressGeocodeHit { query, hit }));
+            }
+        }
+        Ok(hits
+            .into_iter()
+            .next()
+            .map(|hit| AddressGeocodeHit { query, hit }))
+    }
+
+    fn geocode_address_candidates(
+        &self,
+        options: &AddressGeocodeOptions,
+        mut reading: Option<&mut number_reading::AddressVariant>,
+    ) -> Result<(String, Vec<TextSearchHit>)> {
         let limit = effective_limit(options.limit);
         if limit == 0 {
-            return Ok(None);
+            return Ok((options.address.clone(), Vec::new()));
         }
 
         let address = options.address.trim();
         if address.is_empty() {
-            return Ok(None);
+            return Ok((options.address.clone(), Vec::new()));
         }
 
         // Only the address is parsed: the context fields are already labelled,
@@ -1236,7 +1328,12 @@ impl TextSearcher {
                         .area_agreement(hit, &stated, postcode, session)?
                         .unwrap_or(stated.is_empty()),
                 };
-                Ok(hit.record.point.is_some() && !unnumbered_address && in_postcode && in_areas)
+                let accepted =
+                    hit.record.point.is_some() && !unnumbered_address && in_postcode && in_areas;
+                if accepted && let Some(reading) = reading.as_deref_mut() {
+                    self.witness_number_reading(reading, session, plan, postcode, hit)?;
+                }
+                Ok(accepted)
             },
         )?;
         if hits.is_empty() && options.layer.is_none() {
@@ -1245,10 +1342,7 @@ impl TextSearcher {
         }
         self.rate(&mut hits, numbered);
         stated_country(&options.countries, &mut hits);
-        Ok(hits
-            .into_iter()
-            .next()
-            .map(|hit| AddressGeocodeHit { query, hit }))
+        Ok((query, hits))
     }
 
     /// How many documents hold the categories' words, an upper bound on the
@@ -2966,6 +3060,7 @@ impl TextSearcher {
         let first_query = first_plan.text();
         let numbered = Numbered::of(first_plan);
         let named = choose::Named::of(first_plan);
+        let countries = self.stated_places(&first_plan.context).countries;
         let order = match (numbered, pieces.first()) {
             (Numbered::No, Some(best)) if !self.places => {
                 self.name_order(query_text, best, filters, focus)?
@@ -2991,6 +3086,7 @@ impl TextSearcher {
                 numbered,
                 order,
                 named,
+                countries,
             }
         };
         // Where the best reading says the record is holds in every reading:
@@ -9275,6 +9371,17 @@ fn subject_match(
     })
 }
 
+fn contradicts_country(
+    matched: Option<PartMatch>,
+    stated: &[CountryCode],
+    actual: Option<CountryCode>,
+) -> bool {
+    // A reading that omits the country also reports it unmatched.
+    matched == Some(PartMatch::Unmatched)
+        && !stated.is_empty()
+        && actual.is_some_and(|country| !stated.contains(&country))
+}
+
 /// Marks the country matched on each of `hits` when the request names the
 /// countries to answer from: it states the country, and every hit lies in
 /// one it names.
@@ -9325,6 +9432,7 @@ struct Variants {
     order: Option<names::NameOrder>,
     /// What the best reading names, for choosing among the answers.
     named: choose::Named,
+    countries: Vec<CountryCode>,
 }
 
 /// What [`TextSearcher::by_name`] says of a record it found.
@@ -12264,6 +12372,8 @@ mod named;
 mod choose;
 
 mod names;
+mod number_reading;
+mod numbered_area;
 
 mod phrase_prefix;
 
@@ -12283,6 +12393,18 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn an_unjudged_country_only_rejects_a_verified_conflict() {
+        let expected = CountryCode::parse("LU").expect("country code");
+        let other = CountryCode::parse("BE").expect("country code");
+        let unmatched = Some(PartMatch::Unmatched);
+
+        assert!(!contradicts_country(unmatched, &[expected], Some(expected)));
+        assert!(!contradicts_country(unmatched, &[expected], None));
+        assert!(!contradicts_country(unmatched, &[], Some(other)));
+        assert!(contradicts_country(unmatched, &[expected], Some(other)));
+    }
 
     #[test]
     fn equal_scores_prefer_the_closest_label_then_points_then_lower_ids() {
@@ -12774,6 +12896,49 @@ mod tests {
             })
             .expect("geocode")
             .map(|hit| hit.hit.record.id)
+    }
+
+    #[test]
+    fn number_reading_needs_a_single_corroborated_address() {
+        let path = temp_pack_path("number-reading-corroboration");
+        let mut writer = Writer::create(&path).expect("writer");
+        for (id, locality, point) in [
+            ("osm:node:1", "Portside", [-79.0, 43.0]),
+            ("osm:node:2", "Queensport", [-78.0, 43.0]),
+            ("osm:node:3", "Queensport", [-75.0, 45.0]),
+        ] {
+            let mut record = address_record(id, "", "1-12", "Quay Street", Some(locality), None);
+            record.geometry = point_geometry(point[0], point[1]);
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&path).expect("searcher");
+        let query = TextSearchOptions {
+            query: "Portside, Quay Street 1番12号".into(),
+            limit: 1,
+            layer: Some("address".into()),
+            countries: Vec::new(),
+            focus: None,
+            bbox: None,
+        };
+        assert_eq!(searcher.search(&query).unwrap()[0].record.id, "osm:node:1");
+        assert_eq!(
+            geocode(&searcher, "Quay Street 1番12号", Some("Portside"), None).as_deref(),
+            Some("osm:node:1")
+        );
+        let ambiguous = TextSearchOptions {
+            query: "Queensport, Quay Street 1番12号".into(),
+            ..query
+        };
+        assert_eq!(
+            searcher.search(&ambiguous).unwrap(),
+            searcher.search_at(&ambiguous, Depth::Query).unwrap()
+        );
+        assert_eq!(
+            geocode(&searcher, "Quay Street 1番12号", Some("Queensport"), None),
+            None,
+        );
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]
