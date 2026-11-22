@@ -1181,6 +1181,8 @@ impl BoundaryIndex {
         tier: PlaceLayer,
         record: &Record,
         source: &SourceProvenance,
+        area: Option<OwnArea>,
+        mut context: RecordContext,
     ) -> Option<RecordContext> {
         let [lon, lat] = record.display_point()?;
         let own = self
@@ -1190,13 +1192,22 @@ impl BoundaryIndex {
                 || Rect::new((lon, lat), (lon, lat)),
                 |&at| self.boundaries[at].bounds,
             );
-        let mut context = record_context(self, record, None)?;
+        if let Some([inner_lon, inner_lat]) = area.and_then(|area| area.point)
+            && [inner_lon, inner_lat] != [lon, lat]
+        {
+            context.admin_context = self
+                .context_for_point(inner_lon, inner_lat, &SourceContext::default())
+                .admin_context;
+        }
         context.admin_context = context.admin_context.above(tier);
         context.admin_context.retain(|entry| {
-            self.by_record
-                .get(&entry.record_id)
-                .is_none_or(|&at| holds(self.boundaries[at].bounds, own))
+            context.enclosing.contains(&entry.record_id)
+                && self
+                    .by_record
+                    .get(&entry.record_id)
+                    .is_none_or(|&at| holds(self.boundaries[at].bounds, own))
         });
+        context.flags = crate::context::CONTEXT_FLAG_OUTER_ONLY;
         Some(context)
     }
 

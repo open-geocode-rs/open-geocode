@@ -43,6 +43,7 @@ pub const SECTION_TUPLES: &str = "context/tuples";
 /// it one; 1 held a fixed six-slot tuple.
 pub const CONTEXT_VERSION: u32 = 4;
 pub const CONTEXT_FLAG_AMBIGUOUS_ADMIN: u16 = 1;
+pub(crate) const CONTEXT_FLAG_OUTER_ONLY: u16 = 2;
 
 const ENTRY_BYTES: usize = 6;
 /// Bytes of a chain's length and zone, which come before its entries.
@@ -149,11 +150,11 @@ pub struct RecordContext {
 }
 
 impl RecordContext {
-    /// The list of an area's own record: the areas around it, and no chain,
-    /// so nothing the parser's dictionaries may count as its context. A record
-    /// outside every area has neither, and its empty chain is counted.
+    /// A boundary's chain is available to lookup, but does not vote in the
+    /// parser's dictionaries as if it were an address in its parent.
     pub fn is_area_list(&self) -> bool {
-        self.admin_context.is_empty() && !self.enclosing.is_empty()
+        self.flags & CONTEXT_FLAG_OUTER_ONLY != 0
+            || (self.admin_context.is_empty() && !self.enclosing.is_empty())
     }
 }
 

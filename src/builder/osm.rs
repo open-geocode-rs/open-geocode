@@ -3453,18 +3453,21 @@ fn write_ordered(
                                 // A country derived from regions has none around it.
                                 let mut context = match origin {
                                     Some(ContextOrigin::DerivedCountry(_)) => None,
-                                    Some(ContextOrigin::Boundary(_)) => located
-                                        .map(|located| RecordContext {
-                                            enclosing: located.enclosing,
-                                            ..Default::default()
+                                    Some(ContextOrigin::Boundary(_)) => {
+                                        located.and_then(|located| {
+                                            let Record::Place(tier, place) = &record else {
+                                                return Some(located);
+                                            };
+                                            index.area_context(
+                                                *tier,
+                                                &record,
+                                                &place.source,
+                                                own,
+                                                located,
+                                            )
                                         })
-                                        .filter(RecordContext::is_area_list),
-                                    None => match &record {
-                                        Record::Place(tier, place) => {
-                                            index.area_context(*tier, &record, &place.source)
-                                        }
-                                        _ => located,
-                                    },
+                                    }
+                                    None => located,
                                 };
                                 // An area's zone is the one it lies wholly in,
                                 // which the zoning's areas say, never the zone
@@ -5695,6 +5698,7 @@ mod tests {
         // only some builds write (calibration's, timezones) are not listed.
         let formats = section_formats(&dir.join("pack"));
         let expected = [
+            ("context/*", 1),
             ("context/*", 4),
             ("country_codes", 1),
             ("default_languages", 1),
@@ -6084,7 +6088,7 @@ mod tests {
         let expected = records_and_contexts(&dir.join("whole"));
         let with_access = expected
             .iter()
-            .filter(|(record, _)| record.get("access").is_some())
+            .filter(|(record, _)| record["record"].get("access").is_some())
             .count();
         assert_eq!(with_access, 5);
         for (at, step) in Step::all(1).iter().enumerate() {
@@ -7062,7 +7066,15 @@ mod tests {
             (canada, None),
         ] {
             assert_eq!(pack.area_tags(area).unwrap(), tags, "{area}");
-            assert!(pack.boundary_context(area).unwrap().is_none(), "{area}");
+            if let Some(context) = pack.boundary_context(area).unwrap() {
+                let enclosing = pack.enclosing_areas(area).unwrap();
+                assert!(
+                    context
+                        .admin_context
+                        .parent_record_ids()
+                        .all(|parent| enclosing.contains(&parent))
+                );
+            }
         }
     }
 

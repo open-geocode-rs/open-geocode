@@ -1704,7 +1704,7 @@ impl Reader {
             .context
             .map(|reference| self.context.resolve(reference))
             .transpose()?;
-        Ok(context.filter(|context| !context.admin_context.is_empty()))
+        Ok(context.filter(|context| !context.admin_context.is_empty() || context.zone.is_some()))
     }
 
     /// Every area the record lies in, smallest first; empty for a record with
