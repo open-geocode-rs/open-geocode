@@ -209,7 +209,7 @@ impl Spill for PendingStreet {
     fn decode(input: &mut &[u8]) -> Result<Self> {
         let name = get_string(input)?;
         let languages = usize::try_from(get_u64(input)?)?;
-        let mut translated = Vec::with_capacity(languages.min(MAX_VERTICES));
+        let mut translated = Vec::with_capacity(languages.min(1 << 10));
         for _ in 0..languages {
             translated.push(get_string(input)?);
         }
@@ -377,12 +377,28 @@ fn count_element(element: Element<'_>, languages: &[String], out: &mut BlockName
 /// The line of a way as stored: the coordinates of its nodes in order, cut
 /// into runs where a node is missing from the extract, each run simplified.
 /// Joining across a gap would put a segment where there may be no road.
+/// At most [`MAX_VERTICES`] entries, breaks included: a way whose runs cannot
+/// all fit keeps its longest. A dropped run is a stretch the Pack no longer
+/// knows, as a missing node already is, and never adds a segment.
 fn line_vertices(coords: &[Option<[i32; 2]>]) -> Vec<[i32; 2]> {
-    let runs = coords
+    let mut runs = coords
         .split(Option::is_none)
         .map(|run| run.iter().flatten().copied().collect::<Vec<_>>())
         .filter(|run| !run.is_empty())
         .collect::<Vec<_>>();
+    // Every run needs its endpoints and a break before it: a floor no
+    // tolerance lowers. Past it, drop the shortest runs until the rest can fit.
+    let floor =
+        |runs: &[Vec<[i32; 2]>]| runs.iter().map(|run| run.len().min(2) + 1).sum::<usize>() - 1;
+    while runs.len() > 1 && floor(&runs) > MAX_VERTICES {
+        let shortest = runs
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, run)| run.len())
+            .map(|(at, _)| at)
+            .expect("more than one run");
+        runs.remove(shortest);
+    }
     let mut tolerance = SIMPLIFY_TOLERANCE_M;
     loop {
         let mut line = Vec::new();
@@ -392,8 +408,8 @@ fn line_vertices(coords: &[Option<[i32; 2]>]) -> Vec<[i32; 2]> {
             }
             line.extend(simplify(run, tolerance));
         }
-        // A way still too long at any tolerance is one with many gaps.
-        if line.len() <= MAX_VERTICES || tolerance > 1e7 {
+        // One run always fits at some tolerance: it ends as two points.
+        if line.len() <= MAX_VERTICES {
             return line;
         }
         tolerance *= 2.0;
@@ -1538,6 +1554,24 @@ mod tests {
         assert_eq!(
             line_vertices(&gap),
             vec![[0, 0], BREAK, [0, metres(1000.0)]]
+        );
+    }
+
+    #[test]
+    fn a_way_with_many_gaps_keeps_its_longest_runs_within_the_cap() {
+        let metres = |north: f64| (north / 111_000.0 * 1e7) as i32;
+        // 100 lone nodes between gaps, then one run of five nodes.
+        let mut coords = Vec::new();
+        for step in 0..100 {
+            coords.push(Some([0, metres(f64::from(step) * 1000.0)]));
+            coords.push(None);
+        }
+        coords.extend((0..5).map(|step| Some([metres(1000.0), metres(f64::from(step) * 100.0)])));
+        let line = line_vertices(&coords);
+        assert!(line.len() <= MAX_VERTICES, "{} entries", line.len());
+        assert!(
+            line.contains(&[metres(1000.0), 0]) && line.contains(&[metres(1000.0), metres(400.0)]),
+            "the run of five nodes is kept: {line:?}"
         );
     }
 
