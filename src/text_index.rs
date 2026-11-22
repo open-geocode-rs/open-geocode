@@ -1629,9 +1629,12 @@ impl PostcodeAreas {
         let (postcode, [centroid_lon, centroid_lat]) = &self.postcodes[nearest.data];
         let inside_radius =
             haversine_m(lon, lat, *centroid_lon, *centroid_lat) <= POSTCODE_AREA_RADIUS_M;
+        // Unit-vector rounding can split equal chords. Allow for coordinate error
+        // before squaring, so tolerance stays small near coincident points.
+        let tie_limit = (distance.sqrt() + 64.0 * f64::EPSILON).powi(2);
         (inside_radius
             && !neighbors
-                .take_while(|(_, other_distance)| *other_distance == distance)
+                .take_while(|(_, other_distance)| *other_distance <= tie_limit)
                 .any(|(other, _)| self.postcodes[other.data].0 != *postcode))
         .then_some(postcode.as_str())
     }
@@ -2070,6 +2073,17 @@ mod tests {
         ]);
         assert_eq!(areas.nearest([0.0, 0.0]), Some("m5v1a1"));
         assert_eq!(areas.nearest([0.006, 0.0]), Some("m5v1a1"));
+    }
+
+    #[test]
+    fn postcode_areas_treat_rounded_midpoints_as_ties() {
+        let query = [-79.375, 43.625];
+        let west = ("M5V 1A1".to_string(), [-79.390625, 43.625]);
+        let east = ("M5C 2A1".to_string(), [-79.359375, 43.625]);
+        let areas = PostcodeAreas::new([west.clone(), east.clone()]);
+        assert_eq!(areas.nearest(query), None);
+        assert_eq!(PostcodeAreas::new([east, west]).nearest(query), None);
+        assert_eq!(areas.nearest([-79.375_000_01, 43.625]), Some("m5v1a1"));
     }
 
     #[test]
