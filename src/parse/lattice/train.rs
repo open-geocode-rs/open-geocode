@@ -325,7 +325,6 @@ pub fn train(
     // in Pack order. The whole file need not fit, only them.
     report.pack_prefaulted =
         dictionaries.prefault_sections("parse/", Resources::probe().available_memory_bytes) > 0;
-    // Only the dictionaries: the weights are what this trains.
     let tagger = LatticeTagger::new(Dictionaries::open(dictionaries)?, Weights::zero());
     let mut random = Random::new(SEED);
 
@@ -386,7 +385,6 @@ pub fn train(
     }
     drop(renderer);
 
-    // Every row is held out or goes to one shard, in the random order.
     let shards = TRAIN_SHARDS;
     report.shards = shards;
     let mut held_out = Spool::<Row>::create(scratch, "parse-held-out")?;
@@ -850,7 +848,6 @@ impl Model {
 
     /// Learn from one row, labelled `gold` by token.
     fn learn(&mut self, lattice: &Lattice, gold: &[Label]) {
-        // A token's label is the label of every unit of it.
         let gold = lattice.units.expand(gold);
         let gradient = Gradient::of(lattice, &self.weights, &gold);
         for (feature, (values, set)) in gradient.edge {
@@ -972,7 +969,6 @@ impl Gradient {
         }
         for (country, (all, constrained)) in countries.iter().zip(&readings) {
             for (reading, sign, z) in [(constrained, 1.0, gold_z), (all, -1.0, all_z)] {
-                // How much of the row's probability this country carries.
                 let share = (reading.log_z - z).exp();
                 if share < MIN_GRADIENT {
                     continue;
@@ -1751,7 +1747,6 @@ impl<'a> Renderer<'a> {
             names: FxHashMap::default(),
             country_codes: FxHashMap::default(),
             localities: RefCell::default(),
-            // The vendored unit words and those the Pack's units use.
             unit_words: [Field::Unit, Field::PoBox, Field::Level]
                 .map(|field| tagger.dictionaries().keys(field)),
             near: tagger.dictionaries().keys(Field::Near),
@@ -1818,7 +1813,6 @@ impl<'a> Renderer<'a> {
             Record::Postcode(record) => fields.postcode = words(&record.postcode),
             Record::Interpolation(_) => return Ok(None),
         }
-        // A block scheme address is its number in its areas.
         let numbered_in_area = fields.house_number.is_some() && fields.suburb.is_some();
         if fields.house.is_none()
             && fields.street.is_none()
@@ -1827,7 +1821,6 @@ impl<'a> Renderer<'a> {
         {
             return Ok(None);
         }
-        // Where the record is: as it states it, or the areas it lies in.
         let pick = |stated: Option<&str>, area: Option<&str>, random: &mut Random| match (
             stated.and_then(words),
             area.and_then(words),
@@ -2737,7 +2730,6 @@ mod tests {
         assert_eq!(german[0].0, Street);
         assert_eq!(german[1].0, HouseNumber);
         assert_eq!(german[2], (Postcode, "m5v 1m9".to_string(), true));
-        // A missing field leaves its alternative to the next one.
         let mut no_number = fields();
         no_number.house_number = None;
         assert_eq!(rendered("CA", &no_number)[0].0, Street);
@@ -2846,7 +2838,6 @@ mod tests {
         let mut sampler = Sampler::default();
         let addresses = quota(Draw::Layer(Layer::Address)).expect("quota");
         let blocks = quota(Draw::BlockAddress).expect("quota");
-        // One large country, one small, and records in no country.
         for id in 0..3 * addresses as u64 {
             sampler.offer(id, Some(1), &street);
         }
@@ -2866,7 +2857,6 @@ mod tests {
         assert_eq!(held(None, Draw::Layer(Layer::Address)), 10);
 
         let candidates = sampler.candidates(&mut Random::new(5));
-        // The large country's draws spread over all its records.
         let large = &candidates[&Some(1)];
         assert!(large.windows(2).all(|pair| pair[0].id < pair[1].id));
         assert!(large.last().expect("drawn").id > 2 * addresses as u64);

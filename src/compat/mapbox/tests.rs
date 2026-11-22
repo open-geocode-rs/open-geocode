@@ -66,7 +66,6 @@ fn write_pack() -> Pack {
                         geometry: point_geometry(lon, 43.0),
                         source: SourceProvenance::osm(ObjectType::Relation, id),
                         prominence: Default::default(),
-                        // Canada's item, which Mapbox writes on its layer.
                         wikidata: (id == 1).then_some(16),
                     },
                 ),
@@ -363,7 +362,6 @@ async fn geocoding_forward_answers_an_address_in_mapbox_shape() {
                     "feature_type": "address",
                     "full_address": "10 King Street, Unit 2, Toronto, Ontario M5V 1A1, Canada",
                     "name": "10 King Street",
-                    // og's own point of the address, a known address point.
                     "coordinates": {
                         "longitude": -79.0,
                         "latitude": 43.0,
@@ -373,7 +371,6 @@ async fn geocoding_forward_answers_an_address_in_mapbox_shape() {
                         ],
                     },
                     "place_formatted": "Toronto, Ontario M5V 1A1, Canada",
-                    // The query states the number and street, both matched.
                     // Unstated parts are not in the input, and the country
                     // og fills in is inferred.
                     "match_code": {
@@ -392,10 +389,8 @@ async fn geocoding_forward_answers_an_address_in_mapbox_shape() {
                             "address_number": "10",
                             "street_name": "King Street",
                         },
-                        // The address states the flat, so it is the flat's record.
                         "secondary_address": {"mapbox_id": address, "name": "2"},
                         "street": {"mapbox_id": address, "name": "King Street"},
-                        // The postcode record og derived from its addresses.
                         "postcode": {
                             "mapbox_id": encode_parts(
                                 "derived:osm:postcode:ca:M5V%201A1",
@@ -653,7 +648,6 @@ async fn every_og_value_lands_in_its_mapbox_slot() {
             if let Some(code) = og["context"]["region"]["code"].as_str() {
                 assert_eq!(context["region"]["region_code_full"], code, "{at}");
             }
-            // An area result carries its own code in its own layer.
             match (layer, og["code"].as_str()) {
                 ("country", Some(code)) => {
                     assert_eq!(context["country"]["country_code"], code, "{at}");
@@ -670,7 +664,6 @@ async fn every_og_value_lands_in_its_mapbox_slot() {
         }
     }
 
-    // A suggestion carries the distance and metadata a retrieve does.
     let (_, og) = get(&router, "/autocomplete?q=Queen%20Ca&focus=-79.0,43.0").await;
     let (status, suggested) = get(
         &router,
@@ -893,7 +886,6 @@ async fn geocoding_batch_answers_each_query_in_order() {
         batch[3]["features"][0]["id"],
         address_vendor_id("osm:node:10")
     );
-    // Each answer is what the same GET answers.
     let (_, single) = get(
         &router,
         "/compat/mapbox/search/geocode/v6/forward?q=10%20King%20Street&types=address&limit=1",
@@ -1164,18 +1156,15 @@ async fn search_box_forward_picks_the_og_search_of_the_same_meaning() {
     let router = router(&pack);
     let base = "/compat/mapbox/search/searchbox/v1/forward";
     for (query, expected) in [
-        // og's /geocode, which has addresses and no places.
         (
             "q=10%20King%20Street",
             vec![address_vendor_id("osm:node:10")],
         ),
         ("q=Queen%20Cafe&types=address", vec![]),
-        // og's /places.
         (
             "q=Queen%20Cafe&types=poi",
             vec![encode_parts("osm:node:11", Some(Layer::Poi), "")],
         ),
-        // og's /autocomplete, which has both.
         (
             "q=Queen%20Caf&auto_complete=true&types=poi",
             vec![encode_parts("osm:node:11", Some(Layer::Poi), "")],
@@ -1359,7 +1348,6 @@ async fn search_box_category_answers_the_places_of_one_kind() {
         json!({"type": "Point", "coordinates": [-79.005, 43.0]})
     );
 
-    // A wider kind, an id of the catalog's own words, and no point to search around.
     for uri in [
         format!("{base}/food_and_drink?proximity=-79,43&radius=0.1&limit=25"),
         format!("{base}/caf%C3%A9?proximity=-79,43"),
@@ -1405,7 +1393,6 @@ async fn search_box_lists_the_categories_it_searches_by() {
     assert_eq!(coffee["version"], env!("CARGO_PKG_VERSION"));
     assert!(uuid::Uuid::parse_str(coffee["uuid"].as_str().expect("uuid")).is_ok());
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
-    // Every listed id answers a category search.
     for item in items {
         let id = item["canonical_id"].as_str().expect("id");
         let (status, _) = get(
@@ -1695,7 +1682,6 @@ async fn filters_are_honoured_or_refused() {
             .collect::<Vec<_>>()
     };
 
-    // One area type alone is that area at the point.
     let (status, body) = get(
         &router,
         &format!("{geocoding}/reverse?longitude=-79.0&latitude=43.0&types=region"),
@@ -1704,7 +1690,6 @@ async fn filters_are_honoured_or_refused() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(names(&body, "features"), ["Ontario"]);
 
-    // A point in another country answers nothing.
     for uri in [
         format!("{geocoding}/reverse?longitude=-79.0&latitude=43.0&country=fr"),
         format!("{search_box}/reverse?longitude=-79.0&latitude=43.0&country=fr"),
@@ -1730,7 +1715,6 @@ async fn filters_are_honoured_or_refused() {
     assert_eq!(code["address_number"], "matched", "{body}");
     assert_eq!(code["place"], "unmatched", "{body}");
 
-    // A category keeps only places of it.
     let (status, body) = get(
         &router,
         &format!("{search_box}/suggest?q=Queen&session_token=t&poi_category=bank"),
@@ -1739,7 +1723,6 @@ async fn filters_are_honoured_or_refused() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["suggestions"], json!([]));
 
-    // What og cannot honour is refused.
     for (uri, expected, message) in [
         (
             format!("{search_box}/suggest?q=Queen&session_token=t&route=abc"),

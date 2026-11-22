@@ -888,7 +888,6 @@ mod tests {
             ids(resolve(vec![atm(1, east(0.0)), atm(2, east(1_000.0))])),
             [(1, vec![(ObjectType::Node, 2)])]
         );
-        // Spelling as search spells it.
         assert_eq!(
             ids(resolve(vec![
                 atm(1, east(0.0)),
@@ -896,7 +895,6 @@ mod tests {
             ])),
             [(1, vec![(ObjectType::Node, 2)])]
         );
-        // A postcode only one states says nothing; two that differ do.
         assert_eq!(
             ids(resolve(vec![
                 postcode(atm(1, east(0.0)), "9711 KT"),
@@ -949,7 +947,6 @@ mod tests {
             ids(resolve(vec![synagogue(1), building.clone()])),
             [(10, vec![(ObjectType::Node, 1)])]
         );
-        // The node leads when it is better known; the outline joins it.
         let mut known = item(synagogue(1), 5);
         known.record.prominence.linked = true;
         assert_eq!(
@@ -960,13 +957,11 @@ mod tests {
             place(1, "amenity:place_of_worship", east(25.0)),
             building,
         ]);
-        // A hotel and the restaurant inside it are two.
         let restaurant = vec![
             place(1, "amenity:restaurant", east(5.0)),
             outlined(place(10, "tourism:hotel", east(0.0)), 20.0),
         ];
         assert_apart(restaurant);
-        // One item is one place whatever kind each copy says it is.
         assert_eq!(
             ids(resolve(vec![
                 item(place(1, "amenity:university", east(5.0)), 7),
@@ -1077,7 +1072,6 @@ mod tests {
     fn categorizes_by_the_preset_its_tags_match_best() {
         let point = |pairs: &[(&str, &str)]| poi_category(&tags(pairs), Drawn::Point);
         let area = |pairs: &[(&str, &str)]| poi_category(&tags(pairs), Drawn::Area);
-        // A school's building preset scores below the school's.
         assert_eq!(
             area(&[("building", "school"), ("amenity", "school")]).as_deref(),
             Some("amenity:school")
@@ -1128,7 +1122,6 @@ mod tests {
         ]));
         assert!(!named(&[("highway", "residential")]));
         assert!(!named(&[("landuse", "residential")]));
-        // A bench next to a shop is still the shop.
         assert!(named(&[("amenity", "bench"), ("shop", "bakery")]));
         assert!(!drawn_named(&[("building", "yes")], Drawn::Area));
         assert!(drawn_named(

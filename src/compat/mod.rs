@@ -43,6 +43,24 @@ use crate::{
     runtime::{self, AppState},
 };
 
+fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
 /// Every vendor's routes, each under its own prefix.
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
@@ -282,7 +300,6 @@ pub(crate) fn name_joined_areas(pack: &crate::pack::Reader, context: &mut crate:
             continue;
         }
         let parts = area.name.split('/').map(str::trim).collect::<Vec<_>>();
-        // The first part in the place's language, where it speaks several.
         let names = pack.names_by_language(area.record_id);
         let local = parts
             .iter()
@@ -1074,7 +1091,6 @@ mod tests {
         assert_eq!(without_kind("Freistaat Bayern"), "Bayern");
         assert_eq!(without_kind("Berlin"), "Berlin");
         assert_eq!(without_kind("County Cork"), "Cork");
-        // A kind word inside a word is none.
         assert_eq!(without_kind("Statesville"), "Statesville");
     }
 
@@ -1127,7 +1143,6 @@ mod tests {
     fn og_is_asked_again_only_while_it_can_answer_more_houses() {
         // Asked 3, og answered 3 of which 2 houses: ask 6.
         assert_eq!(native::ask_again(3, 3, 3, 2, 50), Some(6));
-        // Enough houses kept.
         assert_eq!(native::ask_again(3, 3, 3, 3, 50), None);
         // og had fewer than asked, so it has no more.
         assert_eq!(native::ask_again(3, 6, 5, 2, 50), None);
@@ -1219,7 +1234,6 @@ mod tests {
             mapbox["features"][0]["properties"]["context"]["country"]["name"], "Suisse",
             "{mapbox}"
         );
-        // Asked in a language, the country is named in it, as before.
         let german = get(&format!("/compat/here/v1/geocode?{q}&lang=de")).await;
         assert_eq!(
             german["items"][0]["address"]["countryName"], "Schweiz",
@@ -1418,7 +1432,6 @@ mod tests {
         writer
             .write(&house.clone().into(), context.clone())
             .expect("house");
-        // A house whose address point is its main entrance.
         let door = crate::record::Entrance::of_tag(Some("main"), -122.09, 37.43)
             .into_iter()
             .collect::<Vec<_>>();

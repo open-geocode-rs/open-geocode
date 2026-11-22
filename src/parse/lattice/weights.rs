@@ -277,7 +277,6 @@ impl Weights {
                 );
             }
             set(&format!("dict_in_country:{field}"), &[(label, 0.5)]);
-            // A character of a known name, read one at a time.
             for part in ["begin", "inside"] {
                 set(&format!("dict_cover:{field}:{part}"), &[(label, 1.0)]);
             }

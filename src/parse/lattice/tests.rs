@@ -183,7 +183,6 @@ fn fuzzy_lookup_corrects_long_unknown_words_only() {
     assert_eq!(hit.entry.country, Some(code("CA")));
     // Three letters are too short to correct.
     assert!(lookup(Field::Street, "kng").is_none());
-    // Known words are no typo: "king" is not corrected to anything.
     assert!(lookup(Field::Locality, "king").is_none());
     // A typo in the first letter is not corrected.
     assert!(lookup(Field::Locality, "roronto").is_none());
@@ -248,7 +247,6 @@ fn n_best_paths_are_distinct_labellings_best_first() {
         assert!(pair[0].score >= pair[1].score);
         assert_ne!(labels(&pair[0].tokens), labels(&pair[1].tokens));
     }
-    // Decoding with the gold labels gives the score of that labelling.
     let tokens = Tokens::new("670 king st w toronto");
     let lattice = tagger.lattice(&tokens, &Suppression::default());
     let gold = labels(&parses[1].tokens);
@@ -683,7 +681,6 @@ fn units_map_labels_back_to_tokens_and_written_words() {
         Locality,
         HouseNumber,
     ];
-    // The token's label is the label of most of its characters.
     assert_eq!(units.collapse(&labels), [Locality, HouseNumber]);
     assert_eq!(
         units.expand(&[Street, HouseNumber]),

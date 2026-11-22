@@ -132,10 +132,7 @@ pub(super) fn address_variant(query: &str) -> Option<AddressVariant> {
         let area = area?;
         let suffix = COMPOUND_END.find(&area)?;
         let prefix = &area[..suffix.start()];
-        if prefix
-            .trim_end()
-            .ends_with(|c: char| c.is_numeric() || "-‐‑–－/／".contains(c))
-        {
+        if ends_with_number_continuation(prefix.trim_end()) {
             return None;
         }
         Some(AddressVariant::new(prefix, search_key(suffix.as_str())?))
@@ -150,9 +147,7 @@ fn alternate(query: &str) -> Option<AddressVariant> {
     let suffix = QUERY_NUMBER.find(query)?;
     let prefix = &query[..suffix.start()];
     let preceding = prefix.trim_end();
-    // A partial match would discard a component of a longer number or fraction.
-    if preceding
-        .ends_with(|character: char| character.is_numeric() || "-‐‑–－/／".contains(character))
+    if ends_with_number_continuation(preceding)
         || markers().any(|(_, marker)| preceding.ends_with(marker))
         || !markers().any(|(_, marker)| suffix.as_str().contains(marker))
     {
@@ -171,6 +166,10 @@ fn alternate(query: &str) -> Option<AddressVariant> {
         return None;
     }
     Some(AddressVariant::new(prefix, number))
+}
+
+fn ends_with_number_continuation(text: &str) -> bool {
+    text.ends_with(|character: char| character.is_numeric() || "-‐‑–－/／".contains(character))
 }
 
 static COMPOUND_END: LazyLock<Regex> =

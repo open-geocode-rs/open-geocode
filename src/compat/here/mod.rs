@@ -189,7 +189,6 @@ impl Gs7Error {
         detail: Option<&str>,
     ) -> Self {
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        // A refusal that names no parameter names one by its code.
         let og_param = og_param.or(match error_code {
             "invalid_query" => Some("q"),
             "invalid_coordinate" => Some("focus"),

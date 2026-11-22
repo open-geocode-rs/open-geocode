@@ -128,7 +128,6 @@ mod tests {
                 ((1, 13, 0), Some((2, 0, 0)))
             ])
         );
-        // Times alone hold for every day.
         assert_eq!(
             periods("05:00-19:00"),
             Some(

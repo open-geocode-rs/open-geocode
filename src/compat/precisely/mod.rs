@@ -330,7 +330,6 @@ impl FilterBias {
             let wanted = wanted.value.trim();
             match field.as_str() {
                 "city" => city.is_some_and(|city| city.eq_ignore_ascii_case(wanted)),
-                // A postcode matches by its start, so `121` holds `12180`.
                 "postalCode" => {
                     !wanted.is_empty() && postcode.is_some_and(|code| code.starts_with(wanted))
                 }

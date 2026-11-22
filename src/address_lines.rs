@@ -253,7 +253,6 @@ fn render(template: &Template, values: &[Option<String>; PARTS]) -> Vec<String> 
 pub(crate) fn address_lines(layer: Layer, address: &Address, context: &Context) -> Vec<String> {
     let addressed = match layer {
         Layer::Address | Layer::Interpolation => address.housenumber.is_some(),
-        // A POI on a street with no number is still found by these lines.
         Layer::Poi => true,
         _ => false,
     };

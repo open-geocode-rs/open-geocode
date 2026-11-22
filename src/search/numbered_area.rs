@@ -61,7 +61,6 @@ pub(super) fn alternate(query: &str) -> Option<String> {
     let parts = COMPACT_NUMBER.captures(query)?;
     let number = parts.get(0)?;
     let prefix = &query[..number.start()];
-    // Only restore a marker adjacent to the name it would qualify.
     if !prefix.ends_with(is_unspaced) || parts[1].starts_with(['0', '０']) {
         return None;
     }

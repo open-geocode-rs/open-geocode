@@ -368,7 +368,6 @@ impl Feature {
                 coordinates: translated.coordinates,
                 place_formatted: translated.place_formatted,
                 match_code,
-                // Geocoding names each context layer by its record's id.
                 context: context.recorded().map_named(layer),
                 bbox: translated
                     .bbox

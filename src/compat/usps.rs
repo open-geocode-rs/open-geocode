@@ -211,7 +211,6 @@ impl Style {
 /// `JORDAN` as `Jordan`. A word with any small letter is kept, and so is
 /// one standing for initials or a code (`S`, `NE`, `4B`).
 fn word_case(word: &str) -> String {
-    // An ordinal in capitals, `58TH` as `58th`.
     let digits = word.chars().take_while(char::is_ascii_digit).count();
     if digits > 0 && ["ST", "ND", "RD", "TH"].contains(&&word[digits..]) {
         return word.to_lowercase();

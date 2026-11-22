@@ -622,8 +622,6 @@ impl BuildObserver for TerminalObserver {
         if let Some(bar) = self.bar.lock().expect("progress bar lock").as_ref() {
             bar.set_prefix(format!("| {}", live.summary()));
         }
-        // A log gets the cost once, as the stage ends; a terminal shows it
-        // live on the bar.
         if live.finished && !std::io::stderr().is_terminal() {
             eprintln!(
                 "[{:>7.1}s]   {}: {}",

@@ -66,7 +66,6 @@ fn names(day: Weekday) -> (&'static str, &'static str) {
 pub(super) fn parse(value: &str, zone: Option<&str>) -> Option<OpeningHours> {
     let week = Week::parse(value)?;
     let is_open = week.open_at(zone, jiff::Timestamp::now());
-    // Days that share their spans are one line, ordered by their first day.
     let mut groups: Vec<(Vec<Weekday>, &[Span])> = Vec::new();
     for (day, spans) in week.days() {
         if spans.is_empty() {

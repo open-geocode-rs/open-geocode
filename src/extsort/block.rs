@@ -554,7 +554,6 @@ impl Cursor {
             match read_full(&mut file, &mut header)? {
                 0 => {
                     drop(file);
-                    // Removes the chunk just read when the run is consumed.
                     self.next_chunk();
                     continue;
                 }

@@ -583,7 +583,6 @@ async fn search_text_refuses_a_missing_query_and_a_bad_body() {
             "Invalid JSON payload received. EOF while parsing an object at line 1 column 1"
         )
     );
-    // og's own refusal keeps its detail, in Google's envelope.
     let long = post(router, SEARCH_TEXT, json!({"textQuery": "a".repeat(257)})).await;
     assert_eq!(
         long.body,
@@ -1004,7 +1003,6 @@ async fn search_nearby_answers_the_places_inside_the_circle() {
     .await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.body, json!({}));
-    // Outside the circle, another type, and the place's own type excluded.
     for request in [
         json!({"locationRestriction": around(100.0)}),
         json!({"locationRestriction": around(1000.0), "includedTypes": ["cafe"]}),
@@ -1194,7 +1192,6 @@ async fn every_og_value_lands_in_its_google_slot() {
             highlights.as_array().is_some_and(|all| !all.is_empty()),
             "{input}"
         );
-        // og's highlights of the label, words typed together joined.
         let first = &highlights[0];
         let last = &highlights[highlights.as_array().map_or(0, Vec::len) - 1];
         assert_eq!(
@@ -1222,7 +1219,6 @@ async fn every_og_value_lands_in_its_google_slot() {
             prediction["structuredFormat"]["secondaryText"]["text"],
             rest
         );
-        // A house or place with postal lines is formatted by them.
         let lines = properties["address_lines"]
             .as_array()
             .map(|lines| lines.iter().filter_map(Value::as_str).collect::<Vec<_>>())
@@ -1252,7 +1248,6 @@ async fn every_og_value_lands_in_its_google_slot() {
             assert_eq!(place["location"], result["location"]);
             assert_eq!(place["addressComponents"], result["addressComponents"]);
             assert_eq!(place["postalAddress"], result["postalAddress"]);
-            // og's box is `[west, south, east, north]`.
             let corner = |at: usize| match &properties["bbox"] {
                 Value::Null => Value::Null,
                 bbox => json!({"latitude": bbox[at + 1], "longitude": bbox[at]}),
@@ -1558,7 +1553,6 @@ async fn language_code_names_areas_og_holds_in_that_language() {
         assert_eq!(suggested.status, StatusCode::OK, "{accept}");
     }
 
-    // `languageCode` is one code.
     let details = format!("/compat/google/v1/places/{}?languageCode=d3", bakery_id());
     for (code, uri) in [
         (
@@ -2084,7 +2078,6 @@ fn us_fixture() -> Fixture {
             context.clone(),
         )
         .expect("outline of the same house");
-    // A house mapped as its building's outline.
     writer
         .write(
             &AddressRecord {
@@ -2159,7 +2152,6 @@ async fn a_us_address_is_written_as_google_writes_it_in_its_town() {
                 "types": ["route"]})
     );
 
-    // The place at the address writes its address alike.
     let found = post(
         &fixture.router,
         "/compat/google/v1/places:searchText",

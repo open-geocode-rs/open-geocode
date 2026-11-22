@@ -78,7 +78,6 @@ mod tests {
             periods[0],
             json!({"open": {"day": 1, "time": "0800"}, "close": {"day": 1, "time": "1800"}})
         );
-        // Past midnight closes on the next day, Saturday's on Sunday.
         assert_eq!(
             periods[6],
             json!({"open": {"day": 6, "time": "1400"}, "close": {"day": 0, "time": "0200"}})

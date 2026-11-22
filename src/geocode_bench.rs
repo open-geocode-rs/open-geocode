@@ -259,7 +259,6 @@ impl GroupAccumulator {
             .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = percentile(&self.distances, 0.5);
         let p90 = percentile(&self.distances, 0.9);
-        // Unanswered first, then the furthest misses.
         self.worst
             .sort_by(|a, b| match (a.distance_m, b.distance_m) {
                 (None, None) => std::cmp::Ordering::Equal,

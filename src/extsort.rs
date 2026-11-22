@@ -233,7 +233,6 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
     /// costs including the item's own heap data.
     fn needed(&self, heap: usize, share: usize) -> (usize, usize) {
         let growth = if self.buffer.len() == self.buffer.capacity() {
-            // Double, but never past what the share can hold.
             let share_items = (share / std::mem::size_of::<T>().max(1)).max(1);
             self.buffer
                 .capacity()

@@ -1487,7 +1487,6 @@ impl BoundaryIndex {
             }
         }
         for (movers, tiers, outward) in [(above, ABOVE_TOWN, true), (inside, INSIDE_TOWN, false)] {
-            // How many other moving areas lie between each and the town.
             let depth = |boundary: &AcceptedBoundary| {
                 movers
                     .iter()
@@ -2338,8 +2337,6 @@ fn assign_layers_by_containment(
 ) -> Vec<String> {
     let (countries, country_ids) = Countries::intern(country_of_each_boundary(candidates, shapes));
     let (verdicts, unmatched) = table_layers(candidates, shapes, &countries, &country_ids);
-    // A boundary the table says is no area of the Pack (a group of regions)
-    // goes, and the rest are ranked without it.
     let keep = verdicts
         .iter()
         .map(|verdict| !matches!(verdict, Some(None)))
@@ -3358,8 +3355,6 @@ mod tests {
     /// the sub-locality of its address.
     #[test]
     fn only_a_tag_that_contradicts_the_level_is_a_second_tier() {
-        // Berlin: an admin level 4, a state everywhere else in Germany,
-        // tagged a city.
         let mut berlin = test_boundary(PlaceLayer::Region);
         berlin.admin_level = Some(4);
         berlin.place_layer = Some(PlaceLayer::Locality);
@@ -3369,8 +3364,6 @@ mod tests {
             "a state that is also a city"
         );
 
-        // An ACT suburb: tagged a suburb, ranked below the locality. The
-        // tag agrees with the level, so there is no second role.
         let mut suburb = test_boundary(PlaceLayer::SubLocality);
         suburb.admin_level = Some(10);
         suburb.place_layer = Some(PlaceLayer::Neighbourhood);
@@ -3978,7 +3971,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for (index, &(level, place_layer)) in levels.iter().enumerate() {
-            // Each level nests inside the one before it.
             let span = 10.0 / (index + 1) as f64;
             let ring = LineString::from(vec![
                 (-span, -span),
@@ -4105,7 +4097,6 @@ mod tests {
                     vertex(12, -70.0, 50.0),
                 ]),
             ),
-            // Reversed relative to the ring direction.
             (
                 2,
                 Some(vec![

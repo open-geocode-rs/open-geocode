@@ -574,7 +574,6 @@ mod tests {
                     i64::from(number) + 100 * index as i64,
                 );
                 writer.write(&record.into(), None).expect("address");
-                // Every other house is held out.
                 if number % 2 == 0 {
                     lines.push(format!("{lon},43.0,{number},{street},Toronto,M5V 1A1"));
                 }

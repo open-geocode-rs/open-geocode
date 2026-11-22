@@ -474,7 +474,6 @@ impl TextSearcher {
             {
                 Naming::BarType
             } else if part.iter().all(|word| {
-                // Some of the name's words, each as written or misspelt.
                 name.split_whitespace()
                     .any(|own| own == *word || typo_distance(word, own).is_some())
             }) {
@@ -1058,7 +1057,6 @@ mod tests {
         ] {
             square(id, bounds, &tags, &mut nodes, &mut ways, &mut relations);
         }
-        // Streets, each a short line at a height of its own.
         let mut street = |id: i64, name: &'static str, lon: f64, lat: f64| {
             let first = next_node;
             nodes.push(node(first, lat, lon, &[]));
@@ -1082,7 +1080,6 @@ mod tests {
         street(109, "Providence Cranston Road", 3.4, 41.3);
         street(110, "Abovyan Street", 5.4, 42.5);
         street(111, "Quonset Point Road", 1.4, 41.8);
-        // A street a country's code names bar its type.
         street(112, "USA Avenue", 5.4, 41.8);
         // A street a town's name names bar its type, in another town.
         street(113, "Providence Street", 7.4, 41.8);
@@ -1108,7 +1105,6 @@ mod tests {
             3.5,
             &[("place", "village"), ("name", "Merkholtz")],
         ));
-        // A village mapped outside every boundary.
         nodes.push(node(
             901,
             41.5,
@@ -1403,7 +1399,6 @@ mod tests {
         answers("Cà Baldino", "osm:node:902");
         answers("Ca' Baldino", "osm:node:903");
         answers("Cà Baldino, RI", "osm:node:902");
-        // At a limit the name pass alone fills, too.
         let one = searcher()
             .search(&TextSearchOptions {
                 query: "Cà Baldino".to_string(),

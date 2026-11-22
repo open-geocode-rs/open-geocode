@@ -1050,11 +1050,9 @@ impl<'a> Run<'a> {
         let input = &self.options.inputs[index];
         let phase = Instant::now();
         let nodes = NodeSet::new(&self.memory);
-        // Nodes whose address tags interpolation ways read.
-        let mut tag_ids = Vec::new();
+        let mut interpolation_anchor_ids = Vec::new();
         let mut node_blobs = Vec::new();
         let mut way_blobs = Vec::new();
-        // Blobs holding a kept way or a member way: all the way pass rereads.
         let mut kept_blobs = Vec::new();
         let mut kept = KeptWays::default();
         let mut part = Vec::new();
@@ -1100,7 +1098,7 @@ impl<'a> Run<'a> {
                         }
                         WayKind::Interpolation => {
                             resolution.interpolation_way_stubs += 1;
-                            tag_ids.extend_from_slice(&refs);
+                            interpolation_anchor_ids.extend_from_slice(&refs);
                         }
                         WayKind::Boundary => {
                             resolution.boundary_way_stubs += 1;
@@ -1121,7 +1119,7 @@ impl<'a> Run<'a> {
         self.input = Some(InputPasses {
             index,
             nodes: Some(nodes),
-            tag_ids,
+            tag_ids: interpolation_anchor_ids,
             node_blobs,
             way_blobs,
             kept_blobs,
@@ -1342,8 +1340,12 @@ impl<'a> Run<'a> {
         // with no line (a missing node, or a feature that was incomplete)
         // has none, as a relation needing it then has no shape.
         let mut lines = IndexedSpool::<GeometryItem>::create(&self.scratch, "boundary-lines")?;
-        // Each line's way id, place in the file and vertex count.
-        let mut line_at = Vec::<(i64, u32, u32)>::new();
+        struct BoundaryLine {
+            way_id: i64,
+            spool_index: u32,
+            vertex_count: u32,
+        }
+        let mut line_at = Vec::<BoundaryLine>::new();
         let mut ways = Vec::new();
         let mut way_vertices = 0;
         // The entrance nodes on the member ways, for the places relations
@@ -1379,34 +1381,34 @@ impl<'a> Run<'a> {
                     GeometryItem::Relation(_) | GeometryItem::Feature(_) => continue,
                 };
                 let vertices = line.as_ref().map_or(0, Vec::len);
-                line_at.push((
+                line_at.push(BoundaryLine {
                     way_id,
-                    u32::try_from(line_at.len())
+                    spool_index: u32::try_from(line_at.len())
                         .map_err(|_| Error::Decode("more boundary lines than a u32 counts"))?,
-                    u32::try_from(vertices).unwrap_or(u32::MAX),
-                ));
+                    vertex_count: u32::try_from(vertices).unwrap_or(u32::MAX),
+                });
                 lines.write(&GeometryItem::Member(way_id, line))?;
             }
         }
         builder.add_ways(&ways)?;
         drop(ways);
         let lines = lines.finish()?;
-        line_at.sort_unstable_by_key(|(way_id, _, _)| *way_id);
+        line_at.sort_unstable_by_key(|line| line.way_id);
         let line_memory = Reservation::forced(
             &self.memory,
-            line_at.capacity() * std::mem::size_of::<(i64, u32, u32)>(),
+            line_at.capacity() * std::mem::size_of::<BoundaryLine>(),
         );
         let find = |way_id: i64| {
             line_at
-                .binary_search_by_key(&way_id, |(id, _, _)| *id)
+                .binary_search_by_key(&way_id, |line| line.way_id)
                 .ok()
-                .map(|at| line_at[at])
+                .map(|at| &line_at[at])
         };
         let member_line = |way_id: i64| -> Result<Option<Vec<Vertex>>> {
-            let Some((_, at, _)) = find(way_id) else {
+            let Some(line) = find(way_id) else {
                 return Ok(None);
             };
-            match lines.get(at as usize)? {
+            match lines.get(line.spool_index as usize)? {
                 GeometryItem::Member(_, line) => Ok(line),
                 _ => Err(Error::Decode("a boundary line file holds only lines")),
             }
@@ -1422,7 +1424,7 @@ impl<'a> Run<'a> {
                 .members
                 .iter()
                 .filter_map(|member| find(member.way_id))
-                .map(|(_, _, count)| count as usize)
+                .map(|line| line.vertex_count as usize)
                 .sum::<usize>();
             if vertices >= batch_vertices || at + 1 == relations.len() {
                 self.progress.check()?;
@@ -1636,7 +1638,6 @@ impl<'a> Run<'a> {
         let mut ordered = Spool::<PendingRecord>::create(&self.scratch, "context-ordered")?;
         let mut boundary_ids = vec![0; boundaries.len()];
         let mut country_ids = HashMap::new();
-        // The areas that are settlements by their own tags.
         let mut settled = HashSet::new();
         // Context records are the first the Pack holds.
         for (index, item) in context_records.finish()?.enumerate() {
@@ -2088,7 +2089,6 @@ impl<'a> Run<'a> {
             .iter()
             .map(SpoolFile::state)
             .collect::<Vec<_>>();
-        // Votes cast since the last checkpoint close into a spool of their own.
         if let Some(open) = &mut self.build.town_votes
             && open.written() > 0
         {
@@ -3696,7 +3696,6 @@ mod tests {
                         ("addr:housenumber", "12"),
                         ("addr:street", "King Street"),
                         ("addr:postcode", "m5v  1a1"),
-                        // Complete source context: its report sample has no missing fields.
                         ("addr:city", "Toronto"),
                         ("addr:state", "ON"),
                         ("addr:country", "CA"),
@@ -3895,11 +3894,9 @@ mod tests {
                 .expect("search")
         };
 
-        // One index over both: the query finds the street in either country.
         let any = search(Vec::new());
         assert!(any.len() >= 2, "both King Streets are indexed: {any:?}");
 
-        // The filter narrows to one, and the two sides partition the whole.
         let ca = search(vec!["CA".to_string()]);
         let nz = search(vec!["NZ".to_string()]);
         assert!(!ca.is_empty(), "Canada has a King Street");
@@ -4573,12 +4570,10 @@ mod tests {
         };
         assert_eq!(top("1367 Eruera Street"), vec!["osm:node:14"]);
         assert_eq!(top("10/1367 Eruera Street"), vec!["osm:node:15"]);
-        // No house 10 or 2: the street answers, not the flats.
         for query in ["10 Eruera Street", "2 Eruera Street"] {
             assert_eq!(top(query), vec!["osm:way:100"], "{query}");
             assert_eq!(geocode(query).as_deref(), Some("osm:way:100"), "{query}");
         }
-        // A missing number is placed between buildings, not flats.
         assert_eq!(
             top("1300 Eruera Street"),
             vec!["derived:estimate:1300:osm:node:11:osm:node:13"]
@@ -4685,7 +4680,6 @@ mod tests {
             assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
         }
 
-        // Boundary-derived context.
         let king = reader
             .find_by_source_id("osm:node:1")
             .expect("lookup")
@@ -4745,7 +4739,6 @@ mod tests {
             street.label
         );
 
-        // Rejections go to the build audit, not the Pack.
         let rejections = reader.rejections(0).expect("rejections");
         let reasons = rejections
             .iter()
@@ -4766,7 +4759,6 @@ mod tests {
         let generation = reader.path().parent().expect("generation");
         assert!(generation.join(AUDIT_DIR).join(BUILD_REPORT_FILE).is_file());
 
-        // The benchmark reads the build report back.
         let bench = crate::bench::benchmark_pack(&crate::bench::PackBenchmarkOptions {
             pack: dir.join("pack"),
             queries: None,
@@ -5479,7 +5471,6 @@ mod tests {
             found("Cafe Blauw")[0],
             ("osm:node:2".to_string(), None, None)
         );
-        // Closed for good is no place: the Pack holds no record to label.
         assert!(
             found("Cafe Oud")
                 .iter()
@@ -5896,8 +5887,6 @@ mod tests {
             );
             zone
         };
-        // What the record's own chain stores, which is a zone only where
-        // no area of the chain says it.
         let stamped = |id: &str| {
             reader
                 .boundary_context(record(id))
@@ -6557,8 +6546,6 @@ mod tests {
         assert!(spilled.geometry_passes.mapped_location_bytes > 0);
         assert_eq!(in_memory.geometry_passes.mapped_location_bytes, 0);
         assert_eq!(in_memory.geometry_resolution, spilled.geometry_resolution);
-        // Every scratch byte was counted and returned: the peak names its
-        // owners, nothing is left live, and the Pack writer's files count.
         let ledger = &spilled.scratch;
         assert!(ledger.peak_live_bytes > 0 && !ledger.peak_owners.is_empty());
         assert!(
@@ -6574,7 +6561,6 @@ mod tests {
         // Every run written, merged ones too, is read back once.
         assert_eq!(records.items_read, records.items_written);
         assert!(records.merge_passes >= 1);
-        // Each stage that ran is in the report, in order.
         let stages = spilled
             .stages
             .iter()
@@ -7089,7 +7075,6 @@ mod tests {
         let (king, south, bay) = (id("osm:node:1"), id("osm:node:2010"), id("osm:way:602"));
         let (ward, ward_relation) = (id("osm:way:605"), id("osm:relation:902"));
         let context = pack.boundary_context(king).unwrap().expect("context");
-        // The place=city area is the town; the tiered locality lies inside it.
         assert_eq!(context.admin_context.locality_record_id(), Some(metro));
         assert_eq!(
             context.admin_context.get(PlaceLayer::SubLocality),
@@ -7933,7 +7918,6 @@ mod tests {
             "{message}"
         );
 
-        // An input that changed since refuses to resume, naming it.
         write_pbf(&options.inputs[1], &town());
         let changed = build_osm_pack(&BuildOsmOptions {
             leftover: Leftover::Resume,
@@ -7945,7 +7929,6 @@ mod tests {
         assert!(message.contains("--fresh"), "{message}");
         assert_eq!(resume::find(&options.pack).expect("find").len(), 1);
 
-        // Cleared, the build starts over and nothing is left.
         let fresh = build_osm_pack(&BuildOsmOptions {
             leftover: Leftover::Clear,
             ..options.clone()

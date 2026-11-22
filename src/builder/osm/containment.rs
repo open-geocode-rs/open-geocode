@@ -72,7 +72,6 @@ pub(crate) fn encode_rings(coords: &[[i32; 2]], ring_ends: &[u32], out: &mut Vec
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), lat| {
             (lo.min(lat), hi.max(lat))
         });
-    // An edge joins a vertex to the next one of its ring.
     let mut edges = Vec::new();
     let mut start = 0;
     for &end in ring_ends {
@@ -873,7 +872,6 @@ mod tests {
 
     #[test]
     fn an_interior_point_is_inside_an_area_whose_centre_is_not() {
-        // A C: its centre lies in the gap.
         let c = shape(&[&[
             (0.0, 0.0),
             (10.0, 0.0),

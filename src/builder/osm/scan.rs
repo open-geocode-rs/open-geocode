@@ -174,7 +174,6 @@ fn scan_node(
     if !poi {
         count_left_out(all_tags, Drawn::Point, out);
     }
-    // A node that is an entrance is the way in to what it maps.
     let entrances = Entrance::of_tag(all_tags.get("entrance").map(String::as_str), lon, lat)
         .into_iter()
         .collect::<Vec<_>>();

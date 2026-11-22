@@ -396,7 +396,6 @@ async fn responses_match_the_committed_examples() {
     assert!(features[1]["properties"].get("distance_m").is_none());
     assert!(features[0]["properties"].get("score").is_none());
 
-    // Off every address but on the range: an estimated house number.
     let on_range = get(&router, "/reverse?lon=-79.0102&lat=43.0005").await;
     assert_example("reverse-interpolation", &on_range);
     let properties = &on_range["features"][0]["properties"];
@@ -417,7 +416,6 @@ async fn responses_match_the_committed_examples() {
     assert_eq!(features.len(), 1);
     assert_eq!(features[0]["properties"]["layer"], "street");
 
-    // Far from everything but the areas.
     let context_only = get(&router, "/reverse?lon=-79.2&lat=43.2").await;
     assert_example("reverse-areas", &context_only);
 
@@ -625,7 +623,6 @@ async fn batch_results_are_their_get_answers() {
         }
     }
 
-    // The committed example of a batch, its answers and its errors alike.
     let (_, example) = send_raw(
         &router,
         "POST",

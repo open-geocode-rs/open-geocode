@@ -1095,7 +1095,6 @@ fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) ->
             part.clone_from(&area.name);
         }
     }
-    // The lines name areas, which just changed language.
     common.address_lines =
         crate::address_lines::address_lines(common.layer, &common.address, &common.context);
     let context = &common.context;

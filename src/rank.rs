@@ -353,8 +353,6 @@ fn thresholds(rows: &[[f32; INPUTS]]) -> Vec<Vec<f32>> {
             values.sort_by(f32::total_cmp);
             values.dedup();
             if values.len() <= BINS {
-                // Between each value and the next, so the split separates
-                // them exactly.
                 return values.windows(2).map(|pair| pair[0]).collect();
             }
             let mut cuts = (1..BINS)
@@ -501,7 +499,6 @@ mod tests {
 
     #[test]
     fn learns_to_rank_the_answer_first() {
-        // The answer has no typo; the noise input says nothing.
         let queries = (0..400)
             .map(|query| Query {
                 hits: (0..4)

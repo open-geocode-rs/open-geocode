@@ -315,7 +315,6 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
         .await
         .map_err(Gs7Error::of)?;
     prefer_postcode_correction(&mut collection);
-    // The kinds asked for first, then the best of them.
     collection
         .features
         .retain(|feature| item(&Feature::from(feature)).is_any_of(types.as_deref()));
@@ -372,8 +371,6 @@ fn parsing(state: &AppState, q: Option<&str>, qualified: &Qualified) -> Parsing 
     if let Some(q) = q
         && let Some(parsed) = state.searcher().best_parse(q)
     {
-        // The words as written, in order, which the parser's words are,
-        // folded.
         let mut written = Vec::new();
         let mut start = None;
         for (at, (byte, character)) in q.char_indices().enumerate() {
@@ -747,7 +744,6 @@ pub(super) async fn multi_revgeocode(
         for line in lines {
             let params = Params::parse(Some(line))?;
             let id = sub_request_id(&params, line)?;
-            // The first of two sub-requests with one id is the one answered.
             if results.iter().any(|result| match result {
                 MultiResult::Items { id: seen, .. } | MultiResult::Error { id: seen, .. } => {
                     *seen == id
@@ -1172,7 +1168,6 @@ pub(super) async fn discover(
         if q.trim().is_empty() {
             return Ok(page(Vec::new(), offset, limit, false));
         }
-        // A query that is a position answers the address nearest it.
         if let Some([lon, lat]) = super::super::position::parse(q) {
             let fields = vec![
                 ("lon", lon.to_string()),

@@ -178,7 +178,6 @@ mod tests {
     #[test]
     fn sanitize_strips_control_chars_and_caps_length() {
         assert_eq!(sanitize("abc-123").as_deref(), Some("abc-123"));
-        // Whitespace and control characters are dropped.
         assert_eq!(sanitize("a b\nc").as_deref(), Some("abc"));
         // Empty after cleaning -> None so we fall back to a generated id.
         assert_eq!(sanitize("   "), None);

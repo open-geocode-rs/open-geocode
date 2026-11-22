@@ -79,19 +79,26 @@ pub(crate) fn narrowest_box(parts: impl IntoIterator<Item = Extent>) -> Option<E
     }
     spans.sort_unstable();
     let &(first, mut reach) = spans.first()?;
-    // The widest gap between parts, as its width, the part after it and
-    // the reach of the parts before it.
-    let mut widest = None::<(i64, i32, i32)>;
+    struct Gap {
+        width: i64,
+        west_after: i32,
+        east_before: i32,
+    }
+    let mut widest = None::<Gap>;
     for &(west, east) in &spans[1..] {
-        let gap = i64::from(west) - i64::from(reach);
-        if gap > widest.map_or(0, |(held, ..)| held) {
-            widest = Some((gap, west, reach));
+        let width = i64::from(west) - i64::from(reach);
+        if width > widest.as_ref().map_or(0, |held| held.width) {
+            widest = Some(Gap {
+                width,
+                west_after: west,
+                east_before: reach,
+            });
         }
         reach = reach.max(east);
     }
     let around = i64::from(first) + TURN - i64::from(reach);
     Some(match widest {
-        Some((gap, west, east)) if gap > around => [west, south, east, north],
+        Some(gap) if gap.width > around => [gap.west_after, south, gap.east_before, north],
         _ => [first, south, reach, north],
     })
 }
@@ -177,7 +184,6 @@ mod tests {
             narrowest_box([part(-90, 0, -80, 1), part(90, 0, 100, 1)]),
             Some(part(-90, 0, 100, 1))
         );
-        // A part inside another widens nothing.
         assert_eq!(
             narrowest_box([part(0, 0, 10, 10), part(2, 2, 3, 3), part(20, 1, 30, 2)]),
             Some(part(0, 0, 30, 10))

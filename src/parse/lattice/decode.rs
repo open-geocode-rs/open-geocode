@@ -381,7 +381,6 @@ pub(super) fn decode(
 ) -> Vec<Path> {
     let k = k.max(1);
     let transitions = weights.transitions(country);
-    // cells[position][state]: the best partial paths ending there.
     let mut cells = vec![vec![Vec::<Entry>::new(); STATES]; lattice.len + 1];
     cells[0][START].push(Entry {
         score: 0.0,

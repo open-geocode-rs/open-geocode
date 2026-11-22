@@ -480,7 +480,6 @@ impl PlaceView {
         let place_id = encode_id(common);
         let kind = Kind::of(common);
         let (postal_address, formatted_address) = address_fields(common, language);
-        // A destination's address leads with a POI's name.
         let formatted_address = match common.layer {
             Layer::Poi => formatted_address.map(|address| format!("{}, {address}", common.name)),
             _ => formatted_address,
@@ -567,7 +566,6 @@ fn formatted_address(common: &Common) -> Option<String> {
 fn address_fields(common: &Common, language: &Language) -> (Option<PostalAddress>, Option<String>) {
     let mut postal = postal_address(common);
     if let Some(postal) = postal.as_mut() {
-        // The address names its town in the language its town is named in.
         let town = common.context.locality.as_ref().map(|town| town.record_id);
         postal.language_code = language.of(town, &common.context);
     }
@@ -692,8 +690,6 @@ fn address_components(common: &Common, language: &Language) -> Vec<AddressCompon
         text.filter(|text| !text.is_empty())
             .map(|text| component(text, types))
     };
-    // The unit, then the building the address is drawn as, by its name,
-    // then the house number.
     let premise = common
         .building
         .as_ref()

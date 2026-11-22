@@ -376,8 +376,6 @@ async fn addresses(
     let mut outcomes = Vec::new();
     for address in checked(body.addresses)? {
         let address_id = address.address_id.clone();
-        // The street as og reads the asked address, to judge its type and
-        // direction apart.
         let asked = address.street_line().unwrap_or_else(|| address.text());
         let asked_street = state.searcher().best_parse(&asked).map(|parsed| {
             parsed

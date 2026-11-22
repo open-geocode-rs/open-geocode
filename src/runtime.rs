@@ -959,7 +959,6 @@ fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardColl
                 bbox: options.bbox,
             };
             let limit = crate::search::effective_limit(options.limit);
-            // A place named as typed is what a search for its name asks for.
             let typed = search_key(&options.query);
             let named_as_typed = named
                 .first()
@@ -1271,7 +1270,6 @@ fn nearest_of_category(
     named: Vec<TextSearchHit>,
 ) -> Result<Vec<TextSearchHit>> {
     let (named, exact_poi) = prefer_poi_names(state, options, limit, named)?;
-    // Through a typo the kind is never the whole query's own name.
     let typo = |kind: &str| category_typo(kind);
     let (request, through_typo) = match categories::of_request(&options.query) {
         Some(request) => (request, false),
@@ -2281,13 +2279,11 @@ pub(crate) mod router_tests {
         let no_basemap = temp_path("search-no-basemap");
         let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
 
-        // Empty query -> 400 invalid_query, Problem Details.
         let reply = send(router.clone(), request("GET", "/geocode?q=")).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert_eq!(reply.content_type(), "application/problem+json");
         assert_eq!(reply.json()["error_code"], "invalid_query");
 
-        // Over-length query -> 400.
         let long = "a".repeat(300);
         let reply = send(
             router.clone(),
@@ -2296,7 +2292,6 @@ pub(crate) mod router_tests {
         .await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
 
-        // limit above the cap -> 400 with invalid_params naming "limit".
         let reply = send(
             router.clone(),
             request("GET", "/geocode?q=king&limit=999999"),
@@ -2305,7 +2300,6 @@ pub(crate) mod router_tests {
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert_eq!(reply.json()["invalid_params"][0]["name"], "limit");
 
-        // Malformed limit type -> 400 malformed_parameter.
         let reply = send(router.clone(), request("GET", "/geocode?q=king&limit=abc")).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert_eq!(reply.json()["error_code"], "malformed_parameter");
@@ -2325,7 +2319,6 @@ pub(crate) mod router_tests {
         assert!(detail.contains("bogus"), "{detail}");
         assert!(detail.contains("address"), "{detail}");
 
-        // An unknown layer is rejected on /autocomplete too.
         let reply = send(
             router.clone(),
             request("GET", "/autocomplete?q=kin&layer=bogus"),
@@ -2345,7 +2338,6 @@ pub(crate) mod router_tests {
         let reply = send(router.clone(), request("GET", "/geocode?q=king&layer=")).await;
         assert_eq!(reply.status, StatusCode::OK);
 
-        // A valid query succeeds.
         let reply = send(router, request("GET", "/geocode?q=King%20Street&limit=5")).await;
         assert_eq!(reply.status, StatusCode::OK);
         assert_eq!(reply.content_type(), "application/json");
@@ -2421,7 +2413,6 @@ pub(crate) mod router_tests {
         let no_basemap = temp_path("geocode-no-basemap");
         let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
 
-        // The address is in this postcode, so it is found.
         let reply = send(
             router.clone(),
             request(
@@ -2461,12 +2452,10 @@ pub(crate) mod router_tests {
             "an address in the wrong postcode should match nothing"
         );
 
-        // Context without an address is not a query.
         let reply = send(router.clone(), request("GET", "/geocode?locality=Toronto")).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert_eq!(reply.json()["error_code"], "invalid_query");
 
-        // The layer filter is validated here as everywhere else.
         let reply = send(
             router,
             request("GET", "/geocode?address=10%20King%20Street&layer=bogus"),
@@ -2486,7 +2475,6 @@ pub(crate) mod router_tests {
         let no_basemap = temp_path("methods-no-basemap");
         let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
 
-        // POST to a GET-only route -> 405 with Allow: GET.
         let reply = send(router.clone(), request("POST", "/autocomplete")).await;
         assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(reply.content_type(), "application/problem+json");
@@ -2502,7 +2490,6 @@ pub(crate) mod router_tests {
         let reply = send(router.clone(), request("HEAD", "/places")).await;
         assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
 
-        // Unknown path -> 404 Problem Details, not a static-file response.
         let reply = send(router.clone(), request("GET", "/does-not-exist")).await;
         assert_eq!(reply.status, StatusCode::NOT_FOUND);
         assert_eq!(reply.content_type(), "application/problem+json");
@@ -2552,7 +2539,6 @@ pub(crate) mod router_tests {
         assert_eq!(reply.status, StatusCode::OK);
         assert_eq!(reply.body.len(), 600_000);
 
-        // HEAD works too.
         let reply = send(router, request("HEAD", "/basemap.pmtiles")).await;
         assert_eq!(reply.status, StatusCode::OK);
 
@@ -2603,7 +2589,6 @@ pub(crate) mod router_tests {
             .insert("cf-ray", header::HeaderValue::from_static("ray-500"));
         let reply = send(failing_router(&log), tagged).await;
 
-        // The client sees a bare 500 with the request id and nothing else.
         assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(reply.content_type(), "application/problem+json");
         assert_eq!(reply.request_id().as_deref(), Some("ray-500"));
@@ -2672,7 +2657,6 @@ pub(crate) mod router_tests {
         ] {
             let reply = send(router.clone(), request(method, uri)).await;
             assert_eq!(reply.status, status, "{method} {uri}");
-            // Every Problem still carries the id the middleware gave it.
             if status != StatusCode::OK {
                 assert_eq!(
                     reply.json()["request_id"].as_str(),
@@ -4347,7 +4331,6 @@ pub(crate) mod router_tests {
             details: None,
             aliases: Vec::new(),
         };
-        // A house whose street the source writes abbreviated.
         let abbreviated = AddressRecord {
             building: None,
             address: AddressComponents {
@@ -4440,7 +4423,6 @@ pub(crate) mod router_tests {
         )
         .await;
         assert_eq!(ids(&reply.json()).len(), 1);
-        // Without a layer the answer is the point's areas, one of each.
         let reply = send(
             router,
             request("GET", "/reverse?lon=-79.0&lat=43.0&limit=2"),
@@ -4575,7 +4557,6 @@ pub(crate) mod router_tests {
                 &in_postcode,
             ),
             ("/geocode?q=10%20Knig%20Street%20West", &typo),
-            // The record writes the abbreviation of the words asked.
             ("/geocode?q=12%20Queen%20Street%20West", &queen),
             ("/geocode?q=99%20Nowhere%20Road,%20Toronto", &town_for_it),
             (
@@ -4590,11 +4571,9 @@ pub(crate) mod router_tests {
                 "/geocode?address=99%20Nowhere%20Road&locality=Toronto&region=Ontario",
                 &town_by_fields,
             ),
-            // The whole query is the town's name, so it states the town.
             ("/geocode?q=Toronto", &town),
             // A street with a word the query leaves out is another street.
             ("/geocode?q=12%20Queen%20Street", &queen_in_part),
-            // A country filter states the country, and the answer lies in it.
             (
                 "/geocode?q=10%20King%20Street%20West&country=CA",
                 &house(&[("country", "matched")]),
@@ -5039,7 +5018,6 @@ pub(crate) mod router_tests {
         let results = body["results"].as_array().expect("results");
         assert_eq!(results.len(), 7);
 
-        // The shared postcode applies: the address is in it.
         assert_eq!(results[0]["id"], "row-1");
         assert_eq!(results[0]["status"], 200);
         assert_eq!(
@@ -5062,7 +5040,6 @@ pub(crate) mod router_tests {
         );
         assert!(results[1].get("response").is_none());
 
-        // The item's own postcode overrides the shared one; no id, no `id`.
         assert!(results[2].get("id").is_none());
         assert_eq!(results[2]["status"], 200);
         assert_eq!(results[2]["response"]["features"], serde_json::json!([]));
@@ -5411,10 +5388,8 @@ pub(crate) mod router_tests {
             Ok(vec!["NZ".to_string(), "AU".to_string()])
         );
         assert_eq!(parse(Some("nz,NZ")), Ok(vec!["NZ".to_string()]));
-        // An empty item between commas is skipped, not an error.
         assert_eq!(parse(Some("NZ,,AU")).map(|v| v.len()), Ok(2));
 
-        // Anything that is not two ASCII letters is a typo.
         for bad in ["Canada", "C", "CAN", "1A", "C-A"] {
             assert!(parse(Some(bad)).is_err(), "{bad:?} should be rejected");
         }
@@ -6170,7 +6145,6 @@ pub(crate) mod router_tests {
                         result["error"].clone()
                     };
                     let mut get = body.clone();
-                    // Each request has its own id.
                     for value in [&mut answer, &mut get] {
                         if let Some(object) = value.as_object_mut() {
                             object.remove("request_id");

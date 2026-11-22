@@ -210,7 +210,6 @@ mod tests {
             building(&with(&[("name", "Googleplex"), ("office", "it")])),
             None
         );
-        // A named building that states no address is no address.
         assert!(kept(&[("building", "yes"), ("name", "Hall")]).is_empty());
     }
 
@@ -312,21 +311,18 @@ mod tests {
         assert_eq!(address.region.as_deref(), Some("宮城県"));
         assert_eq!(record.name(), "10-8 5丁目");
 
-        // A block with no house number is numbered by the block.
         let block = address_record_from_candidate(&candidate(&[
             ("addr:neighbourhood", "遠藤"),
             ("addr:block_number", "4262"),
         ]))
         .expect("block number only");
         assert_eq!(block.address.number, "4262");
-        // A house number in a quarter.
         let quarter = address_record_from_candidate(&candidate(&[
             ("addr:quarter", "中荻野"),
             ("addr:housenumber", "1"),
         ]))
         .expect("quarter");
         assert_eq!(quarter.address.number, "1");
-        // A suburb alone places no house number.
         assert_eq!(
             address_record_from_candidate(&candidate(&[
                 ("addr:suburb", "泉区"),

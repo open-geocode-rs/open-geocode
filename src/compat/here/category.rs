@@ -421,7 +421,6 @@ mod tests {
         );
         assert!(begun_by("res", None).is_empty(), "too short to mean a kind");
         assert!(begun_by("zzzz", None).is_empty());
-        // In another language, og's catalog name of the kind.
         assert!(
             begun_by("bäck", Some("de"))
                 .iter()
@@ -456,7 +455,6 @@ mod tests {
         assert!(!filter.admits(&of_place("amenity:fast_food")));
         assert!(!filter.admits(&of_place("shop:bakery")));
         assert!(!filter.admits(&of_place("craft:brewery")));
-        // A kind the table has no category for takes its group's.
         assert_eq!(of_place("craft:brewery")[0].id, "700-7400-0000");
         assert_eq!(of_place("shop:music")[0].id, "600-6900-0000");
         assert_eq!(of_place("shop:bicycle")[0].id, "600-6900-0246");

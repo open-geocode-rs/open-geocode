@@ -1836,7 +1836,6 @@ mod tests {
                 representative_point: [-79.0, 43.05],
                 source: SourceProvenance::osm(ObjectType::Way, 13),
             }),
-            // The ways of one street, merged.
             Record::Street(StreetRecord {
                 other_ways: vec![14, 2_000_000_000],
                 road_class: RoadClass::Residential,
@@ -2344,7 +2343,6 @@ mod tests {
             0,
         )
         .expect("new");
-        // In the address book, after an address with none and before one.
         for (previous, address) in [(&bare, &pending), (&pending, &bare)] {
             let mut out = Vec::new();
             address.encode_following(Some(previous), &mut out);
@@ -2479,7 +2477,6 @@ mod tests {
             }
             let mut prefix = Vec::new();
             put_u64(&mut prefix, out.len() as u64);
-            // The index keeps an offset per chunk.
             book += out.len() + prefix.len() + 8;
         }
         let house = pending

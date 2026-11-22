@@ -2228,7 +2228,6 @@ mod tests {
             .expect("address");
         let (sealed, _) = replacement.seal().expect("seal");
         let generation = sealed.generation().to_path_buf();
-        // Damage the table of contents of the unpublished Pack.
         let pack = generation.join(PACK_FILE);
         let mut bytes = fs::read(&pack).expect("read");
         let len = bytes.len();

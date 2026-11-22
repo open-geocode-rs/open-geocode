@@ -522,7 +522,6 @@ impl App {
                 let trail = tree.trail(region);
                 let (positions, score) =
                     find(&self.region_query, &region.name, &trail).or_else(|| {
-                        // An alias match ranks below a match of the name.
                         region
                             .aliases
                             .iter()
@@ -589,7 +588,6 @@ impl App {
             self.picked.remove(at);
             return None;
         }
-        // Everything already ticked that this region contains or lies in.
         let overlapping: Vec<usize> = self
             .picked
             .iter()
@@ -732,7 +730,6 @@ impl App {
             self.free_disk = resources::free_disk(&self.pack_dir());
             self.sampled = Instant::now();
         }
-        // A stopped job that has cleaned up is let go of.
         self.stopping_builds.retain(|job| !job.is_finished());
         self.stopping_runs.retain(|run| !run.is_finished());
         self.tick_build();
@@ -747,8 +744,6 @@ impl App {
         let Some(job) = &self.job else {
             return;
         };
-        // Steps that finished and warnings given since the last tick go
-        // into history, in order.
         let inner = ui::content_width(self.width);
         let mut lines = Vec::new();
         {
@@ -824,8 +819,6 @@ impl App {
                 self.show_answer(answer);
             }
             Reply::Pasted { rows, note } => {
-                // What the engine took for every row, also those answered
-                // before.
                 self.batch_millis = rows
                     .iter()
                     .filter_map(|row| row.answer.as_ref())
@@ -1285,7 +1278,6 @@ impl App {
     /// Batch mode edits a block of text: a terminal that does not mark a
     /// paste sends it as keys, so Enter adds a line instead of submitting.
     fn batch_key(&mut self, key: KeyEvent) {
-        // A file is waiting: choose between continuing with it and dropping it.
         if self.batch_candidate.is_some() {
             match key.code {
                 KeyCode::Left | KeyCode::Right => {

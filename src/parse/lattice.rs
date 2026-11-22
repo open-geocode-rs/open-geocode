@@ -146,8 +146,6 @@ impl Tokens {
     pub fn new(text: &str) -> Self {
         let mut tokens = Self::default();
         let mut pending_break = false;
-        // What stood between the last word and this one, while it can still
-        // be a joiner.
         let mut gap = Gap::None;
         search_pieces(text, |piece| match piece {
             Piece::Word(word) => {
@@ -512,7 +510,6 @@ impl Units {
         let by_unit = self.unit_corrections(segments, corrections);
         let mut pieces: Vec<Tagged> = Vec::with_capacity(segments.len());
         let mut corrected: Vec<Option<String>> = Vec::with_capacity(segments.len());
-        // Whether the last piece is a run of one-unit segments.
         let mut open_run = false;
         for &(start, end, label) in segments {
             let single = end - start == 1;
@@ -1114,7 +1111,6 @@ impl LatticeTagger {
                     set.glued_phrase(field);
                 }
                 let mut key = SpanKey::new(phrases.take_key(start, end), &infos[start..end]);
-                // A word's affixes: of a token, or of glued units as one.
                 let glued = end - start > 1 && units.unspaced(start, end);
                 if (end - start == 1 && !infos[start].unspaced) || glued {
                     set.affixes(&key.key);
@@ -1126,7 +1122,6 @@ impl LatticeTagger {
                 }
                 let mut area = false;
                 let mut street = false;
-                // The field of names the most records use the span in.
                 let mut dominant: Option<(Field, u64)> = None;
                 for field in Field::NAMES {
                     if suppression.hides(field, start, end) {
@@ -1233,7 +1228,6 @@ impl LatticeTagger {
                     .push(features::cover_base() + bit);
             }
         }
-        // Runs longer than the longest span looked up.
         for &(start, end) in runs.iter().filter(|(start, end)| end - start > longest) {
             let mut set = FeatureSet::new(tokens, &infos, start, end);
             set.affixes(&units.key(start, end));
@@ -1409,28 +1403,31 @@ impl Chains {
         if end - start < 2 || self.from.is_empty() || !units.unspaced(start, end) {
             return None;
         }
-        // best[offset]: the most names covering start..start + offset, and
-        // whether one is a region.
-        let mut best: Vec<Option<(usize, bool)>> = vec![None; end - start + 1];
-        best[0] = Some((0, false));
+        let mut best_by_offset = vec![None; end - start + 1];
+        best_by_offset[0] = Some(Chain {
+            pieces: 0,
+            region: false,
+        });
+        let score = |chain: Chain| (chain.pieces, chain.region);
         for at in start..end {
-            let Some((pieces, region)) = best[at - start] else {
+            let Some(chain) = best_by_offset[at - start] else {
                 continue;
             };
             for &(to, is_region) in self.from.get(&at).into_iter().flatten() {
                 if to > end {
                     continue;
                 }
-                let next = (pieces + 1, region || is_region);
-                let cell = &mut best[to - start];
-                if cell.is_none_or(|cell| next > cell) {
+                let next = Chain {
+                    pieces: chain.pieces + 1,
+                    region: chain.region || is_region,
+                };
+                let cell = &mut best_by_offset[to - start];
+                if cell.is_none_or(|held| score(next) > score(held)) {
                     *cell = Some(next);
                 }
             }
         }
-        best[end - start]
-            .filter(|(pieces, _)| *pieces >= 2)
-            .map(|(pieces, region)| Chain { pieces, region })
+        best_by_offset[end - start].filter(|chain| chain.pieces >= 2)
     }
 }
 

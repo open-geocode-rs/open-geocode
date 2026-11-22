@@ -1730,7 +1730,6 @@ impl Reader {
             read_u64_le(&self.strings, (8 + segment * 16 + offset) as usize)
                 .expect("validated segments")
         };
-        // Last segment whose first record is at or before this one.
         let (mut low, mut high) = (0, self.segment_count);
         while low < high {
             let mid = low + (high - low) / 2;
@@ -3590,7 +3589,6 @@ mod tests {
         for index in 0..1_050 {
             let mut record = base.clone();
             if let Record::Address(address) = &mut record {
-                // Every record has its own street; locality is shared by all.
                 address.address.street = Some(format!("Street {index}"));
                 address.address.number = (index % 7).to_string();
             }
@@ -3725,7 +3723,6 @@ mod tests {
                     },
                     1_000_000 - index_i64 * 37,
                 );
-                // Anchors and continued addresses both carry their mark.
                 address.disputed = index % 7 == 3;
                 if index == 70 {
                     // A different postcode breaks the run; the next continues

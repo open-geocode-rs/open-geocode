@@ -762,7 +762,6 @@ mod tests {
             "the same seed draws the same cases"
         );
 
-        // One case expects an object the query cannot find.
         let mut fixture = fixture;
         fixture.search.push(TextQueryFixture {
             name: None,

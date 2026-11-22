@@ -280,7 +280,6 @@ impl BuildPlan {
     /// Set the needs from `items`.
     fn size(&mut self) {
         let items = &self.items;
-        // The least budget the build runs on, or the one it was given.
         let least_budget = if self.memory_budget_derived {
             MIN_BUDGET_BYTES as u64
         } else {

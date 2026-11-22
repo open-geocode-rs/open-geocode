@@ -414,11 +414,9 @@ mod tests {
 
     #[test]
     fn prefix_reaching_a_minimum_length_names_the_group() {
-        // "3Pharmacy" lets three typed letters suggest pharmacies.
         assert_eq!(presets_for_prefix("phar"), vec!["amenity pharmacy"]);
         assert_eq!(presets_for_prefix("pha"), vec!["amenity pharmacy"]);
         assert_eq!(presets_for_word("phar"), Vec::<&str>::new());
-        // "4Groceries" needs four letters, not three.
         assert!(presets_for_prefix("groc").contains(&"shop supermarket"));
         assert_eq!(presets_for_prefix("gro"), Vec::<&str>::new());
     }
@@ -432,7 +430,6 @@ mod tests {
 
     #[test]
     fn name_words_outrank_wider_terms() {
-        // Restaurant terms hold "coffee", parking terms hold "park", chemist terms hold "pharmacy".
         let coffee = presets_for_word("coffee");
         assert!(coffee.contains(&"amenity cafe"), "{coffee:?}");
         assert!(!coffee.contains(&"amenity restaurant"), "{coffee:?}");

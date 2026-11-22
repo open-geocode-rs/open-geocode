@@ -235,7 +235,6 @@ mod tests {
             out_of_range.to_string(),
             "context tuple id 2 is out of range"
         );
-        // An area with no tag is not stored.
         let found = [1, 2, 3].map(|area| reader.tags(area).unwrap());
         assert_eq!(found, [tags.get(&1).cloned(), tags.get(&2).cloned(), None]);
     }

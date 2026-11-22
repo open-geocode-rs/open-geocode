@@ -612,7 +612,6 @@ mod tests {
         assert_eq!(zone(12.0, 4.0, 18.0, 6.0), Some(1), "Shared holds a part");
         assert_eq!(zone(18.0, 4.0, 22.0, 6.0), None, "out of every zone");
         assert_eq!(zone(40.0, 4.0, 42.0, 6.0), None);
-        // The zone's own border, as the other source draws it.
         assert_eq!(
             zone(10.000_000_4, -0.000_000_4, 20.000_000_4, 10.000_000_4),
             Some(1)

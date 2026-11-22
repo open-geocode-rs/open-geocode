@@ -188,8 +188,6 @@ pub(super) async fn search_text(
             (None, TextRank::Relevance, None) => limit,
             _ => i64::try_from(NEARBY_WINDOW).unwrap_or(limit),
         };
-        // Along a route og searches the box around it, unless the request
-        // restricts the search to a box of its own.
         let bbox = bbox.or_else(|| {
             corridor.as_ref().map(|corridor| {
                 let [west, south, east, north] = corridor.bbox();
@@ -212,13 +210,10 @@ pub(super) async fn search_text(
             };
             match request.strict_type_filtering {
                 true => features.retain(is),
-                // Without strict filtering the type biases: places of it
-                // first, the rest after in their order.
                 false => features.sort_by_key(|feature| !is(feature)),
             }
         }
         if let Some(corridor) = &corridor {
-            // Along a route, the places on the way, the shortest detour first.
             let detour = |feature: &ForwardFeature| {
                 let [lon, lat] = feature.geometry.coordinates;
                 corridor.reach([lon, lat]).map(|reach| reach.off_m)

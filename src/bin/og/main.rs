@@ -267,8 +267,6 @@ fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result
             }
         })
         .collect();
-    // One region names its own Pack; several go under the given name, or
-    // their slugs joined.
     let pack = match (picked.as_slice(), name) {
         ([region], None) => home.pack_dir(region),
         (_, Some(name)) => home.named_pack_dir(name),
@@ -422,7 +420,6 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, inline: bool) -> io::Resul
             if inline {
                 erase_above(terminal, lines)?;
             } else {
-                // Not printed yet: take them back.
                 let keep = app.scrollback.len().saturating_sub(lines);
                 app.scrollback.truncate(keep);
             }
@@ -527,7 +524,6 @@ mod tests {
             }
             assert_eq!(json(shell.collection.json(None)), api, "search {query}");
             assert!(!shell.hits.is_empty() || api["features"].as_array().unwrap().is_empty());
-            // One feature picked from the list is that feature of the answer.
             if !shell.hits.is_empty() {
                 assert_eq!(
                     json(shell.collection.json(Some(0)))["features"][0],
@@ -544,7 +540,6 @@ mod tests {
                 "reverse {lat},{lon}"
             );
         }
-        // A pasted row is answered as a row of a file is.
         let dir = std::env::temp_dir().join(format!("og-pasted-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let address = "carrer prat de la creu 70, andorra la vella";

@@ -1039,12 +1039,9 @@ impl Builder {
             region_groups,
             stated_regions,
         } = self;
-        // The ids of the areas each area name names, and the levels of the
-        // areas each name names.
         let mut places = BTreeMap::<String, Vec<u32>>::new();
         let mut levels = HashMap::<String, u8>::new();
         let mut aliases = HashMap::<String, Alias>::new();
-        // The numbered forms of area names, with the names that share each.
         let mut numbered = HashMap::<(Field, String), (NameStats, HashSet<String>)>::new();
         for (
             area,
@@ -1094,7 +1091,6 @@ impl Builder {
                     .extend(names.iter().filter_map(|name| dictionary_key(name)));
             }
         }
-        // The levels of the places each name names, points among them.
         let mut place_levels = levels.clone();
         for (key, place, level) in place_names {
             names_of.entry(place).or_default().insert(key.clone());
@@ -1139,7 +1135,6 @@ impl Builder {
             }
             names.entry((field, masked)).or_default().merge(&stats);
         }
-        // A country is also written as its code ("ca"), as people write it.
         for (area, code) in &country_codes {
             let count = area_names
                 .get(area)
@@ -1244,7 +1239,6 @@ impl Builder {
             .into_iter()
             .filter(|pair| !shares_name((pair >> 32) as u32, *pair as u32))
             .collect::<Vec<_>>();
-        // A record lies in the groups of its region as well.
         for context in contexts {
             let groups = context
                 .region_record_id()
@@ -1813,7 +1807,6 @@ mod tests {
         let types = street_types(&streets);
         assert!(types.contains_key("street"));
         assert!(types.contains_key("rue"));
-        // From the vendored list, whatever the Pack holds.
         assert!(types.contains_key("strasse"));
         assert!(!types.contains_key("king"));
         assert!(!types.contains_key("name1"));
@@ -1916,10 +1909,8 @@ mod tests {
         assert_eq!(aliases("aichi prefecture"), ["aichi"]);
         assert_eq!(aliases("경기도"), ["경기"]);
         assert_eq!(aliases("จังหวัดเชียงใหม่"), ["เชียงใหม่"]);
-        // Too little or a number is left: no alias.
         assert!(aliases("北区").is_empty());
         assert!(aliases("3丁目").is_empty());
-        // A type word inside a word is no type word.
         assert!(aliases("statesville").is_empty());
     }
 

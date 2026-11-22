@@ -469,7 +469,6 @@ fn run(
         if let Err(error) = net::check_md5(&partial, &published.md5, cancel, |done| {
             progress.done.store(done, Ordering::Relaxed);
         }) {
-            // A file that does not match is no use to continue from.
             if !cancel.load(Ordering::Relaxed) {
                 net::discard(&partial);
             }

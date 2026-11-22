@@ -790,7 +790,6 @@ fn address(properties: &Properties) -> ItemAddress {
         label: Some(label(properties)),
         country_code,
         country_name: area(&context.country).or_else(|| own(Layer::Country)),
-        // The region's code within its country: `ON` of `CA-ON`.
         state_code: context
             .region
             .as_ref()
@@ -944,7 +943,6 @@ impl Item {
         let properties = &feature.properties;
         let address = &self.address;
         let own_line = match self.result_type {
-            // og's name of a house or street is its own line.
             "houseNumber" | "street" => postal_label(properties)
                 .and_then(|label| label.split(", ").next().map(str::to_string))
                 .or_else(|| Some(properties.name.clone())),

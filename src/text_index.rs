@@ -631,8 +631,6 @@ impl Writer {
             self.scratch.remove_dir(&merged)?;
         }
         let merged = create_dir(&merged)?;
-        // Each part's segments in order, the parts one after another: a
-        // posting list is the runs of its parts' chunks.
         let directory = MmapDirectory::open(&merged)
             .map_err(|error| Error::Inconsistent(format!("text index directory: {error}")))?;
         let index = merge_indices(&self.parts, directory)?;
@@ -917,12 +915,10 @@ impl Document {
             builder.name(name);
         }
         builder.add_content_text(&poi.category);
-        // "Esso" finds "Tankstation Zanoli".
         if let Some(brand) = &poi.brand {
             builder.add_content_text(&brand.name);
             builder.add_optional_autocomplete_text(Some(&brand.name));
         }
-        // "Albert Heijn Damrak": address words find the place too.
         if let Some(address) = &poi.address {
             builder.address(address);
         }
@@ -1117,7 +1113,6 @@ fn build_schema() -> (Schema, Fields) {
         AREA_POSTCODE_FIELD,
         TextOptions::default().set_fast(Some("raw")),
     );
-    // Fast too: confidence is rated by the country an answer lies in.
     let country_code = builder.add_text_field(
         COUNTRY_CODE_FIELD,
         exact_string_options().set_fast(Some("raw")),
@@ -2083,7 +2078,6 @@ mod tests {
             }),
             ..poi
         };
-        // A postcode centroid 1 km away, and one farther than the radius.
         let areas = PostcodeAreas::new([
             ("M5R 2Z3".to_string(), [-79.38, 43.659]),
             ("K0J 1K0".to_string(), [-79.38, 43.8]),
@@ -2184,7 +2178,6 @@ mod tests {
             street_search_text("King St W").as_deref(),
             Some("king street west")
         );
-        // Only the street field: a name keeps its letters.
         assert_eq!(search_text("Plan E").as_deref(), Some("plan e"));
     }
 

@@ -418,8 +418,6 @@ pub(super) async fn suggest(
         .filter(|feature| admitted(types.as_ref(), &feature.properties.common))
         .map(|feature| {
             let (mut described, placed, poi) = described(Found::forward(feature), state.pack());
-            // Every suggestion states where it lies, empty for a place og
-            // finds in no area.
             described.place_formatted.get_or_insert_default();
             Suggestion {
                 described,

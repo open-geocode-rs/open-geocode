@@ -38,7 +38,6 @@ const LATEST_ROWS: usize = 8;
 /// Words of a header that name part of an address, in the languages
 /// address files come in, and the codes of common registers.
 const ADDRESS_WORDS: &[&str] = &[
-    // the address, the street and the house number
     "address",
     "addr",
     "adresse",
@@ -72,7 +71,6 @@ const ADDRESS_WORDS: &[&str] = &[
     "unit",
     "suite",
     "apt",
-    // the place
     "city",
     "town",
     "locality",
@@ -88,7 +86,6 @@ const ADDRESS_WORDS: &[&str] = &[
     "cidade",
     "suburb",
     "village",
-    // the postcode
     "postcode",
     "postal",
     "zip",
@@ -98,7 +95,6 @@ const ADDRESS_WORDS: &[&str] = &[
     "cap",
     "cp",
     "postleitzahl",
-    // the region and the country
     "region",
     "state",
     "province",
@@ -111,7 +107,6 @@ const ADDRESS_WORDS: &[&str] = &[
     "land",
     "pays",
     "paese",
-    // a whole query
     "query",
     "q",
 ];

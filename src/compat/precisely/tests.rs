@@ -353,7 +353,6 @@ fn assert_carries(
         "{feature} as {result}"
     );
 
-    // Each part og judged is described, `EXACT` only for its `matched`.
     let judged = &properties["match"];
     slot("match", judged);
     let description = &result["explanation"]["addressMatch"]["description"];
@@ -422,8 +421,6 @@ fn assert_carries(
         "{feature} as {result}"
     );
 
-    // An area result is its own region or country, which its context does
-    // not name.
     let own = |layer: &str| {
         if properties["layer"] == layer {
             json!({"name": properties["name"], "code": properties["code"]})
@@ -627,7 +624,6 @@ async fn geocode_judges_a_streets_type_and_direction_apart() {
             Some(json!("EXACT"))
         )
     );
-    // `St` is the type written short, and no direction is asked.
     assert_eq!(judged("100 King St, Toronto").await.1, Some(json!("EXACT")));
     assert_eq!(judged("100 King St, Toronto").await.2, Some(json!("NONE")));
 }
@@ -645,7 +641,6 @@ async fn geocode_answers_each_address_in_order() {
             .round() as u8
     );
 
-    // Parts with a street go to og's address fields, which score alike.
     let og = native(
         &router,
         "/geocode?address=100%20King%20Street%20West&locality=Toronto&postcode=M5X%201A9\
@@ -744,7 +739,6 @@ async fn every_og_value_lands_in_its_precisely_slot() {
         ["STREET_CENTER", "STREET", "ADDRESS_POINT"]
     );
 
-    // The point's areas come back too, each its own region or country.
     let og = native(&router, "/reverse?lon=-79.3815&lat=43.6495").await;
     let features = og["features"].as_array().expect("features");
     let reply = post(
@@ -804,7 +798,6 @@ async fn every_og_value_lands_in_its_precisely_slot() {
         );
     }
 
-    // Every slot was reached, so none can go empty unseen.
     assert_eq!(
         seen.into_iter().collect::<Vec<_>>(),
         [
@@ -849,7 +842,6 @@ async fn a_poi_says_what_it_is_and_where() {
                               "matchedSubstring": "QUEEN BAKERY"}),
         _ => json!({"label": label, "matchType": "NONE"}),
     });
-    // og's autocomplete is not calibrated, so it carries no score.
     assert_eq!(
         reply.json(),
         json!({"response": {"status": "OK", "predictions": [{
@@ -983,7 +975,6 @@ async fn a_bad_request_is_refused_whole() {
             json!({"preferences": {"maxResults": 0}, "addresses": addresses}),
             invalid_max.clone(),
         ),
-        // Past og's own limit, which og refuses for every item alike.
         (
             json!({"preferences": {"maxResults": 51}, "addresses": addresses}),
             invalid_max.clone(),
@@ -1072,7 +1063,6 @@ async fn reverse_geocode_answers_each_point() {
     let fields = expected["customFields"].as_object_mut().expect("an object");
     fields.remove("MATCH_TYPE");
     fields.remove("GEOHASH");
-    // The house stands on the asked point.
     expected["customFields"]["REVERSE_GEOCODE_DISTANCE"] = json!("0");
     expected["customFields"]["REVERSE_GEOCODE_DISTANCE_UNIT"] = json!("METERS");
     assert_eq!(
@@ -1083,7 +1073,6 @@ async fn reverse_geocode_answers_each_point() {
              "errorMessage": "Request Body is not valid (DIS-LI-1018)"},
             {"addressId": "c", "status": "INVALID_REQUEST",
              "errorMessage": "Request Body is not valid (DIS-LI-1018)"},
-            // A point in Canada has no answer in the United States.
             {"addressId": "d", "status": "ZERO_RESULTS", "results": []},
         ]})
     );
@@ -1501,7 +1490,6 @@ async fn a_bulk_job_runs_on_og_jobs_and_downloads_as_precisely_csv() {
         again.json(),
         errors("INVALID_REQUEST", "Invalid File Id (DIS-LI-1052)")
     );
-    // The job outlives its input, as og keeps it.
     assert_eq!(finished(&router, &job_id).await["status"], "COMPLETED");
 }
 
@@ -1696,7 +1684,6 @@ fn a_country_is_read_as_any_iso_code() {
         ("036", "AU"),
         ("CA", "CA"),
         (" nz ", "nz"),
-        // Not a code og knows. og decides, refusing all but two letters.
         ("ABC", "ABC"),
         ("999", "999"),
         ("Canada", "Canada"),
@@ -1718,7 +1705,6 @@ async fn uploads_and_job_records_expire_with_og_jobs() {
         serde_json::from_slice::<Value>(&std::fs::read(&record).expect("record")).expect("JSON");
     stale["createdNs"] = json!(0);
     std::fs::write(&record, stale.to_string()).expect("write");
-    // Past its retention it is gone at once, before any sweep.
     assert_eq!(
         get(&router, "/compat/precisely/v2/files").await.json(),
         json!({"results": [{"fileId": kept, "fileName": "test"}]})
@@ -1912,7 +1898,6 @@ async fn explain_reads_a_global_match_code_back_as_words() {
         }}])
     );
 
-    // Without the option, no official description.
     let reply = post(
         &router,
         "/v1/explain-addresscode",
@@ -1956,7 +1941,6 @@ async fn explain_answers_each_code_it_cannot_read() {
                "errorMessage": "Code is null or blank (DIS-LI-1039)"})
     );
 
-    // Every code malformed fails the request.
     let reply =
         explain(json!({"codeType": "GlobalMatchCode", "codes": [{"code": "V5-P4-5"}]})).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
@@ -2055,7 +2039,6 @@ async fn proximity_search_finds_the_nearest_address() {
         .expect("feet");
     assert!((feet - metres / 0.3048).abs() < 1e-9, "{feet}");
 
-    // Out of reach, or over the border, is nothing.
     for (distance, country) in [
         (json!({"value": 1, "distanceUnit": "METER"}), "CAN"),
         (json!({"value": 1, "distanceUnit": "KILOMETER"}), "USA"),

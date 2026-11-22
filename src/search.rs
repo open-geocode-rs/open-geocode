@@ -2791,10 +2791,7 @@ impl TextSearcher {
         corrected: Option<&str>,
     ) -> Result<Vec<String>> {
         let written = searcher.doc_freq(&Term::from_field_text(field, word))?;
-        // No term holds the byte 0xFF, which UTF-8 never uses, so every term
-        // with the prefix sorts below it.
-        let mut upper = prefix.as_bytes().to_vec();
-        upper.push(0xFF);
+        let upper = utf8_prefix_end(prefix);
         let mut found = HashMap::<Vec<u8>, (u8, u64)>::new();
         for segment in searcher.segment_readers() {
             let index = segment.inverted_index(field)?;
@@ -3849,7 +3846,6 @@ impl TextSearcher {
                 entry = "place";
             }
         }
-        // A document under two keys of the street counts once, at its best.
         supported.sort_unstable_by(|left: &(DocId, usize), right| {
             left.0.cmp(&right.0).then(right.1.cmp(&left.1))
         });
@@ -4915,8 +4911,6 @@ impl TextSearcher {
                 continue;
             };
             let (record_id, _) = self.document_records(searcher, address)?;
-            // The street an address is on, or the place it is numbered in
-            // ("Kropfsdorf 8"); a street's own name.
             let street = match records.record(record_id)? {
                 Record::Address(record) => record.address.street.or(record.address.place),
                 Record::Poi(PoiRecord {
@@ -4926,7 +4920,6 @@ impl TextSearcher {
                 Record::Street(record) => Some(record.name),
                 _ => None,
             };
-            // Each word in every form it is written in ("rd" and "road").
             let mut words = HashSet::new();
             for word in street
                 .as_deref()
@@ -5606,7 +5599,6 @@ impl TextSearcher {
     ) -> Result<(Vec<TextSearchHit>, Vec<TextSearchHit>)> {
         let pass = scope.pass();
         let ranking = self.plan_ranking(plan, query_words, focus, self.query_postcode(plan)?);
-        // Every stated locality, known or not, for what the hits rest on.
         let postcode =
             (!ranking.postcode.forms.is_empty()).then_some(ranking.postcode.exact.as_str());
         let (known, localities_stated) = self.localities_stated(plan, postcode)?;
@@ -6697,10 +6689,7 @@ impl TextSearcher {
         field: Field,
         prefix: &str,
     ) -> Result<Vec<String>> {
-        // No term holds the byte 0xFF, which UTF-8 never uses, so every term
-        // with the prefix sorts below it.
-        let mut upper = prefix.as_bytes().to_vec();
-        upper.push(0xFF);
+        let upper = utf8_prefix_end(prefix);
         let mut found = std::collections::BTreeSet::new();
         for segment in searcher.segment_readers() {
             let index = segment.inverted_index(field)?;
@@ -9341,7 +9330,6 @@ fn subject_match(
     let mut covered = vec![false; label.len()];
     let (mut written, mut near) = (0, 0);
     for word in &plan.subject {
-        // Records write either form, "Queen St W" or "Queen Street West".
         let forms = lattice::forms_both_ways(&word.text);
         let as_written = |label: &str| label == word.text || forms.iter().any(|form| form == label);
         let close = |label: &str| {
@@ -11047,14 +11035,10 @@ impl QueryPostcode {
             .map(|form| {
                 form.char_indices()
                     .map(|(index, character)| {
-                        let prefix = &form.as_bytes()[..index + character.len_utf8()];
-                        // No UTF-8 byte is 0xFF, so every postcode with the
-                        // prefix sorts before the prefix followed by it.
-                        let mut end = prefix.to_vec();
-                        end.push(u8::MAX);
+                        let prefix = &form[..index + character.len_utf8()];
                         let (start, end) = dictionary.term_bounds_to_ord(
-                            Bound::Included(prefix.to_vec()),
-                            Bound::Excluded(end),
+                            Bound::Included(prefix.as_bytes().to_vec()),
+                            Bound::Excluded(utf8_prefix_end(prefix)),
                         )?;
                         Ok(ord_range(start, end))
                     })
@@ -11076,6 +11060,13 @@ impl QueryPostcode {
             .unwrap_or(0)
             .min(u8::MAX.into()) as u8
     }
+}
+
+fn utf8_prefix_end(prefix: &str) -> Vec<u8> {
+    // UTF-8 never uses 0xFF, so every term with the prefix sorts below it.
+    let mut end = prefix.as_bytes().to_vec();
+    end.push(u8::MAX);
+    end
 }
 
 fn ord_range(start: Bound<u64>, end: Bound<u64>) -> Range<u64> {
@@ -13321,7 +13312,6 @@ mod tests {
         };
         let hamilton = locality("Hamilton", 100);
         let toronto = locality("Toronto", 101);
-        // As a build names them, so the Pack knows the localities' words.
         writer.set_context_names(
             [
                 (hamilton, vec!["Hamilton".to_string()]),
@@ -13806,8 +13796,6 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(temp_dir);
 
-        // At a full tie a record of another layer stays ahead of a POI,
-        // however well known.
         let first = TieBreak::new(
             &street_summary(),
             Prior {
@@ -15015,10 +15003,8 @@ mod tests {
         for (typed, label, ranges) in [
             ("starb", "Starbucks", vec![(0, 5)]),
             ("pike place", "Pike Place Market", vec![(0, 4), (5, 10)]),
-            // The word being typed marks what is typed of it.
             ("pike pl", "Pike Place Market", vec![(0, 4), (5, 7)]),
             ("place mar", "Pike Place Market", vec![(5, 10), (11, 14)]),
-            // Typed without its accent, and after an apostrophe.
             ("elysee", palace, vec![(12, 18)]),
             (
                 "palais de l'ely",
@@ -15040,7 +15026,6 @@ mod tests {
             ("cafe lo", cafe, vec![(0, 4), (5, 7)]),
             ("10 king st", house, vec![(0, 2), (3, 7), (8, 10)]),
             ("king street 10", house, vec![(0, 2), (3, 7), (8, 14)]),
-            // Out of the label's order, and "st" whole as "street".
             ("toronto king", house, vec![(3, 7), (16, 23)]),
             ("king st tor", house, vec![(3, 7), (8, 14), (16, 19)]),
             // Found by another name, which the label does not show.
@@ -15522,7 +15507,6 @@ mod tests {
         assert_eq!(top_ids(&searcher, "10 King Street"), vec!["osm:node:1"]);
         // No record has 99: the street answers, never the address with 10.
         assert_eq!(top_ids(&searcher, "99 King St"), vec!["osm:way:9"]);
-        // Geocoding falls back to the street too, never to another number.
         assert_eq!(
             geocode(&searcher, "99 King Street", None, None).as_deref(),
             Some("osm:way:9")
@@ -15927,7 +15911,6 @@ mod tests {
                 in_locality(toronto),
             )
             .expect("baldwin range in toronto");
-        // A road in a town named like the street a query asks for.
         writer
             .write(
                 &address_record(
@@ -15984,7 +15967,6 @@ mod tests {
             top_ids(&searcher, "182 Baldwin St, Atlantis")[0],
             "osm:node:1"
         );
-        // "Kingston" names the road, not the town of the address.
         assert_eq!(
             top_ids(&searcher, "2228 Kingston Rd, Toronto"),
             vec!["osm:way:40"]
@@ -16082,7 +16064,6 @@ mod tests {
             top_ids(&searcher, "8 High Street, 7304"),
             vec!["osm:way:2", "osm:node:1"]
         );
-        // A query that states no postcode still reaches it.
         assert!(top_ids(&searcher, "8 High Street").contains(&"osm:node:1".to_string()));
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -16233,7 +16214,6 @@ mod tests {
             geocode(&searcher, "14 Bayview Avenue", None, None).as_deref(),
             Some("derived:estimate:14:osm:node:10:osm:node:11")
         );
-        // Neighbours outside the countries asked for place nothing.
         let in_france = searcher
             .search(&TextSearchOptions {
                 query: "14 Bayview Ave".to_string(),
@@ -16855,7 +16835,6 @@ mod tests {
             ..found(true)
         };
         assert!(house.outweighs(found(false)));
-        // A confirmed postcode ends the search at the first reading.
         assert!(!found(true).open());
         // Fewer typos outweigh a stricter pass.
         let typo = Evidence {
@@ -16947,7 +16926,6 @@ mod tests {
             subject(&plan("15/house_number the/street donway/street e/street")),
             words(&["the", "donway", "east"])
         );
-        // A street named first, its number after it.
         let german = plan("maximilianstr/street 5/house_number münchen/locality");
         assert_eq!(german.house_number.as_ref().expect("number").text, "5");
         assert_eq!(subject(&german), words(&["maximilianstr"]));
@@ -17060,11 +17038,9 @@ mod tests {
     fn a_house_number_states_the_same_digits_with_its_words_abbreviated() {
         let fit =
             |sought: &str, stated: &str| number_fit(&number_runs(sought), &number_runs(stated));
-        // However spaced.
         for stated in ["81 к1", "81к1", "81 к 1", "81к 1"] {
             assert_eq!(fit("81 к1", stated), Some(NumberFit::Stated), "{stated}");
         }
-        // A word written out or abbreviated otherwise.
         for (sought, stated) in [
             ("81 корпус 1", "81 к1"),
             ("81 корп 1", "81 к1"),
@@ -17113,12 +17089,10 @@ mod tests {
         writer.finish().expect("finish");
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
-        // As the record writes it, and spaced otherwise.
         for reading in [
             "81/house_number к1/house_number улица/street вавилова/street москва/locality",
             "81к1/house_number улица/street вавилова/street москва/locality",
             "81/house_number к/house_number 1/house_number улица/street вавилова/street",
-            // Its word written out, or abbreviated otherwise.
             "81/house_number корпус/house_number 1/house_number улица/street вавилова/street",
             "81/house_number корп/house_number 1/house_number улица/street вавилова/street",
         ] {
@@ -17288,7 +17262,6 @@ mod tests {
             }
             records.push(record);
         }
-        // A street of the same name in another town is a group of its own.
         records.push(address_record(
             "osm:node:20",
             "",
@@ -18577,7 +18550,6 @@ mod tests {
             "the whole street is one"
         );
 
-        // A street type glued onto the name, abbreviated.
         assert_eq!(
             answer(&searcher, "eibacher/street hauptstr/street 73/house_number"),
             ["osm:node:12"]
@@ -19029,7 +19001,6 @@ mod tests {
             town_at,
             None,
         );
-        // A town whose name holds the other's and a word more.
         let west = place(
             &mut writer,
             Locality,
@@ -19170,7 +19141,6 @@ mod tests {
                 "osm:node:10",
                 with(&[(postcode, Partial)]),
             ),
-            // The address states the town itself.
             (
                 "1/house_number maple/street street/street alexandria/locality 22310/postcode",
                 "osm:node:13",
@@ -19222,14 +19192,12 @@ mod tests {
                 false,
                 stated(&[(number, Matched), (street, Partial)]),
             ),
-            // Placed between 10 and 20, which state it not.
             (
                 "14 Bayview Avenue",
                 estimate,
                 false,
                 stated(&[(number, Partial), (street, Matched)]),
             ),
-            // Past the last number known, the street stands in.
             (
                 "40 Bayview Avenue",
                 "osm:way:1",
@@ -19261,7 +19229,6 @@ mod tests {
                 true,
                 stated(&[&missed[..], &[(postcode, Matched)]].concat()),
             ),
-            // The whole query is the town's name, so it states the town.
             (
                 "Franconia",
                 "osm:relation:1",

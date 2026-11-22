@@ -77,7 +77,6 @@ pub struct BuilderReport {
     pub timezones: Option<TimezoneReport>,
 }
 
-// Traces a Pack's timezones to the file, and says how each record got its.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TimezoneReport {
     pub path: String,
@@ -95,7 +94,6 @@ pub struct TimezoneReport {
     pub records_without_zone: u64,
 }
 
-// Traces a Pack's importances to the file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct QRankReport {
     pub path: String,

@@ -335,22 +335,7 @@ fn unix_now() -> u64 {
 pub(super) fn date_time(seconds: u64) -> String {
     let days = seconds / 86_400;
     let rest = seconds % 86_400;
-    // Civil date of a day count since 1970-01-01, in the proleptic
-    // Gregorian calendar.
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    let (year, month, day) = super::super::civil_date_from_unix_days(days as i64);
     format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
         rest / 3600,
@@ -546,7 +531,6 @@ fn job_details(view: &View, links: &Links) -> Value {
     if let Some(ended) = view.ended {
         body["ended"] = date_time(ended).into();
     }
-    // A job deleted before it ran has no records to show.
     if !(view.status == "deleted" && view.meta.runs.is_empty()) {
         body["records"] = json!(view.records);
     }
@@ -1176,8 +1160,6 @@ fn translate(service: Service, record: &Record) -> Result<Translated, Gs7Error> 
             .filter(|limit| (1..=100).contains(limit))
             .ok_or_else(|| Gs7Error::illegal("limit", value, "Provide an integer from 1 to 100"))?,
     };
-    // `lang` and `show` are input columns like any query parameter of the
-    // endpoint, and are checked as it checks them.
     let lang = record.get("lang").and_then(first_language);
     super::check_show(
         record.get("show"),
@@ -1824,8 +1806,6 @@ pub(super) async fn start(
         };
         launch(&state, &mut meta, uuid).await?;
         save(&state, &meta).map_err(internal)?;
-        // A started job is scheduled, queued; a read after tells how far it
-        // has run.
         let mut view = view(&state, meta).ok_or_else(BatchError::job_not_found)?;
         view.status = "queued";
         Ok::<_, BatchError>(view)
@@ -2679,7 +2659,6 @@ mod tests {
         let path = dir.join("items");
         let lines = (0..70).map(|ordinal| format!("{{\"id\":\"{ordinal}\"}}\n"));
         fs::write(&path, lines.collect::<String>()).expect("items");
-        // Items 0, 2 and 65 answered.
         let answered = [0b101, 0b10];
         let (sender, mut receiver) = mpsc::channel(16);
         feed(File::open(&path).expect("items"), &answered, &sender);
@@ -2723,7 +2702,6 @@ mod tests {
         let router = crate::runtime::build_router(state.clone(), None, None);
         let id = finished_job(&router, "recId|q\n1|10 King Street\n2|Queen\n3|zzzz\n").await;
         let meta = load(&state, &id).expect("meta");
-        // The run finished its records third, first, second.
         for run in &meta.runs {
             let job = state.jobs().get(run).expect("run");
             let path = job.results_path();

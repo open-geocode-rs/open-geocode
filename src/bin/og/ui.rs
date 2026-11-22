@@ -544,7 +544,6 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
     let browsing = app.region_browsing();
     let inner = area.width.saturating_sub(2) as usize;
 
-    // The title is the way down the tree: the levels above dim, this one bold.
     let mut names = vec!["Region".to_string()];
     if browsing {
         names.extend(
@@ -601,7 +600,6 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
             inner,
         ));
         room -= 1;
-        // A line under the region itself sets it apart from the regions below.
         if all && rows.len() > 1 && room > 0 {
             lines.push(Line::from(span(
                 format!("   {}", "─".repeat(inner.saturating_sub(6))),
@@ -614,7 +612,6 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
     while lines.len() < 4 + app::REGION_ROWS {
         lines.push(Line::raw(""));
     }
-    // Above the counts: what is ticked, and what building it would cost.
     if !app.picked.is_empty() {
         let picked = app.build_regions();
         let names = picked
@@ -641,7 +638,6 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(summary));
     }
 
-    // Under the list: how many rows are out of sight, and where the cursor is.
     let more = rows.len().saturating_sub(next);
     let left = if more > 0 {
         format!("   ↓ {more} more")
@@ -838,7 +834,6 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     };
-    // An extract on disk with newer data published: say so, and how to take it.
     if let (Some(extract), Some(at)) = (&app.on_disk, newest)
         && !several
         && !app.downloads()
@@ -1162,7 +1157,6 @@ fn finished_line(step: &Step, inner: usize) -> Line<'static> {
 fn running_line(app: &App, step: &Step, done: u64, inner: usize) -> Line<'static> {
     let cells = bar_cells(inner);
     let elapsed = step.started.map_or(0.0, |at| at.elapsed().as_secs_f64());
-    // The verb and what it works on shimmer as one title.
     let title = format!(
         "{} {}",
         pad(step.doing, VERB_WIDTH),
@@ -1201,7 +1195,6 @@ fn running_line(app: &App, step: &Step, done: u64, inner: usize) -> Line<'static
             spans.push(span(format!("{left:>TIME_WIDTH$}"), DIM));
         }
         _ => {
-            // No measure, so no percent and no bar: only time passing.
             spans.push(plain("     "));
             spans.push(span(pad("working…", cells + 2), DIM));
             spans.push(plain(" ".repeat(2 + SIZE_WIDTH + SPEED_WIDTH)));
@@ -1529,8 +1522,6 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Batch => None,
         _ => app.answer.as_ref().map(|answer| answer.millis),
     };
-    // While the Pack is still answering, a spinner stands where its time
-    // will be.
     let took = if app.asking() {
         Some(span(format!("{} ", spinner(app)), ACCENT))
     } else {
@@ -1742,7 +1733,6 @@ fn json_line(line: &str) -> Line<'static> {
     let mut rest = line.trim_start();
     while !rest.is_empty() {
         if let Some(body) = rest.strip_prefix('"') {
-            // A string runs to the next quote that is not escaped.
             let mut end = 0;
             let mut escaped = false;
             for (at, c) in body.char_indices() {
@@ -1894,8 +1884,6 @@ fn visible_columns(widths: &[usize], selected: usize, avail: usize) -> std::ops:
     }
 }
 
-// The result columns of the batch screens: the query, what it matched, the
-// coordinates, and one more figure (a score, or the time the query took).
 const MATCH_WIDTH: usize = 20;
 const LAT_WIDTH: usize = 9;
 const LON_WIDTH: usize = 10;
@@ -2005,7 +1993,6 @@ fn batch_setup(frame: &mut Frame, area: Rect, app: &App) {
 
     let facts = file_facts(file);
 
-    // The columns, each with the role it will play, and the first rows.
     let widths: Vec<usize> = file
         .headers
         .iter()

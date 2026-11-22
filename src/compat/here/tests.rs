@@ -447,7 +447,6 @@ fn bakery(distance: Option<i64>) -> Value {
             "www": [{"value": "https://queenbakery.example/"}],
         }],
         "openingHours": [{
-            // The place's hours, of its own kind.
             "categories": [{"id": "600-6300-0244"}],
             "text": ["Mon-Fri: 08:00 - 18:00", "Sat: 09:00 - 13:00"],
             "structured": [
@@ -537,7 +536,6 @@ async fn geocode_answers_here_items() {
         }}))]})
     );
 
-    // `at` is og's focus and gives each item its distance from it.
     let reply = get(
         &router,
         "/compat/here/v1/geocode?q=10+King+Street&at=43.0,-79.005&in=countryCode:CAN",
@@ -551,7 +549,6 @@ async fn geocode_answers_here_items() {
         }}))]})
     );
 
-    // A country filter og honours. Nothing of the Pack lies in the US.
     let reply = get(
         &router,
         "/compat/here/v1/geocode?q=10+King+Street&in=countryCode:USA",
@@ -559,7 +556,6 @@ async fn geocode_answers_here_items() {
     .await;
     assert_eq!(reply.json(), json!({"items": []}));
 
-    // Whitespace asks nothing, and nothing is answered.
     let reply = get(&router, "/compat/here/v1/geocode?q=+").await;
     assert_eq!(reply.json(), json!({"items": []}));
 }
@@ -573,17 +569,14 @@ async fn geocode_reads_qualified_queries() {
         "fieldScore": {"streets": [1.0], "houseNumber": 1.0, "postalCode": 1.0, "country": 1.0},
     }});
 
-    // A street with no text is og's structured geocode.
     let structured = "/compat/here/v1/geocode?qq=houseNumber%3D10%3Bstreet%3DKing+Street%3BpostalCode%3DM5V+1A1%3Bcountry%3DCAN";
     let reply = get(&router, structured).await;
     assert_eq!(reply.json(), json!({"items": [king(scored.clone())]}));
 
-    // A country code in `qq` filters as `in` does.
     let elsewhere =
         "/compat/here/v1/geocode?qq=houseNumber%3D10%3Bstreet%3DKing+Street%3Bcountry%3DUSA";
     assert_eq!(get(&router, elsewhere).await.json(), json!({"items": []}));
 
-    // Text and qualified parts together are one text.
     let hybrid = "/compat/here/v1/geocode?q=10+King&qq=street%3DStreet%3BpostalCode%3DM5V+1A1";
     let reply = get(&router, hybrid).await;
     let mut unfiltered = scored;
@@ -619,7 +612,6 @@ async fn geocode_answers_the_best_match_alone() {
     let items = reply.json()["items"].as_array().expect("items").clone();
     assert_eq!(items.len(), 1, "{}", reply.text());
     assert_eq!(items[0]["resultType"], "street");
-    // Asked for a house, the best house answers.
     let house = get(
         &router,
         "/compat/here/v1/geocode?q=Queen+Street+Toronto&types=houseNumber",
@@ -732,7 +724,6 @@ async fn revgeocode_answers_the_nearest_first() {
         json!({"items": [king(json!({"distance": 8}))]})
     );
 
-    // A bearing answers streets only.
     let reply = get(
         &router,
         "/compat/here/v1/revgeocode?at=43.0005,-79.0&bearing=90",
@@ -838,7 +829,6 @@ async fn autosuggest_autocomplete_and_discover() {
         item
     };
     let mut queen = marked(queen, 3);
-    // The street holds the mark too, counted from its own start.
     queen["highlights"]["address"]["street"] = json!([{"start": 0, "end": 5}]);
     let mut queen_near = queen.clone();
     queen_near["position"] = json!({"lat": 43.0, "lng": -79.002});
@@ -851,8 +841,6 @@ async fn autosuggest_autocomplete_and_discover() {
         json!({"items": [bakery_near.clone(), queen_near], "queryTerms": []})
     );
 
-    // Paging fields appear only with `offset`, and `nextOffset` only before
-    // the last page.
     let page = "/compat/here/v1/autosuggest?q=Queen&at=43.0,-79.0&limit=1&offset=";
     let reply = get(&router, &format!("{page}0")).await;
     assert_eq!(
@@ -887,7 +875,6 @@ async fn autosuggest_autocomplete_and_discover() {
     let reply = get(&router, "/compat/here/v1/autosuggest?q=+&at=43,-79").await;
     assert_eq!(reply.json(), json!({"items": [], "queryTerms": []}));
 
-    // A page reaching past what og answers is cut short, not refused.
     for uri in [
         "/compat/here/v1/autosuggest?q=Queen&at=43,-79&limit=21",
         "/compat/here/v1/autosuggest?q=Queen&at=43,-79&limit=10&offset=15",
@@ -1161,7 +1148,6 @@ async fn errors_take_here_shapes() {
     assert_eq!(reply.json()["title"], "Illegal input for parameter 'q'");
     assert_eq!(reply.json()["requestId"], "rid-1");
 
-    // og keeps no store for signals, so the route is not served.
     let reply = send(
         &router,
         "POST",
@@ -1190,7 +1176,6 @@ async fn errors_take_here_shapes() {
     let reply = send(&router, "DELETE", "/compat/here/v1/lookup", None).await;
     assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
 
-    // The batch API's own shape, which has a code and no request id.
     let reply = get(&router, "/compat/here/v7/nowhere").await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
     assert_eq!(
@@ -1510,7 +1495,6 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
         None if uri.contains("revgeocode") => assert_eq!(item.get("distance"), None, "{at}"),
         None => {}
     }
-    // A place has no box in HERE's answers; anything else carries og's.
     match (layer, properties["bbox"].as_array()) {
         (_, Some(_)) if suggestion => assert_eq!(item.get("mapView"), None, "{at}"),
         ("poi", _) | (_, None) => assert_eq!(item.get("mapView"), None, "{at}"),
@@ -1778,7 +1762,6 @@ async fn a_geocode_batch_runs_on_og_jobs() {
         })
     );
 
-    // The run is an og job like any other, under the HERE job's UUID.
     let native = get(&router, &format!("/jobs/{uuid}")).await;
     assert_eq!(native.status, StatusCode::OK);
     let native = native.json();
@@ -1841,7 +1824,6 @@ async fn a_geocode_batch_runs_on_og_jobs() {
         })
     );
 
-    // A job that ended is neither started nor stopped again.
     for action in ["start", "stop"] {
         let uri = format!("/compat/here/v7/batch/jobs/{id}/{action}");
         let reply = send(&router, "PUT", &uri, None).await;
@@ -1870,8 +1852,6 @@ async fn a_geocode_batch_runs_on_og_jobs() {
         deleted.json(),
         json!({"id": id, "serviceHrn": GEOCODE_HRN, "tag": "nightly", "status": "deleted"})
     );
-    // Deleted, its record still reads by id; its results and og job are
-    // gone.
     let details = get(&router, &job).await.json();
     assert_eq!(details["status"], "deleted");
     assert_eq!(details["resultsHref"], "");
@@ -1975,7 +1955,6 @@ async fn a_revgeocode_batch_waits_for_its_start() {
     );
     let errors = get(&router, &format!("{job}/errors")).await;
     assert_eq!(errors.json()["code"], "E6004044");
-    // Stopping a job that does not run does nothing.
     let stopped = send(&router, "PUT", &format!("{job}/stop"), None).await;
     assert_eq!(stopped.json()["status"], "submitted");
 
@@ -2341,7 +2320,6 @@ async fn notifications_are_kept_and_called_when_a_job_ends() {
     );
     let path = format!("/compat/here/v7/batch/notifications/{id}");
 
-    // Kept on disk. A second server on the same job directory reads it.
     let other = build_router(allowed(), None, None);
     assert_eq!(get(&other, &path).await.json(), created);
     assert_eq!(
@@ -2475,7 +2453,6 @@ async fn a_start_with_no_free_slot_is_too_many_jobs() {
         "correlationId": "rid-1",
     });
 
-    // Refused at once, the job is not kept.
     let input = Some(("text/plain", "q\n10 King Street\n"));
     let reply = send(&router, "POST", "/compat/here/v7/batch/jobs", input).await;
     assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS);
@@ -2532,7 +2509,6 @@ async fn a_job_holds_the_servers_row_limit() {
             "correlationId": "rid-1",
         })
     );
-    // Refused records are not looked up, and do not count against it.
     let reply = post("recId|q\nbad!|King\nok|\n1|King\n2|Queen\n").await;
     assert_eq!(reply.status, StatusCode::CREATED);
 }
@@ -2593,7 +2569,6 @@ async fn lang_names_the_address_in_its_first_language() {
     let suggested = address(get(&router, "/compat/here/v1/autocomplete?q=10+King&lang=de").await);
     assert_eq!(suggested["countryName"], "Kanada");
 
-    // Lookup answers the one item itself.
     let found = get(&router, "/compat/here/v1/discover?q=Queen+Bakery&at=43,-79")
         .await
         .json();
@@ -2863,7 +2838,6 @@ async fn a_search_along_a_route_keeps_what_lies_by_it() {
                     .cloned()
             })
             .expect("the bakery");
-        // Along the route plus off it.
         let distance = bakery["distance"].as_i64().expect("a distance");
         assert!((455..=470).contains(&distance), "{path}: {distance}");
         let body = send(

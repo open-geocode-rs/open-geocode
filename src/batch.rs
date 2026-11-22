@@ -1193,7 +1193,6 @@ mod tests {
             .expect("id column");
         assert_eq!(audit.rows[2][id], "osm:node:1");
 
-        // A file without a header row, watched row by row, with no audit.
         struct Rows(std::sync::Mutex<Vec<(usize, Option<String>)>>);
         impl Observer for Rows {
             fn row(&self, row: &Row) {
@@ -1224,7 +1223,6 @@ mod tests {
         let output = read_csv(&root.join("bare-out.csv")).expect("output");
         assert_eq!(output.headers, vec!["column_1", "column_2", "lat", "lon"]);
 
-        // A run asked to stop writes nothing.
         let error = run_batch_geocode(&GeocodeOptions {
             pack: Some(root.join("pack")),
             input: bare,
@@ -1261,8 +1259,6 @@ mod tests {
         assert_eq!(lines[1], b"1;20 Queen St;Z\xfcrich;43.6000000;-79.4100000");
         assert_eq!(lines[2], b"2;10 King Street;;43.6000000;-79.4000000");
 
-        // Columns picked by place, where names cannot tell them apart; a
-        // name the file does not have is an error.
         let twins = root.join("twins.csv");
         std::fs::write(&twins, "street,street,\nnowhere,10 King Street,x\n").expect("input");
         let report = run_batch_geocode(&GeocodeOptions {
@@ -1291,7 +1287,6 @@ mod tests {
         assert_eq!(delimiter_of(b"a;b;c\n1;2,5;3\n"), b';');
         assert_eq!(delimiter_of(b"a\tb\n1\t2\n"), b'\t');
         assert_eq!(delimiter_of(b"a|b\n1|2\n"), b'|');
-        // One field per line: nothing to choose, so a comma.
         assert_eq!(delimiter_of(b"100 queen st w\n24 sussex dr\n"), b',');
     }
 

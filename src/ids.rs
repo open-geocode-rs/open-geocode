@@ -216,7 +216,6 @@ impl Catalogue {
         let pair = 8 + self.width;
         let pairs = self.more.len() / pair;
         let key_at = |at: usize| &self.more[at * pair..at * pair + 8];
-        // The first pair of the key, by binary search.
         let (mut at, mut end) = (0, pairs);
         while at < end {
             let middle = at + (end - at) / 2;

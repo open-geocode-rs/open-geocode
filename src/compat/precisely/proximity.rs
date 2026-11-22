@@ -168,7 +168,6 @@ pub(super) async fn proximity_search(
                 .country
                 .as_ref()
                 .and_then(|country| country.iso_alpha2_code.as_deref());
-            // An address over the border is not in the country asked for.
             if alpha2.is_some_and(|alpha2| !alpha2.eq_ignore_ascii_case(&wanted)) {
                 return None;
             }
