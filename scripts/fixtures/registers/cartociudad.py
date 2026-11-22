@@ -1,4 +1,4 @@
-from . import fetch, unzip
+from . import derived_path, fetch, unzip
 
 CSV = "es_addresses.csv"
 RELEASE = "2026-11-11 (OpenAddresses CartoCiudad extract)"
@@ -22,17 +22,18 @@ SOURCE = {
 
 def download(cache):
     archive, _ = fetch(SOURCE["url"], cache / f"{CSV}.zip")
-    unzip(archive, cache / "csv", keep=lambda name: name == CSV)
     return [archive], RELEASE
 
 
 def query(files):
-    csv = files[0].parent / "csv" / CSV
+    archive = files[0]
+    csv = unzip(archive, derived_path(archive, "csv"), keep=lambda name: name == CSV) / CSV
+    csv = csv.as_posix().replace("'", "''")
     return f"""
         select id_porpk as id, X as x, Y as y, 'EPSG:4258' as crs,
                nullif(numero, '') || coalesce(trim(extension), '') as house_number,
                concat_ws(' ', tipo_vial, nombre_via) as road, cod_postal as postcode,
                municipio as city, comunidad_autonoma as state
-        from read_csv('{csv.as_posix()}', delim=',', quote='"', escape='"', header=true, all_varchar=true)
+        from read_csv('{csv}', delim=',', quote='"', escape='"', header=true, all_varchar=true)
         where lower(tipo) = 'portal'
     """
