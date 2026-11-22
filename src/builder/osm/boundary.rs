@@ -676,7 +676,7 @@ impl BoundaryIndex {
 
         let envelope = AABB::from_point([lon, lat]);
         let mut covered = Vec::new();
-        for boundary_box in self.tree.locate_in_envelope_intersecting(&envelope) {
+        for boundary_box in self.tree.locate_in_envelope_intersecting(envelope) {
             let boundary = &self.boundaries[boundary_box.boundary_id];
             if self.shapes.covers(boundary.shape, lon, lat) {
                 covered.push(boundary);
