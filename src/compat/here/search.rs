@@ -16,7 +16,7 @@ use crate::{
     http::bounds::MAX_SEARCH_LIMIT,
     record::Layer,
     runtime::AppState,
-    spatial_index::haversine_m,
+    util::geo::haversine_m,
     util::{fold::search_key, geo::EARTH_RADIUS_M},
 };
 

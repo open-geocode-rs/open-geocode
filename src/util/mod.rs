@@ -8,6 +8,7 @@ pub(crate) mod codec;
 pub(crate) mod fold;
 pub(crate) mod geo;
 pub(crate) mod hilbert;
+pub(crate) mod iso;
 #[cfg(test)]
 pub(crate) mod temp;
 pub(crate) mod text;

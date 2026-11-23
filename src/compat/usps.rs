@@ -7,7 +7,7 @@
 //! Google and HERE, keep the case (`350 Jordan Ave`, `1600 Amphitheatre
 //! Pkwy`).
 
-use crate::road::direction_of;
+use crate::search::road::direction_of;
 
 pub(crate) fn zip_plus_four(postcode: &str) -> Option<(&str, &str)> {
     let (zip, plus_four) = postcode.split_once('-')?;

@@ -8,9 +8,9 @@ use crate::{
     api::{Accuracy, Address, Common, ForwardFeature, ReverseFeature},
     builder::osm::DISPUTED_HOUSE_RADIUS_M,
     record::{Building, Layer},
-    spatial_index::haversine_m,
     text_index::compact_postcode,
     util::fold::search_key,
+    util::geo::haversine_m,
 };
 
 /// A native answer: one record at one point.

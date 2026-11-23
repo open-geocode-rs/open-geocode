@@ -424,7 +424,7 @@ impl PackReverseGeocoder {
                     .address
                     .street
                     .as_deref()
-                    .is_some_and(|name| crate::road::same_road(name, street))
+                    .is_some_and(|name| crate::search::road::same_road(name, street))
                 && record.address.locality == address.locality
                 && record.address.region == address.region;
             if !same_house {
@@ -573,7 +573,7 @@ impl PackReverseGeocoder {
         else {
             return Ok(None);
         };
-        let distance = crate::road::planar_m([options.lon, options.lat], [lon, lat]);
+        let distance = crate::search::road::planar_m([options.lon, options.lat], [lon, lat]);
         if distance > radius {
             return Ok(None);
         }

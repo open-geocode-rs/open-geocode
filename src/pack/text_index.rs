@@ -37,7 +37,7 @@ use crate::{
         Layer, PlaceRecord, PoiRecord, PostcodeRecord, Record, StreetRecord, place_rank,
     },
     records::quantize,
-    spatial_index::haversine_m,
+    util::geo::haversine_m,
     util::{fold::search_key, geo::line_parts, text::collapse_whitespace},
 };
 

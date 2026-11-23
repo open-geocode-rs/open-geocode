@@ -9,6 +9,17 @@ pub(crate) const METRES_PER_DEGREE: f64 = 111_320.0;
 /// The mean Earth radius `haversine_m` measures with.
 pub(crate) const EARTH_RADIUS_M: f64 = 6_371_008.8;
 
+pub(crate) fn haversine_m(a_lon: f64, a_lat: f64, b_lon: f64, b_lat: f64) -> f64 {
+    let d_lat = (b_lat - a_lat).to_radians();
+    let d_lon = (b_lon - a_lon).to_radians();
+    let a_lat = a_lat.to_radians();
+    let b_lat = b_lat.to_radians();
+    let sin_d_lat = (d_lat / 2.0).sin();
+    let sin_d_lon = (d_lon / 2.0).sin();
+    let h = sin_d_lat * sin_d_lat + a_lat.cos() * b_lat.cos() * sin_d_lon * sin_d_lon;
+    2.0 * EARTH_RADIUS_M * h.sqrt().asin()
+}
+
 /// Longitude/latitude of a point geometry, or `None` if it is not a point or
 /// either coordinate is non-finite. This is the single canonical, strict
 /// reader; callers that previously skipped the finite check now reject NaN/inf

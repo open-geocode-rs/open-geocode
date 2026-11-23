@@ -54,8 +54,8 @@ use crate::{
         autocomplete_tokens, category_typo, effective_autocomplete_limit, name_starts_as, suggest,
         typed_highlights,
     },
-    spatial_index::haversine_m,
     stop::{self, CancelOnDrop, Stop},
+    util::geo::haversine_m,
     util::{fold::search_key, hilbert::hilbert_key},
 };
 
@@ -949,7 +949,7 @@ fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardColl
                         .address
                         .street
                         .as_deref()
-                        .is_some_and(|street| crate::road::same_road(street, &key))
+                        .is_some_and(|street| crate::search::road::same_road(street, &key))
                 {
                     named.push(hit);
                 }

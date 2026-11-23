@@ -14,7 +14,7 @@
 //! missing number is placed between its neighbours. Every other reading keeps
 //! the number as written.
 
-use crate::{builder::report::SlashNumberCounts, error::Result, spatial_index::haversine_m};
+use crate::{builder::report::SlashNumberCounts, error::Result, util::geo::haversine_m};
 
 use super::spill::PendingAddress;
 

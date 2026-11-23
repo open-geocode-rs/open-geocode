@@ -607,7 +607,7 @@ impl Address {
         self.street_parts = self
             .street
             .as_deref()
-            .and_then(crate::road::StreetParts::of)
+            .and_then(crate::search::road::StreetParts::of)
             .map(|parts| StreetParts {
                 prefix: parts.prefix.map(str::to_string),
                 name: parts.name,
@@ -1208,7 +1208,7 @@ pub fn measure_from(collection: &mut ForwardCollection, focus: Option<[f64; 2]>)
     };
     for feature in &mut collection.features {
         let [feature_lon, feature_lat] = feature.geometry.coordinates;
-        let metres = crate::spatial_index::haversine_m(lon, lat, feature_lon, feature_lat);
+        let metres = crate::util::geo::haversine_m(lon, lat, feature_lon, feature_lat);
         // To the centimetre: finer is noise next to the point's own precision.
         feature.properties.distance_m = Some((metres * 100.0).round() / 100.0);
     }

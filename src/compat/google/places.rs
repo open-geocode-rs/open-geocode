@@ -24,7 +24,7 @@ use crate::{
         route::{self, Corridor},
     },
     runtime::AppState,
-    spatial_index::haversine_m,
+    util::geo::haversine_m,
 };
 
 /// Google's own cap on one page of Text Search results.

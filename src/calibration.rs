@@ -31,8 +31,8 @@ use crate::{
     rank::{self, Ranker},
     record::{AddressRecord, Layer},
     search::{TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher},
-    spatial_index::haversine_m,
     text_index::street_search_text,
+    util::geo::haversine_m,
     util::{fold::search_key, geo::point_lon_lat},
 };
 

@@ -489,7 +489,7 @@ impl Feature {
     pub(super) fn judge_street_parts(&self, candidate: &mut Candidate, asked: Option<&str>) {
         use crate::{
             parse::lattice::other_forms,
-            road::{StreetParts, direction_of},
+            search::road::{StreetParts, direction_of},
         };
         let description = &mut candidate.explanation.address_match.description;
         let street_matched = description

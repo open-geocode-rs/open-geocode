@@ -1,7 +1,7 @@
 //! A route a vendor searches along: its points, decoded from the polyline
 //! the vendor takes, and how far either side of it a result may lie.
 
-use crate::spatial_index::haversine_m;
+use crate::util::geo::haversine_m;
 
 /// A polyline that does not decode.
 #[derive(Debug, PartialEq, Eq)]

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::{
     builder::report::CandidateIssue,
     record::{ObjectType, Record, RoadClass, SourceProvenance, StreetRecord},
-    spatial_index::haversine_m,
+    util::geo::haversine_m,
     util::geo::{METRES_PER_DEGREE, line_geometry, line_parts},
 };
 

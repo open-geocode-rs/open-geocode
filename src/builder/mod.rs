@@ -1,4 +1,5 @@
 pub mod addresses;
+pub mod memory;
 pub mod osm;
 pub mod plan;
 pub mod progress;

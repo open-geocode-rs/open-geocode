@@ -158,7 +158,7 @@ impl Destination {
                 }),
                 place: view,
                 tags: ["ADDRESS"],
-                straight_line_distance_meters: crate::spatial_index::haversine_m(lon, lat, x, y),
+                straight_line_distance_meters: crate::util::geo::haversine_m(lon, lat, x, y),
             });
         }
         Ok(self)

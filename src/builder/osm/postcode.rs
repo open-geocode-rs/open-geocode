@@ -6,7 +6,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::{
     parse::lattice::CountryCode,
     record::{DerivedSourceProvenance, PostcodeRecord, point_geometry},
-    spatial_index::haversine_m,
+    util::geo::haversine_m,
 };
 
 use super::spill::Fields;
