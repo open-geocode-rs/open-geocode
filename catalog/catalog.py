@@ -197,6 +197,26 @@ def oa_license(data, layer_name):
     return data.get("license")
 
 
+def public_license_url(url):
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url.split("?", 1)[0].split("#", 1)[0]
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    keys = {key.lower() for key, _ in query}
+    if not keys.intersection(("x-amz-signature", "x-amz-credential", "awsaccesskeyid")):
+        return url
+    host = parts.hostname or ""
+    item = parts.path.split("/", 2)[1] if parts.path.startswith("/") else ""
+    if (host.startswith("ago-item-storage.s3.") and host.endswith(".amazonaws.com")
+            and len(item) == 32 and all(c in "0123456789abcdef" for c in item.lower())):
+        return f"https://www.arcgis.com/sharing/rest/content/items/{item}/data"
+    signing = {"awsaccesskeyid", "signature", "expires"}
+    unsigned = [(key, value) for key, value in query
+                if key.lower() not in signing and not key.lower().startswith("x-amz-")]
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(unsigned)))
+
+
 def trim_license(lic):
     if not lic:
         return None
@@ -206,7 +226,7 @@ def trim_license(lic):
     for src, dst in (("text", "name"), ("url", "url"), ("attribution", "attribution"),
                      ("attribution name", "attribution_name"), ("share-alike", "share_alike")):
         if lic.get(src) not in (None, ""):
-            out[dst] = lic[src]
+            out[dst] = public_license_url(lic[src]) if src == "url" and isinstance(lic[src], str) else lic[src]
     return out or None
 
 

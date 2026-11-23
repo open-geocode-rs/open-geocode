@@ -46,5 +46,21 @@ class MovedLinks(unittest.TestCase):
         self.assertEqual(catalog.moved_links(self.OLD, dict(self.OLD)), [])
 
 
+class LicenseUrls(unittest.TestCase):
+    def test_arcgis_signature_becomes_a_public_item_link(self):
+        item = "a" * 32
+        url = f"https://ago-item-storage.s3.us-east-1.amazonaws.com/{item}/license.pdf?X-Amz-Signature=test"
+        self.assertEqual(catalog.trim_license({"url": url}),
+                         {"url": f"https://www.arcgis.com/sharing/rest/content/items/{item}/data"})
+
+    def test_a_signed_url_retains_only_its_non_signing_parameters(self):
+        url = "https://license.example/file?version=2&X-Amz-Credential=test&x-amz-signature=test"
+        self.assertEqual(catalog.public_license_url(url), "https://license.example/file?version=2")
+
+    def test_a_public_url_is_preserved(self):
+        url = "https://license.example/item?id=12#terms"
+        self.assertEqual(catalog.public_license_url(url), url)
+
+
 if __name__ == "__main__":
     unittest.main()
