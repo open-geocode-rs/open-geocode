@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="OpenGeocode smoke fixture">
+  <node id="1" version="1" lat="43.732" lon="7.424">
+    <tag k="place" v="city"/>
+    <tag k="name" v="Monaco"/>
+  </node>
+</osm>
