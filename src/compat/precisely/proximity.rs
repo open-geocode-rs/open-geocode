@@ -1,7 +1,4 @@
-//! `/v1/proximity-search`, the address nearest a point.
-//!
-//! og's reverse geocode finds one nearest address, so at most one result
-//! comes back whatever `maxResults` asks.
+//! `/v1/proximity-search`, the nearest eligible addresses to a point.
 
 use std::collections::BTreeMap;
 
@@ -16,8 +13,8 @@ use super::{
     Failure, country_code, error, given, read_json,
     result::{self, Feature, Product},
 };
-use crate::compat::{Args, VendorError, native};
-use crate::runtime::AppState;
+use crate::compat::{Args, VendorError};
+use crate::runtime::{self, AppState};
 
 #[derive(Debug, Deserialize)]
 struct ProximityRequest {
@@ -118,16 +115,11 @@ pub(super) async fn proximity_search(
              openaddresses addresses of its Pack (DIS-LI-1031)"
         )));
     }
-    if preferences.max_results.is_some_and(|max| max < 1) {
+    let max_results = preferences.max_results.unwrap_or(1);
+    if !usize::try_from(max_results)
+        .is_ok_and(|max| (1..=crate::http::bounds::MAX_SEARCH_LIMIT).contains(&max))
+    {
         return Err(invalid("Invalid value for maxResults (DIS-LI-1036)"));
-    }
-    // og's reverse geocode answers the one nearest address, so more cannot
-    // be promised.
-    if preferences.max_results.is_some_and(|max| max > 1) {
-        return Err(invalid(
-            "Invalid value for maxResults, this server answers the one nearest address \
-             (DIS-LI-1036)",
-        ));
     }
     let country = given(location.country.as_deref())
         .ok_or_else(|| invalid("Country is not provided in the request (DIS-LI-1015)"))?;
@@ -149,31 +141,51 @@ pub(super) async fn proximity_search(
         .set("lon", lon.to_string())
         .set("lat", lat.to_string())
         .set("layer", "address")
+        .set("limit", max_results.to_string())
         .maybe("radius", radius.map(crate::compat::radius));
-    let collection = native::reverse(&state, args)
-        .await
-        .map_err(|problem| Failure::of(&problem, Some(country)).into_error(problem))?;
+    let wanted = country_code(country);
+    let collection = runtime::reverse_addresses_where(&state, args.query(), move |state, id| {
+        let pack = state.pack();
+        let record = pack.record_summary(id)?;
+        let source = &record.source.dataset;
+        if source != &dataset
+            && !source
+                .strip_prefix(&dataset)
+                .is_some_and(|tail| tail.starts_with(':'))
+        {
+            return Ok(false);
+        }
+        let context_country = pack
+            .boundary_context(id)?
+            .and_then(|context| {
+                context
+                    .admin_context
+                    .get(crate::record::PlaceLayer::Country)
+            })
+            .and_then(|country| pack.country_code(country));
+        Ok(context_country.map_or_else(
+            || {
+                record
+                    .address
+                    .country
+                    .as_deref()
+                    .is_some_and(|code| country_code(code).eq_ignore_ascii_case(&wanted))
+            },
+            |code| code.as_str().eq_ignore_ascii_case(&wanted),
+        ))
+    })
+    .await
+    .map_err(|problem| Failure::of(&problem, Some(country)).into_error(problem))?;
     let features = collection
         .features
         .iter()
         .map(Feature::from)
         .collect::<Vec<_>>();
-    let wanted = country_code(country);
     let results = features
         .iter()
         .filter_map(|feature| {
             let candidate = feature.candidate(Product::Geocode);
             let address = &candidate.address;
-            let alpha2 = address
-                .country
-                .as_ref()
-                .and_then(|country| country.iso_alpha2_code.as_deref());
-            if alpha2.is_some_and(|alpha2| !alpha2.eq_ignore_ascii_case(&wanted)) {
-                return None;
-            }
-            if !feature.is_from(&dataset) {
-                return None;
-            }
             let distance_m = feature.distance_m()?;
             if radius.is_some_and(|radius| distance_m > radius) {
                 return None;

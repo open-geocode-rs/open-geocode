@@ -846,8 +846,23 @@ impl Reader {
         radius_m: f64,
         limit: usize,
     ) -> Result<Vec<PointCandidate>> {
-        let candidates = self.block_points(lon, lat, radius_m, limit, |_, layer| {
-            Ok(layer == Layer::Address)
+        self.address_candidates_where(lon, lat, radius_m, limit, |_| Ok(true))
+    }
+
+    pub(crate) fn address_candidates_where(
+        &self,
+        lon: f64,
+        lat: f64,
+        radius_m: f64,
+        limit: usize,
+        mut accept: impl FnMut(RecordId) -> Result<bool>,
+    ) -> Result<Vec<PointCandidate>> {
+        let candidates = self.block_points(lon, lat, radius_m, limit, |id, layer| {
+            if layer == Layer::Address {
+                accept(id)
+            } else {
+                Ok(false)
+            }
         })?;
         Ok(closest_candidates(candidates, limit))
     }
@@ -1175,7 +1190,7 @@ impl Reader {
         lat: f64,
         radius_m: f64,
         limit: usize,
-        accepts: impl Fn(RecordId, Layer) -> Result<bool>,
+        mut accepts: impl FnMut(RecordId, Layer) -> Result<bool>,
     ) -> Result<Vec<PointCandidate>> {
         let mut candidates = Vec::new();
         let mut closest = Closest::new(limit);

@@ -1,7 +1,7 @@
 //! Address, location and place geocoding of Geocoding API v4.
 
 use axum::{
-    extract::{Path, RawPathParams, RawQuery, State},
+    extract::{OriginalUri, Path, RawQuery, State},
     http::HeaderMap,
     response::Response,
 };
@@ -31,17 +31,13 @@ struct GeocodeResponse {
 /// `GET /v4/geocode/address/{addressQuery}`.
 pub(super) async fn address_in_path(
     State(state): State<AppState>,
-    params: RawPathParams,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
     run(async {
         let query = QueryParams::parse(query.as_deref())?;
-        let raw = params
-            .iter()
-            .find(|(name, _)| *name == "address_query")
-            .map(|(_, value)| value)
-            .unwrap_or_default();
+        let raw = uri.path().rsplit('/').next().unwrap_or_default();
         geocode_address(&state, &headers, &query, Some(path_text(raw)?)).await
     })
     .await
@@ -50,11 +46,12 @@ pub(super) async fn address_in_path(
 /// A path segment as Google reads it. `+` is a space and a literal plus is
 /// sent as `%2B`, so `+` must become a space before the percent-decoding.
 fn path_text(raw: &str) -> Result<String, VendorError> {
-    serde_urlencoded::from_str::<Vec<(String, String)>>(&format!("q={raw}"))
+    let value = raw.replace('&', "%26");
+    serde_urlencoded::from_str::<Vec<(String, String)>>(&format!("q={value}"))
         .ok()
         .and_then(|pairs| pairs.into_iter().next())
         .map(|(_, value)| value)
-        .ok_or_else(|| invalid(format!("Invalid addressQuery: {raw:?}")))
+        .ok_or_else(|| invalid("Invalid addressQuery"))
 }
 
 /// `GET /v4/geocode/address?addressQuery=` or `?address.*=`.
@@ -188,21 +185,23 @@ fn bias(query: &QueryParams) -> Result<Option<String>, VendorError> {
     let corner = |prefix: &str| -> Result<Option<LatLng>, VendorError> {
         let latitude = query.double(&format!("{prefix}.latitude"))?;
         let longitude = query.double(&format!("{prefix}.longitude"))?;
-        Ok((latitude.is_some() || longitude.is_some()).then(|| LatLng {
-            latitude: latitude.unwrap_or_default(),
-            longitude: longitude.unwrap_or_default(),
-        }))
+        match (latitude, longitude) {
+            (Some(latitude), Some(longitude)) => Ok(Some(LatLng {
+                latitude,
+                longitude,
+            })),
+            (None, None) => Ok(None),
+            _ => Err(invalid(format!("{prefix} requires latitude and longitude"))),
+        }
     };
     let low = corner("locationBias.rectangle.low")?;
     let high = corner("locationBias.rectangle.high")?;
-    if low.is_none() && high.is_none() {
-        return Ok(None);
-    }
-    let [lon, lat] = Viewport {
-        low: low.unwrap_or_default(),
-        high: high.unwrap_or_default(),
-    }
-    .center("locationBias.rectangle")?;
+    let rectangle = match (low, high) {
+        (Some(low), Some(high)) => Viewport { low, high },
+        (None, None) => return Ok(None),
+        _ => return Err(invalid("locationBias.rectangle requires low and high")),
+    };
+    let [lon, lat] = rectangle.center("locationBias.rectangle")?;
     Ok(Some(format!("{lon},{lat}")))
 }
 
@@ -337,4 +336,17 @@ pub(super) async fn place(
         Ok(respond(&result, mask.as_ref()))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_text;
+
+    #[test]
+    fn path_query_is_decoded_once() {
+        assert_eq!(
+            path_text("A%2BB+%26+C&D%2520").expect("decoded path"),
+            "A+B & C&D%20"
+        );
+    }
 }

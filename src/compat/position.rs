@@ -48,9 +48,17 @@ fn sexagesimal(query: &str) -> Option<[f64; 2]> {
         }
         if let Some(hemisphere) = hemisphere {
             let angle = match numbers[..] {
-                [degrees] => degrees,
-                [degrees, minutes] => degrees + minutes / 60.0,
-                [degrees, minutes, seconds] => degrees + minutes / 60.0 + seconds / 3600.0,
+                [degrees] if degrees >= 0.0 => degrees,
+                [degrees, minutes] if degrees >= 0.0 && (0.0..60.0).contains(&minutes) => {
+                    degrees + minutes / 60.0
+                }
+                [degrees, minutes, seconds]
+                    if degrees >= 0.0
+                        && (0.0..60.0).contains(&minutes)
+                        && (0.0..60.0).contains(&seconds) =>
+                {
+                    degrees + minutes / 60.0 + seconds / 3600.0
+                }
                 _ => return None,
             };
             let negative = "SWsw".contains(hemisphere);

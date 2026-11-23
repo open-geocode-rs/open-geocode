@@ -48,10 +48,7 @@ pub(super) struct Gazetteer {
 
 impl Gazetteer {
     pub(super) fn load(pack: &Path) -> Result<Self> {
-        let bytes = cached_archive(pack, NAME, URL, MAX_ARCHIVE_BYTES, |bytes| {
-            Self::read(bytes).map(drop)
-        })?;
-        Self::read(&bytes)
+        cached_archive(pack, NAME, URL, MAX_ARCHIVE_BYTES, Self::read)
     }
 
     fn read(bytes: &[u8]) -> Result<Self> {
@@ -93,17 +90,31 @@ impl Gazetteer {
     }
 }
 
-fn cached_archive(
+fn cached_archive<T>(
     pack: &Path,
     name: &str,
     url: &str,
     max_bytes: u64,
-    check: impl FnOnce(&[u8]) -> Result<()>,
-) -> Result<Vec<u8>> {
+    read: impl Fn(&[u8]) -> Result<T>,
+) -> Result<T> {
     let directory = pack.join("tiger");
     let path = directory.join(format!("{name}.zip"));
-    match fs::read(&path) {
-        Ok(bytes) => return Ok(bytes),
+    match fs::File::open(&path) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(max_bytes + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|source| Error::IoPath {
+                    path: path.clone(),
+                    action: "failed to read",
+                    source,
+                })?;
+            if bytes.len() as u64 <= max_bytes
+                && let Ok(archive) = read(&bytes)
+            {
+                return Ok(archive);
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(source) => {
             return Err(Error::IoPath {
@@ -132,7 +143,7 @@ fn cached_archive(
             "TIGER archive {name} exceeds maximum size"
         )));
     }
-    check(&bytes)?;
+    let archive = read(&bytes)?;
     fs::create_dir_all(&directory)?;
     let partial = directory.join(format!("{name}.{}.part", uuid::Uuid::new_v4()));
     let stored = fs::write(&partial, &bytes).and_then(|()| fs::rename(&partial, &path));
@@ -140,7 +151,7 @@ fn cached_archive(
         let _ = fs::remove_file(&partial);
     }
     stored?;
-    Ok(bytes)
+    Ok(archive)
 }
 
 const STREET_JOIN_M: f64 = 20.0;
@@ -158,29 +169,9 @@ pub(super) fn counties_for_pack(path: &Path, cache: &Path) -> Result<BTreeSet<St
     const NAME: &str = "tl_2026_us_county";
     const URL: &str = "https://www2.census.gov/geo/tiger/TIGER2026/COUNTY/tl_2026_us_county.zip";
     let bad = |error: String| Error::BadInput(format!("TIGER {NAME}: {error}"));
-    let bytes = cached_archive(cache, NAME, URL, MAX_COUNTY_ARCHIVE_BYTES, |bytes| {
-        zip::ZipArchive::new(Cursor::new(bytes))
-            .map(drop)
-            .map_err(|error| bad(error.to_string()))
+    let mut source = cached_archive(cache, NAME, URL, MAX_COUNTY_ARCHIVE_BYTES, |bytes| {
+        shape_reader(bytes, NAME, MAX_COUNTY_ENTRY_BYTES, MAX_COUNTY_ENTRY_BYTES)
     })?;
-    let mut archive =
-        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| bad(error.to_string()))?;
-    let geometry = shapefile::ShapeReader::new(zip_entry(
-        &mut archive,
-        NAME,
-        "shp",
-        MAX_COUNTY_ENTRY_BYTES,
-    )?)
-    .map_err(|error| bad(error.to_string()))?;
-    let attributes = dbase::Reader::new(zip_entry(
-        &mut archive,
-        NAME,
-        "dbf",
-        MAX_COUNTY_ENTRY_BYTES,
-    )?)
-    .map_err(|error| bad(error.to_string()))?;
-    drop(archive);
-    let mut source = shapefile::Reader::new(geometry, attributes);
     let mut counties = BTreeSet::new();
     // Census county equivalents need no matching OSM administrative record.
     for row in source.iter_shapes_and_records_as::<shapefile::Polygon, dbase::Record>() {
@@ -219,20 +210,10 @@ pub(super) fn add_ranges(
             let name = format!("tl_2026_{county}_addrfeat");
             let url = format!("https://www2.census.gov/geo/tiger/TIGER2026/ADDRFEAT/{name}.zip");
             let bad = |error| Error::BadInput(format!("TIGER {name}: {error}"));
-            let bytes = cached_archive(cache, &name, &url, MAX_COUNTY_ARCHIVE_BYTES, |bytes| {
-                zip::ZipArchive::new(Cursor::new(bytes))
-                    .map(drop)
-                    .map_err(|error| bad(error.to_string()))
-            })?;
-            let mut archive =
-                zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| bad(error.to_string()))?;
-            let mut entry =
-                |extension| zip_entry(&mut archive, &name, extension, MAX_COUNTY_ENTRY_BYTES);
-            let geometry = shapefile::ShapeReader::new(entry("shp")?)
-                .map_err(|error| bad(error.to_string()))?;
-            let attributes =
-                dbase::Reader::new(entry("dbf")?).map_err(|error| bad(error.to_string()))?;
-            let mut reader = shapefile::Reader::new(geometry, attributes);
+            let mut reader =
+                cached_archive(cache, &name, &url, MAX_COUNTY_ARCHIVE_BYTES, |bytes| {
+                    shape_reader(bytes, &name, MAX_COUNTY_ENTRY_BYTES, MAX_COUNTY_ENTRY_BYTES)
+                })?;
             let matched = reader
                 .iter_shapes_and_records_as::<Polyline, dbase::Record>()
                 .par_bridge()
@@ -417,6 +398,23 @@ fn match_ranges(
         .collect())
 }
 
+fn zip_archive<'a>(bytes: &'a [u8], name: &str) -> Result<zip::ZipArchive<Cursor<&'a [u8]>>> {
+    zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|error| Error::BadInput(format!("TIGER {name}: {error}")))
+}
+
+type ShapeReader = shapefile::Reader<Cursor<Vec<u8>>, Cursor<Vec<u8>>>;
+
+fn shape_reader(bytes: &[u8], name: &str, shape_limit: u64, dbf_limit: u64) -> Result<ShapeReader> {
+    let bad = |error: String| Error::BadInput(format!("TIGER {name}: {error}"));
+    let mut archive = zip_archive(bytes, name)?;
+    let geometry = shapefile::ShapeReader::new(zip_entry(&mut archive, name, "shp", shape_limit)?)
+        .map_err(|error| bad(error.to_string()))?;
+    let attributes = dbase::Reader::new(zip_entry(&mut archive, name, "dbf", dbf_limit)?)
+        .map_err(|error| bad(error.to_string()))?;
+    Ok(shapefile::Reader::new(geometry, attributes))
+}
+
 fn zip_entry<R: Read + io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
@@ -427,6 +425,9 @@ fn zip_entry<R: Read + io::Seek>(
     let file = archive
         .by_name(&format!("{name}.{extension}"))
         .map_err(|error| bad(error.to_string()))?;
+    if !file.is_file() {
+        return Err(bad(format!("{extension} entry is not a file")));
+    }
     if file.size() > limit {
         return Err(bad("entry exceeds maximum size".into()));
     }
@@ -483,20 +484,9 @@ pub(super) fn add_blocks(
             };
             let url = format!("https://www2.census.gov/geo/tiger/{folder}/{name}.zip");
             let bad = |error| Error::BadInput(format!("TIGER {name}: {error}"));
-            let bytes = cached_archive(cache, &name, &url, 512 << 20, |bytes| {
-                zip::ZipArchive::new(Cursor::new(bytes))
-                    .map(drop)
-                    .map_err(|error| bad(error.to_string()))
+            let mut reader = cached_archive(cache, &name, &url, 512 << 20, |bytes| {
+                shape_reader(bytes, &name, 2 << 30, 512 << 20)
             })?;
-            let mut archive =
-                zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| bad(error.to_string()))?;
-            let geometry =
-                shapefile::ShapeReader::new(zip_entry(&mut archive, &name, "shp", 2 << 30)?)
-                    .map_err(|error| bad(error.to_string()))?;
-            let attributes = dbase::Reader::new(zip_entry(&mut archive, &name, "dbf", 512 << 20)?)
-                .map_err(|error| bad(error.to_string()))?;
-            drop(archive);
-            let mut reader = shapefile::Reader::new(geometry, attributes);
             let mut areas = Vec::new();
             for row in reader.iter_shapes_and_records_as::<shapefile::Polygon, dbase::Record>() {
                 progress.check()?;
@@ -575,20 +565,11 @@ fn county_faces(cache: &Path, county: &str) -> Result<HashMap<u64, Face>> {
     let name = format!("tl_2026_{county}_faces");
     let url = format!("https://www2.census.gov/geo/tiger/TIGER2026/FACES/{name}.zip");
     let bad = |error: String| Error::BadInput(format!("TIGER {name}: {error}"));
-    let bytes = cached_archive(cache, &name, &url, MAX_COUNTY_ARCHIVE_BYTES, |bytes| {
-        zip::ZipArchive::new(Cursor::new(bytes))
-            .map(drop)
-            .map_err(|error| bad(error.to_string()))
+    let mut reader = cached_archive(cache, &name, &url, MAX_COUNTY_ARCHIVE_BYTES, |bytes| {
+        let mut archive = zip_archive(bytes, &name)?;
+        let table = zip_entry(&mut archive, &name, "dbf", MAX_COUNTY_ENTRY_BYTES)?;
+        dbase::Reader::new(table).map_err(|error| bad(error.to_string()))
     })?;
-    let mut archive =
-        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| bad(error.to_string()))?;
-    let mut reader = dbase::Reader::new(zip_entry(
-        &mut archive,
-        &name,
-        "dbf",
-        MAX_COUNTY_ENTRY_BYTES,
-    )?)
-    .map_err(|error| bad(error.to_string()))?;
     let mut faces = HashMap::new();
     for row in reader.iter_records() {
         let row = row.map_err(|error| bad(error.to_string()))?;
@@ -637,29 +618,10 @@ pub(super) fn add_zcta(
             let name = format!("tl_2026_{county}_faces");
             let url = format!("https://www2.census.gov/geo/tiger/TIGER2026/FACES/{name}.zip");
             let bad = |error: String| Error::BadInput(format!("TIGER {name}: {error}"));
-            let bytes = cached_archive(cache, &name, &url, MAX_COUNTY_ARCHIVE_BYTES, |bytes| {
-                zip::ZipArchive::new(Cursor::new(bytes))
-                    .map(drop)
-                    .map_err(|error| bad(error.to_string()))
-            })?;
-            let mut archive =
-                zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| bad(error.to_string()))?;
-            let geometry = shapefile::ShapeReader::new(zip_entry(
-                &mut archive,
-                &name,
-                "shp",
-                MAX_COUNTY_ENTRY_BYTES,
-            )?)
-            .map_err(|error| bad(error.to_string()))?;
-            let attributes = dbase::Reader::new(zip_entry(
-                &mut archive,
-                &name,
-                "dbf",
-                MAX_COUNTY_ENTRY_BYTES,
-            )?)
-            .map_err(|error| bad(error.to_string()))?;
-            drop(archive);
-            let mut reader = shapefile::Reader::new(geometry, attributes);
+            let mut reader =
+                cached_archive(cache, &name, &url, MAX_COUNTY_ARCHIVE_BYTES, |bytes| {
+                    shape_reader(bytes, &name, MAX_COUNTY_ENTRY_BYTES, MAX_COUNTY_ENTRY_BYTES)
+                })?;
             // Census faces carry the ZCTA code along with their other
             // geocodes, so a county build need not fetch national polygons.
             for row in reader.iter_shapes_and_records_as::<shapefile::Polygon, dbase::Record>() {
@@ -693,4 +655,38 @@ pub(super) fn add_zcta(
         sealed.add_section(crate::tiger::ZCTA_SECTION, crate::tiger::VERSION, &bytes)?;
     }
     Ok(bytes.len() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    #[test]
+    fn cache_requires_the_requested_entry() {
+        let root = std::env::temp_dir().join(format!("og-tiger-cache-{}", uuid::Uuid::new_v4()));
+        let cache = root.join("tiger");
+        fs::create_dir_all(&cache).unwrap();
+        let path = cache.join("fixture.zip");
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file("fixture.dbf", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"test data").unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        fs::write(&path, &bytes).unwrap();
+
+        let load = |entry, limit| {
+            cached_archive(&root, "fixture", "", limit, |bytes| {
+                let mut archive = zip_archive(bytes, "fixture")?;
+                zip_entry(&mut archive, "fixture", entry, 32)
+            })
+        };
+        assert_eq!(load("dbf", 1024).unwrap().into_inner(), b"test data");
+        assert!(matches!(load("shp", 1024), Err(Error::Fetch { .. })));
+        assert!(matches!(load("dbf", 4), Err(Error::Fetch { .. })));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

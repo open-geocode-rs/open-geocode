@@ -453,6 +453,11 @@ fn find(state: &AppState, id: &str) -> Result<View, BatchError> {
         .ok_or_else(BatchError::job_not_found)
 }
 
+async fn read_view(state: &AppState, id: &str) -> Result<View, BatchError> {
+    let _guard = LOCK.lock().await;
+    find(state, id)
+}
+
 fn stored(state: &AppState) -> Vec<Meta> {
     let Ok(entries) = fs::read_dir(store_dir(state)) else {
         return Vec::new();
@@ -960,11 +965,11 @@ impl Reader<'_> {
                 || std::str::from_utf8(&line).is_err();
             // Only an inline layout consumes a header from the upload.
             record_number += 1;
-            self.record(layout, record_number, &text, broken)
-                .map_err(|error| Refusal::Unreadable(error.to_string()))?;
-            if self.intake.items > self.max_items {
+            if record_number > self.max_items {
                 return Err(Refusal::TooManyRecords(self.max_items));
             }
+            self.record(layout, record_number, &text, broken)
+                .map_err(|error| Refusal::Unreadable(error.to_string()))?;
         }
         self.items
             .flush()
@@ -1226,6 +1231,12 @@ fn translate(service: Service, record: &Record) -> Result<Translated, Gs7Error> 
                 at,
                 limit,
             };
+            if request.conflicting_country() {
+                return Err(Gs7Error::new(
+                    StatusCode::BAD_REQUEST,
+                    "Qualified country is outside the requested area",
+                ));
+            }
             let fields = request.og_fields().ok_or_else(|| {
                 Gs7Error::new(StatusCode::BAD_REQUEST, "Missing parameter 'q' or 'qq'")
                     .action("Provide 'q', 'qq' or qualified columns")
@@ -1279,11 +1290,23 @@ fn translate(service: Service, record: &Record) -> Result<Translated, Gs7Error> 
                     ));
                 }
             };
+            let mut fields = vec![
+                ("lon", center.lng.to_string()),
+                ("lat", center.lat.to_string()),
+            ];
+            if let Some(radius) = radius_m {
+                const MAX: f64 = crate::reverse::MAX_RADIUS_M;
+                if radius > MAX {
+                    return Err(Gs7Error::illegal(
+                        "in",
+                        area.as_deref().unwrap_or_default(),
+                        format!("Provide a radius greater than zero and at most {MAX} meters"),
+                    ));
+                }
+                fields.push(("radius", radius.to_string()));
+            }
             Ok(Translated {
-                fields: vec![
-                    ("lon", center.lng.to_string()),
-                    ("lat", center.lat.to_string()),
-                ],
+                fields,
                 limit,
                 radius_m: radius_m.map(|radius| radius.ceil() as u64),
             })
@@ -1475,13 +1498,15 @@ async fn create_job(
         notification_ids: plan.notification_ids,
     };
     let _guard = LOCK.lock().await;
-    if plan.start
-        && let Err(error) = launch(state, &mut meta, uuid).await
-    {
+    let stored = if plan.start {
+        launch(state, &mut meta, uuid).await
+    } else {
+        save(state, &meta).map_err(internal)
+    };
+    if let Err(error) = stored {
         remove_files(state, &id, true);
         return Err(error);
     }
-    save(state, &meta).map_err(internal)?;
     let mut view = view(state, meta).ok_or_else(BatchError::job_not_found)?;
     // A created job is submitted, whether its start follows or not; a read
     // after tells how far it has run.
@@ -1520,18 +1545,21 @@ async fn launch(state: &AppState, meta: &mut Meta, uuid: uuid::Uuid) -> Result<(
     .await
     .map_err(BatchError::of)?;
     let run = job.snapshot().id;
-    {
-        let state = state.clone();
-        let id = meta.id.clone();
-        let run = run.clone();
-        tokio::spawn(async move {
-            job.ended().await;
-            announce_end(&state, &id, &run).await;
-        });
-    }
-    meta.runs.push(run);
+    meta.runs.push(run.clone());
     meta.started.get_or_insert_with(unix_now);
     meta.stopped = false;
+    if let Err(error) = save(state, meta) {
+        state.jobs().remove(&run);
+        // The first run reuses the job UUID on retry.
+        job.ended().await;
+        return Err(internal(error));
+    }
+    let state = state.clone();
+    let id = meta.id.clone();
+    tokio::spawn(async move {
+        job.ended().await;
+        announce_end(&state, &id, &run).await;
+    });
     Ok(())
 }
 
@@ -1785,7 +1813,7 @@ pub(super) async fn details(
     headers: HeaderMap,
     UrlPath(id): UrlPath<String>,
 ) -> Response {
-    match find(&state, &id) {
+    match read_view(&state, &id).await {
         Ok(view) => {
             axum::Json(job_details(&view, &links_for(&state, &headers, &uri))).into_response()
         }
@@ -1814,7 +1842,6 @@ pub(super) async fn start(
             _ => uuid::Uuid::new_v4(),
         };
         launch(&state, &mut meta, uuid).await?;
-        save(&state, &meta).map_err(internal)?;
         let mut view = view(&state, meta).ok_or_else(BatchError::job_not_found)?;
         view.status = "queued";
         Ok::<_, BatchError>(view)
@@ -2058,7 +2085,11 @@ const COLUMNS: [&str; 46] = [
 const STANDARD: [&str; 3] = ["recId", "seqNumber", "seqLength"];
 
 fn output_columns(meta: &Meta) -> Vec<&'static str> {
-    let asked = match &meta.output_columns {
+    let asked = match meta
+        .output_columns
+        .as_ref()
+        .filter(|columns| !columns.is_empty())
+    {
         Some(asked) => asked
             .iter()
             .filter_map(|name| {
@@ -2100,10 +2131,13 @@ fn cell_of(item: &Item, column: &str) -> String {
         "addressStateCode" => text(&address.state_code),
         "addressState" => text(&address.state),
         "addressCounty" => text(&address.county),
+        "addressCountyCode" => text(&address.county_code),
         "addressCity" => text(&address.city),
         "addressDistrict" => text(&address.district),
         "addressSubdistrict" => text(&address.subdistrict),
         "addressStreet" => text(&address.street),
+        "addressBlock" => text(&address.block),
+        "addressSubblock" => text(&address.subblock),
         "addressPostalCode" => text(&address.postal_code),
         "addressHouseNumber" => text(&address.house_number),
         "addressUnit" => text(&address.unit),
@@ -2421,7 +2455,7 @@ pub(super) async fn results(
     Rid(request_id): Rid,
     UrlPath(id): UrlPath<String>,
 ) -> Response {
-    let view = match find(&state, &id) {
+    let view = match read_view(&state, &id).await {
         Ok(view) => view,
         Err(error) => return error.into_response(&request_id),
     };
@@ -2453,7 +2487,7 @@ pub(super) async fn errors(
     Rid(request_id): Rid,
     UrlPath(id): UrlPath<String>,
 ) -> Response {
-    let view = match find(&state, &id) {
+    let view = match read_view(&state, &id).await {
         Ok(view) => view,
         Err(error) => return error.into_response(&request_id),
     };
@@ -2688,6 +2722,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_metadata_save_removes_only_the_new_run() {
+        use super::super::tests::pack;
+
+        let pack = pack("batch-metadata-rollback");
+        let state = pack.state(crate::limits::Limits::DEFAULT);
+        let mut meta = meta(false, false);
+        let uuid = job_uuid(&meta.id).unwrap();
+        let run = uuid.simple().to_string();
+        fs::create_dir_all(store_dir(&state)).unwrap();
+        save(&state, &meta).unwrap();
+        fs::write(
+            file(&state, &meta.id, "items"),
+            "{\"id\":\"0|1||1\",\"q\":\"King Street\"}\n",
+        )
+        .unwrap();
+
+        let partial = file(&state, &meta.id, "json.partial");
+        fs::create_dir(&partial).unwrap();
+        {
+            let _guard = LOCK.lock().await;
+            assert!(launch(&state, &mut meta, uuid).await.is_err());
+        }
+        assert!(state.jobs().get(&run).is_none());
+        assert!(!state.jobs().dir().join(format!("{run}.json")).exists());
+
+        fs::remove_dir(partial).unwrap();
+        let mut meta = load(&state, &meta.id).unwrap();
+        assert!(meta.runs.is_empty());
+        {
+            let _guard = LOCK.lock().await;
+            launch(&state, &mut meta, uuid).await.unwrap();
+        }
+        state.jobs().get(&run).unwrap().ended().await;
+        assert_eq!(load(&state, &meta.id).unwrap().runs, [run]);
+    }
+
+    #[tokio::test]
     async fn a_finished_run_answered_every_item() {
         use super::super::tests::{finished_job, pack};
 
@@ -2735,12 +2806,25 @@ mod tests {
     }
 
     #[test]
+    fn revgeocode_rejects_a_circle_above_the_native_limit() {
+        let record = Record(vec![("in".into(), "52.5,13.3,1000.1".into())]);
+        assert!(matches!(
+            translate(Service::Revgeocode, &record),
+            Err(error) if error.status == StatusCode::BAD_REQUEST
+        ));
+    }
+
+    #[test]
     fn revgeocode_reads_a_bare_circle() {
         let record = Record(vec![("in".into(), "52.5,13.3,250".into())]);
         let translated = translate(Service::Revgeocode, &record).unwrap();
         assert_eq!(
             translated.fields,
-            [("lon", "13.3".to_string()), ("lat", "52.5".to_string())]
+            [
+                ("lon", "13.3".to_string()),
+                ("lat", "52.5".to_string()),
+                ("radius", "250".to_string()),
+            ]
         );
         assert_eq!(translated.radius_m, Some(250));
         assert_eq!(translated.limit, 1);

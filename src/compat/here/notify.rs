@@ -239,9 +239,7 @@ fn read(body: &[u8]) -> Result<String, BatchError> {
     if !valid {
         return Err(BatchError::bad_request(
             "Illegal input for field 'config.url'",
-            format!(
-                "Actual value: '{url}'; provide an absolute http or https URL whose placeholders are job properties"
-            ),
+            "Provide an absolute http or https URL whose placeholders are job properties",
         ));
     }
     Ok(url)
@@ -253,9 +251,7 @@ fn on_allowed_host(state: &AppState, url: String) -> Result<String, BatchError> 
         true => Ok(url),
         false => Err(BatchError::bad_request(
             "Illegal input for field 'config.url'",
-            format!(
-                "Actual value: '{url}'; this server calls back only the hosts its operator allows"
-            ),
+            "This server calls back only the hosts its operator allows",
         )),
     }
 }
@@ -271,7 +267,12 @@ fn allowed(state: &AppState, url: &str) -> bool {
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .to_string();
-            Some(state.may_call(&host, uri.port_u16()))
+            let port = match uri.scheme_str()? {
+                "http" => 80,
+                "https" => 443,
+                _ => return None,
+            };
+            Some(state.may_call(&host, Some(uri.port_u16().unwrap_or(port))))
         })
         .unwrap_or(false)
 }
@@ -351,6 +352,9 @@ pub(super) async fn delete(
     Rid(request_id): Rid,
     UrlPath(id): UrlPath<String>,
 ) -> Response {
+    let _guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let removed = file(&state, &id).is_some_and(|path| fs::remove_file(path).is_ok());
     if removed {
         StatusCode::NO_CONTENT.into_response()
@@ -428,6 +432,7 @@ fn call(state: &AppState, id: &str, facts: &Facts) -> Result<(), String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(TIMEOUT))
         .http_status_as_error(false)
+        .max_redirects(0)
         .user_agent(concat!("open-geocode/", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
@@ -437,7 +442,7 @@ fn call(state: &AppState, id: &str, facts: &Facts) -> Result<(), String> {
             "the endpoint answered {}",
             response.status().as_u16()
         )),
-        Err(error) => Err(format!("the call failed: {error}")),
+        Err(_) => Err("the call failed before receiving an HTTP response".to_string()),
     };
     match outcome {
         Ok(status) => {

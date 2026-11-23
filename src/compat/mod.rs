@@ -518,7 +518,13 @@ pub(crate) mod native {
         if !asked {
             name_joined_areas(state.pack(), &mut common.context);
         }
-        with_street_postcode(&mut common.address, common.street_postcode.as_ref());
+        with_street_postcode(
+            &mut common.address,
+            common
+                .street_postcode
+                .as_ref()
+                .or(common.zcta_postcode.as_ref()),
+        );
     }
 
     /// Runs a lookup and keeps one copy of each house in its answer. Where
@@ -617,9 +623,10 @@ pub(crate) mod native {
         });
         addresses.features = merge_search_results(addresses.features, places, query.as_deref());
         let mut seen = std::collections::HashSet::new();
-        addresses
-            .features
-            .retain(|feature| seen.insert(feature.properties.common.id.clone()));
+        addresses.features.retain(|feature| {
+            let common = &feature.properties.common;
+            seen.insert((common.id.clone(), common.layer))
+        });
         addresses.features.truncate(limit);
         Ok(addresses)
     }
@@ -708,6 +715,7 @@ pub(crate) mod native {
             own == Some(PartMatch::Matched)
                 && [
                     found.housenumber,
+                    found.street,
                     found.unit,
                     found.locality,
                     found.region,

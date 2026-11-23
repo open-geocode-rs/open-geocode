@@ -438,16 +438,6 @@ impl Feature {
         self.geometry.coordinates
     }
 
-    /// Whether og took it from `dataset`, `osm` or `openaddresses`, whose
-    /// sources og names `openaddresses:<source>`.
-    pub(super) fn is_from(&self, dataset: &str) -> bool {
-        let source = &self.properties.source.dataset;
-        source == dataset
-            || source
-                .strip_prefix(dataset)
-                .is_some_and(|rest| rest.starts_with(':'))
-    }
-
     /// The result itself as an area of `layer`, when it is one. An area's
     /// `context` holds only the areas around it.
     fn own(&self, layer: Layer) -> Option<AreaRef<'_>> {

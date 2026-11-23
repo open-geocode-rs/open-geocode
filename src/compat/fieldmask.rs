@@ -12,14 +12,16 @@ pub(crate) enum FieldMask {
     Paths(Node),
 }
 
-/// One level of the mask. A field with no children keeps its whole value.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Node(BTreeMap<String, Node>);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Node {
+    All,
+    Fields(BTreeMap<String, Node>),
+}
 
 impl FieldMask {
     /// Reads a mask. `None` when it names no field, which is no mask.
     pub(crate) fn parse(mask: &str) -> Option<Self> {
-        let mut root = Node::default();
+        let mut root = Node::Fields(BTreeMap::new());
         let mut any = false;
         for path in mask
             .split(',')
@@ -30,31 +32,46 @@ impl FieldMask {
                 return Some(Self::All);
             }
             any = true;
-            let mut node = &mut root;
-            for part in path.split('.').filter(|part| !part.is_empty()) {
-                if part == "*" {
-                    break;
-                }
-                node = node.0.entry(camel_case(part)).or_default();
+            let mut parts = path
+                .split('.')
+                .filter(|part| !part.is_empty())
+                .take_while(|part| *part != "*")
+                .peekable();
+            if parts.peek().is_none() {
+                continue;
             }
+            let mut node = &mut root;
+            for part in parts {
+                let Node::Fields(fields) = node else {
+                    break;
+                };
+                node = fields
+                    .entry(camel_case(part))
+                    .or_insert_with(|| Node::Fields(BTreeMap::new()));
+            }
+            *node = Node::All;
         }
-        any.then_some(Self::Paths(root))
+        match root {
+            Node::Fields(fields) if fields.is_empty() => any.then_some(Self::Paths(Node::All)),
+            _ => Some(Self::Paths(root)),
+        }
     }
 
     /// Whether the mask keeps the field at `path`, or a field inside it.
     /// No mask, or `*`, keeps every field.
     pub(crate) fn asks(mask: Option<&Self>, path: &[&str]) -> bool {
-        let Some(Self::Paths(mut node)) = mask.cloned() else {
+        let Some(Self::Paths(node)) = mask else {
             return true;
         };
+        let mut node = node;
         for part in path {
-            if node.0.is_empty() {
+            let Node::Fields(fields) = node else {
                 return true;
-            }
-            match node.0.remove(*part) {
-                Some(child) => node = child,
-                None => return false,
-            }
+            };
+            let Some(child) = fields.get(*part) else {
+                return false;
+            };
+            node = child;
         }
         true
     }
@@ -70,17 +87,18 @@ impl FieldMask {
 
 impl Node {
     fn apply(&self, value: &mut Value) {
-        if self.0.is_empty() {
+        let Self::Fields(fields) = self else {
             return;
-        }
+        };
         match value {
             Value::Object(object) => {
-                object.retain(|key, _| self.0.contains_key(key));
-                for (key, child) in object.iter_mut() {
-                    if let Some(node) = self.0.get(key) {
-                        node.apply(child);
-                    }
-                }
+                object.retain(|key, child| {
+                    let Some(node) = fields.get(key) else {
+                        return false;
+                    };
+                    node.apply(child);
+                    true
+                });
             }
             Value::Array(items) => items.iter_mut().for_each(|item| self.apply(item)),
             _ => {}
@@ -142,6 +160,25 @@ mod tests {
             masked("displayName", value),
             json!({"displayName": {"text": "A", "languageCode": "en"}})
         );
+    }
+
+    #[test]
+    fn a_parent_path_keeps_all_children_in_either_order() {
+        let value = json!({"place": {"name": {"text": "A", "languageCode": "en"}, "id": "a"}});
+        let expected = json!({"place": {"name": {"text": "A", "languageCode": "en"}}});
+        for path in [
+            "place.name,place.name.text",
+            "place.name.text,place.name",
+            "place.name.text,place.name.*",
+        ] {
+            let mask = FieldMask::parse(path).unwrap();
+            assert!(FieldMask::asks(
+                Some(&mask),
+                &["place", "name", "languageCode"]
+            ));
+            assert!(!FieldMask::asks(Some(&mask), &["place", "id"]));
+            assert_eq!(masked(path, value.clone()), expected);
+        }
     }
 
     #[test]

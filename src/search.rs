@@ -1548,21 +1548,22 @@ impl TextSearcher {
             }
             None
         });
-        let matching = |hit: &TextSearchHit, point| {
-            within_bias(hit, point)
-                && ordinal.is_none_or(|number| {
-                    hit.record
-                        .address
-                        .street
-                        .as_deref()
-                        .and_then(search_key)
-                        .is_some_and(|street| {
-                            street.split_whitespace().any(|word| {
-                                word == number || street_ordinal_number(word) == Some(number)
-                            })
+        let same_ordinal = |hit: &TextSearchHit| {
+            ordinal.is_none_or(|number| {
+                hit.record
+                    .address
+                    .street
+                    .as_deref()
+                    .and_then(search_key)
+                    .is_some_and(|street| {
+                        street.split_whitespace().any(|word| {
+                            word == number || street_ordinal_number(word) == Some(number)
                         })
-                })
+                    })
+            })
         };
+        let matching = |hit: &TextSearchHit, point| within_bias(hit, point) && same_ordinal(hit);
+        let mut far = Vec::new();
         for completion in Completion::ALL {
             if completion == Completion::AllWords
                 && let Some(point) = scoped
@@ -1581,7 +1582,16 @@ impl TextSearcher {
             }
             let mut hits = self.autocomplete_as(options, completion)?;
             if let Some(point) = scoped {
-                hits.retain(|hit| matching(hit, point));
+                if options.focus.is_some() {
+                    let (near, other): (Vec<_>, Vec<_>) =
+                        hits.into_iter().partition(|hit| matching(hit, point));
+                    if far.is_empty() {
+                        far = other.into_iter().filter(same_ordinal).collect();
+                    }
+                    hits = near;
+                } else {
+                    hits.retain(|hit| matching(hit, point));
+                }
             }
             if !hits.is_empty() {
                 return Ok(hits);
@@ -1590,7 +1600,8 @@ impl TextSearcher {
         if let Some(normalized) = autocomplete_country_alias(options) {
             return self.autocomplete(&normalized);
         }
-        self.complete_address(options)
+        let completed = self.complete_address(options)?;
+        Ok(if completed.is_empty() { far } else { completed })
     }
 
     fn complete_address(&self, options: &TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
@@ -7423,6 +7434,9 @@ impl TextSearcher {
                 )
             })
             .collect::<Vec<_>>();
+        if let Some(layer) = filters.layer {
+            clauses.push((Occur::Must, self.layer_query(layer)));
+        }
         for word in context {
             let either = [self.fields.context_text, self.fields.content_text].map(|field| {
                 Box::new(TermQuery::new(
@@ -11110,6 +11124,9 @@ pub fn suggest(
     places: &TextSearcher,
     options: &TextAutocompleteOptions,
 ) -> Result<Vec<TextSearchHit>> {
+    if options.layer.as_deref() == Some(Layer::Poi.as_str()) {
+        return places.autocomplete(options);
+    }
     if addresses.numbered_completion_focus(options).is_some() {
         return addresses.autocomplete(options);
     }

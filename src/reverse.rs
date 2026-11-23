@@ -218,26 +218,22 @@ impl PackReverseGeocoder {
         layer: Layer,
         limit: usize,
     ) -> Result<Vec<GeocodeResponse>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let (lon, lat) = (options.lon, options.lat);
         // Each result is labelled by its own areas, in a context of its own.
         let fresh = || (Context::default(), Vec::<RecordId>::new());
         let found = match layer {
-            Layer::Address => {
-                let mut found = self
-                    .spatial
-                    .address_candidates(lon, lat, options.radius_m, limit)?
-                    .iter()
-                    .map(|candidate| {
-                        let (mut context, mut ids) = fresh();
-                        self.address_at(options, candidate, &mut context, &mut ids)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                if found.iter().all(Option::is_none) && limit > 0 {
+            Layer::Address => self
+                .spatial
+                .address_candidates(lon, lat, options.radius_m, limit)?
+                .iter()
+                .map(|candidate| {
                     let (mut context, mut ids) = fresh();
-                    found.push(self.tiger_estimate(options, &mut context, &mut ids)?);
-                }
-                found
-            }
+                    self.address_at(options, candidate, &mut context, &mut ids)
+                })
+                .collect::<Result<Vec<_>>>()?,
             Layer::Poi => self
                 .spatial
                 .poi_candidates(lon, lat, options.radius_m, limit)?
@@ -266,7 +262,7 @@ impl PackReverseGeocoder {
                         self.estimated_at(options, candidate, &mut context, &mut ids)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                if found.iter().all(Option::is_none) && limit > 0 {
+                if found.iter().all(Option::is_none) {
                     let (mut context, mut ids) = fresh();
                     found.push(self.tiger_estimate(options, &mut context, &mut ids)?);
                 }
@@ -310,6 +306,33 @@ impl PackReverseGeocoder {
             .collect())
     }
 
+    pub(crate) fn reverse_addresses_where(
+        &self,
+        options: GeocodeOptions,
+        limit: usize,
+        accept: impl FnMut(RecordId) -> Result<bool>,
+    ) -> Result<Vec<GeocodeResponse>> {
+        let (lon, lat) = (options.lon, options.lat);
+        self.spatial
+            .address_candidates_where(lon, lat, options.radius_m, limit, accept)?
+            .iter()
+            .filter_map(|point| {
+                self.address_at(options, point, &mut Context::default(), &mut Vec::new())
+                    .transpose()
+            })
+            .map(|found| {
+                found.map(|mut result| {
+                    result.evidence.context_record_ids.clear();
+                    GeocodeResponse {
+                        lon,
+                        lat,
+                        result: Some(result),
+                    }
+                })
+            })
+            .collect()
+    }
+
     fn of_layer(
         &self,
         layer: Layer,
@@ -318,12 +341,7 @@ impl PackReverseGeocoder {
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<Option<GeocodeResult>> {
         match layer {
-            Layer::Address => {
-                if let Some(result) = self.explicit_address(options, context, context_record_ids)? {
-                    return Ok(Some(result));
-                }
-                self.tiger_estimate(options, context, context_record_ids)
-            }
+            Layer::Address => self.explicit_address(options, context, context_record_ids),
             Layer::Interpolation => self.estimated_address(options, context, context_record_ids),
             Layer::Street => self.nearest_street(options, context, context_record_ids),
             Layer::Poi => self.nearest_poi(options, context, context_record_ids),

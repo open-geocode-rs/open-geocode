@@ -312,6 +312,9 @@ impl Viewport {
     pub(super) fn center(self, field: &str) -> Result<[f64; 2], VendorError> {
         let [west, south] = self.low.checked(&format!("{field}.low"))?;
         let [east, north] = self.high.checked(&format!("{field}.high"))?;
+        if south > north || (west == 180.0 && east == -180.0) {
+            return Err(invalid(format!("{field} is empty")));
+        }
         let east = if west > east { east + 360.0 } else { east };
         let mut lon = f64::midpoint(west, east);
         if lon > 180.0 {

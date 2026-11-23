@@ -1073,7 +1073,13 @@ impl Spill for PendingAddress {
     }
 
     fn resident_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.order.capacity() + entrances_heap_bytes(&self.access)
+        let building = self.building.as_deref().map_or(0, |building| {
+            std::mem::size_of::<Building>() + building.name.as_ref().map_or(0, String::capacity)
+        });
+        std::mem::size_of::<Self>()
+            + self.order.capacity()
+            + entrances_heap_bytes(&self.access)
+            + building
     }
 }
 

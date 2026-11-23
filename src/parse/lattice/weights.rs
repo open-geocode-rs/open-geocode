@@ -393,9 +393,7 @@ impl Weights {
             return Ok(None);
         }
         let bytes = container.section(WEIGHTS_SECTION, WEIGHTS_VERSION)?;
-        Self::from_bytes(&bytes)
-            .map_err(|_| Error::Decode("invalid parser weights section"))
-            .map(Some)
+        Self::from_bytes(&bytes).map(Some)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {

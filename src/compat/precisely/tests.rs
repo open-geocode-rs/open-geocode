@@ -1999,16 +1999,16 @@ async fn proximity_search_finds_the_nearest_address() {
     let metres = og["features"][0]["properties"]["distance_m"]
         .as_f64()
         .expect("distance");
-    let search = |distance: Value, country: &str| {
+    let search = |distance: Value, country: &str, limit: usize| {
         let router = router.clone();
         let body = json!({
-            "preferences": {"dataset": "osm", "maxResults": 1, "distance": distance},
+            "preferences": {"dataset": "osm", "maxResults": limit, "distance": distance},
             "location": {"addressId": "7", "latitude": 43.6494, "longitude": -79.3816,
                          "country": country},
         });
         async move { post(&router, "/v1/proximity-search", &body).await }
     };
-    let reply = search(json!({"value": 1, "distanceUnit": "KILOMETER"}), "CAN").await;
+    let reply = search(json!({"value": 1, "distanceUnit": "KILOMETER"}), "CAN", 3).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(
         reply.json(),
@@ -2029,7 +2029,7 @@ async fn proximity_search_finds_the_nearest_address() {
             },
         }]}})
     );
-    let reply = search(json!({"value": 100, "distanceUnit": "FOOT"}), "CA").await;
+    let reply = search(json!({"value": 100, "distanceUnit": "FOOT"}), "CA", 1).await;
     let feet = reply.json()["response"]["results"][0]["distance"]
         .as_f64()
         .expect("feet");
@@ -2040,7 +2040,7 @@ async fn proximity_search_finds_the_nearest_address() {
         (json!({"value": 1, "distanceUnit": "KILOMETER"}), "USA"),
     ] {
         assert_eq!(
-            search(distance, country).await.json(),
+            search(distance, country, 1).await.json(),
             json!({"response": {"addressId": "7", "status": "ZERO_RESULTS", "results": []}})
         );
     }
@@ -2057,10 +2057,9 @@ async fn proximity_search_finds_the_nearest_address() {
              osm and openaddresses addresses of its Pack (DIS-LI-1031)",
         ),
         (
-            json!({"preferences": {"dataset": "osm", "maxResults": 3},
+            json!({"preferences": {"dataset": "osm", "maxResults": 51},
                    "location": {"latitude": 1, "longitude": 1, "country": "CA"}}),
-            "Invalid value for maxResults, this server answers the one nearest address \
-             (DIS-LI-1036)",
+            "Invalid value for maxResults (DIS-LI-1036)",
         ),
         (
             json!({"preferences": {"dataset": "osm"}, "location": {"latitude": 1, "longitude": 1}}),

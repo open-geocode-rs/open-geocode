@@ -359,9 +359,9 @@ pub(super) struct ItemAddress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) state_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    block: Option<String>,
+    pub(super) block: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    subblock: Option<String>,
+    pub(super) subblock: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -132,7 +132,7 @@ impl MatchCode {
             3
         } else if verified(judged.postcode) {
             2
-        } else if verified(judged.locality) || verified(judged.country) {
+        } else if verified(judged.locality) && verified(judged.country) {
             1
         } else {
             return None;
@@ -432,7 +432,15 @@ mod tests {
             locality: Some(PartMatch::Matched),
             ..QueryMatch::default()
         };
-        assert_eq!(level(town).as_deref(), Some("V1"));
+        assert_eq!(level(town), None);
+        assert_eq!(
+            level(QueryMatch {
+                country: Some(PartMatch::Matched),
+                ..town
+            })
+            .as_deref(),
+            Some("V1")
+        );
         let nothing = QueryMatch {
             street: Some(PartMatch::Unmatched),
             ..QueryMatch::default()

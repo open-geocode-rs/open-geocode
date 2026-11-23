@@ -849,7 +849,7 @@ pub(super) struct Batch {
 /// One batch query, checked by og's batch engine.
 #[derive(Clone)]
 enum Checked {
-    Places(Named<PlacesRequest>),
+    Places(Named<PlacesRequest>, crate::compat::OgRef),
     Geocode(Named<GeocodeRequest>),
     Typed(Box<BatchCompletion>),
     /// The geocode of the label a vendor id carries, kept to the record the
@@ -1049,7 +1049,7 @@ fn check(
             };
             let ids = Args::new().set("ids", id).maybe("lang", lang);
             match prepared(og_batch::prepare(state, runtime::PLACES, &[], item(ids))) {
-                Ok(request) => Ok(Checked::Places(request)),
+                Ok(request) => Ok(Checked::Places(request, named)),
                 Err(problem) if problem.status() == 400 => {
                     prepared(og_batch::prepare(state, runtime::GEOCODE, &[], item(text)))
                         .map(Checked::Geocode)
@@ -1076,7 +1076,7 @@ fn item(args: Args) -> RawItem {
 
 fn place(query: &Checked) -> Place {
     match query {
-        Checked::Places(request) => Place::Places((runtime::PLACES.place)(request)),
+        Checked::Places(request, _) => Place::Places((runtime::PLACES.place)(request)),
         Checked::Geocode(request) | Checked::Labelled(request, _) => {
             Place::Geocode((runtime::GEOCODE.place)(request))
         }
@@ -1087,14 +1087,17 @@ fn place(query: &Checked) -> Place {
 
 fn look_up(state: &AppState, query: &Checked, cancel: &Arc<AtomicBool>) -> Result<Answer, Problem> {
     match query {
-        Checked::Places(request) => outcome(og_batch::look_up(
+        Checked::Places(request, named) => outcome(og_batch::look_up(
             state,
             runtime::PLACES,
             None,
             request.clone(),
             cancel,
         ))
-        .map(Answer::Forward),
+        .map(|mut collection| {
+            native::keep_named(&mut collection, named);
+            Answer::Forward(collection)
+        }),
         Checked::Geocode(request) => outcome(og_batch::look_up(
             state,
             runtime::GEOCODE,

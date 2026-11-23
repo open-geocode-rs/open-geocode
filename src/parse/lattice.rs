@@ -647,8 +647,15 @@ impl ParsedQuery {
 #[derive(Debug)]
 pub struct Explanation {
     lattice: Lattice,
+    signed: Vec<bool>,
     /// The score of the best labelling the parse returned.
     pub best: f32,
+}
+
+fn signed_allows(lattice: &Lattice, signed: &[bool], span: &decode::Span, label: Label) -> bool {
+    label == Label::Unit
+        || !(span.start..span.end)
+            .any(|unit| signed.get(lattice.units.token_of[unit]) == Some(&true))
 }
 
 /// A set of labels.
@@ -836,14 +843,22 @@ impl LatticeTagger {
         let mut explanation = Explanation {
             best: parsed.first().map_or(0.0, |parse| parse.score),
             lattice,
+            signed,
         };
-        let Some(at) = self.trailing_country(&tokens) else {
+        let Some(at) = self.trailing_country(&tokens).filter(|&at| {
+            !explanation
+                .signed
+                .get(at..)
+                .unwrap_or_default()
+                .contains(&true)
+        }) else {
             return (parsed, Some(explanation));
         };
         let country = &tokens.words[at..];
         let prefix = tokens.prefix(at);
         let prefix_lattice = self.lattice(&prefix, &Suppression::default());
-        for mut reading in self.parse_lattice(&prefix, &prefix_lattice, n, &signed[..at]) {
+        let signed_prefix = &explanation.signed[..at.min(explanation.signed.len())];
+        for mut reading in self.parse_lattice(&prefix, &prefix_lattice, n, signed_prefix) {
             let words = country.iter().map(|word| Tagged {
                 token: word.clone(),
                 label: Label::Country,
@@ -885,9 +900,10 @@ impl LatticeTagger {
             .map(|word| labels(word))
             .collect::<Vec<_>>();
         let allows = |span: &decode::Span, label: Label| {
-            allowed[span.start..span.end]
-                .iter()
-                .all(|set| set.is_empty() || set.contains(label))
+            signed_allows(lattice, &explanation.signed, span, label)
+                && allowed[span.start..span.end]
+                    .iter()
+                    .all(|set| set.is_empty() || set.contains(label))
         };
         decode::best_allowed(lattice, &self.weights, &allows).map(|path| path.score)
     }
@@ -958,11 +974,7 @@ impl LatticeTagger {
         if n == 0 {
             return Vec::new();
         }
-        let flat = |span: &decode::Span, label: Label| {
-            label == Label::Unit
-                || !(span.start..span.end)
-                    .any(|unit| signed.get(lattice.units.token_of[unit]) == Some(&true))
-        };
+        let flat = |span: &decode::Span, label: Label| signed_allows(lattice, signed, span, label);
         let allows: Option<decode::Allows<'_>> = signed.contains(&true).then_some(&flat);
         let mut paths = decode::best(lattice, &self.weights, n, allows);
         // The best labellings are almost always addresses; only when one is

@@ -416,7 +416,11 @@ pub(super) async fn delete_file(
     let file = stored_file(&state, &id)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_REQUEST", INVALID_FILE))?;
     // A job reading the file keeps its open handle.
-    let _ = fs::remove_file(content_path(&state, &file.file_id));
+    if let Err(error) = fs::remove_file(content_path(&state, &file.file_id))
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        return Err(internal(error));
+    }
     fs::remove_file(files_dir(&state).join(format!("{}.json", file.file_id))).map_err(internal)?;
     Ok(Json(Deleted {
         status: "SUCCESS",
@@ -695,7 +699,10 @@ async fn submit(
         submitted_at: u64::try_from(now().as_millis()).unwrap_or(u64::MAX),
         product,
     };
-    write_record(&jobs_dir(&state).join(format!("{job_id}.json")), &stored).map_err(internal)?;
+    if let Err(error) = write_record(&jobs_dir(&state).join(format!("{job_id}.json")), &stored) {
+        state.jobs().remove(&job_id);
+        return Err(internal(error));
+    }
     Ok((
         StatusCode::ACCEPTED,
         Json(Submitted {

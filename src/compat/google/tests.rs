@@ -813,6 +813,13 @@ async fn geocode_address_in_the_path_and_as_fields() {
     .await;
     assert_eq!(biased.body, json!({"results": [{"placeId": address_id()}]}));
 
+    let incomplete_bias = get(
+        router,
+        "/compat/google/v4/geocode/address/10%20King?locationBias.rectangle.low.latitude=42.9",
+    )
+    .await;
+    assert_eq!(incomplete_bias.status, StatusCode::BAD_REQUEST);
+
     let both = get(
         router,
         "/compat/google/v4/geocode/address/10%20King?address.locality=Toronto",

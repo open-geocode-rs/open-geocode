@@ -16,7 +16,8 @@ use crate::{
     http::bounds::MAX_SEARCH_LIMIT,
     record::Layer,
     runtime::AppState,
-    util::fold::search_key,
+    spatial_index::haversine_m,
+    util::{fold::search_key, geo::EARTH_RADIUS_M},
 };
 
 use super::{
@@ -184,6 +185,14 @@ pub(super) struct Geocode {
 }
 
 impl Geocode {
+    pub(super) fn conflicting_country(&self) -> bool {
+        !self.countries.is_empty()
+            && self
+                .qualified
+                .country_code()
+                .is_some_and(|code| !self.countries.contains(&code))
+    }
+
     /// og's `/geocode` parameters, or `None` when nothing is asked, with blank
     /// text and no qualified part.
     ///
@@ -193,20 +202,23 @@ impl Geocode {
     pub(super) fn og_fields(&self) -> Option<Vec<(&'static str, String)>> {
         let qq = &self.qualified;
         let q = self.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
-        let mut countries = self.countries.clone();
-        let code = qq.country_code();
-        if let Some(code) = code
-            && !countries.contains(&code)
-        {
-            countries.push(code);
+        if self.conflicting_country() {
+            return None;
         }
+        let code = qq.country_code();
+        let country_name = qq.country.as_deref().filter(|_| code.is_none());
         let mut fields = Vec::new();
         let number_and_street = [qq.house_number.as_deref(), qq.street.as_deref()]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
             .join(" ");
-        if q.is_none() && qq.street.is_some() {
+        if q.is_none()
+            && qq.street.is_some()
+            && qq.district.is_none()
+            && qq.county.is_none()
+            && country_name.is_none()
+        {
             fields.push(("address", number_and_street));
             let parts = [
                 ("locality", &qq.city),
@@ -219,7 +231,6 @@ impl Geocode {
                 }
             }
         } else {
-            let country_name = qq.country.as_deref().filter(|_| code.is_none());
             let text = [
                 q,
                 Some(number_and_street.as_str()),
@@ -243,8 +254,10 @@ impl Geocode {
                 fields.push(("focus", at.og_point()));
             }
         }
-        if !countries.is_empty() {
-            fields.push(("country", countries.join(",")));
+        if let Some(code) = code {
+            fields.push(("country", code.to_string()));
+        } else if !self.countries.is_empty() {
+            fields.push(("country", self.countries.join(",")));
         }
         fields.push(("limit", self.limit.min(MAX_SEARCH_LIMIT).to_string()));
         Some(fields)
@@ -795,7 +808,7 @@ fn sub_request_id(params: &Params, line: &str) -> Result<String, Gs7Error> {
 #[derive(Debug, Default)]
 struct Near {
     center: Option<LatLng>,
-    radius_m: Option<f64>,
+    area: Option<Area>,
     fields: Vec<(&'static str, String)>,
 }
 
@@ -810,7 +823,7 @@ impl Near {
             center: at,
             ..Self::default()
         };
-        match area {
+        match &area {
             Some(Area::Countries(countries)) => {
                 if required && at.is_none() {
                     return Err(missing_location());
@@ -825,11 +838,10 @@ impl Near {
                 .action("Provide only one of them"));
             }
             Some(Area::Circle { center, radius_m }) => {
-                near.center = Some(center);
-                near.radius_m = Some(radius_m);
+                near.center = Some(*center);
                 // The circle's bounding box narrows og's search; the
                 // distance check on the answer makes it the circle.
-                near.fields.push(("bbox", circle_bbox(center, radius_m)));
+                near.fields.push(("bbox", circle_bbox(*center, *radius_m)));
             }
             Some(Area::Bbox([west, south, east, north])) => {
                 near.fields
@@ -841,14 +853,31 @@ impl Near {
         if let Some(center) = near.center {
             near.fields.push(("focus", center.og_point()));
         }
+        near.area = area;
         Ok(near)
     }
 
     fn admits(&self, item: &Item) -> bool {
-        self.radius_m.is_none_or(|radius| {
-            item.distance
-                .is_some_and(|distance| distance as f64 <= radius)
-        })
+        match self.area {
+            Some(Area::Circle { center, radius_m }) => item.position.is_some_and(|point| {
+                haversine_m(center.lng, center.lat, point.lng, point.lat) <= radius_m
+            }),
+            _ => true,
+        }
+    }
+
+    fn admits_coordinate_result(&self, item: &Item) -> bool {
+        match &self.area {
+            Some(Area::Countries(countries)) => item
+                .address
+                .country_code
+                .and_then(crate::iso::alpha2_of)
+                .is_some_and(|code| countries.contains(&code)),
+            Some(Area::Bbox([west, south, east, north])) => item.position.is_some_and(|point| {
+                (*west..=*east).contains(&point.lng) && (*south..=*north).contains(&point.lat)
+            }),
+            _ => self.admits(item),
+        }
     }
 }
 
@@ -863,14 +892,25 @@ fn missing_location() -> Gs7Error {
 /// The box around a circle, in og's `min_lon,min_lat,max_lon,max_lat`,
 /// clamped to the globe. og's box cannot cross the antimeridian.
 fn circle_bbox(center: LatLng, radius_m: f64) -> String {
-    const METERS_PER_DEGREE: f64 = 111_320.0;
-    let lat_span = radius_m / METERS_PER_DEGREE;
-    let cos = center.lat.to_radians().cos().max(1e-6);
-    let lon_span = (radius_m / (METERS_PER_DEGREE * cos)).min(360.0);
+    let angular = radius_m / EARTH_RADIUS_M;
+    let lat_span = angular.to_degrees();
     let min_lat = (center.lat - lat_span).max(-90.0);
     let max_lat = (center.lat + lat_span).min(90.0);
-    let min_lon = (center.lng - lon_span).max(-180.0);
-    let max_lon = (center.lng + lon_span).min(180.0);
+    let (min_lon, max_lon) = if min_lat == -90.0 || max_lat == 90.0 {
+        (-180.0, 180.0)
+    } else {
+        let lon_span = (angular.sin() / center.lat.to_radians().cos())
+            .min(1.0)
+            .asin()
+            .to_degrees();
+        let west = center.lng - lon_span;
+        let east = center.lng + lon_span;
+        if west < -180.0 || east > 180.0 {
+            (-180.0, 180.0)
+        } else {
+            (west, east)
+        }
+    };
     format!("{min_lon},{min_lat},{max_lon},{max_lat}")
 }
 
@@ -924,18 +964,23 @@ fn corridor(params: &Params, body: &Bytes) -> Result<Option<Corridor>, Gs7Error>
         Gs7Error::new(StatusCode::BAD_REQUEST, "Invalid request body")
             .action("Send the body as application/x-www-form-urlencoded")
     })?;
-    let in_body = match fields.into_iter().next() {
-        None => None,
-        Some((name, value)) if name == "route" => Some(value),
-        Some((name, _)) => {
+    let mut route = params.get("route").map(str::to_string);
+    for (name, value) in fields {
+        if name != "route" {
             return Err(Gs7Error::new(
                 StatusCode::BAD_REQUEST,
                 format!("Parameter '{name}' is not allowed in the request body"),
             )
             .action("Send every parameter but 'route' in the query string"));
         }
-    };
-    let Some(value) = in_body.or_else(|| params.get("route").map(str::to_string)) else {
+        if route.replace(value).is_some() {
+            return Err(
+                Gs7Error::new(StatusCode::BAD_REQUEST, "Duplicate parameter 'route'")
+                    .action("Send 'route' once in either the query string or the body"),
+            );
+        }
+    }
+    let Some(value) = route else {
         return Ok(None);
     };
     let illegal = |reason: &str| Gs7Error::illegal("route", &value, reason);
@@ -1187,8 +1232,9 @@ pub(super) async fn discover(
                         .distance_from(near.center)
                         .with_time_zone(feature, shows(&params, "tz"))
                 })
+                .filter(|item| near.admits_coordinate_result(item))
                 .collect();
-            return Ok(page(items, offset, limit, false));
+            return Ok(page(along(items, corridor.as_ref()), offset, limit, false));
         }
         // Along a route og is asked for all it gives, since the corridor
         // drops what lies off it.
@@ -1342,4 +1388,63 @@ pub(super) async fn lookup(
             .with_time_zone(&feature, shows(&params, "tz")))
     };
     respond(&request_id, answer.await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualified_geography_reaches_geocode() {
+        let request = Geocode {
+            qualified: Qualified::parse(
+                "street=Main Street;district=West End;county=Orange;country=United States",
+            )
+            .unwrap(),
+            ..Geocode::default()
+        };
+        let fields = request.og_fields().unwrap();
+        assert_eq!(
+            fields[0],
+            (
+                "q",
+                "Main Street, West End, Orange, United States".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_qualified_country_cannot_expand_the_requested_area() {
+        let mut request = Geocode {
+            q: Some("Main Street".to_string()),
+            qualified: Qualified::parse("country=USA").unwrap(),
+            countries: vec!["CA"],
+            ..Geocode::default()
+        };
+        assert!(request.og_fields().is_none());
+
+        request.countries.push("US");
+        assert!(
+            request
+                .og_fields()
+                .unwrap()
+                .contains(&("country", "US".to_string()))
+        );
+    }
+
+    #[test]
+    fn circle_candidate_bounds_cover_the_dateline() {
+        let center = LatLng {
+            lat: 0.0,
+            lng: 179.99,
+        };
+        let bbox = circle_bbox(center, 5_000.0);
+        assert!(bbox.starts_with("-180,"));
+        assert!(bbox.split(',').nth(2).is_some_and(|east| east == "180"));
+        let center = LatLng {
+            lat: 0.0,
+            lng: 10.0,
+        };
+        assert!(!circle_bbox(center, 5_000.0).starts_with("-180,"));
+    }
 }

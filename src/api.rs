@@ -288,6 +288,8 @@ pub struct Common {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "94124")]
     pub street_postcode: Option<String>,
+    #[serde(skip)]
+    pub(crate) zcta_postcode: Option<String>,
     /// The points to route to when going to the result, which are the
     /// entrances OpenStreetMap maps for it. They are the nodes tagged
     /// `entrance` on the outline of the building or site an address or a
@@ -1414,7 +1416,8 @@ fn common(
             summary.layer
         ))
     })?;
-    let tiger_range = if summary.source.dataset == crate::tiger::DATASET {
+    let tiger_estimate = summary.source.dataset == crate::tiger::DATASET;
+    let tiger_range = if tiger_estimate {
         summary
             .address
             .housenumber
@@ -1430,14 +1433,15 @@ fn common(
     } else {
         None
     };
-    let mut address = summary.address.with_parts();
+    let address = summary.address.with_parts();
     let context = contexts.of(record_id)?;
     let stored_address = layer == Layer::Address
         && !summary.id.starts_with("derived:")
         && accuracy != Accuracy::Interpolated;
-    if stored_address && address.postcode.is_none() && summary.street_postcode.is_none() {
-        address.postcode = contexts.pack.tiger_zcta.postcode(record_id);
-    }
+    let zcta_postcode =
+        (stored_address && address.postcode.is_none() && summary.street_postcode.is_none())
+            .then(|| contexts.pack.tiger_zcta.postcode(record_id))
+            .flatten();
     let side = |direction| {
         tiger_range.and_then(|range| {
             contexts
@@ -1476,10 +1480,15 @@ fn common(
         brand: summary.brand,
         contact: summary.contact,
         opening_hours: summary.opening_hours,
-        bbox: summary.bbox,
-        timezone: summary.timezone,
+        bbox: if tiger_estimate { None } else { summary.bbox },
+        timezone: if tiger_estimate {
+            None
+        } else {
+            summary.timezone
+        },
         cuisine: summary.cuisine,
         street_postcode: summary.street_postcode,
+        zcta_postcode,
         building: summary.building,
         access: summary.access,
         address_lines: crate::address_lines::address_lines(layer, &address, &context),

@@ -2510,6 +2510,8 @@ async fn a_job_holds_the_servers_row_limit() {
         })
     );
     let reply = post("recId|q\nbad!|King\nok|\n1|King\n2|Queen\n").await;
+    assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+    let reply = post("\nrecId|q\n\nbad!|King\nok|\n\n").await;
     assert_eq!(reply.status, StatusCode::CREATED);
 }
 

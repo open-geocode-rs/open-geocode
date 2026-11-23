@@ -95,12 +95,13 @@ impl Timezones {
             block: Vec::new(),
             failed: None,
         };
-        let read = Collection(&mut loading)
-            .deserialize(&mut serde_json::Deserializer::from_reader(reader));
+        let mut decoder = serde_json::Deserializer::from_reader(reader);
+        let read = Collection(&mut loading).deserialize(&mut decoder);
         if let Some(error) = loading.failed.take() {
             return Err(error);
         }
         read.map_err(|error| unusable(error.to_string()))?;
+        decoder.end().map_err(|error| unusable(error.to_string()))?;
         if loading.zones.is_empty() {
             return Err(unusable("it holds no zone".to_string()));
         }

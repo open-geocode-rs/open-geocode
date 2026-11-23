@@ -248,7 +248,9 @@ pub struct Entrance {
 impl Entrance {
     /// The entrance a node's tags make of it, if they do.
     pub fn of_tag(kind: Option<&str>, lon: f64, lat: f64) -> Option<Self> {
-        let kind = kind.map(str::trim).filter(|kind| !kind.is_empty())?;
+        let kind = kind
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty() && !kind.eq_ignore_ascii_case("no"))?;
         Some(Self {
             at: [
                 crate::records::quantize(lon).ok()?,

@@ -235,11 +235,10 @@ impl Job {
         &self.results
     }
 
-    fn save(&self) {
-        let status = self.snapshot();
+    fn save(&self, status: &JobStatus) {
         // A status that fails to save leaves the job served from memory;
         // only a restart loses it.
-        if let Ok(json) = serde_json::to_vec(&status) {
+        if let Ok(json) = serde_json::to_vec(status) {
             let _ = fs::write(&self.record, json);
         }
     }
@@ -291,7 +290,7 @@ impl JobStore {
                 job.remove_files();
                 continue;
             }
-            job.save();
+            job.save(&job.snapshot());
             let bytes = fs::metadata(&job.results).map_or(0, |meta| meta.len());
             job.progress.send_replace(Progress { bytes, done: true });
             kept.push(job);
@@ -387,10 +386,13 @@ impl JobStore {
 
     pub(crate) fn remove(&self, id: &str) -> Option<Arc<Job>> {
         let job = self.jobs.lock().expect("jobs").remove(id)?;
-        job.deleted.store(true, Ordering::Relaxed);
-        job.cancel.store(true, Ordering::Relaxed);
-        if job.progress.borrow().done {
-            job.remove_files();
+        {
+            let _status = job.status.lock().expect("job status");
+            job.deleted.store(true, Ordering::Relaxed);
+            job.cancel.store(true, Ordering::Relaxed);
+            if job.progress.borrow().done {
+                job.remove_files();
+            }
         }
         Some(job)
     }
@@ -973,7 +975,7 @@ async fn launch(
         error: None,
     });
     let file = File::create(&job.results).map_err(|error| Problem::internal(error.into()))?;
-    job.save();
+    job.save(&job.snapshot());
     store.insert(Arc::clone(&job));
 
     let run = Run {
@@ -1321,31 +1323,29 @@ impl Run {
 
     fn finish(self, ending: Ending, written: io::Result<()>) {
         let now = unix_now();
-        {
-            let mut status = self.job.status.lock().expect("job status");
-            // A cancelled job's upload, cut short, reads as complete.
-            let ending = match ending {
-                Ending::Read if self.job.cancel.load(Ordering::Relaxed) => Ending::Cancelled,
-                other => other,
-            };
-            let (state, error) = match (ending, written) {
-                (_, Err(error)) => (
-                    Status::Failed,
-                    Some(format!("writing results failed: {error}")),
-                ),
-                (Ending::Read, Ok(())) => (Status::Completed, None),
-                (Ending::Cancelled, Ok(())) => (Status::Cancelled, None),
-                (Ending::Failed(error), Ok(())) => (Status::Failed, Some(error)),
-            };
-            status.status = state;
-            status.error = error;
-            status.completed_at = Some(now);
-            status.expires_at = Some(now + self.state.limits().job_retention().as_secs());
-        }
+        let mut status = self.job.status.lock().expect("job status");
+        // A cancelled job's upload, cut short, reads as complete.
+        let ending = match ending {
+            Ending::Read if self.job.cancel.load(Ordering::Relaxed) => Ending::Cancelled,
+            other => other,
+        };
+        let (state, error) = match (ending, written) {
+            (_, Err(error)) => (
+                Status::Failed,
+                Some(format!("writing results failed: {error}")),
+            ),
+            (Ending::Read, Ok(())) => (Status::Completed, None),
+            (Ending::Cancelled, Ok(())) => (Status::Cancelled, None),
+            (Ending::Failed(error), Ok(())) => (Status::Failed, Some(error)),
+        };
+        status.status = state;
+        status.error = error;
+        status.completed_at = Some(now);
+        status.expires_at = Some(now + self.state.limits().job_retention().as_secs());
         if self.job.deleted.load(Ordering::Relaxed) {
             self.job.remove_files();
         } else {
-            self.job.save();
+            self.job.save(&status);
         }
         self.job
             .progress

@@ -330,6 +330,12 @@ impl Asked {
         {
             return Err(Api::SearchBox.invalid(format!("{name} is not supported by this server")));
         }
+        if params
+            .get("open_now")
+            .is_some_and(|value| !value.eq_ignore_ascii_case("false"))
+        {
+            return Err(Api::SearchBox.invalid("open_now is not supported by this server"));
+        }
         let limit = limit(params)?;
         let categories = |name: &str| {
             params

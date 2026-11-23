@@ -1985,6 +1985,33 @@ fn reverse_answer(state: &AppState, request: ReverseRequest) -> Result<ReverseCo
     let nearest = state
         .reverse_geocoder
         .reverse_nearest(options, layer, limit)?;
+    nearest_collection(state, options, &nearest)
+}
+
+pub(crate) async fn reverse_addresses_where(
+    state: &AppState,
+    query: Result<Query<ReverseParams>, QueryRejection>,
+    accept: impl Fn(&AppState, crate::pack::RecordId) -> Result<bool> + Send + 'static,
+) -> Result<ReverseCollection, Problem> {
+    let Query(query) = query.map_err(malformed_parameters)?;
+    let request = reverse_request(state, query)?;
+    let worker = state.clone();
+    lookup(state, move || {
+        let nearest = worker.reverse_geocoder.reverse_addresses_where(
+            request.options,
+            request.limit,
+            |id| accept(&worker, id),
+        )?;
+        nearest_collection(&worker, request.options, &nearest)
+    })
+    .await
+}
+
+fn nearest_collection(
+    state: &AppState,
+    options: GeocodeOptions,
+    nearest: &[crate::reverse::GeocodeResponse],
+) -> Result<ReverseCollection> {
     let mut collection = api::reverse_collection(
         &state.pack,
         &crate::reverse::GeocodeResponse {
@@ -1993,11 +2020,18 @@ fn reverse_answer(state: &AppState, request: ReverseRequest) -> Result<ReverseCo
             result: None,
         },
     )?;
-    for response in &nearest {
+    for response in nearest {
         collection
             .features
             .extend(api::reverse_collection(&state.pack, response)?.features);
     }
+    collection.geocoding.attribution = api::attribution(
+        &state.pack,
+        collection
+            .features
+            .iter()
+            .map(|feature| &feature.properties.common),
+    );
     Ok(collection)
 }
 
