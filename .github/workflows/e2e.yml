@@ -1,10 +1,9 @@
 name: End to end
 
 # The README path on real data, every night. Install og, download a region
-# from the catalog, build its Pack, serve it and ask it. Ashmore and Cartier
-# Islands is 22 KB, and it sits in a nested Geofabrik folder, the layout a
-# moved link breaks. og checks every download against the .md5 Geofabrik
-# publishes beside it, so a wrong file fails here too.
+# from the catalog, build its Pack, serve it and ask it. Monaco keeps the
+# download small and exercises Geofabrik's redirect to a dated extract and
+# its matching checksum.
 on:
   schedule:
     - cron: "7 9 * * *"
@@ -20,9 +19,9 @@ permissions:
   contents: read
 
 env:
-  REGION: australia/ashmore-cartier
-  PACK: australia-ashmore-cartier
-  QUERY: Ashmore and Cartier Islands
+  REGION: monaco
+  PACK: monaco
+  QUERY: Monaco
   ADDRESS: 127.0.0.1:8080
   GEOFABRIK_INDEX: https://download.geofabrik.de/index-v1-nogeom.json
   REPORTING_ISSUE: ${{ vars.REPORTING_ISSUE }}
