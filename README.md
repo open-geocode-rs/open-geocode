@@ -114,8 +114,19 @@ How it was measured, and how to run it again: [bench/](bench/).
 
 ## Quickstart
 
+Install the prebuilt binaries for Linux, macOS or Windows from the [v1.0.0 release](https://github.com/open-geocode-rs/open-geocode/releases/tag/v1.0.0). They run without Rust or Cargo.
+
+To build `og` from source with Cargo, clone the repository and run the install command from the checkout root.
+
+```sh
+git clone --recurse-submodules https://github.com/open-geocode-rs/open-geocode.git
+cd open-geocode
+cargo install --locked --path . --features tui --bin og
 ```
-cargo install --path . --features tui --bin og
+
+Build and serve a Pack.
+
+```sh
 og build --region canada/ontario
 og serve canada-ontario
 ```
@@ -137,8 +148,18 @@ Run `og` with no arguments for the interactive interface: pick a region, build i
 
 ### Docker
 
-The image serves a Pack; it does not build one.
-Mount a Pack directory or `.ogp` file read-only at `/packs/pack`:
+The image includes `open-geocode` and uses it as its entrypoint. To build a Pack from a local `.osm.pbf`, pass `pack build` and mount a writable output directory. On Linux, use your host UID and GID so the container can write to the bind mount.
+
+```sh
+mkdir -p packs
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD/monaco.osm.pbf:/data/monaco.osm.pbf:ro" \
+  -v "$PWD/packs:/packs" \
+  ghcr.io/open-geocode-rs/open-geocode \
+  pack build --input /data/monaco.osm.pbf --pack /packs/monaco
+```
+
+To serve an existing Pack, mount its directory or `.ogp` file read-only at `/packs/pack`.
 
 ```
 docker run -p 8080:8080 -v ~/.local/share/open-geocode/packs/canada-ontario:/packs/pack:ro ghcr.io/open-geocode-rs/open-geocode
