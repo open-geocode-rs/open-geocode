@@ -716,6 +716,7 @@ mod tests {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                details: None,
                 aliases: Vec::new(),
             };
             writer.write(&poi.into(), context).expect("POI");
@@ -761,7 +762,6 @@ mod tests {
             "the same seed draws the same cases"
         );
 
-        // One case expects an object the query cannot find.
         let mut fixture = fixture;
         fixture.search.push(TextQueryFixture {
             name: None,
@@ -867,9 +867,12 @@ mod tests {
         writer
             .write(
                 &AddressRecord {
+                    building: None,
+                    access: Vec::new(),
                     disputed: false,
                     street_postcodes: Vec::new(),
                     address: AddressComponents {
+                        block_number_len: None,
                         areas: Vec::new(),
                         number: "10".to_string(),
                         street: Some("King Street".to_string()),

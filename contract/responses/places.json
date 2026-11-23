@@ -9,15 +9,43 @@
         "type": "Point"
       },
       "properties": {
+        "access": [
+          {
+            "kind": "main",
+            "lat": 42.99992,
+            "lon": -79.005
+          }
+        ],
         "accuracy": "centroid",
         "address": {
           "housenumber": "12",
           "postcode": "M5V 1A1",
-          "street": "King Street"
+          "street": "King Street",
+          "street_parts": {
+            "name": "King",
+            "type": "Street"
+          }
         },
+        "address_lines": [
+          "12 King Street",
+          "Toronto, ON M5V 1A1",
+          "Canada"
+        ],
+        "bbox": [
+          -79.0051,
+          42.99992,
+          -79.0049,
+          43.00008
+        ],
         "category": "shop:bakery",
+        "contact": {
+          "email": "hello@queenbakery.example",
+          "phone": "+1 416-555-0111",
+          "website": "https://queenbakery.example/"
+        },
         "context": {
           "country": {
+            "code": "CA",
             "id": "osm:relation:1",
             "name": "Canada"
           },
@@ -26,18 +54,24 @@
             "name": "Toronto"
           },
           "region": {
+            "code": "CA-ON",
             "id": "osm:relation:2",
             "name": "Ontario"
           }
         },
+        "cuisine": [
+          "coffee_shop"
+        ],
         "id": "osm:way:11",
         "label": "Queen Bakery, 12 King Street, Toronto, M5V 1A1",
         "layer": "poi",
         "name": "Queen Bakery",
+        "opening_hours": "Mo-Fr 07:00-18:00; Sa 08:00-14:00",
         "score": 3.3291442,
         "source": {
           "dataset": "osm"
-        }
+        },
+        "timezone": "America/Toronto"
       },
       "type": "Feature"
     }
@@ -48,6 +82,11 @@
         "licence": "ODbL 1.0",
         "text": "© OpenStreetMap contributors",
         "url": "https://www.openstreetmap.org/copyright"
+      },
+      {
+        "licence": "ODbL 1.0",
+        "text": "Timezone boundaries © OpenStreetMap contributors",
+        "url": "https://github.com/evansiroky/timezone-boundary-builder"
       }
     ],
     "query": "Queen Bakery",

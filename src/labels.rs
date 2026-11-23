@@ -16,7 +16,7 @@ pub fn address_name(components: &AddressComponents) -> String {
 
 /// A unit as a label shows it: "Unit 1" for a bare "1", so it never reads
 /// as a place; "Flat 2" or "Apt 4B" as stated.
-fn unit_label(unit: &str) -> String {
+pub(crate) fn unit_label(unit: &str) -> String {
     let unit = unit.trim();
     if unit.split_whitespace().count() > 1
         || unit.starts_with(|character: char| character.is_alphabetic())
@@ -225,6 +225,7 @@ mod tests {
     #[test]
     fn a_bare_unit_reads_as_a_unit_not_a_place() {
         let address = AddressComponents {
+            block_number_len: None,
             areas: Vec::new(),
             number: "40".to_string(),
             street: Some("Rosedale Road".to_string()),
@@ -252,6 +253,7 @@ mod tests {
     #[test]
     fn composes_poi_labels_from_name_address_and_locality() {
         let address = AddressComponents {
+            block_number_len: None,
             areas: Vec::new(),
             number: "123".to_string(),
             street: Some("King Street West".to_string()),

@@ -236,8 +236,6 @@ fn load(text: &str) -> Tree {
     for region in &mut regions {
         region.children.sort_by(|a, b| names[*a].cmp(&names[*b]));
     }
-    // A label is the name under the continent, with the country before a
-    // sub-region: `Canada / Ontario`.
     for index in 0..regions.len() {
         let mut parts = vec![regions[index].name.clone()];
         let mut next = regions[index].parent;

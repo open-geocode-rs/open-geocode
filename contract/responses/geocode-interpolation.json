@@ -13,11 +13,21 @@
         "address": {
           "housenumber": "50",
           "locality": "Toronto",
-          "street": "Queen Street"
+          "street": "Queen Street",
+          "street_parts": {
+            "name": "Queen",
+            "type": "Street"
+          }
         },
+        "address_lines": [
+          "50 Queen Street",
+          "Toronto, ON",
+          "Canada"
+        ],
         "confidence": 0.95257413,
         "context": {
           "country": {
+            "code": "CA",
             "id": "osm:relation:1",
             "name": "Canada"
           },
@@ -26,6 +36,7 @@
             "name": "Toronto"
           },
           "region": {
+            "code": "CA-ON",
             "id": "osm:relation:2",
             "name": "Ontario"
           }
@@ -33,11 +44,16 @@
         "id": "osm:way:13:interp:2-98",
         "label": "50 Queen Street, Toronto",
         "layer": "interpolation",
+        "match": {
+          "housenumber": "partial",
+          "street": "matched"
+        },
         "name": "50 Queen Street",
         "score": 0.0,
         "source": {
           "dataset": "osm"
-        }
+        },
+        "timezone": "America/Toronto"
       },
       "type": "Feature"
     }
@@ -48,6 +64,11 @@
         "licence": "ODbL 1.0",
         "text": "© OpenStreetMap contributors",
         "url": "https://www.openstreetmap.org/copyright"
+      },
+      {
+        "licence": "ODbL 1.0",
+        "text": "Timezone boundaries © OpenStreetMap contributors",
+        "url": "https://github.com/evansiroky/timezone-boundary-builder"
       }
     ],
     "query": "50 Queen Street",

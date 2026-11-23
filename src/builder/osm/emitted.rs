@@ -39,7 +39,6 @@ impl Emitted {
         self.ready = std::mem::take(&mut self.records)
             .into_iter()
             .map(|record| match record {
-                // A row's dataset is numbered in input order, by the merge.
                 Record::Address(address) if address.source.object_type != ObjectType::Row => {
                     PendingAddress::new(&address, 0, 0).map(Ready::Address)
                 }

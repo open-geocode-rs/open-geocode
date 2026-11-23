@@ -10,16 +10,28 @@
       },
       "properties": {
         "accuracy": "centroid",
+        "bbox": [
+          -79.6392727,
+          43.5796082,
+          -79.1132193,
+          43.8554425
+        ],
         "confidence": 0.0,
         "fallback": true,
         "id": "osm:relation:3",
         "label": "Toronto",
         "layer": "locality",
+        "match": {
+          "housenumber": "unmatched",
+          "locality": "matched",
+          "street": "unmatched"
+        },
         "name": "Toronto",
         "score": 13.642908,
         "source": {
           "dataset": "osm"
-        }
+        },
+        "timezone": "America/Toronto"
       },
       "type": "Feature"
     }
@@ -30,6 +42,11 @@
         "licence": "ODbL 1.0",
         "text": "© OpenStreetMap contributors",
         "url": "https://www.openstreetmap.org/copyright"
+      },
+      {
+        "licence": "ODbL 1.0",
+        "text": "Timezone boundaries © OpenStreetMap contributors",
+        "url": "https://github.com/evansiroky/timezone-boundary-builder"
       }
     ],
     "query": "99 Nowhere Lane, Toronto",

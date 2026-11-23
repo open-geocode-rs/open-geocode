@@ -24,7 +24,7 @@
     "api": "https://batch.openaddresses.io/api/data",
     "fetched": "2026-10-16T20:55:21Z",
     "snapshot": "upstream/openaddresses.json",
-    "sha256": "7a3d7b297c94a8128cbf4dd2d0c1f753674d31b538791fea7ad7635c97d1812f"
+    "sha256": "3347508d8847c7c3a751e2352fe36dc3f7583f0696114ca78fd607724fa6263e"
   },
   "organicmaps": {
     "repository": "https://github.com/organicmaps/organicmaps",

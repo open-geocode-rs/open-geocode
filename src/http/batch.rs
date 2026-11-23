@@ -428,7 +428,6 @@ fn item_query(shared: &[(String, String)], item: &[(String, Value)]) -> Result<S
             Value::String(text) => text.clone(),
             Value::Number(number) => number.to_string(),
             Value::Bool(flag) => flag.to_string(),
-            // An absent value is an absent key, here as in the answers.
             Value::Null => continue,
             Value::Array(_) | Value::Object(_) => {
                 return Err(Problem::malformed_parameter(format!(

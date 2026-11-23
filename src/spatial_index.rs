@@ -490,6 +490,38 @@ impl Tree {
         u64::from_le_bytes(id)
     }
 
+    fn intersects_where(
+        &self,
+        bounds: BoundingBox,
+        mut matches: impl FnMut(u64) -> Result<bool>,
+    ) -> Result<bool> {
+        let Some(root) = self.levels.len().checked_sub(1) else {
+            return Ok(false);
+        };
+        let mut pending = vec![(root, 0)];
+        while let Some((level, node)) = pending.pop() {
+            let (start, _) = self.levels[level];
+            let bbox = self.bbox(start + node);
+            if bbox[0] > bounds[2]
+                || bounds[0] > bbox[2]
+                || bbox[1] > bounds[3]
+                || bounds[1] > bbox[3]
+            {
+                continue;
+            }
+            if level == 0 {
+                if matches(self.id(node))? {
+                    return Ok(true);
+                }
+                continue;
+            }
+            let (_, count) = self.levels[level - 1];
+            let children = node * NODE_SIZE..((node + 1) * NODE_SIZE).min(count);
+            pending.extend(children.map(|child| (level - 1, child)));
+        }
+        Ok(false)
+    }
+
     /// Items whose boxes lie within `radius_m` of the point, nearest box
     /// first, each with a lower bound on its distance.
     fn nearest(&self, lon: f64, lat: f64, radius_m: f64) -> Nearest<'_> {
@@ -712,6 +744,85 @@ impl Reader {
         })
     }
 
+    pub(crate) fn has_street_or_address(&self, area: &geo::Polygon) -> Result<bool> {
+        use geo::{BoundingRect, Intersects};
+
+        let Some(bounds) = area.bounding_rect() else {
+            return Ok(false);
+        };
+        let quantized = [
+            quantize(bounds.min().x)?,
+            quantize(bounds.min().y)?,
+            quantize(bounds.max().x)?,
+            quantize(bounds.max().y)?,
+        ];
+        if self.lines.intersects_where(quantized, |id| {
+            let Some(parts) = self.records.line(id)? else {
+                return Ok(false);
+            };
+            Ok(parts.into_iter().any(|part| {
+                let line = geo::LineString::from_iter(
+                    part.into_iter()
+                        .map(|[lon, lat]| (dequantize(lon), dequantize(lat))),
+                );
+                area.intersects(&line)
+            }))
+        })? {
+            return Ok(true);
+        }
+        self.blocks.intersects_where(quantized, |block| {
+            let mut found = false;
+            self.records.block_points(block, |_, layer, lon, lat, _| {
+                if !found && layer == Layer::Address {
+                    found = area.intersects(&geo::Point::new(dequantize(lon), dequantize(lat)));
+                }
+                Ok(())
+            })?;
+            Ok(found)
+        })
+    }
+
+    pub(crate) fn address_points_in_box(
+        &self,
+        bounds: [f64; 4],
+        mut visit: impl FnMut(RecordId, [f64; 2]) -> Result<()>,
+    ) -> Result<()> {
+        let [west, south, east, north] = bounds;
+        let bbox = [
+            quantize(west)?,
+            quantize(south)?,
+            quantize(east)?,
+            quantize(north)?,
+        ];
+        let Some(root) = self.blocks.levels.len().checked_sub(1) else {
+            return Ok(());
+        };
+        let mut pending = vec![(root, 0)];
+        let overlaps = |box_: BoundingBox| {
+            box_[0] <= bbox[2] && bbox[0] <= box_[2] && box_[1] <= bbox[3] && bbox[1] <= box_[3]
+        };
+        while let Some((level, node)) = pending.pop() {
+            let (start, _) = self.blocks.levels[level];
+            if !overlaps(self.blocks.bbox(start + node)) {
+                continue;
+            }
+            if level == 0 {
+                self.records
+                    .block_points(self.blocks.id(node), |id, layer, lon, lat, _| {
+                        if layer == Layer::Address && overlaps([lon, lat, lon, lat]) {
+                            visit(id, [dequantize(lon), dequantize(lat)])?;
+                        }
+                        Ok(())
+                    })?;
+            } else {
+                let (_, count) = self.blocks.levels[level - 1];
+                let children = node * NODE_SIZE..((node + 1) * NODE_SIZE).min(count);
+                pending.extend(children.rev().map(|child| (level - 1, child)));
+            }
+        }
+        Ok(())
+    }
+
     pub fn point_candidates(
         &self,
         lon: f64,
@@ -735,8 +846,23 @@ impl Reader {
         radius_m: f64,
         limit: usize,
     ) -> Result<Vec<PointCandidate>> {
-        let candidates = self.block_points(lon, lat, radius_m, limit, |_, layer| {
-            Ok(layer == Layer::Address)
+        self.address_candidates_where(lon, lat, radius_m, limit, |_| Ok(true))
+    }
+
+    pub(crate) fn address_candidates_where(
+        &self,
+        lon: f64,
+        lat: f64,
+        radius_m: f64,
+        limit: usize,
+        mut accept: impl FnMut(RecordId) -> Result<bool>,
+    ) -> Result<Vec<PointCandidate>> {
+        let candidates = self.block_points(lon, lat, radius_m, limit, |id, layer| {
+            if layer == Layer::Address {
+                accept(id)
+            } else {
+                Ok(false)
+            }
         })?;
         Ok(closest_candidates(candidates, limit))
     }
@@ -912,7 +1038,9 @@ impl Reader {
         radius_m: f64,
         limit: usize,
     ) -> Result<Vec<SegmentCandidate>> {
-        let mut candidates = Vec::new();
+        // One candidate a record, at its nearest stretch: a road of many
+        // stretches is one answer, however many of them lie near.
+        let mut candidates = Vec::<SegmentCandidate>::new();
         let mut closest = Closest::new(limit);
         for (item, bound) in self.lines.nearest(lon, lat, radius_m) {
             if closest.settled(bound) {
@@ -926,16 +1054,20 @@ impl Reader {
                 continue;
             };
             let total = line.total();
+            let mut nearest: Option<SegmentCandidate> = None;
             for segment in &line.segments {
                 if segment.end_length - segment.start_length <= f64::EPSILON {
                     continue;
                 }
                 let projection = project_to_segment_m(lon, lat, segment.start, segment.end);
-                if projection.distance_m <= radius_m {
+                if projection.distance_m <= radius_m
+                    && nearest
+                        .as_ref()
+                        .is_none_or(|held| projection.distance_m < held.distance_m)
+                {
                     let start_fraction = segment.start_length / total;
                     let end_fraction = segment.end_length / total;
-                    closest.add(projection.distance_m);
-                    candidates.push(SegmentCandidate {
+                    nearest = Some(SegmentCandidate {
                         record_id,
                         layer,
                         closest_lon: projection.lon,
@@ -945,8 +1077,78 @@ impl Reader {
                     });
                 }
             }
+            let Some(nearest) = nearest else {
+                continue;
+            };
+            // A record the index holds as several items keeps its nearest.
+            match candidates
+                .iter_mut()
+                .find(|held| held.record_id == record_id)
+            {
+                Some(held) if nearest.distance_m < held.distance_m => *held = nearest,
+                Some(_) => {}
+                None => {
+                    closest.add(nearest.distance_m);
+                    candidates.push(nearest);
+                }
+            }
         }
         Ok(closest_candidates(candidates, limit))
+    }
+
+    pub(crate) fn project_on_line(
+        &self,
+        record_id: RecordId,
+        points: &[[f64; 2]],
+    ) -> Result<Option<Vec<(f64, f64)>>> {
+        let Some(line) = self.records.line(record_id)?.map(line_cache) else {
+            return Ok(None);
+        };
+        let total = line.total();
+        if total <= f64::EPSILON {
+            return Ok(None);
+        }
+        Ok(Some(
+            points
+                .iter()
+                .map(|&[lon, lat]| {
+                    line.segments
+                        .iter()
+                        .map(|segment| {
+                            let projected =
+                                project_to_segment_m(lon, lat, segment.start, segment.end);
+                            let along = segment.start_length
+                                + projected.t * (segment.end_length - segment.start_length);
+                            (along / total, projected.distance_m)
+                        })
+                        .min_by(|left, right| left.1.total_cmp(&right.1))
+                        .expect("nonempty line")
+                })
+                .collect(),
+        ))
+    }
+
+    pub(crate) fn left_of_line(
+        &self,
+        candidate: &SegmentCandidate,
+        lon: f64,
+        lat: f64,
+    ) -> Result<Option<bool>> {
+        let Some(line) = self.records.line(candidate.record_id)?.map(line_cache) else {
+            return Ok(None);
+        };
+        let at = candidate.fraction * line.total();
+        let Some(segment) = line.segments.iter().find(|segment| {
+            segment.start_length <= at
+                && at <= segment.end_length
+                && segment.end_length > segment.start_length
+        }) else {
+            return Ok(None);
+        };
+        let [sx, sy] = segment.start;
+        let [ex, ey] = segment.end;
+        let cross = (ex - sx) * (lat - sy) - (ey - sy) * (lon - sx);
+        Ok((candidate.distance_m >= 0.5 && cross != 0.0).then_some(cross > 0.0))
     }
 
     /// The point `fraction` of the way along a line record by length, the
@@ -988,7 +1190,7 @@ impl Reader {
         lat: f64,
         radius_m: f64,
         limit: usize,
-        accepts: impl Fn(RecordId, Layer) -> Result<bool>,
+        mut accepts: impl FnMut(RecordId, Layer) -> Result<bool>,
     ) -> Result<Vec<PointCandidate>> {
         let mut candidates = Vec::new();
         let mut closest = Closest::new(limit);
@@ -1214,9 +1416,12 @@ mod tests {
 
     fn address(lon: f64, lat: f64, object_id: i64) -> Record {
         Record::Address(AddressRecord {
+            building: None,
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: Vec::new(),
                 number: "10".to_string(),
                 street: Some("King Street".to_string()),
@@ -1245,6 +1450,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         })
     }
@@ -1301,6 +1507,22 @@ mod tests {
             Reader::open(&container, records).expect("spatial reader"),
             commit,
         )
+    }
+
+    #[test]
+    fn county_coverage_checks_points_inside_the_outline() {
+        let (reader, _) = build(&[address(-79.0, 43.0, 7)]);
+        let triangle = |vertices| geo::Polygon::new(geo::LineString::from_iter(vertices), vec![]);
+        assert!(
+            reader
+                .has_street_or_address(&triangle([(-80.0, 42.0), (-78.0, 43.0), (-80.0, 44.0)]))
+                .expect("read county")
+        );
+        assert!(
+            !reader
+                .has_street_or_address(&triangle([(-80.0, 42.0), (-78.8, 42.0), (-80.0, 43.5)]))
+                .expect("read county")
+        );
     }
 
     #[test]

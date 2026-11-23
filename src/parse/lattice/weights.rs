@@ -277,7 +277,6 @@ impl Weights {
                 );
             }
             set(&format!("dict_in_country:{field}"), &[(label, 0.5)]);
-            // A character of a known name, read one at a time.
             for part in ["begin", "inside"] {
                 set(&format!("dict_cover:{field}:{part}"), &[(label, 1.0)]);
             }
@@ -394,9 +393,7 @@ impl Weights {
             return Ok(None);
         }
         let bytes = container.section(WEIGHTS_SECTION, WEIGHTS_VERSION)?;
-        Self::from_bytes(&bytes)
-            .map_err(|_| Error::Decode("invalid parser weights section"))
-            .map(Some)
+        Self::from_bytes(&bytes).map(Some)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -432,7 +429,11 @@ impl Weights {
         }
         let version = reader.u32()?;
         if version != WEIGHTS_VERSION {
-            return Err(Error::UnsupportedVersion { found: version });
+            return Err(Error::UnsupportedFormat {
+                part: "parser weights".to_string(),
+                found: version,
+                expected: WEIGHTS_VERSION,
+            });
         }
         let schema = reader.u64()?;
         let (features, labels, states) = (reader.u32()?, reader.u32()?, reader.u32()?);

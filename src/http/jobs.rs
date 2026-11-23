@@ -13,7 +13,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
     io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -207,15 +207,38 @@ pub(crate) struct Job {
 }
 
 impl Job {
-    fn snapshot(&self) -> JobStatus {
+    pub(crate) fn snapshot(&self) -> JobStatus {
         self.status.lock().expect("job status").clone()
     }
 
-    fn save(&self) {
-        let status = self.snapshot();
+    /// Stops the job at its next row; it records `cancelled` with the rows
+    /// answered so far.
+    pub(crate) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Resolves once the job has stopped, however it stopped.
+    pub(crate) async fn ended(&self) {
+        let mut progress = self.progress.subscribe();
+        // A sender dropped first means the job is gone, which is an end too.
+        let _ = progress.wait_for(|progress| progress.done).await;
+    }
+
+    /// The results written so far, from the start.
+    pub(crate) fn open_results(&self) -> io::Result<File> {
+        File::open(&self.results)
+    }
+
+    /// Where the results are written.
+    #[cfg(test)]
+    pub(crate) fn results_path(&self) -> &std::path::Path {
+        &self.results
+    }
+
+    fn save(&self, status: &JobStatus) {
         // A status that fails to save leaves the job served from memory;
         // only a restart loses it.
-        if let Ok(json) = serde_json::to_vec(&status) {
+        if let Ok(json) = serde_json::to_vec(status) {
             let _ = fs::write(&self.record, json);
         }
     }
@@ -267,7 +290,7 @@ impl JobStore {
                 job.remove_files();
                 continue;
             }
-            job.save();
+            job.save(&job.snapshot());
             let bytes = fs::metadata(&job.results).map_or(0, |meta| meta.len());
             job.progress.send_replace(Progress { bytes, done: true });
             kept.push(job);
@@ -314,7 +337,29 @@ impl JobStore {
         }
     }
 
-    fn get(&self, id: &str) -> Option<Arc<Job>> {
+    /// Where the store keeps its files. A `/compat` batch flow keeps its own
+    /// beside them, under the same retention.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub(crate) fn status(&self, id: &str) -> Option<JobStatus> {
+        self.get(id).map(|job| job.snapshot())
+    }
+
+    /// Stop a job's rows; those already answered are kept.
+    pub(crate) fn cancel(&self, id: &str) -> Option<JobStatus> {
+        let job = self.get(id)?;
+        job.cancel();
+        Some(job.snapshot())
+    }
+
+    /// The job's results file, written as `output_format`.
+    pub(crate) fn results_path(&self, id: &str) -> Option<PathBuf> {
+        self.get(id).map(|job| job.results.clone())
+    }
+
+    pub(crate) fn get(&self, id: &str) -> Option<Arc<Job>> {
         let job = self.jobs.lock().expect("jobs").get(id).cloned()?;
         if job.snapshot().expires_at.is_some_and(|at| at <= unix_now()) {
             self.remove(id);
@@ -339,12 +384,15 @@ impl JobStore {
         self.jobs.lock().expect("jobs").insert(id, job);
     }
 
-    fn remove(&self, id: &str) -> Option<Arc<Job>> {
+    pub(crate) fn remove(&self, id: &str) -> Option<Arc<Job>> {
         let job = self.jobs.lock().expect("jobs").remove(id)?;
-        job.deleted.store(true, Ordering::Relaxed);
-        job.cancel.store(true, Ordering::Relaxed);
-        if job.progress.borrow().done {
-            job.remove_files();
+        {
+            let _status = job.status.lock().expect("job status");
+            job.deleted.store(true, Ordering::Relaxed);
+            job.cancel.store(true, Ordering::Relaxed);
+            if job.progress.borrow().done {
+                job.remove_files();
+            }
         }
         Some(job)
     }
@@ -802,7 +850,9 @@ pub(crate) async fn create(State(state): State<AppState>, request: Request) -> R
     }
 }
 
-async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
+/// [`create`], with the Problem left to the caller. A vendor route starts
+/// its jobs here and answers a refusal in the vendor's own shape.
+pub(crate) async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
     let started = Instant::now();
     let input = batch::media_type(request.headers())
         .and_then(Format::of)
@@ -825,71 +875,18 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
         .extensions()
         .get::<RequestId>()
         .map(|id| id.0.clone());
-
-    // Checked once, at the start: a job already running may take the store
-    // past its cap, and the next one waits for results to expire.
-    if state.jobs().used_bytes() >= state.limits().max_job_store_bytes() {
-        return Err(Problem::busy(STORE_FULL_RETRY_AFTER_SECONDS).with_detail(
-            "the server keeps as many job results as it can hold; retry once older ones expire",
-        ));
-    }
-    let Ok(permit) = Arc::clone(state.batch_slots()).try_acquire_owned() else {
-        return Err(Problem::busy(1));
-    };
-
-    let (chunks_tx, chunks_rx) = channel::channel(32);
-    let (uploaded_tx, uploaded_rx) = oneshot::channel();
-    tokio::spawn(forward_upload(
+    let id = uuid::Uuid::new_v4();
+    let (job, uploaded_rx) = launch(
+        &state,
+        id,
+        (input, output),
+        plan,
         request.into_body(),
-        max_upload,
-        state.stopping().clone(),
-        chunks_tx,
-        uploaded_tx,
-    ));
-    let mut upload = Upload {
-        chunks: chunks_rx,
-        chunk: Bytes::new(),
-    };
-
-    // The header row is read before answering, so a CSV the job cannot
-    // read is a 400 rather than a stream that stops.
-    let (upload, layout, endpoint, plan) = task::spawn_blocking(move || {
-        let (layout, endpoint) = read_layout(&mut upload, input, &plan)?;
-        Ok::<_, Problem>((upload, layout, endpoint, plan))
-    })
-    .await??;
-
-    let id = uuid::Uuid::new_v4().simple().to_string();
-    let store = state.jobs();
-    let job = store.job(JobStatus {
-        id: id.clone(),
-        endpoint,
-        status: Status::Running,
-        input_format: input,
-        output_format: output,
-        summary: Summary::default(),
-        created_at: unix_now(),
-        completed_at: None,
-        expires_at: None,
-        results_url: format!("/jobs/{id}/results"),
-        error: None,
-    });
-    let file = File::create(&job.results).map_err(|error| Problem::internal(error.into()))?;
-    job.save();
-    store.insert(Arc::clone(&job));
-
-    let run = Run {
-        state: state.clone(),
-        job: Arc::clone(&job),
-        shared: plan.shared,
-        output,
         request_id,
         started,
-    };
-    task::spawn_blocking(move || match endpoint {
-        Endpoint::Geocode => run.go(GEOCODE, upload, layout, file, permit),
-        Endpoint::Reverse => run.go(REVERSE, upload, layout, file, permit),
-    });
+    )
+    .await?;
+    let id = job.snapshot().id;
 
     let location = HeaderValue::from_str(&format!("/jobs/{id}"))
         .map_err(|error| Problem::internal(error.into()))?;
@@ -915,6 +912,105 @@ async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
         .headers_mut()
         .insert(header::CONTENT_LOCATION, results);
     Ok(response)
+}
+
+/// Start a job reading its rows from `body`, kept under `id`, with its
+/// input and output formats and the plan its query string made. Answers once
+/// the header row is read, with the job and a signal that the upload is in.
+async fn launch(
+    state: &AppState,
+    id: uuid::Uuid,
+    (input, output): (Format, Format),
+    plan: Plan,
+    body: Body,
+    request_id: Option<String>,
+    started: Instant,
+) -> Result<(Arc<Job>, oneshot::Receiver<()>), Problem> {
+    // Checked once, at the start: a job already running may take the store
+    // past its cap, and the next one waits for results to expire.
+    if state.jobs().used_bytes() >= state.limits().max_job_store_bytes() {
+        return Err(Problem::busy(STORE_FULL_RETRY_AFTER_SECONDS).with_detail(
+            "the server keeps as many job results as it can hold; retry once older ones expire",
+        ));
+    }
+    let Ok(permit) = Arc::clone(state.batch_slots()).try_acquire_owned() else {
+        return Err(Problem::busy(1));
+    };
+
+    let (chunks_tx, chunks_rx) = channel::channel(32);
+    let (uploaded_tx, uploaded_rx) = oneshot::channel();
+    tokio::spawn(forward_upload(
+        body,
+        state.limits().max_job_upload_bytes(),
+        state.stopping().clone(),
+        chunks_tx,
+        uploaded_tx,
+    ));
+    let mut upload = Upload {
+        chunks: chunks_rx,
+        chunk: Bytes::new(),
+    };
+
+    // The header row is read before answering, so a CSV the job cannot
+    // read is a 400 rather than a stream that stops.
+    let (upload, layout, endpoint, plan) = task::spawn_blocking(move || {
+        let (layout, endpoint) = read_layout(&mut upload, input, &plan)?;
+        Ok::<_, Problem>((upload, layout, endpoint, plan))
+    })
+    .await??;
+
+    let id = id.simple().to_string();
+    let store = state.jobs();
+    let job = store.job(JobStatus {
+        id: id.clone(),
+        endpoint,
+        status: Status::Running,
+        input_format: input,
+        output_format: output,
+        summary: Summary::default(),
+        created_at: unix_now(),
+        completed_at: None,
+        expires_at: None,
+        results_url: format!("/jobs/{id}/results"),
+        error: None,
+    });
+    let file = File::create(&job.results).map_err(|error| Problem::internal(error.into()))?;
+    job.save(&job.snapshot());
+    store.insert(Arc::clone(&job));
+
+    let run = Run {
+        state: state.clone(),
+        job: Arc::clone(&job),
+        shared: plan.shared,
+        output,
+        request_id,
+        started,
+    };
+    task::spawn_blocking(move || match endpoint {
+        Endpoint::Geocode => run.go(GEOCODE, upload, layout, file, permit),
+        Endpoint::Reverse => run.go(REVERSE, upload, layout, file, permit),
+    });
+    Ok((job, uploaded_rx))
+}
+
+/// A JSONL job of `endpoint` items read from `body`, written as JSONL, for a
+/// `/compat` batch flow that translates its vendor's files to and from og's.
+/// Answers once the job runs; it is kept and listed as any other.
+pub(crate) async fn submit(
+    state: &AppState,
+    id: uuid::Uuid,
+    endpoint: Endpoint,
+    body: Body,
+    request_id: Option<String>,
+) -> Result<Arc<Job>, Problem> {
+    let plan = Plan {
+        endpoint: Some(endpoint),
+        named: Vec::new(),
+        shared: Vec::new(),
+    };
+    let formats = (Format::Jsonl, Format::Jsonl);
+    let (job, _) = launch(state, id, formats, plan, body, request_id, Instant::now()).await?;
+    Ok(job)
 }
 
 /// `Prefer: respond-async` (RFC 7240): answer once the upload is in, with
@@ -1227,31 +1323,29 @@ impl Run {
 
     fn finish(self, ending: Ending, written: io::Result<()>) {
         let now = unix_now();
-        {
-            let mut status = self.job.status.lock().expect("job status");
-            // A cancelled job's upload, cut short, reads as complete.
-            let ending = match ending {
-                Ending::Read if self.job.cancel.load(Ordering::Relaxed) => Ending::Cancelled,
-                other => other,
-            };
-            let (state, error) = match (ending, written) {
-                (_, Err(error)) => (
-                    Status::Failed,
-                    Some(format!("writing results failed: {error}")),
-                ),
-                (Ending::Read, Ok(())) => (Status::Completed, None),
-                (Ending::Cancelled, Ok(())) => (Status::Cancelled, None),
-                (Ending::Failed(error), Ok(())) => (Status::Failed, Some(error)),
-            };
-            status.status = state;
-            status.error = error;
-            status.completed_at = Some(now);
-            status.expires_at = Some(now + self.state.limits().job_retention().as_secs());
-        }
+        let mut status = self.job.status.lock().expect("job status");
+        // A cancelled job's upload, cut short, reads as complete.
+        let ending = match ending {
+            Ending::Read if self.job.cancel.load(Ordering::Relaxed) => Ending::Cancelled,
+            other => other,
+        };
+        let (state, error) = match (ending, written) {
+            (_, Err(error)) => (
+                Status::Failed,
+                Some(format!("writing results failed: {error}")),
+            ),
+            (Ending::Read, Ok(())) => (Status::Completed, None),
+            (Ending::Cancelled, Ok(())) => (Status::Cancelled, None),
+            (Ending::Failed(error), Ok(())) => (Status::Failed, Some(error)),
+        };
+        status.status = state;
+        status.error = error;
+        status.completed_at = Some(now);
+        status.expires_at = Some(now + self.state.limits().job_retention().as_secs());
         if self.job.deleted.load(Ordering::Relaxed) {
             self.job.remove_files();
         } else {
-            self.job.save();
+            self.job.save(&status);
         }
         self.job
             .progress
@@ -1601,8 +1695,8 @@ pub(crate) async fn status(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Response, Problem> {
-    let job = state.jobs().get(&id).ok_or_else(no_such_job)?;
-    Ok(axum::Json(job.snapshot()).into_response())
+    let status = state.jobs().status(&id).ok_or_else(no_such_job)?;
+    Ok(axum::Json(status).into_response())
 }
 
 /// Get a job's results
@@ -1658,9 +1752,8 @@ pub(crate) async fn cancel(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Response, Problem> {
-    let job = state.jobs().get(&id).ok_or_else(no_such_job)?;
-    job.cancel.store(true, Ordering::Relaxed);
-    Ok(axum::Json(job.snapshot()).into_response())
+    let status = state.jobs().cancel(&id).ok_or_else(no_such_job)?;
+    Ok(axum::Json(status).into_response())
 }
 
 /// Delete a job
@@ -1699,5 +1792,7 @@ pub(crate) async fn sweep_forever(state: AppState) {
     loop {
         every.tick().await;
         state.jobs().sweep();
+        crate::compat::here::sweep(&state).await;
+        crate::compat::precisely::sweep(&state);
     }
 }

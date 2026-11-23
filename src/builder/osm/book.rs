@@ -75,6 +75,10 @@ impl<T: Entry> Book<T> {
         })
     }
 
+    pub(crate) fn next_position(&self) -> u64 {
+        self.len
+    }
+
     /// Write `item`, returning its position.
     pub(crate) fn push(&mut self, item: T) -> Result<u64> {
         self.chunk.push(item);

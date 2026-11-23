@@ -218,11 +218,8 @@ pub(super) fn read_cell(cell: &mut [PendingAddress], counts: &mut SlashNumberCou
                 let Slash { unit, number, .. } =
                     parse_slash(&address.number).expect("a slash number");
                 let (unit, number) = (unit.to_string(), number.to_string());
-                // An `addr:unit` tag names the flat as its mapper wrote it.
                 address.unit.get_or_insert(unit);
                 address.number = number;
-                // The sort key holds the number, so a flat now sorts with
-                // its building.
                 cell[index] = cell[index].restated(&address);
                 changed = true;
             }
@@ -265,9 +262,12 @@ mod tests {
 
     fn pending(id: i64, number: &str, street: &str, lat: f64) -> PendingAddress {
         let record = AddressRecord {
+            building: None,
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 number: number.to_string(),
                 street: Some(street.to_string()),
                 place: None,

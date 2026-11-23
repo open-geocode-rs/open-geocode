@@ -247,7 +247,6 @@ mod tests {
     #[test]
     fn specific_rules_win_over_levels() {
         let table = admin_levels();
-        // London is a city whatever its level.
         let london = Boundary {
             object: (ObjectType::Relation, 65606),
             ..boundary("gb", 5)
@@ -256,7 +255,6 @@ mod tests {
             table.verdict(london, |_| false),
             Some(Some(PlaceLayer::Locality))
         );
-        // A level 10 inside Berlin is a neighbourhood.
         let berlin = (ObjectType::Relation, 62422);
         assert_eq!(
             table.verdict(boundary("de", 10), |object| object == berlin),

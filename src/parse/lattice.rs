@@ -146,8 +146,6 @@ impl Tokens {
     pub fn new(text: &str) -> Self {
         let mut tokens = Self::default();
         let mut pending_break = false;
-        // What stood between the last word and this one, while it can still
-        // be a joiner.
         let mut gap = Gap::None;
         search_pieces(text, |piece| match piece {
             Piece::Word(word) => {
@@ -274,6 +272,24 @@ pub fn numeral_value(character: char) -> Option<u32> {
 /// ideograph of [`NUMERALS`].
 pub fn is_numeral(character: char) -> bool {
     character.is_numeric() || numeral_value(character).is_some()
+}
+
+/// Per word of `text` as [`Tokens::new`] splits it, whether the number sign
+/// `#` stands right before it, spaces aside, after some other word. Written
+/// so ("District Ave #300") it numbers a flat or a suite, never the house,
+/// though [`search_key`] drops the sign and leaves a bare number.
+fn after_number_sign(text: &str) -> Vec<bool> {
+    let mut signed = Vec::new();
+    let mut sign = false;
+    search_pieces(text, |piece| match piece {
+        Piece::Word(_) => {
+            signed.push(sign && !signed.is_empty());
+            sign = false;
+        }
+        Piece::Gap('#') => sign = true,
+        Piece::Gap(character) => sign &= character.is_whitespace(),
+    });
+    signed
 }
 
 /// `key` with each run of numerals written as `#`, the form numbered areas
@@ -494,7 +510,6 @@ impl Units {
         let by_unit = self.unit_corrections(segments, corrections);
         let mut pieces: Vec<Tagged> = Vec::with_capacity(segments.len());
         let mut corrected: Vec<Option<String>> = Vec::with_capacity(segments.len());
-        // Whether the last piece is a run of one-unit segments.
         let mut open_run = false;
         for &(start, end, label) in segments {
             let single = end - start == 1;
@@ -632,8 +647,15 @@ impl ParsedQuery {
 #[derive(Debug)]
 pub struct Explanation {
     lattice: Lattice,
+    signed: Vec<bool>,
     /// The score of the best labelling the parse returned.
     pub best: f32,
+}
+
+fn signed_allows(lattice: &Lattice, signed: &[bool], span: &decode::Span, label: Label) -> bool {
+    label == Label::Unit
+        || !(span.start..span.end)
+            .any(|unit| signed.get(lattice.units.token_of[unit]) == Some(&true))
 }
 
 /// A set of labels.
@@ -815,17 +837,28 @@ impl LatticeTagger {
         if tokens.is_empty() {
             return (Vec::new(), None);
         }
+        let signed = after_number_sign(query);
         let lattice = self.lattice(&tokens, &Suppression::default());
-        let mut parsed = self.parse_lattice(&tokens, &lattice, n);
+        let mut parsed = self.parse_lattice(&tokens, &lattice, n, &signed);
         let mut explanation = Explanation {
             best: parsed.first().map_or(0.0, |parse| parse.score),
             lattice,
+            signed,
         };
-        let Some(at) = self.trailing_country(&tokens) else {
+        let Some(at) = self.trailing_country(&tokens).filter(|&at| {
+            !explanation
+                .signed
+                .get(at..)
+                .unwrap_or_default()
+                .contains(&true)
+        }) else {
             return (parsed, Some(explanation));
         };
         let country = &tokens.words[at..];
-        for mut reading in self.parse_tokens(&tokens.prefix(at), n) {
+        let prefix = tokens.prefix(at);
+        let prefix_lattice = self.lattice(&prefix, &Suppression::default());
+        let signed_prefix = &explanation.signed[..at.min(explanation.signed.len())];
+        for mut reading in self.parse_lattice(&prefix, &prefix_lattice, n, signed_prefix) {
             let words = country.iter().map(|word| Tagged {
                 token: word.clone(),
                 label: Label::Country,
@@ -867,9 +900,10 @@ impl LatticeTagger {
             .map(|word| labels(word))
             .collect::<Vec<_>>();
         let allows = |span: &decode::Span, label: Label| {
-            allowed[span.start..span.end]
-                .iter()
-                .all(|set| set.is_empty() || set.contains(label))
+            signed_allows(lattice, &explanation.signed, span, label)
+                && allowed[span.start..span.end]
+                    .iter()
+                    .all(|set| set.is_empty() || set.contains(label))
         };
         decode::best_allowed(lattice, &self.weights, &allows).map(|path| path.score)
     }
@@ -925,19 +959,29 @@ impl LatticeTagger {
             return Vec::new();
         }
         let lattice = self.lattice(tokens, &Suppression::default());
-        self.parse_lattice(tokens, &lattice, n)
+        self.parse_lattice(tokens, &lattice, n, &[])
     }
 
-    fn parse_lattice(&self, tokens: &Tokens, lattice: &Lattice, n: usize) -> Vec<ParsedQuery> {
+    /// The best `n` labellings of `tokens`, a word `signed` marks (see
+    /// [`after_number_sign`]) read as a unit.
+    fn parse_lattice(
+        &self,
+        tokens: &Tokens,
+        lattice: &Lattice,
+        n: usize,
+        signed: &[bool],
+    ) -> Vec<ParsedQuery> {
         if n == 0 {
             return Vec::new();
         }
-        let mut paths = decode::best(lattice, &self.weights, n);
+        let flat = |span: &decode::Span, label: Label| signed_allows(lattice, signed, span, label);
+        let allows: Option<decode::Allows<'_>> = signed.contains(&true).then_some(&flat);
+        let mut paths = decode::best(lattice, &self.weights, n, allows);
         // The best labellings are almost always addresses; only when one is
         // not are more decoded to find those that are. When none is, the
         // best ones still read it.
         if !paths.iter().all(|path| self.is_one_address(lattice, path)) {
-            let addresses = decode::best(lattice, &self.weights, n.max(CONSTRAINED_PATHS))
+            let addresses = decode::best(lattice, &self.weights, n.max(CONSTRAINED_PATHS), allows)
                 .into_iter()
                 .filter(|path| self.is_one_address(lattice, path))
                 .collect::<Vec<_>>();
@@ -1079,7 +1123,6 @@ impl LatticeTagger {
                     set.glued_phrase(field);
                 }
                 let mut key = SpanKey::new(phrases.take_key(start, end), &infos[start..end]);
-                // A word's affixes: of a token, or of glued units as one.
                 let glued = end - start > 1 && units.unspaced(start, end);
                 if (end - start == 1 && !infos[start].unspaced) || glued {
                     set.affixes(&key.key);
@@ -1091,7 +1134,6 @@ impl LatticeTagger {
                 }
                 let mut area = false;
                 let mut street = false;
-                // The field of names the most records use the span in.
                 let mut dominant: Option<(Field, u64)> = None;
                 for field in Field::NAMES {
                     if suppression.hides(field, start, end) {
@@ -1198,7 +1240,6 @@ impl LatticeTagger {
                     .push(features::cover_base() + bit);
             }
         }
-        // Runs longer than the longest span looked up.
         for &(start, end) in runs.iter().filter(|(start, end)| end - start > longest) {
             let mut set = FeatureSet::new(tokens, &infos, start, end);
             set.affixes(&units.key(start, end));
@@ -1374,28 +1415,31 @@ impl Chains {
         if end - start < 2 || self.from.is_empty() || !units.unspaced(start, end) {
             return None;
         }
-        // best[offset]: the most names covering start..start + offset, and
-        // whether one is a region.
-        let mut best: Vec<Option<(usize, bool)>> = vec![None; end - start + 1];
-        best[0] = Some((0, false));
+        let mut best_by_offset = vec![None; end - start + 1];
+        best_by_offset[0] = Some(Chain {
+            pieces: 0,
+            region: false,
+        });
+        let score = |chain: Chain| (chain.pieces, chain.region);
         for at in start..end {
-            let Some((pieces, region)) = best[at - start] else {
+            let Some(chain) = best_by_offset[at - start] else {
                 continue;
             };
             for &(to, is_region) in self.from.get(&at).into_iter().flatten() {
                 if to > end {
                     continue;
                 }
-                let next = (pieces + 1, region || is_region);
-                let cell = &mut best[to - start];
-                if cell.is_none_or(|cell| next > cell) {
+                let next = Chain {
+                    pieces: chain.pieces + 1,
+                    region: chain.region || is_region,
+                };
+                let cell = &mut best_by_offset[to - start];
+                if cell.is_none_or(|held| score(next) > score(held)) {
                     *cell = Some(next);
                 }
             }
         }
-        best[end - start]
-            .filter(|(pieces, _)| *pieces >= 2)
-            .map(|(pieces, region)| Chain { pieces, region })
+        best_by_offset[end - start].filter(|chain| chain.pieces >= 2)
     }
 }
 

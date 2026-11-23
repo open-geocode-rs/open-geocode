@@ -10,15 +10,24 @@
       },
       "properties": {
         "accuracy": "centroid",
-        "confidence": 0.76852477,
+        "bbox": [
+          -79.6392727,
+          43.5796082,
+          -79.1132193,
+          43.8554425
+        ],
         "id": "osm:relation:3",
         "label": "Toronto",
         "layer": "locality",
+        "match": {
+          "locality": "matched"
+        },
         "name": "Toronto",
         "score": 1.8413742,
         "source": {
           "dataset": "osm"
-        }
+        },
+        "timezone": "America/Toronto"
       },
       "type": "Feature"
     }
@@ -29,6 +38,11 @@
         "licence": "ODbL 1.0",
         "text": "© OpenStreetMap contributors",
         "url": "https://www.openstreetmap.org/copyright"
+      },
+      {
+        "licence": "ODbL 1.0",
+        "text": "Timezone boundaries © OpenStreetMap contributors",
+        "url": "https://github.com/evansiroky/timezone-boundary-builder"
       }
     ],
     "query": "Toronto",

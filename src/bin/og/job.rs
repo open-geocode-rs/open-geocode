@@ -139,6 +139,7 @@ pub(crate) struct BuildRequest {
     pub leftover: Leftover,
     /// Add the OpenAddresses points of the countries the Pack covers.
     pub openaddresses: bool,
+    pub tiger: bool,
 }
 
 /// A finished build.
@@ -468,7 +469,6 @@ fn run(
         if let Err(error) = net::check_md5(&partial, &published.md5, cancel, |done| {
             progress.done.store(done, Ordering::Relaxed);
         }) {
-            // A file that does not match is no use to continue from.
             if !cancel.load(Ordering::Relaxed) {
                 net::discard(&partial);
             }
@@ -523,6 +523,7 @@ fn run(
         } else {
             0
         },
+        tiger: request.tiger,
         ..BuildOsmOptions::default()
     };
     let plan = plan_osm_build(&options)?;

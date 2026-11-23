@@ -1,0 +1,28 @@
+reviews:
+  path_instructions:
+    - path: "**/*.rs"
+      instructions: |
+        Review added or changed comments in the diff using pstack's Comment Sicko
+        rules and this repository's AGENTS.md.
+
+        Flag narration, banners, commented-out code, and workaround sermons.
+        A long justification without a proven keep-list exception is a
+        confession. Never polish it into a shorter alibi.
+
+        Keep legal or license headers, public API contract docs, and issue or RFC
+        links that explain a constraint code cannot express. Keep non-obvious
+        behavior forced by an external dependency, platform, vendor, or protocol
+        we cannot reshape. Preserve mandatory SAFETY comments that state the
+        invariant for an unsafe block. Keep lint suppressions only when their
+        rule is faulty, pedantic, or style-only.
+
+        Before judging "IMPORTANT" or "do not remove", read nearby code and trace
+        the named symbol when the claim is unclear. Verify that any claimed
+        external constraint still applies on a live path. For surprises in our
+        own code, mark the exact symbol MUST KILL and suggest the smallest rename,
+        extraction, type, or reshape that makes the behavior obvious without prose.
+        Correctness or safety lint suppressions also get a MUST KILL finding on
+        the exact symbol.
+
+        Every finding names code inside the diff's scope and tells the truth.
+        Identify refactor targets and explain why. Report findings only.

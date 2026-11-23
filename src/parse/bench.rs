@@ -888,7 +888,6 @@ mod tests {
         let report = run_parse_bench(&options(gold, predictions, 5)).expect("report");
         assert_eq!(report.systems, vec!["og-legacy", "base"]);
         assert_eq!(report.variants, vec!["as-is", "stripped", "messy"]);
-        // Two countries and a total, three variants each.
         assert_eq!(report.groups.len(), 9);
         let group = |country: &str, variant: &str| {
             report
@@ -991,7 +990,6 @@ mod tests {
         let answers = root.join("answers");
         fs::create_dir_all(&answers).expect("dir");
         for variant in Variant::ALL {
-            // The baseline answers with the variant's own query text.
             let query = fs::read_to_string(queries.join(format!("us.{}.txt", variant.name())))
                 .expect("query");
             let answer = serde_json::json!({ "components": [["road", query.trim()]] });

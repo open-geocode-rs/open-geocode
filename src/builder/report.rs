@@ -73,9 +73,27 @@ pub struct BuilderReport {
     pub resumes: Vec<ResumeReport>,
     #[serde(default)]
     pub qrank: Option<QRankReport>,
+    #[serde(default)]
+    pub timezones: Option<TimezoneReport>,
 }
 
-// Traces a Pack's importances to the file.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TimezoneReport {
+    pub path: String,
+    pub bytes: u64,
+    pub modified_unix: u64,
+    pub zones: u64,
+    pub areas: u64,
+    /// Areas that lie wholly in one zone, which their records read it from.
+    pub areas_in_one_zone: u64,
+    /// Records in such an area.
+    pub records_zoned_by_area: u64,
+    /// Records in no such area, given the zone at their own point.
+    pub records_zoned_by_point: u64,
+    /// Records in no such area whose point lies in no zone, or in two.
+    pub records_without_zone: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct QRankReport {
     pub path: String,
@@ -718,6 +736,9 @@ pub struct GeometryPassReport {
     pub stored_nodes: u64,
     /// Nodes whose address tags interpolation ways read.
     pub tagged_nodes: u64,
+    /// Needed nodes tagged `entrance`, kept for the records drawn with them.
+    #[serde(default)]
+    pub entrance_nodes: u64,
     /// Most bytes one input's node id bitmap and rank index held.
     pub peak_node_set_bytes: u64,
     /// Most bytes one input's coordinates held.
@@ -748,6 +769,7 @@ impl GeometryPassReport {
         self.needed_nodes += stored.needed;
         self.stored_nodes += stored.stored;
         self.tagged_nodes += stored.tagged;
+        self.entrance_nodes += stored.entrances;
         self.peak_node_set_bytes = self.peak_node_set_bytes.max(stored.set_bytes);
         self.peak_location_bytes = self.peak_location_bytes.max(stored.location_bytes);
         if stored.mapped {
@@ -2005,9 +2027,12 @@ mod tests {
     ) -> AddressRecord {
         let street = street.map(str::to_string);
         AddressRecord {
+            building: None,
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: Vec::new(),
                 number: "10".to_string(),
                 street,

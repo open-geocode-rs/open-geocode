@@ -144,7 +144,6 @@ fn parts(row: &TaggedRow) -> Vec<Vec<Tagged>> {
 /// countries the benchmark covers, so their streets can be fused too. They
 /// have no abbreviation in the table.
 const OTHER_STREET_TYPES: &[&str] = &[
-    // German.
     "strasse",
     "weg",
     "platz",
@@ -154,14 +153,12 @@ const OTHER_STREET_TYPES: &[&str] = &[
     "damm",
     "ufer",
     "chaussee",
-    // French.
     "rue",
     "chemin",
     "impasse",
     "route",
     "quai",
     "cours",
-    // Russian.
     "улица",
     "проспект",
     "переулок",
@@ -392,7 +389,6 @@ mod tests {
             match tokens(&messy).as_slice() {
                 ["king", "st"] => abbreviated += 1,
                 ["kingstreet"] => fused += 1,
-                // A typo hit the fused token.
                 [one] if one_typo_apart("kingstreet", one) => fused += 1,
                 other => panic!("{other:?}"),
             }
@@ -422,7 +418,6 @@ mod tests {
                 one_typo_apart("manosquerstrasse", &out.tokens[0].token),
                 "{out:?}"
             );
-            // Neither: "rue" first and unabbreviated stays.
             let out = messy(&row(&format!("fr{index}\tfr\true/street x/street")));
             assert_eq!(tokens(&out), ["rue", "x"]);
         }

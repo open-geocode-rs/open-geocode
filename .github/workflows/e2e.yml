@@ -1,10 +1,7 @@
 name: End to end
 
-# The README path on real data, every night. Install og, download a region
-# from the catalog, build its Pack, serve it and ask it. Ashmore and Cartier
-# Islands is 22 KB, and it sits in a nested Geofabrik folder, the layout a
-# moved link breaks. og checks every download against the .md5 Geofabrik
-# publishes beside it, so a wrong file fails here too.
+# Nightly runs exercise Geofabrik's download and checksum. Pull requests
+# seed the cache so the build and serve check can run during upstream outages.
 on:
   schedule:
     - cron: "7 9 * * *"
@@ -12,6 +9,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/e2e.yml
+      - fixtures/smoke/**
       - src/bin/og/net.rs
       - src/bin/og/job.rs
       - src/bin/og/regions.rs
@@ -20,9 +18,9 @@ permissions:
   contents: read
 
 env:
-  REGION: australia/ashmore-cartier
-  PACK: australia-ashmore-cartier
-  QUERY: Ashmore and Cartier Islands
+  REGION: monaco
+  PACK: monaco
+  QUERY: Monaco
   ADDRESS: 127.0.0.1:8080
   GEOFABRIK_INDEX: https://download.geofabrik.de/index-v1-nogeom.json
   REPORTING_ISSUE: ${{ vars.REPORTING_ISSUE }}
@@ -49,6 +47,11 @@ jobs:
 
       - name: Install og
         run: cargo install --path . --features tui --bin og
+
+      - name: Seed the extract cache
+        if: github.event_name == 'pull_request'
+        run: |
+          install -D fixtures/smoke/monaco.osm.pbf "$RUNNER_TEMP/og/pbf/$REGION.osm.pbf"
 
       - name: Build a Pack
         run: |
@@ -81,7 +84,7 @@ jobs:
 
       # The index answering says nothing about the extract or its .md5, so no side is blamed.
       - name: Check the Geofabrik index
-        if: failure()
+        if: failure() && github.event_name != 'pull_request'
         run: |
           if curl -fsS --max-time 30 --output /dev/null "$GEOFABRIK_INDEX"; then
             echo "::notice::Geofabrik answers its index. This alone does not say which side failed."

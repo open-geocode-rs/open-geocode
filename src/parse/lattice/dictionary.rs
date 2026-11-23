@@ -1039,12 +1039,9 @@ impl Builder {
             region_groups,
             stated_regions,
         } = self;
-        // The ids of the areas each area name names, and the levels of the
-        // areas each name names.
         let mut places = BTreeMap::<String, Vec<u32>>::new();
         let mut levels = HashMap::<String, u8>::new();
         let mut aliases = HashMap::<String, Alias>::new();
-        // The numbered forms of area names, with the names that share each.
         let mut numbered = HashMap::<(Field, String), (NameStats, HashSet<String>)>::new();
         for (
             area,
@@ -1094,7 +1091,6 @@ impl Builder {
                     .extend(names.iter().filter_map(|name| dictionary_key(name)));
             }
         }
-        // The levels of the places each name names, points among them.
         let mut place_levels = levels.clone();
         for (key, place, level) in place_names {
             names_of.entry(place).or_default().insert(key.clone());
@@ -1139,7 +1135,6 @@ impl Builder {
             }
             names.entry((field, masked)).or_default().merge(&stats);
         }
-        // A country is also written as its code ("ca"), as people write it.
         for (area, code) in &country_codes {
             let count = area_names
                 .get(area)
@@ -1244,7 +1239,6 @@ impl Builder {
             .into_iter()
             .filter(|pair| !shares_name((pair >> 32) as u32, *pair as u32))
             .collect::<Vec<_>>();
-        // A record lies in the groups of its region as well.
         for context in contexts {
             let groups = context
                 .region_record_id()
@@ -1381,6 +1375,11 @@ fn admin_types() -> &'static [(String, Attach)] {
             } else if let Some(phrase) = phrase.strip_suffix('-') {
                 (phrase, Attach::Before)
             } else if let Some(phrase) = phrase.strip_suffix(" ~") {
+                // A type written "town of ~" is also written after the
+                // name it types ("Bristol town", "Jefferson Parish").
+                if let Some(kind) = phrase.strip_suffix(" of") {
+                    types.extend(dictionary_key(kind).map(|key| (key, Attach::WordAfter)));
+                }
                 (phrase, Attach::WordBefore)
             } else if let Some(phrase) = phrase.strip_prefix("~ ") {
                 (phrase, Attach::WordAfter)
@@ -1434,7 +1433,7 @@ pub(crate) fn same_admin_name(left: &str, right: &str) -> bool {
 /// "freistaat bayern", "madrid" of "comunidad de madrid", "경기" of "경기도".
 /// What is left must be two or more characters with no numeral, so "北区"
 /// and "3丁目" have none.
-pub(super) fn admin_aliases(key: &str) -> Vec<String> {
+pub(crate) fn admin_aliases(key: &str) -> Vec<String> {
     let mut aliases = Vec::new();
     for (phrase, attach) in admin_types() {
         let rests = match attach {
@@ -1808,7 +1807,6 @@ mod tests {
         let types = street_types(&streets);
         assert!(types.contains_key("street"));
         assert!(types.contains_key("rue"));
-        // From the vendored list, whatever the Pack holds.
         assert!(types.contains_key("strasse"));
         assert!(!types.contains_key("king"));
         assert!(!types.contains_key("name1"));
@@ -1854,6 +1852,7 @@ mod tests {
             prominence: Default::default(),
             wikidata: None,
             brand: None,
+            details: None,
             aliases: Vec::new(),
         });
         assert_eq!(
@@ -1910,10 +1909,8 @@ mod tests {
         assert_eq!(aliases("aichi prefecture"), ["aichi"]);
         assert_eq!(aliases("경기도"), ["경기"]);
         assert_eq!(aliases("จังหวัดเชียงใหม่"), ["เชียงใหม่"]);
-        // Too little or a number is left: no alias.
         assert!(aliases("北区").is_empty());
         assert!(aliases("3丁目").is_empty());
-        // A type word inside a word is no type word.
         assert!(aliases("statesville").is_empty());
     }
 
@@ -1982,9 +1979,12 @@ mod tests {
     fn words_many_units_are_written_with_are_unit_words() {
         let address = |unit: &str| {
             Record::Address(crate::record::AddressRecord {
+                building: None,
+                access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: AddressComponents {
+                    block_number_len: None,
                     areas: Vec::new(),
                     number: "1".into(),
                     street: Some("Main Street".into()),
@@ -2034,9 +2034,12 @@ mod tests {
     #[test]
     fn records_name_their_streets_areas_and_country() {
         let names = RecordNames::of(&Record::Address(crate::record::AddressRecord {
+            building: None,
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: vec!["Liberty Village".into()],
                 number: "670".into(),
                 street: Some("King Street West".into()),

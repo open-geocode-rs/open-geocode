@@ -5,10 +5,8 @@
 //! planet build trains each country on as many rows as a build of that
 //! country alone, in memory that does not grow with the input. Once the Pack
 //! is sealed, [`train`] reads the drawn records back in Pack order and writes
-//! them out the way people write addresses: through an address template of
-//! OpenCageData's address-formatting
-//! (<https://github.com/OpenCageData/address-formatting>, MIT, see `NOTICE`),
-//! vendored as `data/templates.tsv`, with the noise real queries carry:
+//! them out the way people write addresses, through its country's address
+//! template ([`crate::address_template`]), with the noise real queries carry:
 //! commas dropped, fields left out or swapped, street types abbreviated, a
 //! unit added, one-letter typos. Some rows hide the dictionary hits of their
 //! street or venue, so the model also learns to read names the Pack does not
@@ -49,6 +47,7 @@ use super::{
     weights::Weights,
 };
 use crate::{
+    address_template::{self, Piece},
     extsort::{ExternalSorter, IndexedSpool, IndexedSpoolFile, Scratch, Spill, Spool, SpoolFile},
     memory::{Budget, Reservation, Spillable},
     pack::{Reader, RecordId},
@@ -61,8 +60,6 @@ use crate::{
     },
 };
 
-/// `CC<TAB>template` rows, `ZZ` the default.
-const TEMPLATES: &str = include_str!("data/templates.tsv");
 /// Training rows rendered for each country of the Pack. Deepparse trains on
 /// 100,000 addresses per country; on the Japan Pack 200,000 rows label the
 /// held-out rows and the libpostal bench as well as 400,000, and 100,000
@@ -328,7 +325,6 @@ pub fn train(
     // in Pack order. The whole file need not fit, only them.
     report.pack_prefaulted =
         dictionaries.prefault_sections("parse/", Resources::probe().available_memory_bytes) > 0;
-    // Only the dictionaries: the weights are what this trains.
     let tagger = LatticeTagger::new(Dictionaries::open(dictionaries)?, Weights::zero());
     let mut random = Random::new(SEED);
 
@@ -389,7 +385,6 @@ pub fn train(
     }
     drop(renderer);
 
-    // Every row is held out or goes to one shard, in the random order.
     let shards = TRAIN_SHARDS;
     report.shards = shards;
     let mut held_out = Spool::<Row>::create(scratch, "parse-held-out")?;
@@ -853,7 +848,6 @@ impl Model {
 
     /// Learn from one row, labelled `gold` by token.
     fn learn(&mut self, lattice: &Lattice, gold: &[Label]) {
-        // A token's label is the label of every unit of it.
         let gold = lattice.units.expand(gold);
         let gradient = Gradient::of(lattice, &self.weights, &gold);
         for (feature, (values, set)) in gradient.edge {
@@ -975,7 +969,6 @@ impl Gradient {
         }
         for (country, (all, constrained)) in countries.iter().zip(&readings) {
             for (reading, sign, z) in [(constrained, 1.0, gold_z), (all, -1.0, all_z)] {
-                // How much of the row's probability this country carries.
                 let share = (reading.log_z - z).exp();
                 if share < MIN_GRADIENT {
                     continue;
@@ -1294,7 +1287,7 @@ impl Tally {
             .par_iter()
             .map(|row| {
                 let lattice = tagger.lattice(&row.tokens, &Suppression::default());
-                decode::best(&lattice, weights, 1)
+                decode::best(&lattice, weights, 1, None)
                     .into_iter()
                     .next()
                     .map(|path| lattice.units.collapse(&path.labels(&lattice)))
@@ -1422,57 +1415,14 @@ impl Slot {
     }
 }
 
-/// A parsed address template.
-#[derive(Debug, Clone)]
-enum Node {
-    /// Literal text; only the field breaks in it matter.
-    Text(String),
-    Slot(Slot),
-    /// A field the parser has no label for (`attention`, `county`).
-    Unused,
-    /// `{{#first}} a || b {{/first}}`: the first alternative with a value.
-    First(Vec<Vec<Node>>),
-}
-
-fn parse_template(template: &str) -> Vec<Node> {
-    let mut nodes = Vec::new();
-    let mut rest = template;
-    while !rest.is_empty() {
-        if let Some(after) = rest.strip_prefix("{{#first}}") {
-            let (inner, tail) = after.split_once("{{/first}}").unwrap_or((after, ""));
-            nodes.push(Node::First(inner.split("||").map(parse_template).collect()));
-            rest = tail;
-        } else if let Some(after) = rest.strip_prefix("{{{") {
-            let (name, tail) = after.split_once("}}}").unwrap_or((after, ""));
-            nodes.push(Slot::of(name.trim()).map_or(Node::Unused, Node::Slot));
-            rest = tail;
-        } else {
-            let first = rest.chars().next().map_or(1, char::len_utf8);
-            let end = rest[first..]
-                .find("{{")
-                .map_or(rest.len(), |end| end + first);
-            nodes.push(Node::Text(rest[..end].to_string()));
-            rest = &rest[end..];
-        }
-    }
-    nodes
-}
+/// An address template, each field the label the parser has for it. `None`
+/// is a field it has none for (`attention`, `county_code`).
+type Node = address_template::Node<Option<Slot>>;
 
 /// Every country's template, parsed once.
 fn templates() -> &'static BTreeMap<String, Vec<Node>> {
     static TABLE: OnceLock<BTreeMap<String, Vec<Node>>> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        TEMPLATES
-            .lines()
-            .filter_map(|line| line.split_once('\t'))
-            .map(|(code, template)| {
-                (
-                    code.to_string(),
-                    parse_template(&template.replace("\\n", "\n")),
-                )
-            })
-            .collect()
-    })
+    TABLE.get_or_init(|| address_template::table(Slot::of))
 }
 
 /// One field of a rendered address.
@@ -1488,14 +1438,17 @@ struct Group {
 
 /// The fields of `fields` in the order `nodes` writes them.
 fn render(nodes: &[Node], fields: &Fields, groups: &mut Vec<Group>, pending_break: &mut bool) {
-    for node in nodes {
-        match node {
-            Node::Text(text) => {
+    address_template::write(
+        nodes,
+        &|slot| slot.is_some_and(|slot| slot.value(fields).is_some()),
+        &mut |piece| match piece {
+            // Only the field breaks in literal text matter.
+            Piece::Text(text) => {
                 if text.contains(FIELD_BREAKS) && !groups.is_empty() {
                     *pending_break = true;
                 }
             }
-            Node::Slot(slot) => {
+            Piece::Field(Some(slot)) => {
                 if let Some(words) = slot.value(fields) {
                     groups.push(Group {
                         label: slot.label(),
@@ -1505,17 +1458,9 @@ fn render(nodes: &[Node], fields: &Fields, groups: &mut Vec<Group>, pending_brea
                     });
                 }
             }
-            Node::Unused => {}
-            Node::First(alternatives) => {
-                if let Some(alternative) = alternatives
-                    .iter()
-                    .find(|alternative| has_value(alternative, fields))
-                {
-                    render(alternative, fields, groups, pending_break);
-                }
-            }
-        }
-    }
+            Piece::Field(None) | Piece::Unfilled => {}
+        },
+    );
 }
 
 /// Write `groups` in the opposite order, each field break staying between
@@ -1536,7 +1481,7 @@ fn reverse_groups(groups: &mut [Group]) {
 /// Whether `nodes` have a place for `slot`.
 fn writes_slot(nodes: &[Node], slot: Slot) -> bool {
     nodes.iter().any(|node| match node {
-        Node::Slot(written) => *written == slot,
+        Node::Field(written) => *written == Some(slot),
         Node::First(alternatives) => alternatives.iter().any(|nodes| writes_slot(nodes, slot)),
         _ => false,
     })
@@ -1571,14 +1516,6 @@ fn insert_area(groups: &mut Vec<Group>, label: Label, words: &Tokens) {
             joiner: None,
         },
     );
-}
-
-fn has_value(nodes: &[Node], fields: &Fields) -> bool {
-    nodes.iter().any(|node| match node {
-        Node::Slot(slot) => slot.value(fields).is_some(),
-        Node::First(alternatives) => alternatives.iter().any(|nodes| has_value(nodes, fields)),
-        _ => false,
-    })
 }
 
 /// Share of rows that name a record or an area by one of its alternate names
@@ -1810,7 +1747,6 @@ impl<'a> Renderer<'a> {
             names: FxHashMap::default(),
             country_codes: FxHashMap::default(),
             localities: RefCell::default(),
-            // The vendored unit words and those the Pack's units use.
             unit_words: [Field::Unit, Field::PoBox, Field::Level]
                 .map(|field| tagger.dictionaries().keys(field)),
             near: tagger.dictionaries().keys(Field::Near),
@@ -1877,7 +1813,6 @@ impl<'a> Renderer<'a> {
             Record::Postcode(record) => fields.postcode = words(&record.postcode),
             Record::Interpolation(_) => return Ok(None),
         }
-        // A block scheme address is its number in its areas.
         let numbered_in_area = fields.house_number.is_some() && fields.suburb.is_some();
         if fields.house.is_none()
             && fields.street.is_none()
@@ -1886,7 +1821,6 @@ impl<'a> Renderer<'a> {
         {
             return Ok(None);
         }
-        // Where the record is: as it states it, or the areas it lies in.
         let pick = |stated: Option<&str>, area: Option<&str>, random: &mut Random| match (
             stated.and_then(words),
             area.and_then(words),
@@ -2796,7 +2730,6 @@ mod tests {
         assert_eq!(german[0].0, Street);
         assert_eq!(german[1].0, HouseNumber);
         assert_eq!(german[2], (Postcode, "m5v 1m9".to_string(), true));
-        // A missing field leaves its alternative to the next one.
         let mut no_number = fields();
         no_number.house_number = None;
         assert_eq!(rendered("CA", &no_number)[0].0, Street);
@@ -2876,9 +2809,12 @@ mod tests {
 
     fn address(street: Option<&str>, areas: &[&str]) -> Record {
         Record::Address(crate::record::AddressRecord {
+            building: None,
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: areas.iter().map(|area| area.to_string()).collect(),
                 number: "10-8".into(),
                 street: street.map(str::to_string),
@@ -2902,7 +2838,6 @@ mod tests {
         let mut sampler = Sampler::default();
         let addresses = quota(Draw::Layer(Layer::Address)).expect("quota");
         let blocks = quota(Draw::BlockAddress).expect("quota");
-        // One large country, one small, and records in no country.
         for id in 0..3 * addresses as u64 {
             sampler.offer(id, Some(1), &street);
         }
@@ -2922,7 +2857,6 @@ mod tests {
         assert_eq!(held(None, Draw::Layer(Layer::Address)), 10);
 
         let candidates = sampler.candidates(&mut Random::new(5));
-        // The large country's draws spread over all its records.
         let large = &candidates[&Some(1)];
         assert!(large.windows(2).all(|pair| pair[0].id < pair[1].id));
         assert!(large.last().expect("drawn").id > 2 * addresses as u64);
@@ -2970,6 +2904,7 @@ mod tests {
     #[test]
     fn stated_areas_chain_into_one_field() {
         let address = AddressComponents {
+            block_number_len: None,
             areas: vec!["西区".into(), "みなとみらい".into(), "3丁目".into()],
             number: "3-1".into(),
             street: None,

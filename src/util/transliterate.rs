@@ -164,7 +164,6 @@ fn romanize_kana(kana: &[char]) -> Option<String> {
     let mut double_next = false;
     for &character in kana {
         match character {
-            // A small tsu doubles the consonant after it.
             'っ' => {
                 double_next = true;
                 continue;
@@ -175,7 +174,6 @@ fn romanize_kana(kana: &[char]) -> Option<String> {
                 syllables.push(" ".to_string());
                 continue;
             }
-            // An iteration mark repeats the syllable before it.
             'ゝ' | 'ゞ' => {
                 if let Some(last) = syllables.last().cloned() {
                     syllables.push(last);

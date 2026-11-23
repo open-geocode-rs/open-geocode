@@ -1,0 +1,8 @@
+separator	番地の
+both	番地
+both	番
+separator	號之
+separator	号之
+terminal	號
+terminal	号
+terminal	번지

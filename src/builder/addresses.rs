@@ -531,9 +531,12 @@ fn address(
         return Err("bad_coordinates");
     }
     Ok(AddressRecord {
+        building: None,
+        access: Vec::new(),
         disputed: false,
         street_postcodes: Vec::new(),
         address: AddressComponents {
+            block_number_len: None,
             number,
             street: Some(street),
             place: None,
@@ -699,7 +702,6 @@ mod tests {
 
     #[test]
     fn rows_prepared_on_the_pool_are_taken_in_file_order() {
-        // Past two batches, so rows from three batches must line up.
         let rows = 2 * ROW_BATCH + 3;
         let mut csv = String::from("lon,lat,number,street\n");
         for row in 1..=rows {

@@ -24,9 +24,9 @@ use crate::{
     context::{AdminContextTuple, RecordContext},
     pack::Writer,
     record::{
-        AddressComponents, AddressRecord, InterpolationAddressComponents, InterpolationRange,
-        InterpolationRecord, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, PoiRecord,
-        Record, SourceProvenance, StreetRecord, point_geometry,
+        AddressComponents, AddressRecord, Contact, InterpolationAddressComponents,
+        InterpolationRange, InterpolationRecord, LocationPrecision, ObjectType, PlaceLayer,
+        PlaceRecord, PoiDetails, PoiRecord, Record, SourceProvenance, StreetRecord, point_geometry,
     },
     runtime::{AppState, build_router},
 };
@@ -255,14 +255,19 @@ async fn responses_match_the_committed_examples() {
     assert_eq!(properties["name"], "10 King Street");
     assert_eq!(
         properties["address"],
-        json!({"housenumber": "10", "street": "King Street", "postcode": "M5V 1A1"})
+        json!({
+            "housenumber": "10",
+            "street": "King Street",
+            "street_parts": {"name": "King", "type": "Street"},
+            "postcode": "M5V 1A1",
+        })
     );
     assert_eq!(
         properties["context"],
         json!({
             "locality": {"id": "osm:relation:3", "name": "Toronto"},
-            "region": {"id": "osm:relation:2", "name": "Ontario"},
-            "country": {"id": "osm:relation:1", "name": "Canada"},
+            "region": {"id": "osm:relation:2", "name": "Ontario", "code": "CA-ON"},
+            "country": {"id": "osm:relation:1", "name": "Canada", "code": "CA"},
         })
     );
     assert!(properties["score"].is_number());
@@ -391,7 +396,6 @@ async fn responses_match_the_committed_examples() {
     assert!(features[1]["properties"].get("distance_m").is_none());
     assert!(features[0]["properties"].get("score").is_none());
 
-    // Off every address but on the range: an estimated house number.
     let on_range = get(&router, "/reverse?lon=-79.0102&lat=43.0005").await;
     assert_example("reverse-interpolation", &on_range);
     let properties = &on_range["features"][0]["properties"];
@@ -412,7 +416,6 @@ async fn responses_match_the_committed_examples() {
     assert_eq!(features.len(), 1);
     assert_eq!(features[0]["properties"]["layer"], "street");
 
-    // Far from everything but the areas.
     let context_only = get(&router, "/reverse?lon=-79.2&lat=43.2").await;
     assert_example("reverse-areas", &context_only);
 
@@ -483,11 +486,33 @@ async fn responses_match_the_committed_examples() {
         0,
         "a country the Pack does not hold answers with no features"
     );
+    // Places and suggestions are filtered alike, names and addresses both.
+    for uri in [
+        "/places?q=Queen%20Bakery",
+        "/autocomplete?q=Queen%20Bak",
+        "/autocomplete?q=10%20King",
+    ] {
+        let found = get(&router, &format!("{uri}&country=CA")).await;
+        assert_eq!(
+            found["features"].as_array().expect("features").len(),
+            1,
+            "{uri}"
+        );
+        let elsewhere = get(&router, &format!("{uri}&country=FR")).await;
+        assert_eq!(elsewhere["features"], json!([]), "{uri}");
+    }
 
     // The country the contract Pack is built from finds the same places the
     // unfiltered query does, so the filter narrows without changing ranking.
+    // It states the country, which each answer then matches.
     let unfiltered = get(&router, "/geocode?q=king").await;
-    let filtered = get(&router, "/geocode?q=king&country=CA").await;
+    let mut filtered = get(&router, "/geocode?q=king&country=CA").await;
+    for feature in filtered["features"].as_array_mut().expect("features") {
+        let matched = feature["properties"]["match"]
+            .as_object_mut()
+            .expect("a match");
+        assert_eq!(matched.remove("country"), Some(json!("matched")));
+    }
     assert_eq!(unfiltered["features"], filtered["features"]);
 
     let _ = std::fs::remove_dir_all(&pack);
@@ -598,7 +623,6 @@ async fn batch_results_are_their_get_answers() {
         }
     }
 
-    // The committed example of a batch, its answers and its errors alike.
     let (_, example) = send_raw(
         &router,
         "POST",
@@ -901,6 +925,24 @@ fn write_pack(dir: &PathBuf) {
         .into_iter()
         .collect(),
     );
+    writer.set_subdivision_codes([(region, "CA-ON".to_string())].into_iter().collect());
+    writer.set_extents(vec![
+        (
+            country,
+            [-1_410_027_000, 416_765_000, -523_231_000, 833_362_000],
+        ),
+        (
+            region,
+            [-951_537_000, 416_765_000, -743_199_000, 568_593_000],
+        ),
+        (
+            locality,
+            [-796_392_727, 435_796_082, -791_132_193, 438_554_425],
+        ),
+    ]);
+    // Toronto lies wholly in one zone, as a build given timezone boundaries
+    // finds. Ontario and Canada reach into several, so they name none.
+    writer.set_timezones(vec!["America/Toronto".to_string()], vec![(locality, 0)]);
     let context = Some(RecordContext {
         admin_context: AdminContextTuple::from_tiers([
             (PlaceLayer::Country, country),
@@ -911,6 +953,7 @@ fn write_pack(dir: &PathBuf) {
         ..Default::default()
     });
     let king = AddressComponents {
+        block_number_len: None,
         areas: Vec::new(),
         number: "10".to_string(),
         street: Some("King Street".to_string()),
@@ -924,6 +967,8 @@ fn write_pack(dir: &PathBuf) {
     writer
         .write(
             &AddressRecord {
+                building: None,
+                access: Vec::new(),
                 disputed: false,
                 street_postcodes: Vec::new(),
                 address: king.clone(),
@@ -951,6 +996,21 @@ fn write_pack(dir: &PathBuf) {
                 prominence: Default::default(),
                 wikidata: None,
                 brand: None,
+                details: PoiDetails {
+                    contact: Contact::stated(
+                        Some("+1 416-555-0111".to_string()),
+                        Some("https://queenbakery.example/".to_string()),
+                        Some("hello@queenbakery.example".to_string()),
+                    ),
+                    opening_hours: Some("Mo-Fr 07:00-18:00; Sa 08:00-14:00".to_string()),
+                    extent: Some([-790_051_000, 429_999_200, -790_049_000, 430_000_800]),
+                    access: vec![crate::record::Entrance {
+                        at: [-790_050_000, 429_999_200],
+                        kind: "main".to_string(),
+                    }],
+                    cuisine: vec!["coffee_shop".to_string()],
+                }
+                .kept(),
                 aliases: Vec::new(),
             }
             .into(),
@@ -1019,4 +1079,273 @@ fn line(from_lon: f64, from_lat: f64, to_lon: f64, to_lat: f64) -> Geometry {
     Geometry::new(GeometryValue::LineString {
         coordinates: vec![vec![from_lon, from_lat].into(), vec![to_lon, to_lat].into()],
     })
+}
+
+/// Geneva in Switzerland, each area with its names in other languages, and
+/// an address in Geneva.
+fn write_geneva_pack(dir: &PathBuf) {
+    let _ = std::fs::remove_dir_all(dir);
+    let mut writer = Writer::create(dir).expect("writer");
+    let mut place = |layer, name: &str, alt_names: &[&str], id, context| {
+        writer
+            .write(
+                &Record::Place(
+                    layer,
+                    PlaceRecord {
+                        alt_names: alt_names.iter().map(|name| (*name).to_string()).collect(),
+                        name: name.to_string(),
+                        place_type: "admin_level:8".to_string(),
+                        geometry: point_geometry(6.14, 46.2),
+                        source: SourceProvenance::osm(ObjectType::Relation, id),
+                        prominence: Default::default(),
+                        wikidata: None,
+                    },
+                ),
+                context,
+            )
+            .expect("place")
+    };
+    let country = place(
+        PlaceLayer::Country,
+        "Schweiz/Suisse/Svizzera/Svizra",
+        &["Schweiz", "Suisse", "Svizzera"],
+        51_701,
+        None,
+    );
+    let locality = place(
+        PlaceLayer::Locality,
+        "Genève",
+        &["Genf", "Ginevra"],
+        1_685_488,
+        Some(RecordContext {
+            admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Country, country)]),
+            flags: 0,
+            zone: None,
+            enclosing: Vec::new(),
+        }),
+    );
+    let names = |pairs: &[(&str, &str)]| {
+        pairs
+            .iter()
+            .map(|(code, name)| ((*code).to_string(), (*name).to_string()))
+            .collect::<Vec<_>>()
+    };
+    writer.set_language_names(
+        [
+            (
+                country,
+                names(&[("de", "Schweiz"), ("fr", "Suisse"), ("it", "Svizzera")]),
+            ),
+            (
+                locality,
+                names(&[("de", "Genf"), ("fr", "Genève"), ("it", "Ginevra")]),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    writer.set_country_codes(
+        [(
+            country,
+            crate::parse::lattice::CountryCode::parse("CH").expect("code"),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let context = Some(RecordContext {
+        admin_context: AdminContextTuple::from_tiers([
+            (PlaceLayer::Country, country),
+            (PlaceLayer::Locality, locality),
+        ]),
+        flags: 0,
+        zone: None,
+        enclosing: Vec::new(),
+    });
+    writer
+        .write(
+            &AddressRecord {
+                building: None,
+                access: Vec::new(),
+                disputed: false,
+                street_postcodes: Vec::new(),
+                address: AddressComponents {
+                    block_number_len: None,
+                    areas: Vec::new(),
+                    number: "1".to_string(),
+                    street: Some("Rue du Rhône".to_string()),
+                    place: None,
+                    unit: None,
+                    locality: None,
+                    region: None,
+                    postcode: Some("1204".to_string()),
+                    country: None,
+                },
+                geometry: point_geometry(6.145, 46.203),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Node, 20),
+            }
+            .into(),
+            context,
+        )
+        .expect("address");
+    writer.finish().expect("finish");
+}
+
+fn geneva_router() -> Router {
+    let pack = std::env::temp_dir().join(format!(
+        "open-geocode-geneva-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    write_geneva_pack(&pack);
+    build_router(
+        AppState::open(
+            &pack,
+            &pack.with_extension("jobs"),
+            crate::limits::Limits::DEFAULT,
+        )
+        .expect("open pack"),
+        Some(&pack.join("demo")),
+        Some(&pack.join("basemap.pmtiles")),
+    )
+}
+
+/// `lang` names results and their areas. The first language gives `name`,
+/// with the local name standing in where there is none, and each other one
+/// gives `translations`.
+#[tokio::test]
+async fn lang_names_results_and_areas_in_the_languages_asked() {
+    let router = geneva_router();
+
+    let local = get(&router, "/places?ids=osm:relation:1685488").await;
+    let city = &local["features"][0]["properties"];
+    assert_eq!(city["name"], "Genève");
+    assert!(city.get("translations").is_none());
+
+    let german = get(&router, "/places?ids=osm:relation:1685488&lang=de").await;
+    let city = &german["features"][0]["properties"];
+    assert_eq!(city["name"], "Genf");
+    assert_eq!(city["context"]["country"]["name"], "Schweiz");
+    assert!(city.get("translations").is_none());
+
+    let both = get(&router, "/places?ids=osm:relation:1685488&lang=fr,de").await;
+    assert_example("places-lang", &both);
+    let city = &both["features"][0]["properties"];
+    assert_eq!(city["name"], "Genève");
+    assert_eq!(city["translations"], json!({"de": "Genf"}));
+    assert_eq!(city["context"]["country"]["name"], "Suisse");
+    assert_eq!(
+        city["context"]["country"]["translations"],
+        json!({"de": "Schweiz"})
+    );
+
+    // A language with no name falls back to the local one, and adds nothing.
+    let romansh = get(&router, "/places?ids=osm:relation:1685488&lang=rm,ja").await;
+    let city = &romansh["features"][0]["properties"];
+    assert_eq!(city["name"], "Genève");
+    assert!(city.get("translations").is_none());
+    assert_eq!(
+        city["context"]["country"]["name"],
+        "Schweiz/Suisse/Svizzera/Svizra"
+    );
+
+    // A region or script with no name of its own reads its base language,
+    // and a repeat counts once.
+    let swiss = get(&router, "/places?ids=osm:relation:1685488&lang=de-CH,DE-ch").await;
+    let city = &swiss["features"][0]["properties"];
+    assert_eq!(city["name"], "Genf");
+    assert!(city.get("translations").is_none());
+
+    let address = get(&router, "/geocode?q=1%20Rue%20du%20Rh%C3%B4ne&lang=it,de").await;
+    let context = &address["features"][0]["properties"]["context"];
+    assert_eq!(context["locality"]["name"], "Ginevra");
+    assert_eq!(context["locality"]["translations"], json!({"de": "Genf"}));
+
+    let suggested = get(&router, "/autocomplete?q=1%20Rue%20du%20Rh&lang=de").await;
+    assert_eq!(
+        suggested["features"][0]["properties"]["context"]["locality"]["name"],
+        "Genf"
+    );
+
+    let reverse = get(&router, "/reverse?lon=6.145&lat=46.203&lang=de").await;
+    assert_eq!(
+        reverse["features"][0]["properties"]["context"]["locality"]["name"],
+        "Genf"
+    );
+
+    for uri in [
+        "/geocode?q=Rue&lang=german",
+        "/places?q=Rue&lang=d3",
+        "/reverse?lon=6.1&lat=46.2&lang=de,x",
+        "/autocomplete?q=Rue&lang=de-",
+    ] {
+        let (status, problem) = get_error(&router, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(problem["invalid_params"][0]["name"], "lang", "{uri}");
+    }
+}
+
+/// `lang` takes at most twenty distinct languages. Repeats drop first, so a
+/// list over the cap only by repeats is answered.
+#[tokio::test]
+async fn lang_takes_at_most_twenty_languages() {
+    let router = geneva_router();
+    let twenty = "fr,de,it,rm,en,es,pt,nl,sv,da,fi,pl,cs,sk,hu,ro,bg,el,ru,ja";
+
+    let answer = get(
+        &router,
+        &format!("/places?ids=osm:relation:1685488&lang={twenty}"),
+    )
+    .await;
+    let city = &answer["features"][0]["properties"];
+    assert_eq!(city["name"], "Genève");
+    assert_eq!(city["translations"]["de"], "Genf");
+
+    let repeated = format!("/places?ids=osm:relation:1685488&lang={twenty},DE,fr");
+    let answer = get(&router, &repeated).await;
+    assert_eq!(answer["features"][0]["properties"]["name"], "Genève");
+
+    for uri in [
+        format!("/places?ids=osm:relation:1685488&lang={twenty},ko"),
+        format!("/geocode?q=Rue&lang={twenty},ko"),
+        format!("/reverse?lon=6.1&lat=46.2&lang={twenty},ko"),
+        format!("/autocomplete?q=Rue&lang={twenty},ko"),
+    ] {
+        let (status, problem) = get_error(&router, &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(
+            problem["invalid_params"],
+            json!([{"name": "lang", "reason": "at most 20 languages"}]),
+            "{uri}"
+        );
+        assert_eq!(
+            problem["detail"], "lang asks for 21 languages, and the most is 20",
+            "{uri}"
+        );
+    }
+}
+
+/// A batch item names its answer in its own `lang`, as its `GET` would.
+#[tokio::test]
+async fn a_batch_item_takes_lang() {
+    let router = geneva_router();
+    let body = json!([
+        {"ids": "osm:relation:1685488", "lang": "de"},
+        {"ids": "osm:relation:1685488"},
+        {"ids": "osm:relation:1685488", "lang": "d3"},
+    ])
+    .to_string();
+    let (status, answer) = send_raw(&router, "QUERY", "/places", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let answer: Value = serde_json::from_slice(&answer).expect("batch is JSON");
+    let results = &answer["results"];
+    assert_eq!(
+        results[0]["response"]["features"][0]["properties"]["name"],
+        "Genf"
+    );
+    assert_eq!(
+        results[1]["response"]["features"][0]["properties"]["name"],
+        "Genève"
+    );
+    assert_eq!(results[2]["error"]["invalid_params"][0]["name"], "lang");
 }

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     search::{TextSearchOptions, TextSearcher},
-    util::geo::METRES_PER_DEGREE,
+    util::geo::{METRES_PER_DEGREE, geohash},
 };
 
 #[derive(Debug, Clone)]
@@ -259,7 +259,6 @@ impl GroupAccumulator {
             .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = percentile(&self.distances, 0.5);
         let p90 = percentile(&self.distances, 0.9);
-        // Unanswered first, then the furthest misses.
         self.worst
             .sort_by(|a, b| match (a.distance_m, b.distance_m) {
                 (None, None) => std::cmp::Ordering::Equal,
@@ -315,46 +314,6 @@ fn distance_metres((lat1, lon1): (f64, f64), (lat2, lon2): (f64, f64)) -> f64 {
     dx.hypot(dy)
 }
 
-const GEOHASH_ALPHABET: &[u8] = b"0123456789bcdefghjkmnpqrstuvwxyz";
-
-fn geohash(lat: f64, lon: f64, chars: usize) -> String {
-    let mut lat_range = (-90.0f64, 90.0f64);
-    let mut lon_range = (-180.0f64, 180.0f64);
-    let mut hash = String::with_capacity(chars);
-    let mut bit = 0;
-    let mut value = 0usize;
-    let mut even = true;
-    while hash.len() < chars {
-        if even {
-            let mid = (lon_range.0 + lon_range.1) / 2.0;
-            if lon > mid {
-                value = (value << 1) | 1;
-                lon_range.0 = mid;
-            } else {
-                value <<= 1;
-                lon_range.1 = mid;
-            }
-        } else {
-            let mid = (lat_range.0 + lat_range.1) / 2.0;
-            if lat > mid {
-                value = (value << 1) | 1;
-                lat_range.0 = mid;
-            } else {
-                value <<= 1;
-                lat_range.1 = mid;
-            }
-        }
-        even = !even;
-        bit += 1;
-        if bit == 5 {
-            hash.push(GEOHASH_ALPHABET[value] as char);
-            bit = 0;
-            value = 0;
-        }
-    }
-    hash
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,20 +342,5 @@ mod tests {
         // A degree of longitude is shorter away from the equator.
         let equator = distance_metres((0.0, 147.3), (0.0, 147.4));
         assert!(forward < equator);
-    }
-
-    #[test]
-    fn geohash_prefixes_agree_for_nearby_points() {
-        let a = geohash(-42.91654, 147.26215, 6);
-        let b = geohash(-42.91669, 147.26209, 6);
-        assert_eq!(a, b, "points ~20m apart share a 6-char geohash");
-        let far = geohash(-33.86, 151.21, 6);
-        assert_ne!(a, far);
-    }
-
-    #[test]
-    fn geohash_length_is_requested_length() {
-        assert_eq!(geohash(-42.9, 147.3, 4).len(), 4);
-        assert_eq!(geohash(-42.9, 147.3, 6).len(), 6);
     }
 }

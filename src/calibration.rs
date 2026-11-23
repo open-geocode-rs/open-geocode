@@ -511,9 +511,12 @@ mod tests {
 
     fn row() -> AddressRecord {
         AddressRecord {
+            building: None,
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 number: "10".into(),
                 street: Some("King Street West".into()),
                 place: None,
@@ -571,7 +574,6 @@ mod tests {
                     i64::from(number) + 100 * index as i64,
                 );
                 writer.write(&record.into(), None).expect("address");
-                // Every other house is held out.
                 if number % 2 == 0 {
                     lines.push(format!("{lon},43.0,{number},{street},Toronto,M5V 1A1"));
                 }

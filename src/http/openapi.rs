@@ -45,7 +45,7 @@ use crate::{
     },
     http::batch,
     limits::Limits,
-    record::{Brand, Layer, RoadClass},
+    record::{AccessPoint, Brand, Contact, Layer, RoadClass},
     runtime::AppState,
 };
 
@@ -115,6 +115,8 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
         Source,
         RoadClass,
         Brand,
+        Contact,
+        AccessPoint,
         // Only ever reached through a parameter, so it needs naming here or
         // it is left out of the components and the `$ref` dangles.
         Layer,
@@ -304,6 +306,9 @@ pub(crate) struct ReverseItem {
     #[schema(example = 43.6532, minimum = -90.0, maximum = 90.0)]
     pub lat: Option<f64>,
     pub layer: Option<Layer>,
+    /// How far to look for the nearest address, street or place, in metres.
+    #[schema(example = 150.0, minimum = 0.0, maximum = 1000.0)]
+    pub radius: Option<f64>,
 }
 
 /// A forward batch's answer: one result per item, in input order.

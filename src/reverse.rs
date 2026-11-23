@@ -10,11 +10,16 @@ use crate::{
     spatial_index,
 };
 
-const ADDRESS_RADIUS_M: f64 = 30.0;
-const INTERPOLATION_RADIUS_M: f64 = 30.0;
-const STREET_RADIUS_M: f64 = 30.0;
+/// How far reverse looks for the nearest house, street or place when the
+/// caller names no distance. Past it, a house says less about where the
+/// point is than the areas holding it.
+pub const DEFAULT_RADIUS_M: f64 = 30.0;
+/// The farthest a caller may ask reverse to look. Candidates are read cell
+/// by cell, so the cost grows with the square of the radius.
+pub const MAX_RADIUS_M: f64 = 1_000.0;
 const CONTEXT_RADIUS_M: f64 = 50_000.0;
 const CANDIDATE_LIMIT: usize = 16;
+const POSTCODE_CANDIDATE_LIMIT: usize = 6;
 
 #[derive(Debug)]
 pub struct PackReverseGeocoder {
@@ -28,6 +33,9 @@ pub struct GeocodeOptions {
     pub lat: f64,
     /// Answer only with a record of this layer, and list no other area.
     pub layer: Option<Layer>,
+    /// How far to look for the nearest house, street or place, in metres.
+    /// Areas hold the point, so it does not bound them.
+    pub radius_m: f64,
 }
 
 impl GeocodeOptions {
@@ -36,6 +44,7 @@ impl GeocodeOptions {
             lon,
             lat,
             layer: None,
+            radius_m: DEFAULT_RADIUS_M,
         }
     }
 }
@@ -200,6 +209,130 @@ impl PackReverseGeocoder {
         })
     }
 
+    /// The `limit` results of `layer` nearest the point, nearest first, each
+    /// labelled by its own areas. A point lies in one area of each layer, so
+    /// an area layer answers at most one.
+    pub fn reverse_nearest(
+        &self,
+        options: GeocodeOptions,
+        layer: Layer,
+        limit: usize,
+    ) -> Result<Vec<GeocodeResponse>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (lon, lat) = (options.lon, options.lat);
+        // Each result is labelled by its own areas, in a context of its own.
+        let fresh = || (Context::default(), Vec::<RecordId>::new());
+        let found = match layer {
+            Layer::Address => self
+                .spatial
+                .address_candidates(lon, lat, options.radius_m, limit)?
+                .iter()
+                .map(|candidate| {
+                    let (mut context, mut ids) = fresh();
+                    self.address_at(options, candidate, &mut context, &mut ids)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Layer::Poi => self
+                .spatial
+                .poi_candidates(lon, lat, options.radius_m, limit)?
+                .iter()
+                .map(|candidate| {
+                    let (mut context, mut ids) = fresh();
+                    self.poi_at(options, candidate, &mut context, &mut ids)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Layer::Street => self
+                .spatial
+                .segment_candidates(lon, lat, Layer::Street, options.radius_m, limit)?
+                .iter()
+                .map(|candidate| {
+                    let (mut context, mut ids) = fresh();
+                    self.street_at(options, candidate, &mut context, &mut ids)
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Layer::Interpolation => {
+                let mut found = self
+                    .spatial
+                    .segment_candidates(lon, lat, Layer::Interpolation, options.radius_m, limit)?
+                    .iter()
+                    .map(|candidate| {
+                        let (mut context, mut ids) = fresh();
+                        self.estimated_at(options, candidate, &mut context, &mut ids)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if found.iter().all(Option::is_none) {
+                    let (mut context, mut ids) = fresh();
+                    found.push(self.tiger_estimate(options, &mut context, &mut ids)?);
+                }
+                found
+            }
+            Layer::Country
+            | Layer::District
+            | Layer::Locality
+            | Layer::Neighbourhood
+            | Layer::Place
+            | Layer::Postcode
+            | Layer::Region => {
+                let options = GeocodeOptions {
+                    layer: Some(layer),
+                    ..options
+                };
+                return Ok(self
+                    .reverse(options)?
+                    .result
+                    .map_or_else(Vec::new, |result| {
+                        vec![GeocodeResponse {
+                            lon,
+                            lat,
+                            result: Some(result),
+                        }]
+                    }));
+            }
+        };
+        Ok(found
+            .into_iter()
+            .flatten()
+            .map(|mut result| {
+                // Its areas label it, and are no answers of their own.
+                result.evidence.context_record_ids.clear();
+                GeocodeResponse {
+                    lon,
+                    lat,
+                    result: Some(result),
+                }
+            })
+            .collect())
+    }
+
+    pub(crate) fn reverse_addresses_where(
+        &self,
+        options: GeocodeOptions,
+        limit: usize,
+        accept: impl FnMut(RecordId) -> Result<bool>,
+    ) -> Result<Vec<GeocodeResponse>> {
+        let (lon, lat) = (options.lon, options.lat);
+        self.spatial
+            .address_candidates_where(lon, lat, options.radius_m, limit, accept)?
+            .iter()
+            .filter_map(|point| {
+                self.address_at(options, point, &mut Context::default(), &mut Vec::new())
+                    .transpose()
+            })
+            .map(|found| {
+                found.map(|mut result| {
+                    result.evidence.context_record_ids.clear();
+                    GeocodeResponse {
+                        lon,
+                        lat,
+                        result: Some(result),
+                    }
+                })
+            })
+            .collect()
+    }
+
     fn of_layer(
         &self,
         layer: Layer,
@@ -228,14 +361,112 @@ impl PackReverseGeocoder {
         context: &mut Context,
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<Option<GeocodeResult>> {
-        let Some(candidate) = self
-            .spatial
-            .address_candidates(options.lon, options.lat, ADDRESS_RADIUS_M, 1)?
-            .into_iter()
-            .next()
+        let candidates = self.spatial.address_candidates(
+            options.lon,
+            options.lat,
+            options.radius_m,
+            POSTCODE_CANDIDATE_LIMIT,
+        )?;
+        let Some(first) = candidates.first() else {
+            return Ok(None);
+        };
+        let candidate = self
+            .corroborated_zip(first, &candidates[1..])?
+            .unwrap_or(first);
+        self.address_at(options, candidate, context, context_record_ids)
+    }
+
+    fn corroborated_zip<'a>(
+        &self,
+        first: &spatial_index::PointCandidate,
+        other: &'a [spatial_index::PointCandidate],
+    ) -> Result<Option<&'a spatial_index::PointCandidate>> {
+        if other.len() < 2 {
+            return Ok(None);
+        }
+        let records = self.pack.records();
+        let Record::Address(first_record) = records.record(first.record_id)? else {
+            return Ok(None);
+        };
+        let address = &first_record.address;
+        if address.country.as_deref().is_some_and(|country| {
+            let code = if country.len() == 2 {
+                Some(country)
+            } else {
+                crate::iso::alpha2_of(country).or_else(|| crate::iso::alpha2_of_name(country))
+            };
+            code.is_some_and(|code| !code.eq_ignore_ascii_case("US"))
+        }) {
+            return Ok(None);
+        }
+        let Some(zip) = address
+            .postcode
+            .as_deref()
+            .filter(|zip| zip.len() == 5 && zip.bytes().all(|byte| byte.is_ascii_digit()))
         else {
             return Ok(None);
         };
+        let Some(street) = address.street.as_deref() else {
+            return Ok(None);
+        };
+        let mut plain = Vec::new();
+        let mut extended = BTreeSet::new();
+        for candidate in other {
+            if candidate.distance_m > first.distance_m + DEFAULT_RADIUS_M {
+                break;
+            }
+            let Record::Address(record) = records.record(candidate.record_id)? else {
+                continue;
+            };
+            let same_house = record.address.number == address.number
+                && record.address.unit == address.unit
+                && record
+                    .address
+                    .street
+                    .as_deref()
+                    .is_some_and(|name| crate::road::same_road(name, street))
+                && record.address.locality == address.locality
+                && record.address.region == address.region;
+            if !same_house {
+                continue;
+            }
+            let Some(postcode) = record.address.postcode.as_deref() else {
+                continue;
+            };
+            if postcode.len() == 5 && postcode.bytes().all(|byte| byte.is_ascii_digit()) {
+                plain.push((postcode.to_string(), candidate));
+            } else if let Some((base, addon)) = postcode.split_once('-')
+                && base.len() == 5
+                && addon.len() == 4
+                && base
+                    .bytes()
+                    .chain(addon.bytes())
+                    .all(|byte| byte.is_ascii_digit())
+            {
+                extended.insert(base.to_string());
+            }
+        }
+        // A ZIP+4 can break a disagreement only when a separate point for
+        // the same house gives its five-digit ZIP and no other ZIP+4 competes.
+        let Some(preferred) = extended
+            .first()
+            .filter(|preferred| extended.len() == 1 && preferred.as_str() != zip)
+        else {
+            return Ok(None);
+        };
+        Ok(plain
+            .into_iter()
+            .find_map(|(postcode, candidate)| (postcode == *preferred).then_some(candidate)))
+    }
+
+    /// The address result of `candidate`, the address found near the point.
+    fn address_at(
+        &self,
+        options: GeocodeOptions,
+        candidate: &spatial_index::PointCandidate,
+        context: &mut Context,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<Option<GeocodeResult>> {
         let record = self.pack.records().record(candidate.record_id)?;
         let Record::Address(AddressRecord { address, .. }) = &record else {
             return Ok(None);
@@ -276,42 +507,143 @@ impl PackReverseGeocoder {
             options.lon,
             options.lat,
             Layer::Interpolation,
-            INTERPOLATION_RADIUS_M,
+            options.radius_m,
             CANDIDATE_LIMIT,
         )? {
             crate::stop::check()?;
-            let Some(interpolation) = self.pack.interpolation(candidate.record_id)? else {
-                continue;
-            };
-            let number = interpolation.interpolation.number_at(candidate.fraction);
-            self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
-            apply_interpolation_context(context, &interpolation.address);
-            self.enrich_context(options, context, context_record_ids)?;
-            let primary = labels::estimated_address_name(number, &interpolation.address)
-                .unwrap_or_else(|| format!("{} {}", number, interpolation.name()));
-
-            return Ok(Some(GeocodeResult {
-                match_kind: MatchKind::EstimatedAddress,
-                label: compose_label(&primary, context),
-                primary_record_id: Some(candidate.record_id),
-                id: Some(interpolation.id()),
-                layer: Some("interpolation".to_string()),
-                distance_m: Some(candidate.distance_m),
-                point: Some(Point {
-                    lon: candidate.closest_lon,
-                    lat: candidate.closest_lat,
-                    precision: PointPrecision::Estimated,
-                }),
-                context: context.clone(),
-                evidence: Evidence {
-                    interpolation_record_id: Some(candidate.record_id),
-                    context_record_ids: context_record_ids.clone(),
-                    ..Evidence::default()
-                },
-            }));
+            if let Some(result) =
+                self.estimated_at(options, &candidate, context, context_record_ids)?
+            {
+                return Ok(Some(result));
+            }
         }
+        self.tiger_estimate(options, context, context_record_ids)
+    }
 
-        Ok(None)
+    fn tiger_estimate(
+        &self,
+        options: GeocodeOptions,
+        context: &mut Context,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<Option<GeocodeResult>> {
+        if self.pack.tiger_ranges.is_empty() {
+            return Ok(None);
+        }
+        let radius = options.radius_m.min(40.0);
+        // Looking farther than the nearest street could put someone across
+        // a junction on a different road to fetch a range.
+        let Some(candidate) = self
+            .spatial
+            .segment_candidates(options.lon, options.lat, Layer::Street, radius, 1)?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let Some(left) = self
+            .spatial
+            .left_of_line(&candidate, options.lon, options.lat)?
+        else {
+            return Ok(None);
+        };
+        let mut ranges = self
+            .pack
+            .tiger_ranges
+            .for_street(candidate.record_id)
+            .filter_map(|range| {
+                let is_left = left == (range.start < range.end);
+                if is_left != (range.side == b'L') {
+                    return None;
+                }
+                Some((range, range.number_at(candidate.fraction)?))
+            });
+        let Some((range, number)) = ranges.next() else {
+            return Ok(None);
+        };
+        if ranges.next().is_some() {
+            return Ok(None);
+        }
+        let Some(street) = self.pack.street(candidate.record_id)? else {
+            return Ok(None);
+        };
+        let Some([lon, lat]) = self.spatial.point_along_line(
+            candidate.record_id,
+            range.fraction(number).unwrap_or(candidate.fraction),
+        )?
+        else {
+            return Ok(None);
+        };
+        let distance = crate::road::planar_m([options.lon, options.lat], [lon, lat]);
+        if distance > radius {
+            return Ok(None);
+        }
+        self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
+        context.street = Some(street.name.clone());
+        context.postcode = range.postcode().or_else(|| {
+            self.pack
+                .tiger_side_zips
+                .postcode(range.side_key(range.side))
+        });
+        self.enrich_context(options, context, context_record_ids)?;
+        Ok(Some(GeocodeResult {
+            match_kind: MatchKind::EstimatedAddress,
+            label: compose_label(&format!("{number} {}", street.name), context),
+            primary_record_id: Some(candidate.record_id),
+            id: Some(range.id(number)),
+            layer: Some(Layer::Interpolation.as_str().into()),
+            distance_m: Some(distance),
+            point: Some(Point {
+                lon,
+                lat,
+                precision: PointPrecision::Estimated,
+            }),
+            context: context.clone(),
+            evidence: Evidence {
+                street_record_id: Some(candidate.record_id),
+                context_record_ids: context_record_ids.clone(),
+                ..Evidence::default()
+            },
+        }))
+    }
+
+    /// The estimated address of `candidate`, a range found near the point,
+    /// at the number along it the point is nearest.
+    fn estimated_at(
+        &self,
+        options: GeocodeOptions,
+        candidate: &spatial_index::SegmentCandidate,
+        context: &mut Context,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<Option<GeocodeResult>> {
+        let Some(interpolation) = self.pack.interpolation(candidate.record_id)? else {
+            return Ok(None);
+        };
+        let number = interpolation.interpolation.number_at(candidate.fraction);
+        self.enrich_record_context(candidate.record_id, context, context_record_ids)?;
+        apply_interpolation_context(context, &interpolation.address);
+        self.enrich_context(options, context, context_record_ids)?;
+        let primary = labels::estimated_address_name(number, &interpolation.address)
+            .unwrap_or_else(|| format!("{} {}", number, interpolation.name()));
+
+        Ok(Some(GeocodeResult {
+            match_kind: MatchKind::EstimatedAddress,
+            label: compose_label(&primary, context),
+            primary_record_id: Some(candidate.record_id),
+            id: Some(interpolation.id()),
+            layer: Some("interpolation".to_string()),
+            distance_m: Some(candidate.distance_m),
+            point: Some(Point {
+                lon: candidate.closest_lon,
+                lat: candidate.closest_lat,
+                precision: PointPrecision::Estimated,
+            }),
+            context: context.clone(),
+            evidence: Evidence {
+                interpolation_record_id: Some(candidate.record_id),
+                context_record_ids: context_record_ids.clone(),
+                ..Evidence::default()
+            },
+        }))
     }
 
     fn nearest_street(
@@ -322,12 +654,23 @@ impl PackReverseGeocoder {
     ) -> Result<Option<GeocodeResult>> {
         let Some(candidate) = self
             .spatial
-            .segment_candidates(options.lon, options.lat, Layer::Street, STREET_RADIUS_M, 1)?
+            .segment_candidates(options.lon, options.lat, Layer::Street, options.radius_m, 1)?
             .into_iter()
             .next()
         else {
             return Ok(None);
         };
+        self.street_at(options, &candidate, context, context_record_ids)
+    }
+
+    /// The street result of `candidate`, a street found near the point.
+    fn street_at(
+        &self,
+        options: GeocodeOptions,
+        candidate: &spatial_index::SegmentCandidate,
+        context: &mut Context,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<Option<GeocodeResult>> {
         let Some(street) = self.pack.street(candidate.record_id)? else {
             return Ok(None);
         };
@@ -365,12 +708,23 @@ impl PackReverseGeocoder {
     ) -> Result<Option<GeocodeResult>> {
         let Some(candidate) = self
             .spatial
-            .poi_candidates(options.lon, options.lat, ADDRESS_RADIUS_M, 1)?
+            .poi_candidates(options.lon, options.lat, options.radius_m, 1)?
             .into_iter()
             .next()
         else {
             return Ok(None);
         };
+        self.poi_at(options, &candidate, context, context_record_ids)
+    }
+
+    /// The POI result of `candidate`, a POI found near the point.
+    fn poi_at(
+        &self,
+        options: GeocodeOptions,
+        candidate: &spatial_index::PointCandidate,
+        context: &mut Context,
+        context_record_ids: &mut Vec<RecordId>,
+    ) -> Result<Option<GeocodeResult>> {
         let record = self.pack.records().record(candidate.record_id)?;
         let Record::Poi(poi) = &record else {
             return Ok(None);
@@ -442,15 +796,24 @@ impl PackReverseGeocoder {
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<Option<GeocodeResult>> {
         self.enrich_context(options, context, context_record_ids)?;
-        let Some(primary_record_id) = context_record_ids.first().copied() else {
+        // The answer is the area its label leads with, the first found of
+        // the most precise tier, so its id and layer name what it says.
+        let mut primary: Option<(usize, RecordId, ContextRecord)> = None;
+        for &record_id in context_record_ids.iter() {
+            let Some(record) = self.pack.context_record(record_id)? else {
+                continue;
+            };
+            let Some(rank) = LABEL_TIERS.iter().position(|tier| *tier == record.layer) else {
+                continue;
+            };
+            if primary.as_ref().is_none_or(|(best, ..)| rank < *best) {
+                primary = Some((rank, record_id, record));
+            }
+        }
+        let Some((_, primary_record_id, record)) = primary else {
             return Ok(None);
         };
-        let Some(record) = self.pack.context_record(primary_record_id)? else {
-            return Ok(None);
-        };
-        let Some(label) = context_only_label(context).or_else(|| Some(record.label.clone())) else {
-            return Ok(None);
-        };
+        let label = context_only_label(context).unwrap_or_else(|| record.label.clone());
 
         Ok(Some(GeocodeResult {
             match_kind: MatchKind::ContextOnly,
@@ -570,6 +933,18 @@ fn compose_label(primary: &str, context: &Context) -> String {
     parts.join(", ")
 }
 
+/// The area tiers a point's label names, most precise first, as
+/// [`context_only_label`] reads them.
+const LABEL_TIERS: [&str; 7] = [
+    "place",
+    "neighbourhood",
+    "locality",
+    "district",
+    "region",
+    "postcode",
+    "country",
+];
+
 fn context_only_label(context: &Context) -> Option<String> {
     [
         context.place.as_deref(),
@@ -655,6 +1030,38 @@ mod tests {
         assert_eq!(result.primary_record_id, Some(1));
         assert_eq!(result.evidence.explicit_address_record_id, Some(1));
 
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn reverse_uses_a_zip_corroborated_by_a_separate_zip_plus_four() {
+        let temp_dir = temp_pack_dir("postal-conflict");
+        let mut writer = Writer::create(&temp_dir).expect("writer");
+        for (id, longitude, number, zip) in [
+            (100, -77.0, "10", "20001"),
+            (101, -77.00002, "11", "20001-1111"),
+            (102, -77.00003, "10", "20002"),
+            (103, -77.00010, "10", "20002-4214"),
+        ] {
+            let mut record = address_record();
+            record.address.number = number.into();
+            record.address.locality = Some("Washington".into());
+            record.address.region = Some("DC".into());
+            record.address.country = Some("US".into());
+            record.address.postcode = Some(zip.into());
+            record.geometry = point_geometry(longitude, 38.9);
+            record.source = SourceProvenance::osm(ObjectType::Node, id);
+            writer.write(&record.into(), None).expect("address");
+        }
+        writer.finish().expect("finish");
+        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
+        let result = geocoder
+            .reverse(GeocodeOptions::at(-77.0, 38.9))
+            .expect("reverse")
+            .result
+            .expect("result");
+        assert_eq!(result.id.as_deref(), Some("osm:node:102"));
+        assert_eq!(result.context.postcode.as_deref(), Some("20002"));
         let _ = fs::remove_dir_all(temp_dir);
     }
 
@@ -766,6 +1173,7 @@ mod tests {
                     prominence: Default::default(),
                     wikidata: None,
                     brand: None,
+                    details: None,
                     aliases: Vec::new(),
                 }
                 .into(),
@@ -785,6 +1193,7 @@ mod tests {
                     prominence: Default::default(),
                     wikidata: None,
                     brand: None,
+                    details: None,
                     aliases: Vec::new(),
                 }
                 .into(),
@@ -835,6 +1244,7 @@ mod tests {
                     prominence: Default::default(),
                     wikidata: None,
                     brand: None,
+                    details: None,
                     aliases: Vec::new(),
                 }
                 .into(),
@@ -883,9 +1293,12 @@ mod tests {
 
     fn address_record() -> AddressRecord {
         AddressRecord {
+            building: None,
+            access: Vec::new(),
             disputed: false,
             street_postcodes: Vec::new(),
             address: AddressComponents {
+                block_number_len: None,
                 areas: Vec::new(),
                 number: "10".to_string(),
                 street: Some("Queen Street".to_string()),

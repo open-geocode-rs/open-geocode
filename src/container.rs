@@ -418,8 +418,10 @@ impl Container {
     pub fn section(&self, name: &str, version: u32) -> Result<Bytes> {
         let info = self.info(name)?;
         if info.version != version {
-            return Err(Error::UnsupportedVersion {
+            return Err(Error::UnsupportedFormat {
+                part: format!("section {name}"),
                 found: info.version,
+                expected: version,
             });
         }
         Ok(self.bytes_of(info))

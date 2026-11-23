@@ -17,9 +17,20 @@ pub enum Record {
     Poi(PoiRecord),
 }
 
+/// The building an address is drawn as, when its source maps it as one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct Building {
+    /// Its name, as its `name` tag writes it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[schema(example = "Google Building 41")]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AddressRecord {
     pub address: AddressComponents,
+    /// The building its source draws it as, if it does (see [`Building`]).
+    pub building: Option<Building>,
     /// For an address that states no postcode, the postcodes the other
     /// addresses of its street state: the evidence of where it is. Empty when
     /// it states one, or its street's addresses state none.
@@ -30,6 +41,8 @@ pub struct AddressRecord {
     /// Whether another source places the same house farther from this point
     /// than sources placing one house ever disagree: the point may be wrong.
     pub disputed: bool,
+    /// The entrances its source maps (see [`Entrance`]).
+    pub access: Vec<Entrance>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -199,6 +212,7 @@ pub struct PoiRecord {
     pub prominence: Prominence,
     pub wikidata: Option<u32>,
     pub brand: Option<Brand>,
+    pub details: Option<Box<PoiDetails>>,
     /// Ids of objects merged into it: they still find it.
     pub aliases: Vec<(ObjectType, i64)>,
 }
@@ -218,6 +232,139 @@ pub struct Brand {
     )]
     #[schema(value_type = Option<String>, example = "Q867662")]
     pub wikidata: Option<u32>,
+}
+
+/// A way in that OpenStreetMap maps for a record, which is a node tagged
+/// `entrance` on the outline of the building or site the record is drawn
+/// with, or the record's own node when it is so tagged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entrance {
+    /// Its longitude and latitude in 1e-7 degrees.
+    pub at: [i32; 2],
+    /// The value of its `entrance` tag as written, such as `main`.
+    pub kind: String,
+}
+
+impl Entrance {
+    /// The entrance a node's tags make of it, if they do.
+    pub fn of_tag(kind: Option<&str>, lon: f64, lat: f64) -> Option<Self> {
+        let kind = kind
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty() && !kind.eq_ignore_ascii_case("no"))?;
+        Some(Self {
+            at: [
+                crate::records::quantize(lon).ok()?,
+                crate::records::quantize(lat).ok()?,
+            ],
+            kind: kind.to_string(),
+        })
+    }
+}
+
+/// A point to route to when going to a result.
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
+pub struct AccessPoint {
+    #[schema(example = 7.4263)]
+    pub lon: f64,
+    #[schema(example = 43.7396)]
+    pub lat: f64,
+    /// What kind of way in it is, as the value of the OpenStreetMap
+    /// `entrance` tag that maps it, such as `main`, `yes`, `service` or
+    /// `staircase`.
+    #[schema(example = "main")]
+    pub kind: String,
+}
+
+impl From<&Entrance> for AccessPoint {
+    fn from(entrance: &Entrance) -> Self {
+        let [lon, lat] = entrance.at.map(crate::records::dequantize);
+        Self {
+            lon,
+            lat,
+            kind: entrance.kind.clone(),
+        }
+    }
+}
+
+/// The box around something larger than a point, as its west, south, east
+/// and north in 1e-7 degrees. West is greater than east when the box crosses the
+/// antimeridian, and only then.
+pub type Extent = [i32; 4];
+
+/// What few POIs state. Boxed on the record: every record of a build is as
+/// wide as the widest, and most would carry these empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PoiDetails {
+    pub contact: Option<Contact>,
+    /// The `opening_hours` tag as written, never parsed.
+    pub opening_hours: Option<String>,
+    /// The box around its outline, when it is drawn as an area.
+    pub extent: Option<Extent>,
+    /// The entrances its source maps (see [`Entrance`]).
+    pub access: Vec<Entrance>,
+    /// The kinds of food it serves, as its `cuisine` tag lists them, in
+    /// lower case and in order (`pizza`, `italian`).
+    pub cuisine: Vec<String>,
+}
+
+impl PoiDetails {
+    /// What a POI's tags state of it.
+    pub fn stated(contact: Option<Contact>, opening_hours: Option<String>) -> Option<Box<Self>> {
+        Self {
+            contact,
+            opening_hours,
+            ..Self::default()
+        }
+        .kept()
+    }
+
+    /// None when it holds nothing, as a record never holds empty details.
+    pub fn kept(self) -> Option<Box<Self>> {
+        (self != Self::default()).then(|| Box::new(self))
+    }
+}
+
+/// How to reach a place, each value as its source writes it: a phone number
+/// in any spelling, a website with or without its scheme. og rewrites none
+/// of them and does not check that one still answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct Contact {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[schema(example = "+1 416-555-0111")]
+    pub phone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[schema(example = "https://queenbakery.example/")]
+    pub website: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[schema(example = "hello@queenbakery.example")]
+    pub email: Option<String>,
+    #[serde(skip)]
+    pub(crate) fax: Option<String>,
+}
+
+impl Contact {
+    /// None when nothing is stated: a record never holds an empty contact.
+    pub fn stated(
+        phone: Option<String>,
+        website: Option<String>,
+        email: Option<String>,
+    ) -> Option<Self> {
+        Self::with_fax(phone, website, email, None)
+    }
+
+    pub(crate) fn with_fax(
+        phone: Option<String>,
+        website: Option<String>,
+        email: Option<String>,
+        fax: Option<String>,
+    ) -> Option<Self> {
+        (phone.is_some() || website.is_some() || email.is_some() || fax.is_some()).then_some(Self {
+            phone,
+            website,
+            email,
+            fax,
+        })
+    }
 }
 
 // serde's `serialize_with` hands the field by reference.
@@ -494,6 +641,8 @@ impl From<PlaceLayer> for Layer {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AddressComponents {
     pub number: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_number_len: Option<std::num::NonZeroU16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub street: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -785,7 +934,7 @@ impl AddressRecord {
 
 impl Serialize for AddressRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("AddressRecord", 8)?;
+        let mut state = serializer.serialize_struct("AddressRecord", 9)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name())?;
@@ -798,6 +947,7 @@ impl Serialize for AddressRecord {
         } else {
             state.skip_field("disputed")?;
         }
+        serialize_access(&mut state, &self.access)?;
         state.end()
     }
 }
@@ -990,11 +1140,35 @@ impl PoiRecord {
     pub fn label(&self) -> String {
         labels::poi_label(&self.name, self.address.as_ref(), None)
     }
+
+    pub fn contact(&self) -> Option<&Contact> {
+        self.details.as_ref()?.contact.as_ref()
+    }
+
+    pub fn opening_hours(&self) -> Option<&str> {
+        self.details.as_ref()?.opening_hours.as_deref()
+    }
+
+    pub fn extent(&self) -> Option<Extent> {
+        self.details.as_ref()?.extent
+    }
+
+    pub fn access(&self) -> &[Entrance] {
+        self.details
+            .as_ref()
+            .map_or(&[], |details| details.access.as_slice())
+    }
+
+    pub fn cuisine(&self) -> &[String] {
+        self.details
+            .as_ref()
+            .map_or(&[], |details| details.cuisine.as_slice())
+    }
 }
 
 impl Serialize for PoiRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("PoiRecord", 13)?;
+        let mut state = serializer.serialize_struct("PoiRecord", 16)?;
         state.serialize_field("id", &self.id())?;
         state.serialize_field("label", &self.label())?;
         state.serialize_field("name", &self.name)?;
@@ -1021,6 +1195,15 @@ impl Serialize for PoiRecord {
             Some(brand) => state.serialize_field("brand", brand)?,
             None => state.skip_field("brand")?,
         }
+        match self.contact() {
+            Some(contact) => state.serialize_field("contact", contact)?,
+            None => state.skip_field("contact")?,
+        }
+        match self.opening_hours() {
+            Some(hours) => state.serialize_field("opening_hours", hours)?,
+            None => state.skip_field("opening_hours")?,
+        }
+        serialize_access(&mut state, self.access())?;
         if self.aliases.is_empty() {
             state.skip_field("aliases")?;
         } else {
@@ -1032,6 +1215,18 @@ impl Serialize for PoiRecord {
             state.serialize_field("aliases", &aliases)?;
         }
         state.end()
+    }
+}
+
+fn serialize_access<S: SerializeStruct>(
+    state: &mut S,
+    access: &[Entrance],
+) -> Result<(), S::Error> {
+    if access.is_empty() {
+        state.skip_field("access")
+    } else {
+        let points = access.iter().map(AccessPoint::from).collect::<Vec<_>>();
+        state.serialize_field("access", &points)
     }
 }
 

@@ -311,11 +311,17 @@ pub(super) fn countries(lattice: &Lattice) -> Vec<Option<CountryCode>> {
 }
 
 /// The best `n` labellings over the countries of [`countries`], each
-/// labelling once, under the country that scores it best.
-pub(super) fn best(lattice: &Lattice, weights: &Weights, n: usize) -> Vec<Path> {
+/// labelling once, under the country that scores it best. With `allows`,
+/// only those that give each span a label it allows.
+pub(super) fn best(
+    lattice: &Lattice,
+    weights: &Weights,
+    n: usize,
+    allows: Option<Allows<'_>>,
+) -> Vec<Path> {
     let mut paths = countries(lattice)
         .into_iter()
-        .flat_map(|country| decode(lattice, weights, country, n, None))
+        .flat_map(|country| decode(lattice, weights, country, n, allows))
         .collect::<Vec<_>>();
     sort_paths(&mut paths);
     let mut seen = Vec::new();
@@ -375,7 +381,6 @@ pub(super) fn decode(
 ) -> Vec<Path> {
     let k = k.max(1);
     let transitions = weights.transitions(country);
-    // cells[position][state]: the best partial paths ending there.
     let mut cells = vec![vec![Vec::<Entry>::new(); STATES]; lattice.len + 1];
     cells[0][START].push(Entry {
         score: 0.0,

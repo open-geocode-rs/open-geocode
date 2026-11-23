@@ -28,8 +28,8 @@ use crate::{
     pack::{self, SCRATCH_POINTER_FILE},
 };
 
-/// The manifest's own format. A build refuses a manifest of another.
-pub const FORMAT_VERSION: u32 = 7;
+/// Checkpoint format, including the saved scratch files.
+pub const FORMAT_VERSION: u32 = 10;
 /// Bytes of an input's start and end the fingerprint hashes: a PBF's header
 /// and its last blocks, enough to tell an extract from a newer one of the
 /// same size and time.
@@ -125,6 +125,10 @@ pub struct Fingerprint {
     /// The address source the build adds addresses from, as it describes
     /// itself, if any.
     pub addresses: Option<String>,
+    #[serde(default)]
+    pub tiger: bool,
+    #[serde(default)]
+    pub timezones: Option<FileStamp>,
     /// The address files it imported, once it has.
     pub imported: Vec<FileStamp>,
 }
@@ -145,6 +149,8 @@ impl Fingerprint {
                 .collect::<Result<_>>()?,
             input_sources: input_sources.to_vec(),
             addresses,
+            tiger: false,
+            timezones: None,
             imported: Vec::new(),
         })
     }
@@ -187,6 +193,14 @@ impl Fingerprint {
                 self.addresses.as_deref().unwrap_or("nothing"),
                 now.addresses.as_deref().unwrap_or("nothing")
             ));
+        }
+        if self.tiger != now.tiger {
+            out.push("the --tiger option changed".into());
+        }
+        match (&self.timezones, &now.timezones) {
+            (Some(was), Some(is)) => was.differences(is, "timezone boundary file", &mut out),
+            (None, None) => {}
+            _ => out.push("the --timezones option changed".into()),
         }
         for file in &self.imported {
             match FileStamp::of(&file.path) {
@@ -236,7 +250,6 @@ pub struct Manifest<S> {
 /// What a manifest says without knowing the builder's state.
 #[derive(Debug, Deserialize)]
 struct Summary {
-    format: u32,
     stage: String,
 }
 
@@ -246,8 +259,7 @@ struct Summary {
 pub struct Found {
     pub generation: PathBuf,
     pub scratch: PathBuf,
-    /// The last stage it completed; `None` when it reached no checkpoint,
-    /// or left one of another format.
+    /// The last stage of its readable checkpoint.
     pub stage: Option<String>,
     /// Bytes it holds on disk, scratch and unpublished Pack file together.
     pub bytes: u64,
@@ -291,10 +303,11 @@ pub fn find(destination: &Path) -> Result<Vec<Found>> {
             continue;
         };
         let scratch = PathBuf::from(pointer.trim());
+        // An incompatible checkpoint reaches resume's version check. Clearing
+        // it as unfinished would discard the saved build on --resume.
         let summary = fs::read(scratch.join(MANIFEST_FILE))
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<Summary>(&bytes).ok())
-            .filter(|summary| summary.format == FORMAT_VERSION);
+            .and_then(|bytes| serde_json::from_slice::<Summary>(&bytes).ok());
         let modified = fs::metadata(scratch.join(MANIFEST_FILE))
             .and_then(|metadata| metadata.modified())
             .ok();

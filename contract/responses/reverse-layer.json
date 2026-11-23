@@ -10,8 +10,15 @@
       },
       "properties": {
         "accuracy": "street",
+        "bbox": [
+          -79.0,
+          43.0,
+          -79.0,
+          43.001
+        ],
         "context": {
           "country": {
+            "code": "CA",
             "id": "osm:relation:1",
             "name": "Canada"
           },
@@ -20,6 +27,7 @@
             "name": "Toronto"
           },
           "region": {
+            "code": "CA-ON",
             "id": "osm:relation:2",
             "name": "Ontario"
           }
@@ -32,7 +40,8 @@
         "road_class": "residential",
         "source": {
           "dataset": "osm"
-        }
+        },
+        "timezone": "America/Toronto"
       },
       "type": "Feature"
     }
@@ -43,6 +52,11 @@
         "licence": "ODbL 1.0",
         "text": "© OpenStreetMap contributors",
         "url": "https://www.openstreetmap.org/copyright"
+      },
+      {
+        "licence": "ODbL 1.0",
+        "text": "Timezone boundaries © OpenStreetMap contributors",
+        "url": "https://github.com/evansiroky/timezone-boundary-builder"
       }
     ],
     "point": {

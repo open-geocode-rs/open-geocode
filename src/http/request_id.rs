@@ -15,7 +15,7 @@
 use std::time::Instant;
 
 use axum::{
-    extract::{Request, State},
+    extract::{MatchedPath, Request, State},
     http::{HeaderValue, StatusCode, header},
     middleware::Next,
     response::Response,
@@ -76,6 +76,12 @@ impl ErrorLog {
         self.write(&line.to_string());
     }
 
+    /// One line an operator reads that no error caused, such as a call the
+    /// server made out to a client's own endpoint.
+    pub(crate) fn event(&self, line: &serde_json::Value) {
+        self.write(&line.to_string());
+    }
+
     fn write(&self, line: &str) {
         #[cfg(test)]
         if let Some(lines) = &self.captured {
@@ -90,6 +96,11 @@ impl ErrorLog {
 /// inside a 200, as a batch does.
 #[derive(Debug, Clone)]
 pub(crate) struct RequestId(pub String);
+
+/// The Problem behind an error a route answers in another shape, such as a
+/// vendor's error under `/compat`: logged like a Problem, its body left alone.
+#[derive(Debug, Clone)]
+pub(crate) struct Logged(pub Problem);
 
 /// Middleware: resolve (or generate) the request id, set it on the response
 /// `x-request-id` header and in any Problem body, and log a 500 with its cause.
@@ -106,9 +117,8 @@ pub(crate) async fn propagate(
         .and_then(|value| value.to_str().ok())
         .and_then(sanitize);
     let id = incoming.unwrap_or_else(generate);
-    // The path only: the query string holds what the user searched for,
-    // which is personal data and stays out of the log.
-    let route = request.uri().path().to_string();
+    // Path parameters can carry addresses, even without a query string.
+    let route = request.extensions().get::<MatchedPath>().cloned();
     request.extensions_mut().insert(RequestId(id.clone()));
 
     let mut response = next.run(request).await;
@@ -125,12 +135,15 @@ pub(crate) async fn propagate(
     }
     // Only a 500 is ours to fix; a 4xx is the request's fault and a 503 from
     // `/readyz` is the expected answer while the Pack loads.
+    let logged = response.extensions_mut().remove::<Logged>();
     if response.status() == StatusCode::INTERNAL_SERVER_ERROR {
         let cause = problem
             .as_ref()
+            .or_else(|| logged.as_ref().map(|logged| &logged.0))
             .and_then(Problem::cause)
             .map(|cause| format!("{cause:#}"));
-        log.internal_error(&id, &route, None, started, cause.as_deref());
+        let route = route.as_ref().map_or("<unmatched>", MatchedPath::as_str);
+        log.internal_error(&id, route, None, started, cause.as_deref());
     }
     if let Ok(value) = HeaderValue::from_str(&id) {
         response.headers_mut().insert("x-request-id", value);
@@ -160,12 +173,14 @@ fn generate() -> String {
 
 #[cfg(test)]
 mod tests {
+    use axum::{Router, body::Body, middleware, routing::get};
+    use tower::ServiceExt;
+
     use super::*;
 
     #[test]
     fn sanitize_strips_control_chars_and_caps_length() {
         assert_eq!(sanitize("abc-123").as_deref(), Some("abc-123"));
-        // Whitespace and control characters are dropped.
         assert_eq!(sanitize("a b\nc").as_deref(), Some("abc"));
         // Empty after cleaning -> None so we fall back to a generated id.
         assert_eq!(sanitize("   "), None);
@@ -176,5 +191,31 @@ mod tests {
     #[test]
     fn generate_produces_distinct_ids() {
         assert_ne!(generate(), generate());
+    }
+
+    #[tokio::test]
+    async fn internal_errors_log_route_templates() {
+        let log = ErrorLog::capture();
+        let router = Router::new()
+            .route(
+                "/lookup/{id}",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR })
+            .layer(middleware::from_fn_with_state(log.clone(), propagate));
+
+        for (uri, template) in [
+            ("/lookup/private-input?q=private-query", "/lookup/{id}"),
+            ("/private-fallback", "<unmatched>"),
+        ] {
+            let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let lines = log.lines();
+            let last = lines.last().unwrap();
+            let event: serde_json::Value = serde_json::from_str(last).unwrap();
+            assert_eq!(event["route"], template);
+            assert!(!last.contains("private-"));
+        }
     }
 }

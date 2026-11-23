@@ -16,9 +16,12 @@
 //!
 //! ```text
 //! context/tuples  chain_count u64, then per chain:
-//!                   len u8, then len x (record_id u32, tiers u16)
+//!                   len u8, zone u16, then len x (record_id u32, tiers u16)
 //!                 tiers is a bit per PlaceLayer discriminant, so one area
-//!                 can be two things at once; chains sorted by outermost
+//!                 can be two things at once; chains sorted by outermost.
+//!                 zone is 0 for none, else one more than the index of a
+//!                 timezone in the Pack's zone names (see
+//!                 [`RecordContext::zone`])
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
@@ -36,12 +39,15 @@ use crate::{
 };
 
 pub const SECTION_TUPLES: &str = "context/tuples";
-/// 3 gives each entry a set of tiers; 2 gave it one; 1 held a fixed
-/// six-slot tuple.
-pub const CONTEXT_VERSION: u32 = 3;
+/// 4 gives each chain a timezone; 3 gave each entry a set of tiers; 2 gave
+/// it one; 1 held a fixed six-slot tuple.
+pub const CONTEXT_VERSION: u32 = 4;
 pub const CONTEXT_FLAG_AMBIGUOUS_ADMIN: u16 = 1;
+pub(crate) const CONTEXT_FLAG_OUTER_ONLY: u16 = 2;
 
 const ENTRY_BYTES: usize = 6;
+/// Bytes of a chain's length and zone, which come before its entries.
+const CHAIN_HEADER_BYTES: usize = 3;
 /// Bounds one chain so a corrupt length cannot drive a huge allocation. No
 /// country maps anywhere near this many tiers.
 const MAX_CHAIN: usize = 32;
@@ -137,14 +143,18 @@ pub struct RecordContext {
     /// Every area the record lies in, smallest first. Written to the Pack;
     /// what a Pack reads back is [`crate::pack::Reader::enclosing_areas`].
     pub enclosing: Vec<RecordId>,
+    /// The timezone at the record's point, by its index in the Pack's zone
+    /// names, when no area of the chain lies wholly in one zone to say it.
+    /// Records in an area two zones share then differ by this alone.
+    pub zone: Option<u16>,
 }
 
 impl RecordContext {
-    /// The list of an area's own record: the areas around it, and no chain,
-    /// so nothing the parser's dictionaries may count as its context. A record
-    /// outside every area has neither, and its empty chain is counted.
+    /// A boundary's chain is available to lookup, but does not vote in the
+    /// parser's dictionaries as if it were an address in its parent.
     pub fn is_area_list(&self) -> bool {
-        self.admin_context.is_empty() && !self.enclosing.is_empty()
+        self.flags & CONTEXT_FLAG_OUTER_ONLY != 0
+            || (self.admin_context.is_empty() && !self.enclosing.is_empty())
     }
 }
 
@@ -231,6 +241,27 @@ impl AdminContextTuple {
         self.entries.iter().rev().map(|entry| entry.record_id)
     }
 
+    /// The areas of the chain an area of `tier` lies in: those whose every
+    /// tier is broader than `tier`. The area itself, another boundary of its
+    /// tier and every finer area its point falls in are left out, since none
+    /// of them holds it.
+    #[must_use]
+    pub fn above(&self, tier: PlaceLayer) -> Self {
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .filter(|entry| entry.tiers.iter().all(|held| held < tier))
+                .copied()
+                .collect(),
+        }
+    }
+
+    /// Keeps only the areas `keep` says to.
+    pub fn retain(&mut self, keep: impl FnMut(&AdminEntry) -> bool) {
+        self.entries.retain(keep);
+    }
+
     pub fn country_record_id(&self) -> Option<RecordId> {
         self.get(PlaceLayer::Country)
     }
@@ -299,10 +330,10 @@ impl FromIterator<AdminEntry> for AdminContextTuple {
 
 #[derive(Debug, Default)]
 pub struct TupleWriter {
-    tuples: Vec<AdminContextTuple>,
+    tuples: Vec<(AdminContextTuple, Option<u16>)>,
     /// By tuple id, parallel to `tuples`.
     lists: Vec<Vec<RecordId>>,
-    ids: HashMap<(AdminContextTuple, Vec<RecordId>), u32>,
+    ids: HashMap<(AdminContextTuple, Vec<RecordId>, Option<u16>), u32>,
     area_tags: BTreeMap<RecordId, AreaTags>,
 }
 
@@ -314,10 +345,22 @@ impl TupleWriter {
     /// Reference for a record's context; `None` when there is no admin context
     /// and no list of areas.
     pub fn intern(&mut self, context: &RecordContext) -> Result<Option<ContextRef>> {
-        if context.admin_context.is_empty() && context.enclosing.is_empty() {
+        if context.admin_context.is_empty()
+            && context.enclosing.is_empty()
+            && context.zone.is_none()
+        {
             return Ok(None);
         }
-        let key = (context.admin_context.clone(), context.enclosing.clone());
+        if context.zone == Some(u16::MAX) {
+            return Err(Error::Inconsistent(
+                "a timezone's index is past what a chain stores".into(),
+            ));
+        }
+        let key = (
+            context.admin_context.clone(),
+            context.enclosing.clone(),
+            context.zone,
+        );
         let tuple_id = match self.ids.get(&key) {
             Some(id) => *id,
             None => {
@@ -336,7 +379,7 @@ impl TupleWriter {
                 }
                 let id = u32::try_from(self.tuples.len())
                     .map_err(|_| Error::Inconsistent("context table is full".into()))?;
-                self.tuples.push(key.0.clone());
+                self.tuples.push((key.0.clone(), key.2));
                 self.lists.push(key.1.clone());
                 self.ids.insert(key, id);
                 id
@@ -354,10 +397,12 @@ impl TupleWriter {
 
     /// Write the table, and hand back its tuples.
     pub fn finish(self, pack: &mut Writer) -> Result<Vec<AdminContextTuple>> {
-        let mut bytes = Vec::with_capacity(8 + self.tuples.len() * (1 + 4 * ENTRY_BYTES));
+        let mut bytes =
+            Vec::with_capacity(8 + self.tuples.len() * (CHAIN_HEADER_BYTES + 4 * ENTRY_BYTES));
         bytes.extend_from_slice(&(self.tuples.len() as u64).to_le_bytes());
-        for tuple in &self.tuples {
+        for (tuple, zone) in &self.tuples {
             bytes.push(tuple.entries().len() as u8);
+            bytes.extend_from_slice(&zone.map_or(0, |zone| zone + 1).to_le_bytes());
             for entry in tuple.entries() {
                 bytes.extend_from_slice(&(entry.record_id as u32).to_le_bytes());
                 bytes.extend_from_slice(&entry.tiers.bits().to_le_bytes());
@@ -365,7 +410,7 @@ impl TupleWriter {
         }
         pack.add(SECTION_TUPLES, CONTEXT_VERSION, &bytes)?;
         enclosing::write(pack, &self.lists, &self.area_tags)?;
-        Ok(self.tuples)
+        Ok(self.tuples.into_iter().map(|(tuple, _)| tuple).collect())
     }
 }
 
@@ -395,7 +440,7 @@ impl Reader {
                     .map_err(|_| Error::Inconsistent("context table is too large".into()))?,
             );
             offset = offset
-                .checked_add(1 + len * ENTRY_BYTES)
+                .checked_add(CHAIN_HEADER_BYTES + len * ENTRY_BYTES)
                 .ok_or_else(truncated)?;
             if offset > tuples.len() {
                 return Err(truncated());
@@ -418,9 +463,10 @@ impl Reader {
         };
         let offset = offset as usize;
         let len = self.tuples[offset] as usize;
+        let zone = u16::from_le_bytes([self.tuples[offset + 1], self.tuples[offset + 2]]);
         let mut entries = Vec::with_capacity(len);
         for index in 0..len {
-            let at = offset + 1 + index * ENTRY_BYTES;
+            let at = offset + CHAIN_HEADER_BYTES + index * ENTRY_BYTES;
             let record_id = read_u32_le(&self.tuples, at).expect("validated table");
             let bits = u16::from_le_bytes([self.tuples[at + 4], self.tuples[at + 5]]);
             let tiers = TierSet::from_bits(bits)
@@ -438,6 +484,7 @@ impl Reader {
                 0
             },
             enclosing: Vec::new(),
+            zone: zone.checked_sub(1),
         })
     }
 }
@@ -491,6 +538,60 @@ mod tests {
             berlin.tiers.iter().collect::<Vec<_>>(),
             [PlaceLayer::Region, PlaceLayer::Locality]
         );
+    }
+
+    #[test]
+    fn a_chain_keeps_the_zone_it_is_given_and_a_zone_alone_is_a_chain() {
+        let path =
+            std::env::temp_dir().join(format!("open-geocode-context-{}", uuid::Uuid::new_v4()));
+        let town = AdminContextTuple::from_tiers([(PlaceLayer::Locality, 3)]);
+        let context = |admin_context: &AdminContextTuple, zone| RecordContext {
+            admin_context: admin_context.clone(),
+            flags: 0,
+            zone,
+            enclosing: Vec::new(),
+        };
+        let mut writer = TupleWriter::default();
+        let mut intern = |context: &RecordContext| {
+            writer
+                .intern(context)
+                .expect("intern")
+                .map(|reference| reference.tuple_id)
+        };
+        let nowhere = AdminContextTuple::default();
+        assert_eq!(intern(&context(&town, None)), Some(0));
+        assert_eq!(intern(&context(&town, Some(0))), Some(1));
+        assert_eq!(intern(&context(&town, Some(418))), Some(2));
+        assert_eq!(intern(&context(&town, Some(0))), Some(1));
+        assert_eq!(intern(&context(&nowhere, Some(7))), Some(3));
+        assert_eq!(intern(&context(&nowhere, None)), None);
+        assert_eq!(
+            writer
+                .intern(&context(&town, Some(u16::MAX)))
+                .expect_err("past the format")
+                .to_string(),
+            Error::Inconsistent("a timezone's index is past what a chain stores".into())
+                .to_string()
+        );
+        assert_eq!(writer.tuple_count(), 4);
+
+        let mut pack = Writer::create(&path).expect("pack");
+        writer.finish(&mut pack).expect("finish");
+        pack.finish().expect("pack finish");
+        let reader = Reader::open(&Container::open(&path).expect("open")).expect("reader");
+        let _ = std::fs::remove_file(&path);
+        let resolve = |tuple_id| {
+            reader
+                .resolve(ContextRef {
+                    tuple_id,
+                    ambiguous: false,
+                })
+                .expect("resolve")
+        };
+        assert_eq!(resolve(0), context(&town, None));
+        assert_eq!(resolve(1), context(&town, Some(0)));
+        assert_eq!(resolve(2), context(&town, Some(418)));
+        assert_eq!(resolve(3), context(&nowhere, Some(7)));
     }
 
     #[test]

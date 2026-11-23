@@ -874,7 +874,6 @@ mod tests {
         assert_eq!(shape("m5v"), Shape::Mixed);
         assert_eq!(shape("1st"), Shape::Mixed);
         assert_eq!(TokenInfo::new("улица", &dictionaries).script, Some(2));
-        // Numerals of any script are digits.
         assert_eq!(shape("１２"), Shape::Digits);
         assert_eq!(shape("八"), Shape::Digits);
         assert_eq!(shape("٣"), Shape::Digits);

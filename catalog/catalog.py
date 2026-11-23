@@ -197,6 +197,26 @@ def oa_license(data, layer_name):
     return data.get("license")
 
 
+def public_license_url(url):
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url.split("?", 1)[0].split("#", 1)[0]
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    keys = {key.lower() for key, _ in query}
+    if not keys.intersection(("x-amz-signature", "x-amz-credential", "awsaccesskeyid")):
+        return url
+    host = parts.hostname or ""
+    item = parts.path.split("/", 2)[1] if parts.path.startswith("/") else ""
+    if (host.startswith("ago-item-storage.s3.") and host.endswith(".amazonaws.com")
+            and len(item) == 32 and all(c in "0123456789abcdef" for c in item.lower())):
+        return f"https://www.arcgis.com/sharing/rest/content/items/{item}/data"
+    signing = {"awsaccesskeyid", "signature", "expires"}
+    unsigned = [(key, value) for key, value in query
+                if key.lower() not in signing and not key.lower().startswith("x-amz-")]
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(unsigned)))
+
+
 def trim_license(lic):
     if not lic:
         return None
@@ -206,7 +226,7 @@ def trim_license(lic):
     for src, dst in (("text", "name"), ("url", "url"), ("attribution", "attribution"),
                      ("attribution name", "attribution_name"), ("share-alike", "share_alike")):
         if lic.get(src) not in (None, ""):
-            out[dst] = lic[src]
+            out[dst] = public_license_url(lic[src]) if src == "url" and isinstance(lic[src], str) else lic[src]
     return out or None
 
 
@@ -928,10 +948,11 @@ def categories_text(places_json):
     """The text of catalog/categories.json. The words that name each searchable place preset,
     in every language its sources have, and the groups that gather presets under one word ("food").
 
-    Presets are a list, so groups and names point at them by index. Only names and
-    group words are kept, every language in one map: terms and aliases reach wider
-    ("coffee" is a restaurant term) and are not searched, and og never asks which
-    language a word is from. A regional name (en-AU "Pharmacy" for a chemist) is kept
+    Presets are a list, so groups, names and titles point at them by index. Only names and
+    group words are searched, every language in one map: terms and aliases reach wider
+    ("coffee" is a restaurant term) and are not searched, and search never asks which
+    language a word is from. Titles keep each preset's name per language as written, for
+    answers that name a kind of place in the language asked. A regional name (en-AU "Pharmacy" for a chemist) is kept
     apart, so the language's own name outranks it. Words keep case folded only; og
     normalizes them as it normalizes search text when it loads them.
     Returns the text, the presets with no English word, and a coverage report."""
@@ -1018,12 +1039,18 @@ def categories_text(places_json):
                     merged.setdefault(word, set()).update(targets)
         return ",\n".join(f"{json.dumps(w, ensure_ascii=False)}:{line(sorted(t))}" for w, t in sorted(merged.items()))
 
+    # The name of each preset in each language as it is written, for answers that title
+    # a kind of place in the language asked.
+    title_lines = [line({lang: ws[0] for lang, ws in sorted(rows.get(pid, {}).get("words", {}).items()) if ws[0]})
+                   for pid in order]
+
     pins = {"id-tagging-schema": words["version"], "category-groups": groups_snapshot["commit"][:12]}
-    text = ('{"schema":2,\n"pins":' + line(pins)
+    text = ('{"schema":3,\n"pins":' + line(pins)
             + ',\n"presets":[\n' + ",\n".join(preset_lines)
             + '\n],\n"groups":[\n' + ",\n".join(group_lines)
             + '\n],\n"names":{\n' + merged_names(lambda lang: not regional(lang))
-            + '\n},\n"regional":{\n' + merged_names(regional) + "\n}}\n")
+            + '\n},\n"regional":{\n' + merged_names(regional)
+            + '\n},\n"titles":[\n' + ",\n".join(title_lines) + "\n]}\n")
 
     def with_words(lang):
         return sum(1 for pid in order if rows.get(pid, {}).get("words", {}).get(lang))

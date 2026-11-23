@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::{
     builder::report::CandidateIssue,
     record::{
-        AddressComponents, AddressRecord, LocationPrecision, ObjectType, Record, SourceProvenance,
-        point_geometry,
+        AddressComponents, AddressRecord, Building, Entrance, LocationPrecision, ObjectType,
+        Record, SourceProvenance, point_geometry,
     },
     util::text::collapse_whitespace,
 };
@@ -19,6 +19,8 @@ pub(crate) struct AddressCandidate {
     pub lon: f64,
     pub location_precision: LocationPrecision,
     pub tags: BTreeMap<String, String>,
+    /// The entrances mapped for it (see [`Entrance`]).
+    pub entrances: Vec<Entrance>,
 }
 
 /// Turn a candidate into an address record, or count why it was not one.
@@ -44,8 +46,10 @@ pub(crate) fn address_record_from_candidate(
     candidate: &AddressCandidate,
 ) -> std::result::Result<AddressRecord, CandidateIssue> {
     Ok(AddressRecord {
+        building: building_of(&candidate.tags),
         disputed: false,
         street_postcodes: Vec::new(),
+        access: candidate.entrances.clone(),
         address: address_components(&candidate.tags)?,
         geometry: point_geometry(candidate.lon, candidate.lat),
         location_precision: candidate.location_precision,
@@ -82,6 +86,9 @@ pub(crate) fn address_components(
     let place = tags.cleaned("addr:place");
     let block_scheme =
         block_number.is_some() || BLOCK_AREA_KEYS.into_iter().any(|key| tags.has(key));
+    let block_number_len = block_number
+        .as_ref()
+        .and_then(|block| std::num::NonZeroU16::new(u16::try_from(block.len()).ok()?));
     let number = match (block_number, house_number) {
         (Some(block), Some(house)) => format!("{block}-{house}"),
         (Some(block), None) => block,
@@ -99,6 +106,7 @@ pub(crate) fn address_components(
     }
 
     Ok(AddressComponents {
+        block_number_len,
         number,
         street,
         place,
@@ -123,13 +131,34 @@ pub(crate) fn collect_clean_tags<'a>(
     .collect()
 }
 
+/// An object's `addr:*` tags, and, when it states an address and is a
+/// building, its `building` and `name` tags, which say the building the
+/// address is drawn as.
 pub(crate) fn collect_addr_tags_from_map(
     tags: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
-    tags.iter()
+    let mut kept = tags
+        .iter()
         .filter(|(key, _)| key.starts_with("addr:"))
         .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
+        .collect::<BTreeMap<_, _>>();
+    if !kept.is_empty() && building_of(tags).is_some() {
+        for key in ["building", "name"] {
+            if let Some(value) = tags.get(key) {
+                kept.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    kept
+}
+
+/// The building an object's tags draw it as: a `building` tag other than
+/// `no`, named by its `name` tag.
+pub(crate) fn building_of(tags: &BTreeMap<String, String>) -> Option<Building> {
+    tags.cleaned("building").filter(|value| value != "no")?;
+    Some(Building {
+        name: tags.cleaned("name"),
+    })
 }
 
 pub(crate) fn validate_address_tags(
@@ -142,10 +171,53 @@ pub(crate) fn validate_address_tags(
 mod tests {
     use geojson::GeometryValue;
 
+    #[test]
+    fn an_addressed_building_says_it_is_one_and_its_name() {
+        let kept = |pairs: &[(&str, &str)]| {
+            collect_addr_tags_from_map(
+                &pairs
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            )
+        };
+        let building = |pairs: &[(&str, &str)]| building_of(&kept(pairs));
+        let address = [
+            ("addr:housenumber", "1600"),
+            ("addr:street", "Amphitheatre Parkway"),
+        ];
+        let with = |more: &[(&'static str, &'static str)]| {
+            address.iter().chain(more).copied().collect::<Vec<_>>()
+        };
+        assert_eq!(
+            building(&with(&[
+                ("building", "commercial"),
+                ("name", "Google Building 41")
+            ])),
+            Some(Building {
+                name: Some("Google Building 41".into())
+            })
+        );
+        assert_eq!(
+            building(&with(&[("building", "yes")])),
+            Some(Building::default())
+        );
+        assert_eq!(
+            building(&with(&[("building", "no"), ("name", "Shed")])),
+            None
+        );
+        assert_eq!(
+            building(&with(&[("name", "Googleplex"), ("office", "it")])),
+            None
+        );
+        assert!(kept(&[("building", "yes"), ("name", "Hall")]).is_empty());
+    }
+
     use super::*;
 
     fn candidate(tags: &[(&str, &str)]) -> AddressCandidate {
         AddressCandidate {
+            entrances: Vec::new(),
             object_type: ObjectType::Node,
             object_id: 42,
             lat: 43.6532,
@@ -239,21 +311,18 @@ mod tests {
         assert_eq!(address.region.as_deref(), Some("宮城県"));
         assert_eq!(record.name(), "10-8 5丁目");
 
-        // A block with no house number is numbered by the block.
         let block = address_record_from_candidate(&candidate(&[
             ("addr:neighbourhood", "遠藤"),
             ("addr:block_number", "4262"),
         ]))
         .expect("block number only");
         assert_eq!(block.address.number, "4262");
-        // A house number in a quarter.
         let quarter = address_record_from_candidate(&candidate(&[
             ("addr:quarter", "中荻野"),
             ("addr:housenumber", "1"),
         ]))
         .expect("quarter");
         assert_eq!(quarter.address.number, "1");
-        // A suburb alone places no house number.
         assert_eq!(
             address_record_from_candidate(&candidate(&[
                 ("addr:suburb", "泉区"),

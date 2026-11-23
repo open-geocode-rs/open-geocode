@@ -302,10 +302,10 @@ fn licensed(
             kept.push((source, area, dataset));
             continue;
         }
-        let quoted: String = [licence.text.as_deref(), licence.url.as_deref()]
-            .into_iter()
-            .flatten()
-            .next()
+        let quoted: String = licence
+            .text
+            .as_deref()
+            .or_else(|| licence.url.as_deref()?.split(['?', '#']).next())
             .unwrap_or_default()
             .chars()
             .take(80)

@@ -123,8 +123,15 @@ og serve canada-ontario
 Ontario's 2 million addresses build in about a minute on a 24-core machine, then the API serves on `http://127.0.0.1:8080`.
 `GET /version` returns the server version and the Pack it serves: content id, schema version, and which og version built it and when.
 Add `--openaddresses` to `og build` to merge in OpenAddresses points (needs an API token in `OA_TOKEN`).
+
+This version reads Pack schema 11. Deploy it with a schema-11 Pack built by
+this version. Existing schema-10 Packs require rebuilding before the upgrade.
+
+`og build --tiger` (or `open-geocode pack build --tiger`) adds U.S. address ranges and Census geography from the 2026 release. It caches county address-range and face archives and state Census-block archives under `<PACK>/tiger`. The Pack stores range references to existing streets and compact Census codes. Forward and reverse estimates can use those ranges. For vendor responses, a ZIP Code Tabulation Area can fill a missing ZIP after source and street postcodes.
 A build leaves out the OpenAddresses data sets whose licence forbids commercial use or serving them at all, judged by the licence each job states, and warns of each one.
 `open-geocode pack build --openaddresses-non-commercial` takes the non-commercial ones too, for a Pack used only for non-commercial purposes.
+`open-geocode pack build --timezones <file>` gives each result the timezone it lies in, from the timezone boundaries of [timezone-boundary-builder](https://github.com/evansiroky/timezone-boundary-builder): the GeoJSON file inside `timezones.geojson.zip` of a release, unpacked.
+They are derived from OpenStreetMap and under its licence, and an answer that names a timezone credits them.
 
 Run `og` with no arguments for the interactive interface: pick a region, build it, search it, and geocode CSV files.
 

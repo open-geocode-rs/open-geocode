@@ -11,7 +11,6 @@ use std::{borrow::Cow, path::PathBuf};
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    // --- the caller asked for something impossible ----------------------
     /// A query with nothing in it to search for.
     #[error("search query is empty")]
     EmptyQuery,
@@ -36,7 +35,6 @@ pub enum Error {
     #[error("{input} has no column {column}")]
     MissingColumn { input: PathBuf, column: String },
 
-    // --- the Pack cannot be used ----------------------------------------
     /// The file does not start with the Pack magic.
     #[error("not an open-geocode Pack file")]
     NotAPack,
@@ -44,6 +42,15 @@ pub enum Error {
     /// A Pack written against a different container format.
     #[error("Pack container version {found} is unsupported; rebuild the Pack")]
     UnsupportedVersion { found: u32 },
+
+    /// A part of a Pack (its schema, a section, the parser's weights)
+    /// written in a format this og does not read.
+    #[error("the Pack's {part} is format {found} and this og reads {expected}; rebuild the Pack")]
+    UnsupportedFormat {
+        part: String,
+        found: u32,
+        expected: u32,
+    },
 
     /// A section's bytes do not hash to what the table of contents recorded.
     #[error("Pack section {section} is corrupt: its checksum does not match")]
@@ -73,7 +80,6 @@ pub enum Error {
     #[error("Pack manifest does not match the build")]
     ManifestMismatch,
 
-    // --- the Pack's structures disagree with each other ------------------
     /// An index, table or block that does not match what it indexes. The
     /// detail says which; no caller can do more than rebuild either way.
     #[error("Pack is inconsistent: {0}")]
@@ -92,7 +98,6 @@ pub enum Error {
     #[error("stored geometry is invalid: {0}")]
     BadGeometry(String),
 
-    // --- the build could not finish --------------------------------------
     /// A line with more segments than the spatial index can address.
     #[error("line record {id} has too many segments to index")]
     TooManySegments { id: String },
@@ -119,7 +124,6 @@ pub enum Error {
     #[error("{0}")]
     BadFixtureRow(String),
 
-    // --- the caller stopped the run --------------------------------------
     /// The cancel flag was set, so the run wrote nothing.
     #[error("the run was cancelled")]
     Cancelled,
@@ -128,7 +132,6 @@ pub enum Error {
     #[error("the lookup took longer than {} ms", after.as_millis())]
     TimedOut { after: std::time::Duration },
 
-    // --- from below -------------------------------------------------------
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

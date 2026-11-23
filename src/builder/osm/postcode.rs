@@ -97,29 +97,21 @@ impl Accumulator {
     }
 }
 
-/// The postcodes the addresses of one street state, lent to its addresses
-/// that state none. Fed in street order, where a street's addresses stating
-/// a postcode come before the ones that do not.
+/// Addresses stating a postcode come first, so an address without one sees
+/// every postcode on its street.
 #[derive(Debug, Default)]
 pub(crate) struct Street {
-    key: Vec<u8>,
-    postcodes: Vec<String>,
+    pub(super) postcodes: Vec<String>,
     /// The postcode the street's last address stated, as stated: the same
     /// one again adds nothing.
     stated: Option<String>,
 }
 
 impl Street {
-    /// The postcodes lent to `address`, on the street of `key`: none when
-    /// it states one, names no street, or its street states none.
-    pub(crate) fn lend(&mut self, key: &[u8], address: &Fields<'_>) -> Option<&[String]> {
-        if self.key != key {
-            self.key = key.to_vec();
-            self.postcodes.clear();
-            self.stated = None;
+    pub(crate) fn lends_to(&mut self, address: &Fields<'_>) -> bool {
+        if address.subject().is_none() {
+            return false;
         }
-        // No street, no street to borrow from: the key is the cell alone.
-        address.subject()?;
         match address.postcode {
             Some(postcode) => {
                 if self.stated.as_deref() != Some(postcode) {
@@ -130,9 +122,9 @@ impl Street {
                     }
                     self.stated = Some(postcode.to_string());
                 }
-                None
+                false
             }
-            None => (!self.postcodes.is_empty()).then_some(&self.postcodes[..]),
+            None => !self.postcodes.is_empty(),
         }
     }
 }
