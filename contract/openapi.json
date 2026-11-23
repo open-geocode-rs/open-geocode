@@ -1129,7 +1129,7 @@
           },
           "radius": {
             "description": "How far to look for the nearest address, street or place, in metres.",
-            "example": 150.0,
+            "example": 150,
             "format": "double",
             "maximum": 1000,
             "minimum": 0,
@@ -1280,7 +1280,7 @@
       "name": "Apache-2.0"
     },
     "title": "open-geocode",
-    "version": "0.1.0"
+    "version": "1.0.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -3549,7 +3549,7 @@
           },
           {
             "description": "How far to look for the nearest address, street or place, in metres, up to 1000. Default 30. Areas hold the point, so it does not bound them.",
-            "example": 150.0,
+            "example": 150,
             "in": "query",
             "name": "radius",
             "required": false,
