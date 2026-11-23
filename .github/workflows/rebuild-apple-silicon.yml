@@ -1,0 +1,51 @@
+name: Rebuild Apple Silicon release archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable release tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    runs-on: macos-15
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Validate release tag
+        shell: bash
+        run: '[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install dist
+        shell: bash
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli --version 0.9.3
+
+      - name: Generate THIRD-PARTY-LICENSES
+        run: cargo about generate --all-features --locked --fail -o THIRD-PARTY-LICENSES about.hbs
+
+      - name: Build archive
+        run: |
+          dist build --tag="$RELEASE_TAG" --artifacts=local --target=aarch64-apple-darwin --print=linkage --output-format=json > dist-manifest.json
+          cp dist-manifest.json target/distrib/aarch64-apple-darwin-dist-manifest.json
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
+        with:
+          name: artifacts-build-local-aarch64-apple-darwin
+          path: |
+            target/distrib/open-geocode-aarch64-apple-darwin.tar.xz*
+            target/distrib/aarch64-apple-darwin-dist-manifest.json
+          if-no-files-found: error
