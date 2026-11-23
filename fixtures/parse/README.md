@@ -70,7 +70,7 @@ In order:
 
 1. The parts are shuffled into a uniformly random order, and the tokens of a part keep their order.
 2. Each street-labelled token that is a street-type word is abbreviated or fused onto the token before it, on a fair coin.
-   Abbreviating uses the street-type table of `src/text_index.rs` read backwards, a word's first abbreviation there being its usual one (`street` to `st`, `avenue` to `ave`).
+   Abbreviating uses the street-type table of `src/pack/text_index.rs` read backwards, a word's first abbreviation there being its usual one (`street` to `st`, `avenue` to `ave`).
    Fusing joins the word onto the token before it in its part when that token is also a street token (`manosquer strasse` to `manosquerstrasse`).
    The fused token is one gold token labelled `street`, so a messy row can have fewer tokens than its gold row.
    When the coin's pick is impossible for the word, the other is used, and when neither is, the word stays.

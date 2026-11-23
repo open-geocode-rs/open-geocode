@@ -15,6 +15,8 @@
 //!   optionally `UNIT`, `CITY`, `DISTRICT`, `REGION` and `POSTCODE`, in any
 //!   case and order: the OpenAddresses CSV layout.
 
+pub mod openaddresses;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,

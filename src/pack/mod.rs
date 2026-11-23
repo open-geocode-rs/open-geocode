@@ -33,9 +33,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    container::{self, Container},
-    context::{self, TupleWriter},
-    enclosing::{self, AreaTags},
+    container::Container,
+    context::TupleWriter,
+    enclosing::AreaTags,
     extsort::Scratch,
     labels,
     memory::Budget,
@@ -44,8 +44,8 @@ use crate::{
         dictionary::{Builder, RecordNames},
     },
     record::{Extent, InterpolationRecord, Layer, Record, RejectedRecord, StreetRecord},
-    records, spatial_index,
-    text_index::{self, PostcodeAreas},
+    records,
+    text_index::PostcodeAreas,
 };
 
 pub use crate::{
@@ -55,7 +55,15 @@ pub use crate::{
 
 pub type RecordId = u64;
 
+pub mod container;
+pub mod context;
+pub mod enclosing;
+pub mod ids;
 mod publication;
+pub mod record_store;
+pub mod spatial_index;
+pub mod text_index;
+pub(crate) mod tiger;
 pub use publication::{resolve_pack_path, unpublished_generations};
 
 pub const PACK_FILE: &str = "pack.ogp";

@@ -3,22 +3,22 @@ area:parse:
       - any-glob-to-any-file: ["src/parse/**", "src/labels.rs"]
 area:search:
   - changed-files:
-      - any-glob-to-any-file: ["src/search.rs", "src/text_index.rs", "src/confidence.rs", "src/calibration.rs", "src/context.rs"]
+      - any-glob-to-any-file: ["src/search/**", "src/pack/text_index.rs", "src/pack/context.rs", "src/calibration.rs"]
 area:reverse:
   - changed-files:
-      - any-glob-to-any-file: ["src/reverse.rs", "src/spatial_index.rs"]
+      - any-glob-to-any-file: ["src/reverse.rs", "src/pack/spatial_index.rs"]
 area:batch:
   - changed-files:
       - any-glob-to-any-file: ["src/batch.rs", "src/bin/og/batch.rs"]
 area:builder:
   - changed-files:
-      - any-glob-to-any-file: ["src/builder/**", "src/builder.rs", "src/extsort/**", "src/extsort.rs", "src/openaddresses.rs"]
+      - any-glob-to-any-file: ["src/builder/**", "src/extsort/**"]
 area:pack:
   - changed-files:
-      - any-glob-to-any-file: ["src/pack/**", "src/pack.rs", "src/container.rs", "src/record.rs", "src/records.rs"]
+      - any-glob-to-any-file: ["src/pack/**", "src/record.rs"]
 area:api:
   - changed-files:
-      - any-glob-to-any-file: ["src/http/**", "src/api.rs", "contract/**"]
+      - any-glob-to-any-file: ["src/http/**", "src/response.rs", "src/address_template/**", "contract/**"]
 area:ci:
   - changed-files:
       - any-glob-to-any-file: [".github/**"]

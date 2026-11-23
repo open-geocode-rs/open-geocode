@@ -9,10 +9,12 @@
 //! terms through [`table`] and reads a template through [`write`], so the
 //! format and the choice between alternatives have one definition.
 
+pub(crate) mod lines;
+
 use std::collections::BTreeMap;
 
 /// `CC<TAB>template` rows, `ZZ` the default.
-const TEMPLATES: &str = include_str!("address_template/templates.tsv");
+const TEMPLATES: &str = include_str!("templates.tsv");
 
 /// A parsed address template, its fields named as `F`.
 #[derive(Debug, Clone)]

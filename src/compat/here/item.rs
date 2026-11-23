@@ -7,7 +7,7 @@ use crate::{
     compat::{self, encode_parts},
     iso,
     record::{Contact, Layer},
-    spatial_index::haversine_m,
+    util::geo::haversine_m,
 };
 
 use super::{

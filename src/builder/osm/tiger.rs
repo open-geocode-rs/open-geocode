@@ -14,7 +14,8 @@ use crate::{
     error::{Error, Result},
     pack,
     record::Layer,
-    road, spatial_index,
+    search::road,
+    spatial_index,
     tiger::Range,
 };
 

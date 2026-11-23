@@ -44,7 +44,7 @@ use crate::{
     records::{self, BLOCK_RECORDS, dequantize, quantize},
     util::{
         codec::read_u64_le,
-        geo::{EARTH_RADIUS_M, line_parts},
+        geo::{EARTH_RADIUS_M, haversine_m, line_parts},
     },
 };
 
@@ -1311,17 +1311,6 @@ fn local_xy_m(lon: f64, lat: f64, origin_lon: f64, origin_lat: f64) -> (f64, f64
     let x = (lon - origin_lon).to_radians() * EARTH_RADIUS_M * origin_lat.to_radians().cos();
     let y = (lat - origin_lat).to_radians() * EARTH_RADIUS_M;
     (x, y)
-}
-
-pub(crate) fn haversine_m(a_lon: f64, a_lat: f64, b_lon: f64, b_lat: f64) -> f64 {
-    let d_lat = (b_lat - a_lat).to_radians();
-    let d_lon = (b_lon - a_lon).to_radians();
-    let a_lat = a_lat.to_radians();
-    let b_lat = b_lat.to_radians();
-    let sin_d_lat = (d_lat / 2.0).sin();
-    let sin_d_lon = (d_lon / 2.0).sin();
-    let h = sin_d_lat * sin_d_lat + a_lat.cos() * b_lat.cos() * sin_d_lon * sin_d_lon;
-    2.0 * EARTH_RADIUS_M * h.sqrt().asin()
 }
 
 trait CandidateDistance {

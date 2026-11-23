@@ -1416,8 +1416,7 @@ impl BoundaryIndex {
             })
             .filter(move |dot| dot.country == country)
             .filter_map(move |dot| {
-                let distance =
-                    crate::spatial_index::haversine_m(lon, lat, dot.point[0], dot.point[1]);
+                let distance = crate::util::geo::haversine_m(lon, lat, dot.point[0], dot.point[1]);
                 let share = distance / dot.reach_m;
                 (share <= 1.0).then_some((dot, share))
             })

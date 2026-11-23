@@ -328,7 +328,7 @@ impl AddressDescriptor {
                         language_code: language.of(found.record_id, &found.context),
                     },
                     types: Kind::of(found).types(),
-                    straight_line_distance_meters: crate::spatial_index::haversine_m(
+                    straight_line_distance_meters: crate::util::geo::haversine_m(
                         point[0], point[1], lon, lat,
                     ),
                 }

@@ -318,7 +318,7 @@ impl StructuredIndex {
     /// empty), and of the same name with a direction word more or less at
     /// either end: one source's "roosevelt blvd" is another's "e roosevelt
     /// blvd". Whether such a list is the same road is for its records'
-    /// places and points to tell (see [`crate::road`]).
+    /// places and points to tell (see [`crate::search::road`]).
     pub(crate) fn street_lists(&self, street: &str, countries: &[String]) -> Vec<StreetList> {
         let mut found = self.street_lists_keyed(street, countries);
         for other in direction_spellings(street) {

@@ -10,8 +10,8 @@ use rayon::prelude::*;
 use rstar::{RTree, primitives::GeomWithData};
 
 use crate::{
-    error::Result, parse::lattice::dictionary_key, spatial_index::haversine_m,
-    util::geo::METRES_PER_DEGREE,
+    error::Result, parse::lattice::dictionary_key, util::geo::METRES_PER_DEGREE,
+    util::geo::haversine_m,
 };
 
 use super::{boundary::TownDot, checkpoint::NamedPoint};

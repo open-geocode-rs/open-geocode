@@ -10,9 +10,9 @@ use std::{
 };
 
 use crate::error::{Error, Result};
-use crate::structured::{self, Place, StructuredIndex};
 use levenshtein_automata::{DFA, Distance, SINK_STATE};
 use serde::Serialize;
+use structured::{Place, StructuredIndex};
 use tantivy::{
     DocAddress, DocId, DocSet, IndexReader, Score, Searcher, SegmentReader, Term,
     collector::{ScoreSegmentTweaker, ScoreTweaker, TopDocs},
@@ -28,7 +28,7 @@ use tantivy::{
 
 use crate::{
     api::{Accuracy, Address, Highlight, PartMatch, QueryMatch},
-    confidence::{self, Agreement, Features},
+    confidence::{Agreement, Features},
     labels,
     pack::{self, Point, PointPrecision, RecordId, Source, Summary},
     parse::{
@@ -46,8 +46,7 @@ use crate::{
         Record, place_rank,
     },
     records::{dequantize, quantize},
-    road,
-    spatial_index::{self, haversine_m},
+    spatial_index::{self},
     text_index::{
         AREA_POSTCODE_FIELD, COUNTRY_CODE_FIELD, Fields, HOUSE_NUMBER_FIELD,
         INTERPOLATION_END_FIELD, INTERPOLATION_START_FIELD, MAX_LAT_FIELD, MAX_LON_FIELD,
@@ -58,7 +57,13 @@ use crate::{
         street_search_text,
     },
     util::fold::{exact_key, replaced_characters, search_key},
+    util::geo::haversine_m,
 };
+
+pub mod confidence;
+pub mod rank;
+pub(crate) mod road;
+pub mod structured;
 
 #[derive(Clone)]
 pub struct TextSearcher {

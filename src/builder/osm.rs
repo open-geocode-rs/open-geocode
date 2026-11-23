@@ -3116,7 +3116,7 @@ fn find_repeated_houses(
             kept.clear();
         }
         let distance = |kept: &House| {
-            crate::spatial_index::haversine_m(
+            crate::util::geo::haversine_m(
                 kept.point[0],
                 kept.point[1],
                 house.point[0],
