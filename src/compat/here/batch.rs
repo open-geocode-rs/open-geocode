@@ -14,7 +14,8 @@ use std::{
     fs::{self, File},
     io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -26,11 +27,16 @@ use axum::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{sync::mpsc, task};
+use tokio::{
+    sync::{OwnedSemaphorePermit, mpsc},
+    task,
+};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     compat::{VendorError, retry_after},
     http::{
+        bounds::UPLOAD_STALL_SECONDS,
         jobs::{self, Endpoint, Status},
         problem::{ErrorCode, Problem},
     },
@@ -57,6 +63,7 @@ const MAX_LINE_CHARS: usize = 4096;
 const MAX_LINE_BYTES: u64 = MAX_LINE_CHARS as u64 * 4;
 /// Bytes per chunk when streaming a file out.
 const CHUNK_BYTES: usize = 64 << 10;
+const UPLOAD_DEADLINE: Duration = Duration::from_secs(15 * 60);
 
 /// Read-modify-write of a job's record, one at a time. A start and a stop
 /// arriving together must not both win.
@@ -367,7 +374,22 @@ fn load(state: &AppState, id: &str) -> Option<Meta> {
 }
 
 fn save(state: &AppState, meta: &Meta) -> io::Result<()> {
-    let json = serde_json::to_vec(meta).map_err(io::Error::other)?;
+    write_meta(
+        state,
+        meta,
+        &serde_json::to_vec(meta).map_err(io::Error::other)?,
+    )
+}
+
+fn save_capped(state: &AppState, meta: &Meta, remaining: u64) -> Result<(), BatchError> {
+    let json = serde_json::to_vec(meta).map_err(|error| internal(io::Error::other(error)))?;
+    if json.len() as u64 > remaining {
+        return Err(store_full());
+    }
+    write_meta(state, meta, &json).map_err(internal)
+}
+
+fn write_meta(state: &AppState, meta: &Meta, json: &[u8]) -> io::Result<()> {
     let path = file(state, &meta.id, "json");
     let partial = path.with_extension("json.partial");
     fs::write(&partial, json)?;
@@ -381,6 +403,80 @@ fn remove_files(state: &AppState, id: &str, record_too: bool) {
     if record_too {
         let _ = fs::remove_file(file(state, id, "json"));
         let _ = fs::remove_file(file(state, id, "json.partial"));
+    }
+}
+
+struct Staging {
+    state: AppState,
+    id: String,
+    committed: bool,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if !self.committed {
+            remove_files(&self.state, &self.id, true);
+        }
+    }
+}
+
+fn upload_busy() -> BatchError {
+    let mut error = BatchError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "E6004291",
+        "Another batch upload is in progress",
+        "This server stages one HERE batch upload at a time",
+        "Wait for the current upload to finish and try again",
+    );
+    error.problem = Some(Problem::busy(1));
+    error
+}
+
+fn store_full() -> BatchError {
+    BatchError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "E6004291",
+        "Batch upload storage is full",
+        "The server cannot retain more HERE batch uploads",
+        "Delete a batch job or wait for an existing job to expire",
+    )
+}
+
+const FILE_OVERHEAD: u64 = 4096;
+
+fn available_bytes(state: &AppState) -> io::Result<u64> {
+    let mut remaining = state.limits().max_job_store_bytes();
+    for entry in fs::read_dir(store_dir(state))? {
+        let entry = entry?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.is_file() {
+            remaining = remaining.saturating_sub(metadata.len().saturating_add(FILE_OVERHEAD));
+        }
+    }
+    Ok(remaining)
+}
+
+fn remove_abandoned_staging(state: &AppState) {
+    for entry in fs::read_dir(store_dir(state))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name();
+        let Some((id, extension)) = name.to_str().and_then(|name| name.split_once('.')) else {
+            continue;
+        };
+        if job_uuid(id).is_some()
+            && (extension == "json.partial"
+                || (matches!(extension, "items" | "rejects") && !file(state, id, "json").exists()))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -475,6 +571,9 @@ pub(crate) async fn sweep(state: &AppState) {
     let _guard = LOCK.lock().await;
     for meta in stored(state) {
         view(state, meta);
+    }
+    if let Ok(_upload) = state.here_upload_slot().try_acquire() {
+        remove_abandoned_staging(state);
     }
 }
 
@@ -771,7 +870,7 @@ fn billing_tags(value: Option<&str>) -> Result<Vec<String>, BatchError> {
 /// The upload as a [`Read`], fed chunk by chunk from the request body.
 #[derive(Debug)]
 struct Upload {
-    chunks: mpsc::Receiver<Result<Bytes, String>>,
+    chunks: mpsc::Receiver<io::Result<Bytes>>,
     chunk: Bytes,
 }
 
@@ -780,7 +879,7 @@ impl Read for Upload {
         while self.chunk.is_empty() {
             match self.chunks.blocking_recv() {
                 Some(Ok(chunk)) => self.chunk = chunk,
-                Some(Err(error)) => return Err(io::Error::other(error)),
+                Some(Err(error)) => return Err(error),
                 None => return Ok(0),
             }
         }
@@ -804,7 +903,7 @@ struct Intake {
 enum Refusal {
     TooLarge,
     TooManyRecords(usize),
-    Unreadable(String),
+    Unreadable(io::Error),
 }
 
 /// One column of the input. Its name is lower-cased, since HERE's are not
@@ -901,6 +1000,7 @@ struct Reader<'a> {
     rejects: BufWriter<File>,
     intake: Intake,
     max_items: usize,
+    remaining: u64,
 }
 
 impl Reader<'_> {
@@ -920,7 +1020,7 @@ impl Reader<'_> {
             let read = (&mut upload)
                 .take(MAX_LINE_BYTES + 1)
                 .read_until(b'\n', &mut line)
-                .map_err(|error| Refusal::Unreadable(error.to_string()))?;
+                .map_err(Refusal::Unreadable)?;
             if read == 0 {
                 break;
             }
@@ -928,8 +1028,7 @@ impl Reader<'_> {
             let mut too_long = false;
             if read as u64 > MAX_LINE_BYTES && line.last() != Some(&b'\n') {
                 too_long = true;
-                total += skip_line(&mut upload)
-                    .map_err(|error| Refusal::Unreadable(error.to_string()))?;
+                total += skip_line(&mut upload).map_err(Refusal::Unreadable)?;
             }
             if total > max_bytes {
                 return Err(Refusal::TooLarge);
@@ -969,12 +1068,12 @@ impl Reader<'_> {
                 return Err(Refusal::TooManyRecords(self.max_items));
             }
             self.record(layout, record_number, &text, broken)
-                .map_err(|error| Refusal::Unreadable(error.to_string()))?;
+                .map_err(Refusal::Unreadable)?;
         }
         self.items
             .flush()
             .and_then(|()| self.rejects.flush())
-            .map_err(|error| Refusal::Unreadable(error.to_string()))
+            .map_err(Refusal::Unreadable)
     }
 
     fn record(
@@ -1017,8 +1116,7 @@ impl Reader<'_> {
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), Value::String(value)))
                     .collect::<serde_json::Map<_, _>>();
-                serde_json::to_writer(&mut self.items, &object)?;
-                self.items.write_all(b"\n")?;
+                write_staged(&mut self.items, &mut self.remaining, &object)?;
                 self.intake.items += 1;
             }
             Err(error) => {
@@ -1057,12 +1155,25 @@ impl Reader<'_> {
 
     /// A record refused before it runs, its message already as text.
     fn reject(&mut self, rec_id: &str, code: u16, message: &str) -> io::Result<()> {
-        serde_json::to_writer(
+        write_staged(
             &mut self.rejects,
+            &mut self.remaining,
             &json!({ "recId": rec_id, "code": code, "message": message }),
-        )?;
-        self.rejects.write_all(b"\n")
+        )
     }
+}
+
+fn write_staged(
+    out: &mut impl Write,
+    remaining: &mut u64,
+    value: &impl Serialize,
+) -> io::Result<()> {
+    let row = serde_json::to_vec(value)?;
+    *remaining = remaining
+        .checked_sub(row.len() as u64 + 1)
+        .ok_or(io::ErrorKind::StorageFull)?;
+    out.write_all(&row)?;
+    out.write_all(b"\n")
 }
 
 /// Read past the rest of an overlong line. Returns the bytes skipped.
@@ -1320,25 +1431,45 @@ fn translate(service: Service, record: &Record) -> Result<Translated, Gs7Error> 
 
 /// Pass the request body on a chunk at a time, refusing one that grows past
 /// `max_bytes`.
-async fn forward(body: Body, max_bytes: u64, chunks: mpsc::Sender<Result<Bytes, String>>) {
-    let mut stream = body.into_data_stream();
+async fn forward(
+    body: Body,
+    max_bytes: u64,
+    stall: Duration,
+    total: Duration,
+    stopping: &CancellationToken,
+    chunks: mpsc::Sender<io::Result<Bytes>>,
+) {
+    let mut stream = body
+        .into_data_stream()
+        .filter(|chunk| std::future::ready(chunk.as_ref().map_or(true, |chunk| !chunk.is_empty())));
     let mut received = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                let _ = chunks
-                    .send(Err(format!("the body broke off: {error}")))
-                    .await;
-                return;
+    let deadline = tokio::time::Instant::now() + total;
+    loop {
+        let idle_deadline = tokio::time::Instant::now() + stall;
+        let next = tokio::select! {
+            biased;
+            () = chunks.closed() => return,
+            () = stopping.cancelled() => Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
+            () = tokio::time::sleep_until(deadline) => {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "Upload deadline exceeded"))
             }
+            () = tokio::time::sleep_until(idle_deadline) => {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "No upload data received"))
+            }
+            next = stream.next() => match next {
+                Some(chunk) => chunk.map_err(io::Error::other),
+                None => return,
+            },
         };
-        received += chunk.len() as u64;
-        if received > max_bytes {
-            let _ = chunks.send(Err("too large".to_string())).await;
-            return;
-        }
-        if chunks.send(Ok(chunk)).await.is_err() {
+        let next = next.and_then(|chunk| {
+            received = received.saturating_add(chunk.len() as u64);
+            if received > max_bytes {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "too large"));
+            }
+            Ok(chunk)
+        });
+        let failed = next.is_err();
+        if chunks.send(next).await.is_err() || failed {
             return;
         }
     }
@@ -1407,66 +1538,17 @@ async fn create_job(
 
     let uuid = uuid::Uuid::new_v4();
     let id = format!("JOB-{uuid}");
-    fs::create_dir_all(store_dir(state)).map_err(internal)?;
-    let items = File::create(file(state, &id, "items")).map_err(internal)?;
-    let rejects = File::create(file(state, &id, "rejects")).map_err(internal)?;
-
-    let (chunks_tx, chunks_rx) = mpsc::channel(32);
-    // The compressed body is held to the cap too. No upload is read past
-    // what a plain one may hold.
-    tokio::spawn(forward(body, max_bytes, chunks_tx));
-    let upload = Upload {
-        chunks: chunks_rx,
-        chunk: Bytes::new(),
+    let stage = Staging {
+        state: state.clone(),
+        id: id.clone(),
+        committed: false,
+        _slot: Arc::clone(state.here_upload_slot())
+            .try_acquire_owned()
+            .map_err(|_| upload_busy())?,
     };
-    let max_items = state.limits().max_job_rows();
-    let reading = {
-        let request_id = request_id.to_string();
-        task::spawn_blocking(move || {
-            let mut reader = Reader {
-                plan: &plan,
-                request_id: &request_id,
-                items: BufWriter::new(items),
-                rejects: BufWriter::new(rejects),
-                intake: Intake::default(),
-                max_items,
-            };
-            let read = if gzip {
-                reader.run(flate2::read::MultiGzDecoder::new(upload), max_bytes)
-            } else {
-                reader.run(upload, max_bytes)
-            };
-            let intake = std::mem::take(&mut reader.intake);
-            drop(reader);
-            read.map(|()| (plan, intake))
-        })
-    };
-    let read = reading
-        .await
-        .map_err(|error| internal(io::Error::other(error)))?;
-    let (plan, intake) = match read {
-        Ok(read) => read,
-        Err(refusal) => {
-            remove_files(state, &id, true);
-            return Err(match refusal {
-                Refusal::TooLarge => too_large(max_bytes),
-                Refusal::TooManyRecords(max) => BatchError::new(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "E6004131",
-                    "Input exceeds maximum record count limit.",
-                    format!("The input holds more than {max} records"),
-                    "Split the job into smaller jobs",
-                ),
-                Refusal::Unreadable(cause) if cause == "too large" => too_large(max_bytes),
-                Refusal::Unreadable(cause) => BatchError::bad_request(
-                    "Input could not be read",
-                    format!("The upload failed: {cause}"),
-                ),
-            });
-        }
-    };
+    let (mut stage, plan, intake, remaining) =
+        stage_upload(stage, plan, request_id, body, max_bytes, gzip).await?;
     if intake.items + intake.invalid + intake.rejected == 0 {
-        remove_files(state, &id, true);
         return Err(BatchError::bad_request(
             "Input for the Job is not defined.",
             "The upload holds no records",
@@ -1498,15 +1580,12 @@ async fn create_job(
         notification_ids: plan.notification_ids,
     };
     let _guard = LOCK.lock().await;
-    let stored = if plan.start {
-        launch(state, &mut meta, uuid).await
+    if plan.start {
+        launch(state, &mut meta, uuid, remaining).await?;
     } else {
-        save(state, &meta).map_err(internal)
-    };
-    if let Err(error) = stored {
-        remove_files(state, &id, true);
-        return Err(error);
+        save_capped(state, &meta, remaining)?;
     }
+    stage.committed = true;
     let mut view = view(state, meta).ok_or_else(BatchError::job_not_found)?;
     // A created job is submitted, whether its start follows or not; a read
     // after tells how far it has run.
@@ -1515,12 +1594,106 @@ async fn create_job(
     Ok((StatusCode::CREATED, axum::Json(job_response(&view, &links))).into_response())
 }
 
+async fn stage_upload(
+    stage: Staging,
+    plan: Plan,
+    request_id: &str,
+    body: Body,
+    max_bytes: u64,
+    gzip: bool,
+) -> Result<(Staging, Plan, Intake, u64), BatchError> {
+    let (chunks_tx, chunks) = mpsc::channel(32);
+    let upload = Upload {
+        chunks,
+        chunk: Bytes::new(),
+    };
+    let max_items = stage.state.limits().max_job_rows();
+    let stopping = stage.state.stopping().clone();
+    let request_id = request_id.to_string();
+    let reading = task::spawn_blocking(move || {
+        let state = &stage.state;
+        fs::create_dir_all(store_dir(state)).map_err(internal)?;
+        let remaining = available_bytes(state)
+            .map_err(internal)?
+            .checked_sub(4 * FILE_OVERHEAD)
+            .filter(|remaining| *remaining > 0)
+            .ok_or_else(store_full)?;
+        let mut reader = Reader {
+            plan: &plan,
+            request_id: &request_id,
+            items: BufWriter::new(File::create(file(state, &stage.id, "items")).map_err(internal)?),
+            rejects: BufWriter::new(
+                File::create(file(state, &stage.id, "rejects")).map_err(internal)?,
+            ),
+            intake: Intake::default(),
+            max_items,
+            remaining,
+        };
+        let result = if gzip {
+            reader.run(flate2::read::MultiGzDecoder::new(upload), max_bytes)
+        } else {
+            reader.run(upload, max_bytes)
+        };
+        result.map_err(|refusal| upload_refused(refusal, max_bytes))?;
+        let intake = std::mem::take(&mut reader.intake);
+        let remaining = reader.remaining;
+        drop(reader);
+        Ok((stage, plan, intake, remaining))
+    });
+    let (read, ()) = tokio::join!(
+        reading,
+        forward(
+            body,
+            max_bytes,
+            Duration::from_secs(UPLOAD_STALL_SECONDS),
+            UPLOAD_DEADLINE,
+            &stopping,
+            chunks_tx
+        )
+    );
+    read.map_err(|error| internal(io::Error::other(error)))?
+}
+
+fn upload_refused(refusal: Refusal, max_bytes: u64) -> BatchError {
+    match refusal {
+        Refusal::TooLarge => too_large(max_bytes),
+        Refusal::TooManyRecords(max) => BatchError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "E6004131",
+            "Input exceeds maximum record count limit.",
+            format!("The input holds more than {max} records"),
+            "Split the job into smaller jobs",
+        ),
+        Refusal::Unreadable(error) => match error.kind() {
+            io::ErrorKind::StorageFull => store_full(),
+            io::ErrorKind::TimedOut => BatchError::new(
+                StatusCode::REQUEST_TIMEOUT,
+                "E6004081",
+                "Upload timed out",
+                error.to_string(),
+                "Send the upload again",
+            ),
+            io::ErrorKind::ConnectionAborted => BatchError::of(Problem::busy(1)),
+            io::ErrorKind::InvalidData if error.to_string() == "too large" => too_large(max_bytes),
+            _ => BatchError::bad_request(
+                "Input could not be read",
+                format!("The upload failed: {error}"),
+            ),
+        },
+    }
+}
+
 fn internal(error: io::Error) -> BatchError {
     BatchError::of(Problem::internal(error.into()))
 }
 
 /// Start an og job over the items no earlier run of this job answered.
-async fn launch(state: &AppState, meta: &mut Meta, uuid: uuid::Uuid) -> Result<(), BatchError> {
+async fn launch(
+    state: &AppState,
+    meta: &mut Meta,
+    uuid: uuid::Uuid,
+    remaining: u64,
+) -> Result<(), BatchError> {
     let answered = {
         let state = state.clone();
         let meta = meta.clone();
@@ -1548,11 +1721,11 @@ async fn launch(state: &AppState, meta: &mut Meta, uuid: uuid::Uuid) -> Result<(
     meta.runs.push(run.clone());
     meta.started.get_or_insert_with(unix_now);
     meta.stopped = false;
-    if let Err(error) = save(state, meta) {
+    if let Err(error) = save_capped(state, meta, remaining) {
         state.jobs().remove(&run);
         // The first run reuses the job UUID on retry.
         job.ended().await;
-        return Err(internal(error));
+        return Err(error);
     }
     let state = state.clone();
     let id = meta.id.clone();
@@ -1841,7 +2014,7 @@ pub(super) async fn start(
             (true, Some(uuid)) => uuid,
             _ => uuid::Uuid::new_v4(),
         };
-        launch(&state, &mut meta, uuid).await?;
+        launch(&state, &mut meta, uuid, u64::MAX).await?;
         let mut view = view(&state, meta).ok_or_else(BatchError::job_not_found)?;
         view.status = "queued";
         Ok::<_, BatchError>(view)
@@ -2722,6 +2895,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_idle_upload_reports_a_timeout() {
+        let body = Body::from_stream(futures_util::stream::pending::<io::Result<Bytes>>());
+        let (tx, mut rx) = mpsc::channel(1);
+        forward(
+            body,
+            1024,
+            Duration::from_millis(5),
+            Duration::from_secs(60),
+            &CancellationToken::new(),
+            tx,
+        )
+        .await;
+        let error = rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(
+            upload_refused(Refusal::Unreadable(error), 1024).status,
+            StatusCode::REQUEST_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn the_total_deadline_applies_even_when_idle_time_remains() {
+        let body = Body::from_stream(futures_util::stream::pending::<io::Result<Bytes>>());
+        let (tx, mut rx) = mpsc::channel(1);
+        forward(
+            body,
+            1024,
+            Duration::from_secs(60),
+            Duration::from_millis(5),
+            &CancellationToken::new(),
+            tx,
+        )
+        .await;
+        assert_eq!(
+            rx.recv().await.unwrap().unwrap_err().to_string(),
+            "Upload deadline exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_admission_reserves_disk_and_preserves_active_uploads() {
+        use super::super::tests::{pack, send};
+
+        let pack = pack("batch-staging");
+        let state = pack.state(crate::limits::Limits::DEFAULT);
+        let router = crate::runtime::build_router(state.clone(), None, None);
+        let dir = store_dir(&state);
+        fs::create_dir_all(&dir).unwrap();
+        let id = meta(false, false).id;
+        let upload = file(&state, &id, "items");
+        let held = File::create(&upload).unwrap();
+        held.set_len(state.limits().max_job_store_bytes() - 5 * FILE_OVERHEAD - 8)
+            .unwrap();
+        drop(held);
+
+        let uri = "/compat/here/v7/batch/jobs?startJob=false";
+        let body = Some(("text/plain", "q\n10 King Street\n"));
+        let slot = state.here_upload_slot().try_acquire().unwrap();
+        assert_eq!(
+            send(&router, "POST", uri, body).await.status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        sweep(&state).await;
+        assert!(upload.exists());
+        drop(slot);
+
+        let reply = send(&router, "POST", uri, body).await;
+        assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(reply.json()["title"], "Batch upload storage is full");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+
+        sweep(&state).await;
+        assert!(!upload.exists());
+        assert_eq!(
+            send(&router, "POST", uri, body).await.status,
+            StatusCode::CREATED
+        );
+        sweep(&state).await;
+        assert_eq!(fs::read_dir(dir).unwrap().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_request_releases_staging_after_the_reader_exits() {
+        use super::super::tests::pack;
+        use tower::ServiceExt;
+
+        let pack = pack("batch-upload-disconnect");
+        let state = pack.state(crate::limits::Limits::DEFAULT);
+        let router = crate::runtime::build_router(state.clone(), None, None);
+        let stream = futures_util::stream::iter([Ok(Bytes::from_static(b"q\n10 King Street\n"))])
+            .chain(futures_util::stream::pending::<io::Result<Bytes>>());
+        let request = axum::http::Request::post("/compat/here/v7/batch/jobs?startJob=false")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let task = tokio::spawn(router.oneshot(request));
+        let dir = store_dir(&state);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fs::read_dir(&dir).map_or(0, Iterator::count) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let _slot =
+            tokio::time::timeout(Duration::from_secs(5), state.here_upload_slot().acquire())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn a_failed_metadata_save_removes_only_the_new_run() {
         use super::super::tests::pack;
 
@@ -2742,7 +3030,7 @@ mod tests {
         fs::create_dir(&partial).unwrap();
         {
             let _guard = LOCK.lock().await;
-            assert!(launch(&state, &mut meta, uuid).await.is_err());
+            assert!(launch(&state, &mut meta, uuid, u64::MAX).await.is_err());
         }
         assert!(state.jobs().get(&run).is_none());
         assert!(!state.jobs().dir().join(format!("{run}.json")).exists());
@@ -2752,7 +3040,7 @@ mod tests {
         assert!(meta.runs.is_empty());
         {
             let _guard = LOCK.lock().await;
-            launch(&state, &mut meta, uuid).await.unwrap();
+            launch(&state, &mut meta, uuid, u64::MAX).await.unwrap();
         }
         state.jobs().get(&run).unwrap().ended().await;
         assert_eq!(load(&state, &meta.id).unwrap().runs, [run]);

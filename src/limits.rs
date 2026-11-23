@@ -56,6 +56,7 @@ pub struct Limits {
 
     /// Most GiB the results of every kept job may take on disk. While they
     /// take more, a new job is refused with 503 `busy`.
+    /// The same limit is applied separately to HERE batch upload staging.
     #[arg(long, env = "OG_MAX_JOB_STORE_GIB", value_name = "GIB",
           default_value_t = Limits::DEFAULT.max_job_store_gib)]
     pub max_job_store_gib: NonZeroU64,

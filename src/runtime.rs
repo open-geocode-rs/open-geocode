@@ -105,6 +105,7 @@ pub(crate) struct AppState {
     error_log: ErrorLog,
     batch_pool: Arc<ThreadPool>,
     batch_slots: Arc<Semaphore>,
+    here_upload_slot: Arc<Semaphore>,
     jobs: Arc<JobStore>,
     limits: Limits,
     /// One permit per single lookup running; one without a permit is refused.
@@ -156,6 +157,7 @@ impl AppState {
             // Batches and jobs share the pool's cores, so running more of them
             // at once than there are cores only slows each one down.
             batch_slots: Arc::new(Semaphore::new(resources.usable_cpus)),
+            here_upload_slot: Arc::new(Semaphore::new(1)),
             jobs: Arc::new(JobStore::open(jobs.to_path_buf(), limits.job_retention())?),
             lookup_slots: Arc::new(Semaphore::new(
                 limits
@@ -238,6 +240,10 @@ impl AppState {
     /// One permit per batch or job running; one without a permit is refused.
     pub(crate) fn batch_slots(&self) -> &Arc<Semaphore> {
         &self.batch_slots
+    }
+
+    pub(crate) fn here_upload_slot(&self) -> &Arc<Semaphore> {
+        &self.here_upload_slot
     }
 
     pub(crate) fn error_log(&self) -> &ErrorLog {
