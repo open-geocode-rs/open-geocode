@@ -1832,7 +1832,7 @@ fn geocode_answer(state: &AppState, request: GeocodeRequest) -> Result<ForwardCo
          description = "How far to look for the nearest address, street or place, in \
                         metres, up to 1000. Default 30. Areas hold the point, so it \
                         does not bound them.",
-         example = 150.0, minimum = 0.0, maximum = 1000.0),
+         example = 150, minimum = 0.0, maximum = 1000.0),
         ("lang" = Option<String>, Query,
          description = "Languages to name results and their areas in, as \
                         comma-separated language codes. The first names each \

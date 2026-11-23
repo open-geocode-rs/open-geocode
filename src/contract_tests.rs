@@ -102,23 +102,24 @@ async fn committed_openapi_is_the_served_contract() {
     let _ = std::fs::remove_dir_all(&pack);
 }
 
-/// The committed contract survives release-please rewriting its version.
-///
-/// `release-please-config.json` lists `contract/openapi.json` as an extra
-/// file, and release-please rewrites a JSON file by parsing it and
-/// re-serializing with `JSON.stringify(value, null, 2)`. If the committed
-/// text were not already exactly that, every release would reformat the file
-/// and the drift test above would fail on main until someone regenerated it.
-///
-/// Keeping the file a fixed point of that transform is what makes the two
-/// safe together. The risk is integral floats: a bound written `-180.0` in
-/// Rust would serialize as `-180.0` but come back `-180`. Today none survive
-/// serialization, and this notices if one ever does.
+/// Release Please uses JSON.stringify, which writes integral floats as integers.
 #[test]
 fn the_contract_survives_a_release_version_bump() {
     let document =
         crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
     let value: Value = serde_json::from_str(&document).expect("spec is JSON");
+    let mut values = vec![&value];
+    while let Some(value) = values.pop() {
+        match value {
+            Value::Array(items) => values.extend(items),
+            Value::Object(fields) => values.extend(fields.values()),
+            Value::Number(number) if number.is_f64() => assert!(
+                number.as_f64().is_some_and(|float| float.fract() != 0.0),
+                "Release Please would rewrite {number} as an integer"
+            ),
+            _ => {}
+        }
+    }
     let mut restringified = serde_json::to_string_pretty(&value).expect("re-serializes");
     restringified.push('\n');
     assert_eq!(

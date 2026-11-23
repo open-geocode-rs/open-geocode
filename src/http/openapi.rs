@@ -307,7 +307,7 @@ pub(crate) struct ReverseItem {
     pub lat: Option<f64>,
     pub layer: Option<Layer>,
     /// How far to look for the nearest address, street or place, in metres.
-    #[schema(example = 150.0, minimum = 0.0, maximum = 1000.0)]
+    #[schema(example = 150, minimum = 0.0, maximum = 1000.0)]
     pub radius: Option<f64>,
 }
 
