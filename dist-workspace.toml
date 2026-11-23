@@ -5,6 +5,7 @@ members = ["cargo:."]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
+features = ["tui"]
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
@@ -20,3 +21,4 @@ github-build-setup = "../build-setup.yml"
 # Native ARM runner: builds the musl binary without a cross toolchain.
 [dist.github-custom-runners]
 aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
+aarch64-apple-darwin = "macos-15"

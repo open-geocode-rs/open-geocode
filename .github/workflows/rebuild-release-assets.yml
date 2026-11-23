@@ -1,0 +1,110 @@
+name: Rebuild release assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable release tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      commit: ${{ steps.plan.outputs.commit }}
+    steps:
+      - name: Validate release tag
+        run: '[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cp dist-workspace.toml "$RUNNER_TEMP/dist-workspace.toml"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+          submodules: recursive
+      - run: cp "$RUNNER_TEMP/dist-workspace.toml" dist-workspace.toml
+
+      - name: Install dist
+        shell: bash
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+
+      - id: plan
+        run: |
+          dist plan --tag="$RELEASE_TAG" --output-format=json > plan.json
+          echo "matrix=$(jq -ce '.ci.github.artifacts_matrix' plan.json)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
+        with:
+          name: release-build-recipe
+          path: dist-workspace.toml
+          if-no-files-found: error
+
+  build:
+    needs: plan
+    name: Build (${{ join(matrix.targets, ', ') }})
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Enable Windows long paths
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
+        with:
+          name: release-build-recipe
+
+      - name: Install release tooling
+        run: ${{ matrix.install_dist.run }}
+
+      - name: Install platform dependencies
+        if: matrix.packages_install != ''
+        run: ${{ matrix.packages_install }}
+
+      - name: Generate third-party licenses
+        shell: bash
+        run: |
+          cargo install cargo-about --locked --features cli --version 0.9.3
+          cargo about generate --all-features --locked --fail -o THIRD-PARTY-LICENSES about.hbs
+
+      - id: build
+        name: Build release archives
+        shell: bash
+        env:
+          DIST_ARGS: ${{ matrix.dist_args }}
+          TARGETS: ${{ join(matrix.targets, '-') }}
+        run: |
+          read -r -a args <<< "$DIST_ARGS"
+          dist build --tag="$RELEASE_TAG" --print=linkage --output-format=json "${args[@]}" > dist-manifest.json
+          cp dist-manifest.json "target/distrib/$TARGETS-dist-manifest.json"
+          echo 'paths<<EOF' >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo EOF >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
+        with:
+          name: artifacts-build-local-${{ join(matrix.targets, '_') }}
+          path: |
+            ${{ steps.build.outputs.paths }}
+            target/distrib/*-dist-manifest.json
+          if-no-files-found: error
