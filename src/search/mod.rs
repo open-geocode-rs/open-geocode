@@ -12414,6 +12414,7 @@ mod tests {
             AddressComponents, AddressRecord, DerivedSourceProvenance, LocationPrecision,
             ObjectType, PostcodeRecord, SourceProvenance, StreetRecord, point_geometry,
         },
+        test_support::TempDir,
         text_index::PostcodeAreas,
     };
 
@@ -13649,8 +13650,8 @@ mod tests {
     /// and a street of the name never takes the lead for fame it has none of.
     #[test]
     fn a_place_named_by_any_of_its_names_leads_by_fame() {
-        let pack = TempPack::new("search-place-any-name");
-        let mut writer = Writer::create(&pack.0).expect("writer");
+        let pack = TempDir::new("search-place-any-name");
+        let mut writer = Writer::create(&pack).expect("writer");
         let fame = |importance| Prominence {
             importance,
             linked: true,
@@ -13716,7 +13717,7 @@ mod tests {
             writer.write(&record, None).expect("record");
         }
         writer.finish().expect("finish");
-        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+        let searcher = TextSearcher::open(&pack).expect("searcher");
 
         assert_eq!(
             top_ids(&searcher, "Rome")[..2],
@@ -13746,8 +13747,8 @@ mod tests {
     /// and a way, answers once, and an alternate name finds it.
     #[test]
     fn a_poi_mapped_twice_answers_once() {
-        let pack = TempPack::new("search-poi-one-item");
-        let mut writer = Writer::create(&pack.0).expect("writer");
+        let pack = TempDir::new("search-poi-one-item");
+        let mut writer = Writer::create(&pack).expect("writer");
         let colosseo = |object_type, object_id, wikidata| {
             Record::from(PoiRecord {
                 alt_names: vec!["Colosseum".to_string()],
@@ -13776,7 +13777,7 @@ mod tests {
             writer.write(&record, None).expect("poi");
         }
         writer.finish().expect("finish");
-        let places = TextSearcher::open(&pack.0).expect("searcher").places();
+        let places = TextSearcher::open(&pack).expect("searcher").places();
         assert_eq!(top_ids(&places, "Colosseum"), ["osm:node:1", "osm:node:3"]);
     }
 
@@ -15188,8 +15189,8 @@ mod tests {
     /// else the best known: from Seattle "amsterdam" is in the Netherlands.
     #[test]
     fn a_place_mapped_as_a_node_and_a_boundary_answers_the_boundary() {
-        let pack = TempPack::new("node-and-boundary");
-        let mut writer = Writer::create(&pack.0).expect("writer");
+        let pack = TempDir::new("node-and-boundary");
+        let mut writer = Writer::create(&pack).expect("writer");
         let town = |object_type, prominence| {
             Record::Place(
                 PlaceLayer::Locality,
@@ -15221,7 +15222,7 @@ mod tests {
             [-717_900_000, 415_000_000, -715_000_000, 416_000_000],
         )]);
         writer.finish().expect("finish");
-        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+        let searcher = TextSearcher::open(&pack).expect("searcher");
         let hits = searcher
             .search(&TextSearchOptions {
                 query: "Exeter".to_string(),
@@ -15241,8 +15242,8 @@ mod tests {
 
     #[test]
     fn a_poi_mapped_as_a_node_and_a_building_answers_the_node() {
-        let pack = TempPack::new("poi-node-and-building");
-        let mut writer = Writer::create(&pack.0).expect("writer");
+        let pack = TempDir::new("poi-node-and-building");
+        let mut writer = Writer::create(&pack).expect("writer");
         let station = |object_type, name: &str| {
             Record::Poi(PoiRecord {
                 alt_names: Vec::new(),
@@ -15274,7 +15275,7 @@ mod tests {
             [-714_200_000, 418_100_000, -714_000_000, 418_300_000],
         )]);
         writer.finish().expect("finish");
-        let searcher = TextSearcher::open(&pack.0).expect("searcher").places();
+        let searcher = TextSearcher::open(&pack).expect("searcher").places();
         let hits = searcher
             .search(&TextSearchOptions {
                 query: "Providence".to_string(),
@@ -15294,8 +15295,8 @@ mod tests {
 
     #[test]
     fn a_named_place_is_near_else_best_known() {
-        let pack = TempPack::new("place-point");
-        let mut writer = Writer::create(&pack.0).expect("writer");
+        let pack = TempDir::new("place-point");
+        let mut writer = Writer::create(&pack).expect("writer");
         let town = |object_id, [lon, lat]: [f64; 2], prominence| {
             Record::Place(
                 PlaceLayer::Locality,
@@ -15322,7 +15323,7 @@ mod tests {
             .write(&town(2, [-111.3, 45.8], Prominence::default()), None)
             .expect("montana");
         writer.finish().expect("finish");
-        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+        let searcher = TextSearcher::open(&pack).expect("searcher");
 
         let from_seattle = searcher
             .place_point("amsterdam", Some([-122.33, 47.61]), false)
@@ -15339,8 +15340,8 @@ mod tests {
     /// street.
     #[test]
     fn a_named_place_may_be_an_alternate_name_or_a_street() {
-        let pack = TempPack::new("place-point-alternate");
-        let mut writer = Writer::create(&pack.0).expect("writer");
+        let pack = TempDir::new("place-point-alternate");
+        let mut writer = Writer::create(&pack).expect("writer");
         writer
             .write(
                 &Record::Place(
@@ -15362,7 +15363,7 @@ mod tests {
             .write(&street_record("osm:way:2", "Queen Street").into(), None)
             .expect("street");
         writer.finish().expect("finish");
-        let searcher = TextSearcher::open(&pack.0).expect("searcher");
+        let searcher = TextSearcher::open(&pack).expect("searcher");
 
         let near = |words| {
             searcher
@@ -18998,24 +18999,6 @@ mod tests {
         assert!(!LAST_STRUCTURED.with(Cell::get).answered);
         assert_eq!(found, ids(&plain, query));
         let _ = std::fs::remove_dir_all(temp_dir);
-    }
-
-    /// A temporary Pack directory, removed when it goes out of scope, a
-    /// failed assertion included.
-    struct TempPack(std::path::PathBuf);
-
-    impl TempPack {
-        fn new(name: &str) -> Self {
-            let path = temp_pack_path(name);
-            let _ = std::fs::remove_dir_all(&path);
-            Self(path)
-        }
-    }
-
-    impl Drop for TempPack {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
     }
 
     /// A town with its postcode, a street of three stated houses and a flat
