@@ -2044,7 +2044,7 @@ impl<'a> Run<'a> {
         self.progress.start(BuildStage::StructuredIndex, None)?;
         let structured = Instant::now();
         crate::structured::add_to(&mut sealed, &scratch, &self.memory, self.budget)?;
-        crate::ids::add_to(&mut sealed)?;
+        crate::ids::add_to(&mut sealed, &scratch, &self.memory, self.budget)?;
         if self.options.tiger {
             let counties = tiger::counties_for_pack(&sealed.path(), &self.options.pack)?;
             let sections =
@@ -5896,6 +5896,19 @@ mod tests {
             let spill = &ledger.spills[owner];
             assert!(spill.written_bytes > 0, "{owner}: {spill:?}");
         }
+        for owner in [
+            "dictionary-streets",
+            "dictionary-pois",
+            "dictionary-words",
+            "dictionary-aliases",
+        ] {
+            let spill = ledger.spills.get(owner);
+            assert!(
+                spill.is_some_and(|spill| spill.merges > 0),
+                "{owner}: {:?}",
+                ledger.spills
+            );
+        }
         let records = &ledger.spills["records"];
         assert_eq!(records.items_read, records.items_written);
         assert!(records.merge_passes >= 1);
@@ -5923,14 +5936,16 @@ mod tests {
         assert_eq!(in_memory.triage, spilled.triage);
         let structured = spilled.stages.last().expect("structured index stage");
         assert_eq!(structured.stage, BuildStage::StructuredIndex.description());
-        assert!(
-            structured
-                .spills
-                .get("structured-keys")
-                .is_some_and(|spill| spill.written_bytes > 0),
-            "{:?}",
-            structured.spills
-        );
+        for owner in ["structured-keys", "places-ids"] {
+            assert!(
+                structured
+                    .spills
+                    .get(owner)
+                    .is_some_and(|spill| spill.merges > 0),
+                "{owner}: {:?}",
+                structured.spills
+            );
+        }
 
         let memory = Reader::open(dir.join("memory")).expect("memory pack");
         let spilled = Reader::open(dir.join("spilled")).expect("spilled pack");
@@ -5947,6 +5962,35 @@ mod tests {
                 meta.to_string().into_bytes()
             };
             assert_eq!(section_of(&memory), section_of(&spilled), "{section}");
+        }
+        let sorted = memory
+            .container()
+            .sections()
+            .keys()
+            .filter(|name| name.starts_with("parse/") || *name == crate::ids::SECTION)
+            .collect::<Vec<_>>();
+        assert!(
+            sorted.contains(
+                &&crate::parse::lattice::dictionary::Field::Street
+                    .section()
+                    .to_string()
+            )
+        );
+        assert!(sorted.contains(&&crate::ids::SECTION.to_string()));
+        for section in sorted {
+            assert_eq!(
+                memory
+                    .container()
+                    .raw_section(section)
+                    .expect(section)
+                    .as_slice(),
+                spilled
+                    .container()
+                    .raw_section(section)
+                    .expect(section)
+                    .as_slice(),
+                "{section}"
+            );
         }
         assert_eq!(
             memory.manifest().record_count,

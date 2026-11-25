@@ -10999,7 +10999,13 @@ mod tests {
             usize::MAX,
         )
         .expect("structured index");
-        crate::ids::add_to(&mut pack).expect("ids");
+        crate::ids::add_to(
+            &mut pack,
+            &scratch,
+            &crate::memory::Budget::unlimited(),
+            usize::MAX,
+        )
+        .expect("ids");
         let ranges = crate::tiger::encode(vec![crate::tiger::Range {
             street,
             from: 2,

@@ -408,7 +408,6 @@ fn zone_of(entry: &[u8; AREA_ZONE_BYTES]) -> u16 {
 pub struct WriterOptions {
     pub memory: Arc<Budget>,
     pub text_index_memory_bytes: usize,
-    /// The most one sorter of the writer may hold before it spills.
     pub sorter_bytes: usize,
 }
 
@@ -876,7 +875,7 @@ impl Writer {
         let sorter_bytes = self.sorter_bytes;
         let (mut sealed, _) = self.seal()?;
         crate::structured::add_to(&mut sealed, &scratch, &memory, sorter_bytes)?;
-        crate::ids::add_to(&mut sealed)?;
+        crate::ids::add_to(&mut sealed, &scratch, &memory, sorter_bytes)?;
         sealed.publish()
     }
 }
