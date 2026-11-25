@@ -1,16 +1,3 @@
-//! Build memory accounting.
-//!
-//! One [`Budget`] is shared by every large buffer of a build: sort
-//! buffers (counted by capacity, so `Vec` growth is included), merge read
-//! buffers, the text indexing buffers and the parser's lattice cache. A
-//! buffer reserves bytes before it grows; when the pool is full its owner
-//! spills to disk instead. Buffers that can spill hold a [`Spillable`]
-//! reservation, and each of them may hold a fair share of what the buffers
-//! that cannot spill leave, as DataFusion's `FairSpillPool` does: a sorter
-//! open alone may take the whole pool, and four take a quarter each.
-//!
-//! The build report records the peaks.
-
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -18,8 +5,6 @@ use std::sync::{
 
 use crate::{alloc, resources::Resources};
 
-/// The heap may grow by at most this share of the memory available when the
-/// pool was last sampled before tracked buffers must spill.
 const HEAP_CEILING_PERCENT: u64 = 85;
 const MIN_FAIR_SHARE_BYTES: usize = 16 << 20;
 pub const MIN_BUDGET_BYTES: usize = 256 << 20;
@@ -92,11 +77,6 @@ impl Budget {
         self.heap_ceiling.fetch_min(bytes, Ordering::Relaxed);
     }
 
-    /// The bytes one buffer that can spill may hold: a fair share of what
-    /// the buffers that cannot spill leave of the pool, and at least
-    /// [`MIN_FAIR_SHARE_BYTES`]. A full pool still lets each buffer grow to
-    /// the floor, so the floor is capped at half a fair share of the whole
-    /// pool. All floors together go at most half the limit over it.
     pub fn fair_share(&self) -> usize {
         let unspillable = self
             .used()

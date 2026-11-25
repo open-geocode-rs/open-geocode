@@ -1,14 +1,3 @@
-//! Street-type and direction abbreviations of every language libpostal lists,
-//! read both ways: a query's "str" is also looked up as "straße", and
-//! training writes a name's "straße" as "str" some of the time.
-//!
-//! The phrases are libpostal's street types and directionals (MIT, see
-//! `NOTICE`), each line a phrase and its `|`-separated variants. The languages that
-//! glue a street type onto the name ("hauptstraße", "kerkstraat") are those
-//! libpostal lists concatenated suffixes for, and in them a name ending in a
-//! variant also ends in each other form of it ("hauptstr" is "hauptstraße").
-//! Nothing here names a language: every list is read the same way.
-
 use std::{collections::BTreeSet, sync::OnceLock};
 
 use rustc_hash::FxHashMap;
@@ -24,9 +13,7 @@ const MIN_GLUED_STEM_CHARS: usize = 3;
 
 #[derive(Debug, Default)]
 pub(super) struct Abbreviations {
-    /// A variant to its full forms ("str" to "straße").
     full: FxHashMap<String, Vec<String>>,
-    /// A full form to its variants ("straße" to "str", "strasse").
     short: FxHashMap<String, Vec<String>>,
     glued: FxHashMap<String, Vec<String>>,
 }

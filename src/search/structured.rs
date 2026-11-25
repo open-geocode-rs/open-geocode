@@ -41,8 +41,6 @@ const PLACE_FILE: &str = "places.fst";
 const PLACE_RECORDS_FILE: &str = "places.rec";
 const PLACE_CELLS_FILE: &str = "places.u32";
 const CELL_STREET_FILE: &str = "cell-streets.fst";
-/// The Pack section each file of a build goes into, the meta first: a Pack
-/// holds the structured index when it holds its meta.
 pub(crate) const SECTIONS: [(&str, &str); 7] = [
     ("streets/meta", META_FILE),
     ("streets/keys", STREET_FILE),
@@ -630,9 +628,6 @@ fn key_chunk(
     Ok(chunk)
 }
 
-/// Build the structured index of the sealed Pack `sealed` and add it to the Pack:
-/// one pass over its text index's documents into files beside it, each then
-/// copied into a section of its own.
 pub fn add_to(
     sealed: &mut pack::SealedPack,
     scratch: &Arc<Scratch>,

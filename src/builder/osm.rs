@@ -2010,7 +2010,6 @@ impl<'a> Run<'a> {
         self.checkpoints.voided = scratch.voided();
     }
 
-    /// Train the parser on the sealed Pack and publish it.
     fn finish(mut self) -> Result<BuilderReport> {
         let phase = Instant::now();
         let (mut sealed, mut stats) = self.sealed.take().ok_or_else(|| missing("the Pack"))?;
@@ -5956,7 +5955,6 @@ mod tests {
         let memory = Reader::open(dir.join("memory")).expect("memory pack");
         let spilled = Reader::open(dir.join("spilled")).expect("spilled pack");
         for (section, _) in crate::structured::SECTIONS {
-            // The meta names the text index's segments, whose ids are random.
             let section_of = |pack: &Reader| {
                 let bytes = pack.container().raw_section(section).expect(section);
                 if section != "streets/meta" {

@@ -1,24 +1,3 @@
-//! Sizing a build to the machine, before it starts and again once its input
-//! is counted.
-//!
-//! A build is planned twice. [`plan_build`] runs before any work, knowing
-//! only the machine ([`Resources`]) and the inputs' sizes: it keeps every
-//! CPU, sizes the memory budget from the memory available less the heap the
-//! build holds outside it, and checks memory and disk against item counts
-//! estimated from the input's size. [`BuildPlan::refine`] runs again after
-//! each input's scan, when the items are counted: how many node coordinates
-//! the ways need, how many records, addresses and streets the build will
-//! spill, how many boundary vertices it holds. It decides whether the node
-//! coordinates stay in memory and checks the rest of the build against the
-//! scratch disk. Both stop the build, unless forced, when it does not fit,
-//! naming each shortfall and how to fix it, like Planetiler's resource
-//! check; within 10% of a limit they warn.
-//!
-//! Every cost is per item, not per PBF byte: a PBF byte of Germany holds four
-//! times the node references of a byte of Canada, so no ratio of input bytes
-//! fits both. Only the estimate before the scan reads counts from bytes, at
-//! the densest input measured, so it errs towards needing more.
-
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -38,17 +17,12 @@ const GERMANY_KEPT_WAYS: f64 = 21_178_798.0;
 const GERMANY_RECORDS: f64 = 26_131_991.0;
 const GERMANY_ADDRESSES: f64 = 19_719_186.0;
 const GERMANY_STREETS: f64 = 4_103_850.0;
-// The planet's counts (build report, 2026-10-26) cap the estimate, as no input holds more.
 const PLANET_INPUT_BYTES: f64 = 95_631_115_419.0;
 const PLANET_NEEDED_NODES: f64 = 1_646_327_702.0;
 const PLANET_KEPT_WAYS: f64 = 156_619_174.0;
 const PLANET_RECORDS: f64 = 269_486_139.0;
 const PLANET_ADDRESSES: f64 = 173_821_696.0;
 const PLANET_STREETS: f64 = 56_214_445.0;
-/// Boundary vertices per input byte. Never measured: the spill study's
-/// upper estimate of the planet's boundary heap, 15 GB, at
-/// 64 B a vertex over 95.4 GB of PBF. The refined plan
-/// counts them.
 const BOUNDARY_REFS_PER_INPUT_BYTE: f64 = 0.0025;
 const NODE_ID_SPACE: u64 = 14_300_000_000;
 
@@ -62,15 +36,7 @@ const PACK_BYTES_PER_RECORD: f64 = 102.0;
 const PACK_BYTES_PER_IMPORTED_ROW: f64 = 25.0;
 
 pub const WORKER_BYTES: u64 = 64 << 20;
-/// Four extracts of 2 to 12 GB held at most 760 MiB beyond their budget with 6 workers (2026-11).
 pub const BASE_UNTRACKED_BYTES: u64 = 512 << 20;
-/// Heap the boundaries hold per boundary vertex, inside the memory budget:
-/// what describes each area, and the index of the ways' lines while they
-/// are assembled. The vertices themselves stay on disk, the ways' until the
-/// boundary stage reads them back by way id and the shapes' in a file they
-/// are mapped from. The planet (2026-10) held 409 MB of descriptions for
-/// 203.6 million vertices, 2.0 B each; twice that leaves room for the line
-/// index.
 const BOUNDARY_HEAP_BYTES_PER_REF: f64 = 4.0;
 const BOUNDARY_SHAPE_BYTES_PER_REF: f64 = 30.0;
 const BUDGET_PERCENT: u64 = 75;
@@ -91,7 +57,6 @@ pub struct ItemCounts {
 impl ItemCounts {
     fn estimate(input_bytes: u64, imported_rows: u64) -> Self {
         let bytes = input_bytes as f64;
-        // A planet newer than the one counted is larger, at about the same density.
         let at = |germany: f64, planet: f64| {
             let dense = bytes * germany / GERMANY_INPUT_BYTES;
             let whole = planet * (bytes / PLANET_INPUT_BYTES).max(1.0);
@@ -198,7 +163,6 @@ impl BuildPlan {
         self.memory_budget_bytes + untracked_beside_boundaries(self.threads)
     }
 
-    /// Set the needs from `items`.
     fn size(&mut self) {
         let items = &self.items;
         let least_budget = if self.memory_budget_derived {
@@ -367,7 +331,6 @@ fn worker_threads(resources: &Resources) -> usize {
         .max(1)
 }
 
-/// The plan before any work, on `resources`.
 fn preflight(
     resources: Resources,
     threads: usize,
@@ -522,7 +485,6 @@ mod tests {
         let planet = preflight(machine(28), 24, 95_380_942_829, 0, None);
         assert_eq!(planet.threads, 24);
         assert!(planet.memory_budget_bytes > 16 << 30);
-        // The planet's counted build fit its 1.6 billion needed nodes in a 20 GiB budget.
         assert!(planet.locations_in_memory);
         assert!(
             planet.shared_disk_needed_bytes < disk / 10 * 9,
@@ -584,7 +546,6 @@ mod tests {
                 56_214_445
             )
         );
-        // Its build peaked at 65 GiB of scratch and Pack, so 80 GB free must pass the check.
         assert!(
             planet.shared_disk_needed_bytes < 80_000_000_000,
             "{} MiB",

@@ -2170,3 +2170,35 @@ Rejected.
 Evidence.
 
 Tim Hortons has two in Toronto, so neither can be expected.
+
+### The memory check adds a fixed overhead and a per-thread overhead to the budget
+
+Where. `BuildPlan` and the memory constants in `src/builder/plan.rs`.
+
+A build needs its memory budget plus 512 MiB plus 64 MiB for each worker thread, and the check wants that free beyond what the process already holds outside its heap.
+The overhead covers allocator pages, thread stacks and read buffers that no budget counts.
+
+Rejected.
+
+- **Check the budget alone.** Builds then peaked above the memory the check had cleared.
+
+Evidence.
+
+Four extracts of 2 to 12 GB held at most 760 MiB beyond their budget with 6 workers, in 2026-11.
+
+### The disk and node estimates before the scan cap at the planet's counts
+
+Where. The estimate constants in `src/builder/plan.rs`.
+
+The estimate before the scan reads item counts from input bytes at the densest input measured, and caps them at the planet's counts, as no input holds more.
+A planet newer than the one counted is larger, at about the same density.
+The boundary heap is sized at 4.0 B per boundary vertex, twice the 2.0 B measured on the planet (409 MB of descriptions for 203.6 million vertices), to leave room for the index of the ways' lines.
+Boundary vertices per input byte was never measured. It comes from the spill study's upper estimate of 15 GB over 95.4 GB of PBF at 64 B a vertex, and the refined plan replaces it with the real count.
+
+Rejected.
+
+- **One ratio of items to PBF bytes for every input.** A byte of Germany holds four times the node references of a byte of Canada, so no ratio fits both.
+
+Evidence.
+
+The planet's counted build fit its 1.6 billion needed nodes in a 20 GiB budget and peaked at 65 GiB of scratch and Pack, so 80 GB free must pass the check.

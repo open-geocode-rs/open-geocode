@@ -49,7 +49,6 @@ impl Spill for Use {
     }
 }
 
-/// `seq` keeps the merges of one alias in street order.
 #[derive(Debug, Clone)]
 struct Named {
     name: String,
@@ -351,7 +350,6 @@ impl Finished {
         &self.types
     }
 
-    /// `false` when `field`'s names are not held here. `held` are its names held in memory.
     pub(super) fn write(
         &mut self,
         field: Field,

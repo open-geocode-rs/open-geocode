@@ -431,10 +431,6 @@ mod platform {
         )
     }
 
-    /// The tightest cgroup memory limit over this process's cgroup and its
-    /// ancestors, and what is left under it: v2 `memory.max` less
-    /// `memory.current`, or v1 `memory.limit_in_bytes` less
-    /// `memory.usage_in_bytes`.
     #[cfg(target_os = "linux")]
     pub(super) fn cgroup_memory_from(
         groups: &str,
@@ -496,7 +492,6 @@ mod platform {
                     if let Some(limit) =
                         number(&directory.join(limit_file)).filter(|limit| *limit < 1 << 62)
                     {
-                        // Reclaimed before any kill, so free, as in the host's MemAvailable.
                         let inactive = read(&directory.join("memory.stat"))
                             .and_then(|stat| {
                                 stat.lines().find_map(|line| {

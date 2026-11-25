@@ -51,7 +51,6 @@ fn count(bytes: isize) {
     let flush = flushed.unwrap_or(bytes);
     if flush != 0 {
         let live = (LIVE.fetch_add(flush, Ordering::Relaxed) + flush).max(0) as usize;
-        // Read first, as for `INSTALLED`: the peaks rarely move.
         for peak in [&PEAK, &STAGE_PEAK] {
             if peak.load(Ordering::Relaxed) < live {
                 peak.fetch_max(live, Ordering::Relaxed);

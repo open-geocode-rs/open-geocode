@@ -1,22 +1,3 @@
-//! Stable id to record block.
-//!
-//! Only OSM places, areas and streets: OpenAddresses row ids renumber every
-//! release, so a saved one would open another house. A street answers to any
-//! of its ways' ids: a tile names the way a tap lands on.
-//!
-//! Stores no id. A minimal perfect hash (FMPHGO, `ph` crate, ~2-3 bits an id)
-//! maps each id to a slot holding its first block number. The hash sends
-//! unknown ids to some slot too, so a lookup checks the record's own id.
-//! One object can be records in several blocks (a way that is a POI and a
-//! district): its other blocks are listed apart, by key, few as they are.
-//!
-//! ```text
-//! places/ids   width u8 (bytes of a block number) | count u64 | count block
-//!              numbers, `width` bytes each, little-endian | more u64 | more
-//!              (key, block number) pairs, by key, the key 8 bytes and the
-//!              block `width` | the hash, as `ph` writes it
-//! ```
-
 use std::{
     fs::{File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Write},
@@ -98,7 +79,6 @@ pub fn add_to(
 const LABEL: &str = "places-ids";
 const BLOCKS_PER_THREAD: u64 = 64;
 
-/// A place's block sorts before a street's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Catalogued {
     key: [u8; 8],
@@ -161,9 +141,6 @@ fn build(
     let mut firsts = BufWriter::new(ScratchFile::create(scratch, LABEL, "places-ids.firsts")?);
     let mut more = BufWriter::new(ScratchFile::create(scratch, LABEL, "places-ids.more")?);
     let (mut places, mut more_count) = (0u64, 0u64);
-    // One object can be two records (a node that is a town and a POI, a way
-    // that is a market and a road), in one block or in two. A place's block
-    // comes before a street's, and every block holding the object is kept.
     let mut held: Option<Catalogued> = None;
     let mut others = Vec::new();
     let mut flush = |held: Catalogued, others: &mut Vec<u64>| -> Result<()> {

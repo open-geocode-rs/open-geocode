@@ -1,32 +1,3 @@
-//! The parser's dictionaries, written into the Pack at build time.
-//!
-//! Each field is one FST section, `parse/<field>`, mapping a name's
-//! [`dictionary_key`] (the `search_key` the search path uses,
-//! glued as a query's units are) to how often the Pack uses it and the
-//! country it is used in most. Every name a record has counts: its `name`
-//! and its alternate names (`name:ja-Hira`, `name:en`, `alt_name`, ...). Street, locality, region
-//! and country names come from the Pack's own records, so the Pack stays the
-//! only copy of place data. Street-type words are the words that start or end
-//! many of those street names, plus a vendored list of common types and
-//! abbreviations; unit words are a vendored list plus the words that
-//! designate many of the Pack's `addr:unit` values. libpostal's open word
-//! lists (unit, PO box, level, building and street types, directionals) in
-//! every language they hold join the street-type and unit dictionaries and
-//! fill dictionaries of their own. POI names are a field of
-//! their own, so a venue's name is known as one. A `words` section holds
-//! every word of every name but a POI's, so a lookup knows when a word is no
-//! typo.
-//!
-//! An admin area is also named without the word of its type ("愛知" for
-//! "愛知県", "Bayern" for "Freistaat Bayern"), from libpostal's qualifiers
-//! and a vendored list of admin type words (see [`admin_aliases`]). Which
-//! areas each area name names and which areas lie in which are sections of
-//! their own (`parse/areas`, `parse/area_ids`, `parse/nesting`), so a parse
-//! naming places that cannot be in one address is known as one.
-//!
-//! A Pack built before these sections existed still opens: its dictionaries
-//! are empty and the parser runs on token shapes alone.
-
 mod spill;
 
 use std::{
@@ -519,7 +490,6 @@ impl Dictionaries {
     }
 }
 
-/// An FST stream decodes the node behind every transition; this drops dead ones on the byte alone.
 struct Walk<'a> {
     fst: &'a Fst<Bytes>,
     dfa: &'a DFA,
@@ -773,12 +743,10 @@ struct Alias {
     areas: Vec<u32>,
 }
 
-/// Collects the dictionaries while the Pack writer writes records.
 #[derive(Debug)]
 pub struct Builder {
     names: HashMap<(Field, String), NameStats>,
     streamed: spill::Streamed,
-    /// Records lying in each admin area, by the area's record id.
     areas: HashMap<RecordId, Area>,
     area_pairs: Vec<u64>,
     place_names: Vec<(String, u32, u8)>,
@@ -807,8 +775,6 @@ impl Builder {
         }
     }
 
-    /// Country codes of the country records, so every record can be counted
-    /// in the country its admin context places it in.
     pub fn set_country_codes(&mut self, codes: HashMap<RecordId, CountryCode>) {
         self.country_codes = codes;
     }
@@ -835,7 +801,6 @@ impl Builder {
         }
     }
 
-    /// Count one written record: its own names, and its admin areas.
     pub fn add(&mut self, names: RecordNames, context: Option<&RecordContext>) -> Result<()> {
         let tuple = context.map(|context| &context.admin_context);
         let country = tuple
@@ -1186,16 +1151,6 @@ enum Attach {
     Before,
 }
 
-/// The admin type words of [`LIBPOSTAL_QUALIFIERS`] and [`ADMIN_TYPES`] as
-/// dictionary keys with how they attach to a name. In [`ADMIN_TYPES`] and
-/// [`LIBPOSTAL_ADMIN_AFFIXES`] a leading `-` attaches a word after the name
-/// and a trailing `-` before it, `word ~` is a word of its own before the
-/// name and `~ word` one after it, and a bare word is either. A libpostal
-/// qualifier of a script written without spaces, or of Hangul, whose words
-/// carry their type attached, attaches after the name; any other is a word
-/// of its own after it, the side libpostal's qualifiers do not state and a
-/// word before a name cannot be told from the end of the field before it
-/// ("2 chome taitoku" is no "taitoku" chome).
 fn admin_types() -> &'static FxHashMap<String, Vec<(usize, Attach)>> {
     static TYPES: OnceLock<FxHashMap<String, Vec<(usize, Attach)>>> = OnceLock::new();
     TYPES.get_or_init(|| {
@@ -1295,7 +1250,6 @@ pub(crate) fn admin_aliases(key: &str) -> Vec<String> {
     aliases
 }
 
-/// A query often drops a street's type, or a given name before its last.
 fn street_alias_keys(key: &str, types: &BTreeMap<String, Entry>) -> (Option<String>, Vec<String>) {
     let words = key
         .split_whitespace()
