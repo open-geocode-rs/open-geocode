@@ -120,6 +120,28 @@ mod tests {
     }
 
     #[test]
+    fn rows_from_the_start_middle_and_end_of_the_vendored_table_load() {
+        let table = Table::global();
+        for (country, postcode) in [
+            ("AC", "ASCN 1ZZ"),
+            ("AD", "AD500"),
+            ("AF", "1001"),
+            ("KR", "110-110"),
+            ("KY", "KY1-1100"),
+            ("KZ", "050000"),
+            ("XK", "10000"),
+            ("ZA", "2001"),
+            ("ZM", "10101"),
+        ] {
+            let code = CountryCode::parse(country).unwrap();
+            assert!(
+                table.matches_country(code, postcode),
+                "{country} {postcode}"
+            );
+        }
+    }
+
+    #[test]
     fn rows_without_a_pattern_or_code_are_skipped() {
         let table = Table::parse("CA\t\\d{3}\nbad row\nXYZ\t\\d\n");
         assert_eq!(table.len(), 1);
