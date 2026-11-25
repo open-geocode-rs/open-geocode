@@ -1898,20 +1898,19 @@ async fn a_stopped_batch_answers_stopped_never_in_progress() {
     let id = created.json()["id"].as_str().expect("id").to_string();
     let uri = format!("/compat/here/v7/batch/jobs/{id}/stop");
     let mut stop = std::pin::pin!(send(&router, "PUT", &uri, None));
-    let first = std::future::poll_fn(|context| {
-        std::task::Poll::Ready(stop.as_mut().poll(context).map(|reply| reply.text()))
+    let record = super::batch::store_dir(&state).join(format!("{id}.json"));
+    // The stop records itself and cancels the run with no wait between, so a recorded stop has cancelled.
+    let recorded = || {
+        serde_json::from_slice::<Value>(&std::fs::read(&record).expect("record"))
+            .expect("record JSON")["stopped"]
+            == true
+    };
+    std::future::poll_fn(|context| match stop.as_mut().poll(context) {
+        std::task::Poll::Ready(reply) => panic!("the stop answered first: {}", reply.text()),
+        std::task::Poll::Pending if recorded() => std::task::Poll::Ready(()),
+        std::task::Poll::Pending => std::task::Poll::Pending,
     })
     .await;
-    assert_eq!(
-        first,
-        std::task::Poll::Pending,
-        "the stop waits for the run"
-    );
-    // The stop records itself, then cancels the run, with no wait between, so a recorded stop has cancelled.
-    let record = super::batch::store_dir(&state).join(format!("{id}.json"));
-    let record = serde_json::from_slice::<Value>(&std::fs::read(record).expect("record"))
-        .expect("record JSON");
-    assert_eq!(record["stopped"], true);
     drop(release);
     let stopped = stop.await;
     assert_eq!(stopped.status, StatusCode::OK, "{}", stopped.text());
