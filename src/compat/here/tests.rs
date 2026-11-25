@@ -1664,21 +1664,21 @@ pub(super) async fn finished_job(router: &Router, input: &str) -> String {
     id
 }
 
-/// Polls a batch job until it ends, and answers its details.
 async fn finished(router: &Router, id: &str) -> Value {
-    for _ in 0..400 {
-        let details = get(router, &format!("/compat/here/v7/batch/jobs/{id}"))
-            .await
-            .json();
-        if !matches!(
+    let run = id.strip_prefix("JOB-").expect("JOB- id").replace('-', "");
+    // og streams a job's results until the job ends.
+    get(router, &format!("/jobs/{run}/results")).await;
+    let details = get(router, &format!("/compat/here/v7/batch/jobs/{id}"))
+        .await
+        .json();
+    assert!(
+        !matches!(
             details["status"].as_str(),
             Some("inProgress" | "queued" | "pending")
-        ) {
-            return details;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("job {id} did not end");
+        ),
+        "{details}"
+    );
+    details
 }
 
 /// A file's lines, the header first and the rest sorted. A job writes its
@@ -2321,15 +2321,11 @@ async fn batch_errors_take_the_batch_shape() {
 
 /// A server that answers every request 200 and keeps the request lines,
 /// as a webhook endpoint does.
-async fn hook_receiver() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let kept = std::sync::Arc::clone(&calls);
+async fn hook_receiver() -> (String, tokio::sync::watch::Receiver<Vec<String>>) {
+    let (kept, calls) = tokio::sync::watch::channel(Vec::new());
     let app = Router::new().fallback(move |uri: axum::http::Uri| {
-        let kept = std::sync::Arc::clone(&kept);
-        async move {
-            kept.lock().expect("calls").push(uri.to_string());
-            StatusCode::OK
-        }
+        kept.send_modify(|calls| calls.push(uri.to_string()));
+        async { StatusCode::OK }
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -2340,21 +2336,24 @@ async fn hook_receiver() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>
 }
 
 /// Waits for the receiver to have taken `count` calls.
-async fn calls_taken(calls: &std::sync::Mutex<Vec<String>>, count: usize) -> Vec<String> {
-    for _ in 0..400 {
-        let taken = calls.lock().expect("calls").clone();
-        if taken.len() >= count {
-            return taken;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("the webhook took {count} calls")
+async fn calls_taken(
+    calls: &mut tokio::sync::watch::Receiver<Vec<String>>,
+    count: usize,
+) -> Vec<String> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        calls.wait_for(|taken| taken.len() >= count),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the webhook took {count} calls"))
+    .expect("the webhook runs")
+    .clone()
 }
 
 #[tokio::test]
 async fn notifications_are_kept_and_called_when_a_job_ends() {
     let pack = pack("batch-notify");
-    let (hook, calls) = hook_receiver().await;
+    let (hook, mut calls) = hook_receiver().await;
     let allowed = || {
         pack.state(Limits::DEFAULT)
             .with_hook_hosts(vec![hook.trim_start_matches("http://").to_string()])
@@ -2404,7 +2403,7 @@ async fn notifications_are_kept_and_called_when_a_job_ends() {
     let reply = get(&router, &format!("{path}/test")).await;
     assert_eq!(reply.status, StatusCode::NO_CONTENT, "{}", reply.text());
     assert_eq!(
-        calls_taken(&calls, 1).await,
+        calls_taken(&mut calls, 1).await,
         [
             "/done?id=JOB-00000000-0000-0000-0000-000000000000&name=test&status=completed&ok=0&failed=0&total=0"
         ]
@@ -2431,7 +2430,7 @@ async fn notifications_are_kept_and_called_when_a_job_ends() {
     let details = finished(&router, &job).await;
     assert_eq!(details["notificationIds"], json!([id]));
     assert_eq!(
-        calls_taken(&calls, 2).await[1],
+        calls_taken(&mut calls, 2).await[1],
         format!("/done?id={job}&name=night%20run&status=completed&ok=2&failed=0&total=2")
     );
 

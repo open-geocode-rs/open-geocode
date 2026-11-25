@@ -1,6 +1,6 @@
 //! `/compat/precisely` driven through og's router on a small Pack.
 
-use std::{collections::BTreeSet, path::Path, sync::LazyLock, time::Duration};
+use std::{collections::BTreeSet, path::Path, sync::LazyLock};
 
 use axum::{
     Router,
@@ -1263,16 +1263,17 @@ async fn upload(router: &Router, csv: &str) -> String {
 }
 
 async fn finished(router: &Router, job_id: &str) -> Value {
-    for _ in 0..500 {
-        let status = get(router, &format!("/compat/precisely/v2/bulk/jobs/{job_id}")).await;
-        assert_eq!(status.status, StatusCode::OK, "{}", status.text());
-        let status = status.json();
-        if status["status"] != "RUNNING" {
-            return status;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("job {job_id} never finished");
+    let og_id = uuid::Uuid::try_parse(job_id)
+        .expect("a UUID")
+        .simple()
+        .to_string();
+    // og streams a job's results until the job ends.
+    get(router, &format!("/jobs/{og_id}/results")).await;
+    let status = get(router, &format!("/compat/precisely/v2/bulk/jobs/{job_id}")).await;
+    assert_eq!(status.status, StatusCode::OK, "{}", status.text());
+    let status = status.json();
+    assert_ne!(status["status"], "RUNNING", "{status}");
+    status
 }
 
 #[tokio::test]
