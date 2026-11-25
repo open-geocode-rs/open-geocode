@@ -1,3 +1,4 @@
+use fs4::fs_std::FileExt;
 use std::{
     fs::{self, File},
     ops::Deref,
@@ -13,7 +14,6 @@ struct Root {
     _lock: File,
 }
 
-// Statics never drop. A later run's sweep frees this root once the lock dies with us.
 static ROOT: LazyLock<Root> = LazyLock::new(|| {
     let temp = std::env::temp_dir();
     sweep_dead_roots(&temp);
@@ -23,11 +23,13 @@ static ROOT: LazyLock<Root> = LazyLock::new(|| {
         uuid::Uuid::new_v4()
     ));
     fs::create_dir(&path).expect("create the test root");
-    let staged = path.join(format!("{LOCK_FILE}.new"));
-    let lock = File::create(&staged).expect("create the test root lock");
-    lock.try_lock().expect("lock the test root");
-    // A sweep opens only the final name, so it never sees the lock unheld.
-    fs::rename(&staged, path.join(LOCK_FILE)).expect("publish the test root lock");
+    let unswept_lock_path = path.join(format!("{LOCK_FILE}.new"));
+    let lock = File::create(&unswept_lock_path).expect("create the test root lock");
+    assert!(
+        lock.try_lock_exclusive().expect("lock the test root"),
+        "the new test root's lock is free"
+    );
+    fs::rename(&unswept_lock_path, path.join(LOCK_FILE)).expect("publish the test root lock");
     Root { path, _lock: lock }
 });
 
@@ -40,16 +42,14 @@ fn sweep_dead_roots(temp: &Path) {
             continue;
         }
         let root = entry.path();
-        let Ok(lock) = File::open(root.join(LOCK_FILE)) else {
-            continue;
-        };
-        if lock.try_lock().is_err() {
-            continue;
+        if lock_is_free(&root) {
+            let _ = fs::remove_dir_all(root);
         }
-        // Windows refuses to remove a directory holding an open file.
-        drop(lock);
-        let _ = fs::remove_dir_all(root);
     }
+}
+
+fn lock_is_free(root: &Path) -> bool {
+    File::open(root.join(LOCK_FILE)).is_ok_and(|lock| matches!(lock.try_lock_exclusive(), Ok(true)))
 }
 
 pub(crate) struct TempDir(PathBuf);

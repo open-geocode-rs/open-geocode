@@ -2095,8 +2095,7 @@ pub(crate) mod router_tests {
     }
 
     impl Areas {
-        // Setters replace their map, and a record indexes the codes set when it is written.
-        fn apply(&self, writer: &mut Writer) {
+        fn replace_writer_maps(&self, writer: &mut Writer) {
             writer.set_country_codes(self.country_codes.clone());
             writer.set_subdivision_codes(self.subdivision_codes.clone());
             writer.set_language_names(self.language_names.clone());
@@ -3651,7 +3650,7 @@ pub(crate) mod router_tests {
                 ]),
             ),
         ]);
-        areas.apply(writer);
+        areas.replace_writer_maps(writer);
         let within = |tiers: &[(PlaceLayer, crate::pack::RecordId)]| {
             Some(RecordContext {
                 admin_context: AdminContextTuple::from_tiers(tiers.iter().copied()),
@@ -3939,7 +3938,7 @@ pub(crate) mod router_tests {
             (ontario, vec!["Ontario".to_string()]),
             (toronto, vec!["Toronto".to_string()]),
         ]);
-        areas.apply(writer);
+        areas.replace_writer_maps(writer);
         Canada {
             canada,
             ontario,
@@ -5757,9 +5756,7 @@ pub(crate) mod router_tests {
         fixed: &'static [(&'static str, &'static str)],
         /// A valid value for every text parameter.
         filled: &'static [(&'static str, &'static str)],
-        /// Parameters that pick the outcome, in classes sharing one rule. Other
-        /// parameters only filter, so each is tried alone beside one combination per outcome.
-        modes: &'static [&'static [&'static str]],
+        outcome_classes: &'static [&'static [&'static str]],
         /// Where it answers, these sent empty answer as if not sent.
         empty_is_missing: &'static [&'static str],
         /// Takes a `QUERY` batch, whose items each answer as their `GET`.
@@ -5824,7 +5821,7 @@ pub(crate) mod router_tests {
                     ("country", "CA"),
                     ("lang", "fr,de"),
                 ],
-                modes: &[&["q"], &["address"], &["locality", "region", "postcode"]],
+                outcome_classes: &[&["q"], &["address"], &["locality", "region", "postcode"]],
                 empty_is_missing: &[
                     "focus", "bbox", "locality", "region", "postcode", "layer", "country", "lang",
                 ],
@@ -5857,7 +5854,7 @@ pub(crate) mod router_tests {
                     ("bbox", "-80,42,-78,44"),
                     ("lang", "fr,de"),
                 ],
-                modes: &[&["q"], &["ids"]],
+                outcome_classes: &[&["q"], &["ids"]],
                 empty_is_missing: &["country", "focus", "bbox", "lang"],
                 expect: |sent| match (sent["q"], sent["ids"]) {
                     (Sent::Missing, Sent::Missing) => Expect::Problem {
@@ -5889,7 +5886,7 @@ pub(crate) mod router_tests {
                     ("bbox", "-80,42,-78,44"),
                     ("lang", "fr,de"),
                 ],
-                modes: &[&["q"]],
+                outcome_classes: &[&["q"]],
                 empty_is_missing: &["q", "country", "layer", "focus", "bbox", "lang"],
                 expect: |_| Expect::Answer,
             },
@@ -5904,7 +5901,7 @@ pub(crate) mod router_tests {
                     ("radius", "150"),
                 ],
                 filled: &[("layer", "address"), ("lang", "fr,de")],
-                modes: &[&["layer"]],
+                outcome_classes: &[&["layer"]],
                 empty_is_missing: &["layer", "lang"],
                 expect: |_| Expect::Answer,
             },
@@ -5934,7 +5931,7 @@ pub(crate) mod router_tests {
                 rules.route
             );
 
-            let modes = rules.modes.iter().flat_map(|class| class.iter());
+            let modes = rules.outcome_classes.iter().flat_map(|class| class.iter());
             assert!(
                 modes
                     .clone()
@@ -5953,7 +5950,7 @@ pub(crate) mod router_tests {
                 .map(|name| (*name, Sent::Missing))
                 .collect::<Sents>();
             let mut combos = vec![unsent];
-            for class in rules.modes {
+            for class in rules.outcome_classes {
                 let options = std::iter::once(None)
                     .chain(class.iter().flat_map(|member| {
                         [Sent::Empty, Sent::Filled].map(|state| Some((*member, state)))

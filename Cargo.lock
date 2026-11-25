@@ -1997,6 +1997,7 @@ dependencies = [
  "csv",
  "dirs",
  "flate2",
+ "fs4",
  "fst",
  "futures-util",
  "geo",

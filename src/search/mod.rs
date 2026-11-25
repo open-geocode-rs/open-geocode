@@ -12439,8 +12439,6 @@ mod tests {
             writer.write(&record.into(), None).expect("write");
         }
 
-        // Forty streets of one name the query cannot tell apart, more than
-        // the rank window holds for one hit, the nearest written last.
         for index in 1..=40 {
             let mut street = street_record(&format!("osm:way:{}", 100 + index), "Tamarack Road");
             let lon = -100.0 + f64::from(index);
@@ -12448,7 +12446,6 @@ mod tests {
             street.representative_point = [lon, 45.0];
             writer.write(&street.into(), None).expect("street");
         }
-        // The better match lies far away, the worse beside the caller.
         let mut prince =
             address_record("osm:node:21", "", "342", "Prince Regent Street", None, None);
         prince.geometry = point_geometry(-60.0, 45.0);
@@ -12457,8 +12454,6 @@ mod tests {
         regent.geometry = point_geometry(-120.0, 45.0);
         writer.write(&regent.into(), None).expect("regent");
 
-        // More roads of the name than the rank window holds, written first,
-        // so a window that kept any of the tie would keep only roads.
         for index in 1..=60 {
             writer
                 .write(
@@ -12486,8 +12481,6 @@ mod tests {
                 )
                 .expect("place");
         }
-        // A street known by a second name repeats a word of it, which must
-        // not score it over the street the query names.
         let mut upper = street_record("osm:way:201", "Upper Kent Street");
         upper.alt_names = vec!["Belgium Street".to_string()];
         writer.write(&upper.into(), None).expect("upper");
@@ -12495,8 +12488,6 @@ mod tests {
             .write(&street_record("osm:way:202", "Kent Street").into(), None)
             .expect("kent");
 
-        // One street group whose addresses run across the box's east edge,
-        // and the same street name far away.
         for number in 1..=6 {
             let mut address = address_record(
                 &format!("osm:node:{}", 30 + number),
@@ -12882,7 +12873,6 @@ mod tests {
             writer.write(&street.into(), None).expect("street");
         };
         street("osm:way:701", "Bayview Avenue", -79.0);
-        // Two streets of one name, 1.6 km apart.
         street("osm:way:702", "Victoria Street", -79.1);
         street("osm:way:703", "Victoria Street", -79.12);
         for (id, number, street, lon, lat) in [
@@ -12939,7 +12929,6 @@ mod tests {
                 .expect("address");
         }
 
-        // Two postcodes split the street into two documents.
         for (index, (id, number, postcode)) in [
             ("osm:node:1201", "85 с1", "420015"),
             ("osm:node:1202", "85 соор1", "420016"),
@@ -13207,9 +13196,6 @@ mod tests {
             )
             .expect("write");
 
-        // Twelve identical streets without a postcode tie with, and sort ahead
-        // of, the one inside the requested postcode area. Only the postcode
-        // record beside each of them tells them apart.
         let write_street = |writer: &mut Writer, id: &str, lon: f64, postcode: &str| {
             let mut record = address_record(id, "", "10", "King Street", None, None);
             record.geometry = point_geometry(lon, 43.0);
@@ -13228,8 +13214,6 @@ mod tests {
         }
         write_street(writer, "osm:node:199", -76.0, "N7N 1A1");
 
-        // A rural address lies about 12 km from the record of its postcode,
-        // too far for the postcode nearest it to stand in for its own.
         writer
             .write(&postcode_record("3902", None, [-76.15, 30.0]), None)
             .expect("postcode");
@@ -13271,13 +13255,10 @@ mod tests {
         writer
             .write(&postcode_record("J0J 1K0", None, [-76.881, 45.631]), None)
             .expect("postcode");
-        // An address far from every postcode record: its area is unknown.
         let mut remote = address_record("osm:node:302", "", "7", "Far Road", None, None);
         remote.geometry = point_geometry(-90.0, 50.0);
         writer.write(&remote.into(), None).expect("remote");
 
-        // AU and NZ both use "2110": Hunters Hill in Sydney, Papakura in
-        // Auckland, each among postcodes of its own country.
         for (country, code, lon, lat) in [
             ("AU", "2110", 151.150, -33.830),
             ("AU", "2111", 151.135, -33.815),
@@ -13324,8 +13305,6 @@ mod tests {
         let mut border = address_record("osm:node:601", "", "5", "Line Road", None, None);
         border.geometry = point_geometry(-70.0, 43.0);
         writer.write(&border.into(), None).expect("address");
-        // Twenty centres of the neighbouring area right next to the address,
-        // and the address's own area 8 km away.
         for index in 0..20 {
             writer
                 .write(
@@ -13363,11 +13342,9 @@ mod tests {
             writer.write(&record.into(), None).expect("address");
         }
 
-        // The number exists, but only in the wrong postcode.
         let mut elsewhere =
             address_record("osm:node:801", "", "8", "High Street", None, Some("7018"));
         elsewhere.geometry = point_geometry(147.4, -42.9);
-        // The right locality has the street but not the number.
         let mut street = street_record("osm:way:802", "High Street");
         street.geometry = point_geometry(146.65, -41.52);
         street.representative_point = [146.65, -41.52];
@@ -13378,8 +13355,6 @@ mod tests {
             ("S5C 1A1".to_string(), [-79.0, 43.0005]),
             ("S8V 1A1".to_string(), [-79.5, 43.6]),
         ]));
-        // The number stated on a street of that name elsewhere, and a range
-        // that holds it in the postcode the query names.
         let mut elsewhere = address_record("osm:node:901", "", "23", "Victoria Street", None, None);
         elsewhere.geometry = point_geometry(-79.5, 43.6);
         writer.write(&elsewhere.into(), None).expect("elsewhere");
@@ -13409,7 +13384,6 @@ mod tests {
                 None,
             )
             .expect("range");
-        // A street in the named postcode, and the number on it elsewhere.
         let mut elm = street_record("osm:way:930", "Elm Street");
         elm.geometry = queen_street_line();
         elm.representative_point = [-79.0, 43.0005];
@@ -13417,7 +13391,6 @@ mod tests {
         let mut number = address_record("osm:node:904", "", "7", "Elm Street", None, None);
         number.geometry = point_geometry(-79.5, 43.6);
         writer.write(&number.into(), None).expect("number");
-        // So the Pack knows Atlantis, and does not drop it from the query.
         let mut atlantis = address_record(
             "osm:node:905",
             "",
@@ -13442,9 +13415,9 @@ mod tests {
             geocode(&searcher, "10 Gerrard Street", None, Some("m5v1a1")).as_deref(),
             Some("osm:node:1")
         );
-        // A forward sortation area matches the full postcode it starts.
+        let forward_sortation_area = Some("M5V");
         assert_eq!(
-            geocode(&searcher, "10 Gerrard Street", None, Some("M5V")).as_deref(),
+            geocode(&searcher, "10 Gerrard Street", None, forward_sortation_area).as_deref(),
             Some("osm:node:1")
         );
     }
@@ -13511,8 +13484,6 @@ mod tests {
     fn geocode_reads_a_postcode_two_countries_share_in_each_one() {
         let searcher = TextSearcher::open(&*POSTCODES).expect("searcher");
 
-        // A code only the other country uses lies a sea away. The house is no
-        // answer, and the row falls back to the postcode it names.
         for (country, street, id, foreign, other) in [
             ("NZ", "10 Elliot Street", "osm:node:401", "2111", "au"),
             ("AU", "10 Ferry Street", "osm:node:402", "2113", "nz"),
@@ -13530,9 +13501,6 @@ mod tests {
         }
     }
 
-    /// A street's postcodes name the blocks its addresses state. The one a
-    /// query asks for missing from them says nothing: where the hit lies
-    /// decides, and the house in that postcode's neighbourhood wins.
     #[test]
     fn a_house_between_its_streets_postcodes_lies_in_the_one_asked_for() {
         let searcher = TextSearcher::open(&*POSTCODES).expect("searcher");
@@ -13580,8 +13548,7 @@ mod tests {
         write_matched(writer, &mut names);
     }
 
-    // Context names replace the last set, so each fixture adds to every name so far.
-    fn name_areas(
+    fn extend_context_names(
         writer: &mut Writer,
         names: &mut HashMap<RecordId, Vec<String>>,
         more: impl IntoIterator<Item = (RecordId, Vec<String>)>,
@@ -13619,7 +13586,7 @@ mod tests {
         };
         let guelph = locality("Guelph", 1100);
         let brampton = locality("Brampton", 1101);
-        name_areas(
+        extend_context_names(
             writer,
             names,
             [
@@ -13832,20 +13799,20 @@ mod tests {
                 aliases: Vec::new(),
             })
         };
-        writer
-            .write(&city(10_001, Prominence::default()), None)
-            .expect("benin");
-        // More streets and cafes of the name than the tie window holds, all
-        // scoring as the cities and the known cafe do.
         for id in 10_002..=(10_000 + TIE_WINDOW as i64 + 100) {
             let mut street = street_record(&format!("osm:way:{id}"), "Paris");
             street.geometry = point_geometry(-75.0, 40.0);
             street.representative_point = [-75.0, 40.0];
             writer.write(&street.into(), None).expect("street");
+        }
+        for id in 10_002..=(10_001 + NAMED_PLACES_WINDOW as i64) {
             writer
                 .write(&cafe(id, Prominence::default()), None)
                 .expect("cafe");
         }
+        writer
+            .write(&city(10_001, Prominence::default()), None)
+            .expect("benin");
         writer.write(&city(19_999, known), None).expect("france");
         writer
             .write(&cafe(19_998, known), None)
@@ -14023,7 +13990,6 @@ mod tests {
                 },
             )
         };
-        // The node labels the boundary and is the better known of the two.
         let known = Prominence {
             importance: 40,
             linked: true,
@@ -14273,35 +14239,35 @@ mod tests {
         );
     }
 
-    /// More records of one name than the tie window holds: the best known
-    /// place or POI is collected and ranked first, wherever it lies in the
-    /// index.
     #[test]
-    fn the_best_known_of_many_same_named_places_wins() {
+    fn a_place_behind_more_same_named_streets_than_the_tie_window_answers() {
         let searcher = TextSearcher::open(&*PLACES).expect("searcher");
         assert_eq!(
             top_ids(&searcher, "Paris")[..2],
             ["osm:node:19999", "osm:node:10001"]
         );
+    }
+
+    #[test]
+    fn the_best_known_of_more_same_named_pois_than_the_name_window_wins() {
+        let searcher = TextSearcher::open(&*PLACES).expect("searcher");
         assert_eq!(top_ids(&searcher.places(), "Paris")[0], "osm:node:19998");
     }
 
-    /// A place the query names by any of its names leads, nearest the
-    /// caller first, then best known, then, of places about as well read,
-    /// the one it names by its own name; a place mapped twice answers once,
-    /// and a street of the name never takes the lead for fame it has none of.
     #[test]
     fn a_place_named_by_any_of_its_names_leads_by_fame() {
         let searcher = TextSearcher::open(&*PLACES).expect("searcher");
 
         assert_eq!(
             top_ids(&searcher, "Rome")[..2],
-            ["osm:node:401", "osm:node:403"]
+            ["osm:node:401", "osm:node:403"],
+            "Roma mapped twice answers once, ahead of the lesser Rome and the Rome street"
         );
         assert_eq!(top_ids_limited(&searcher, "Rome", 1), ["osm:node:401"]);
         assert_eq!(
             top_ids(&searcher, "Lagos"),
-            ["osm:node:405", "osm:node:406"]
+            ["osm:node:405", "osm:node:406"],
+            "the city named Lagos before Laos, which only has it as another name"
         );
         let near = searcher
             .search(&TextSearchOptions {
@@ -14317,7 +14283,8 @@ mod tests {
             near.iter()
                 .map(|hit| hit.record.id.as_str())
                 .collect::<Vec<_>>(),
-            ["osm:node:403"]
+            ["osm:node:403"],
+            "the Rome nearest the caller"
         );
     }
 
@@ -14800,7 +14767,6 @@ mod tests {
         pier.geometry = point_geometry(-89.0, 41.0);
         writer.write(&pier.into(), None).expect("pier street");
 
-        // More known branches far away than the rank window holds.
         let known = Prominence {
             importance: 30,
             linked: true,
@@ -15601,7 +15567,6 @@ mod tests {
             geocode(&searcher, "99 Bloor Street", None, None).as_deref(),
             Some("osm:way:49")
         );
-        // A street states no postcode: no postcode data confirms it here.
         assert_eq!(
             geocode(&searcher, "99 Bloor Street", None, Some("M5V 1A1")),
             None
@@ -15777,7 +15742,7 @@ mod tests {
         };
         let toronto = locality("Toronto", 3100);
         let st_catharines = locality("St. Catharines", 3101);
-        name_areas(
+        extend_context_names(
             writer,
             names,
             [
@@ -16838,7 +16803,7 @@ mod tests {
                 None,
             )
             .expect("municipality");
-        name_areas(
+        extend_context_names(
             writer,
             names,
             [(huron_east, vec!["Huron East".to_string()])],
@@ -16981,7 +16946,7 @@ mod tests {
         };
         let (county, county_name) = area(PlaceLayer::District, "Providence County", 6001);
         let (town, town_name) = area(PlaceLayer::Locality, "Woonsocket", 6002);
-        name_areas(
+        extend_context_names(
             writer,
             names,
             [(county, vec![county_name]), (town, vec![town_name])],
@@ -17065,7 +17030,7 @@ mod tests {
         };
         let hamilton = area(PlaceLayer::Locality, "Hamilton", 7001);
         let dickson = area(PlaceLayer::SubLocality, "Dickson", 7002);
-        name_areas(
+        extend_context_names(
             writer,
             names,
             [
@@ -17091,8 +17056,6 @@ mod tests {
                 None,
             )
             .expect("frankton");
-        // Te Rapa is a point in OSM. No boundary holds the address, but
-        // the address states it.
         let mut te_rapa = located(
             address_record("osm:node:7003", "", "123", "Crummer Road", None, None),
             at,
@@ -17349,7 +17312,7 @@ mod tests {
             at,
             in_region(canada, ontario),
         );
-        name_areas(
+        extend_context_names(
             writer,
             names,
             [
@@ -17546,7 +17509,7 @@ mod tests {
             [-2.99, 53.455],
             None,
         );
-        name_areas(
+        extend_context_names(
             writer,
             names,
             [
@@ -17704,7 +17667,7 @@ mod tests {
             at,
             chain(&[(Locality, dunedin)]),
         );
-        name_areas(
+        extend_context_names(
             writer,
             names,
             [
@@ -17813,9 +17776,6 @@ mod tests {
         );
     }
 
-    /// A place search answers first with the places whose names hold every
-    /// word, the one named exactly so first, then the better known, however
-    /// the address reading of the query takes the words.
     #[test]
     fn a_place_search_answers_with_the_places_so_named_the_best_known_first() {
         let places = TextSearcher::open(&*PLACES).expect("searcher").places();
@@ -17992,7 +17952,7 @@ mod tests {
             [174.775, -41.28],
             in_town(wellington),
         );
-        name_areas(
+        extend_context_names(
             writer,
             names,
             [
@@ -18032,10 +17992,8 @@ mod tests {
         }
     }
 
-    /// The rule #36 rests on: a known locality that disagrees still rejects,
-    /// whatever the reading, and a fallback answers only in it.
     #[test]
-    fn a_known_town_the_record_is_not_in_rejects_it() {
+    fn a_known_town_the_record_is_not_in_rejects_it_under_any_reading() {
         let searcher = TextSearcher::open(&*AREAS).expect("searcher");
 
         for reading in [
@@ -18204,6 +18162,12 @@ mod tests {
             .collect()
     }
 
+    fn structured_answer(searcher: &TextSearcher, query: &str) -> (Vec<String>, bool) {
+        LAST_STRUCTURED.with(|last| last.set(false));
+        let found = first_ids(searcher, query);
+        (found, LAST_STRUCTURED.with(Cell::get))
+    }
+
     #[test]
     fn the_structured_stage_answers_as_the_text_search_does() {
         let structured = TextSearcher::open(&*STRUCTURED).expect("searcher");
@@ -18223,8 +18187,8 @@ mod tests {
             "10 Quen Street Toronto",
         ] {
             assert_eq!(
-                first_ids(&structured, query),
-                first_ids(&plain, query),
+                structured_answer(&structured, query),
+                (first_ids(&plain, query), true),
                 "{query}"
             );
         }
@@ -18247,10 +18211,9 @@ mod tests {
     #[test]
     fn of_streets_a_key_cannot_tell_apart_the_one_the_query_names_answers() {
         let searcher = TextSearcher::open(&*STRUCTURED).expect("searcher");
-        assert!(searcher.structured.is_some());
         assert_eq!(
-            first_ids(&searcher, "Mobilheimplatz B XI 19, Sankt Andrä am Zicksee"),
-            vec!["osm:node:202".to_string()]
+            structured_answer(&searcher, "Mobilheimplatz B XI 19, Sankt Andrä am Zicksee"),
+            (vec!["osm:node:202".to_string()], true)
         );
     }
 
@@ -18263,15 +18226,14 @@ mod tests {
         // The town is another and the postcode the address's own: the
         // address the postcode, street and number agree on.
         assert_eq!(
-            first_ids(&structured, "10 James Street Burlington L8P 4R5"),
-            ["osm:node:301"]
+            structured_answer(&structured, "10 James Street Burlington L8P 4R5"),
+            (vec!["osm:node:301".to_string()], true)
         );
-        assert!(LAST_STRUCTURED.with(Cell::get));
         // The other town alone still holds it: the text search answers, and
         // never with the address in another town.
         let query = "10 James Street Burlington";
-        let found = first_ids(&structured, query);
-        assert!(!LAST_STRUCTURED.with(Cell::get));
+        let (found, answered) = structured_answer(&structured, query);
+        assert!(!answered);
         assert_eq!(found, first_ids(&plain, query));
     }
 
@@ -18299,7 +18261,7 @@ mod tests {
             [-78.0, 39.5],
             None,
         );
-        name_areas(
+        extend_context_names(
             writer,
             names,
             [

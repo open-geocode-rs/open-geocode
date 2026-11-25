@@ -963,8 +963,13 @@ mod tests {
     fn a_tiny_share_spills_many_runs_and_merges_them_twice() {
         let (_dir, scratch) = scratch("spill");
         let item = std::mem::size_of::<(u64, u64)>();
-        // A share of a few hundred items cuts over a hundred runs and reads only a few at once.
-        let mut sorter = ExternalSorter::new(&scratch, "pairs", &Budget::unlimited(), 400 * item);
+        let share_of_a_few_hundred_items = 400 * item;
+        let mut sorter = ExternalSorter::new(
+            &scratch,
+            "pairs",
+            &Budget::unlimited(),
+            share_of_a_few_hundred_items,
+        );
         let input = pseudo_random(8_000);
         for item in &input {
             sorter.push(*item).expect("push");

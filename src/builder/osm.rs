@@ -3726,6 +3726,21 @@ mod tests {
         }
     }
 
+    fn one_extract(
+        cells: Vec<(&'static str, Vec<Vec<TestElement>>)>,
+    ) -> Vec<(&'static str, Vec<Vec<TestElement>>)> {
+        let mut blocks = [Vec::new(), Vec::new(), Vec::new()];
+        for element in cells.into_iter().flat_map(|(_, cell)| cell).flatten() {
+            let kind = match element {
+                TestElement::Node { .. } => 0,
+                TestElement::Way { .. } => 1,
+                TestElement::Relation { .. } => 2,
+            };
+            blocks[kind].push(element);
+        }
+        vec![("cells", blocks.into())]
+    }
+
     static TOWN: LazyLock<Built> = LazyLock::new(|| Built::new("town", vec![("town", town())]));
 
     static TWO_COUNTRIES: LazyLock<Built> = LazyLock::new(|| {
@@ -4563,11 +4578,8 @@ mod tests {
         ]]
     }
 
-    /// New Zealand writes a flat "UNIT/NUMBER". Read from the plain numbers
-    /// around it, "10/1367" is flat 10 of 1367: found by its building's
-    /// number, never standing for house 10.
     #[test]
-    fn reads_a_slash_number_as_a_flat_of_its_building() {
+    fn reads_a_slash_number_as_a_flat_of_its_building_never_a_house() {
         let searcher = TextSearcher::open(ADMIN.built.pack()).expect("searcher");
         let top = |query: &str| {
             searcher
@@ -5223,7 +5235,7 @@ mod tests {
     static NL_PLACES: LazyLock<Built> = LazyLock::new(|| {
         Built::with(
             "nl-places",
-            vec![
+            one_extract(vec![
                 ("cafes", renumbered(cafes(), 1000)),
                 ("stadium", renumbered(stadium(), 2000)),
                 ("brands", renumbered(brands(), 3000)),
@@ -5236,7 +5248,7 @@ mod tests {
                     moved(renumbered(buildings_with_entrances(), 8000), 6.0, 0.0),
                 ),
                 ("ranked", renumbered(ranked_cafes(), 9000)),
-            ],
+            ]),
             |dir| {
                 let qrank = dir.join("qrank.csv");
                 fs::write(&qrank, "Entity,QRank\nQ11,40\nQ22,90000\n").expect("qrank");
@@ -5626,9 +5638,6 @@ mod tests {
     static ZONELESS: LazyLock<Built> =
         LazyLock::new(|| Built::new("zoneless", vec![("zones", zoned_town())]));
 
-    /// A town over the border of two zones with a suburb wholly in the
-    /// western one, a house in the suburb, one in the town either side of
-    /// the border, a cafe east of the town and a house in no zone.
     fn zoned_town() -> Vec<Vec<TestElement>> {
         let house = |id: i64, lat: f64, lon: f64| {
             node(
@@ -6276,12 +6285,8 @@ mod tests {
         vec![nodes, ways, relations]
     }
 
-    /// France in the planet has levels no table row names above its
-    /// communes (3, France métropolitaine; 5, Collectivité européenne
-    /// d'Alsace). A street is still labelled and found by its commune, not by
-    /// the arrondissement named for the commune that is its seat.
     #[test]
-    fn a_french_street_is_labelled_and_found_by_its_commune() {
+    fn a_french_street_is_labelled_and_found_by_its_commune_not_its_arrondissement() {
         let reader = ADMIN.pack();
         let mut streets = reader
             .records_json_by_layer("street", 0)
@@ -7002,7 +7007,6 @@ mod tests {
         }
     }
 
-    // A country drawn twice would split the boundaries lying in it, so each is drawn once.
     static ADMIN: LazyLock<Admin> = LazyLock::new(|| {
         let mut map = Map::new();
         map.area([50.2, -2.0, 53.0, 1.0], &country("United Kingdom", "GB"));
@@ -7042,7 +7046,7 @@ mod tests {
         let kept = std::mem::take(&mut map.kept);
         let built = Built::new(
             "admin-cells",
-            vec![
+            one_extract(vec![
                 ("map", map.blocks()),
                 ("ward", renumbered(ward(), 100_000)),
                 ("honshu", renumbered(honshu(), 200_000)),
@@ -7051,7 +7055,7 @@ mod tests {
                     "communes",
                     moved(renumbered(communes(), 400_000), 40.5, -17.0),
                 ),
-            ],
+            ]),
         );
         Admin { built, kept }
     });
@@ -7142,12 +7146,8 @@ mod tests {
         map.keep("downing", downing);
     }
 
-    /// A town mapped only as a point is the town of the houses around it,
-    /// as far as the addresses that name it. The borough holding it is a
-    /// city by its own tags too, and yields to the city it is part of, which
-    /// is better known.
     #[test]
-    fn a_town_mapped_as_a_point_is_the_locality() {
+    fn a_town_point_is_the_locality_and_a_city_tagged_borough_yields_to_its_city() {
         assert_eq!(
             ADMIN.tiers("downing"),
             named(&[
@@ -7176,10 +7176,8 @@ mod tests {
         map.keep("ashby farm", farm);
     }
 
-    /// Of two villages mapped as points, a house by one lies in that one,
-    /// though the other is better known.
     #[test]
-    fn a_house_by_a_village_point_is_in_that_village() {
+    fn a_house_by_a_village_point_is_in_that_village_over_a_better_known_one() {
         assert_eq!(
             ADMIN.tiers("ashby farm"),
             named(&[
@@ -7206,10 +7204,8 @@ mod tests {
         map.keep("elmvale farm", farm);
     }
 
-    /// A village point is the town of a house in an extract that holds a
-    /// region but no country boundary, where the country is only inferred.
     #[test]
-    fn a_village_point_names_a_house_when_the_country_is_inferred() {
+    fn a_village_point_names_a_house_in_a_region_with_no_country_boundary() {
         let tiers = ADMIN.tiers("elmvale farm");
         assert!(
             tiers.contains(&(PlaceLayer::Locality, "Elmvale".to_string())),
@@ -7254,10 +7250,8 @@ mod tests {
         map.keep("kaufingerstraße", street);
     }
 
-    /// A city whose boundary sits in a tier above `locality` is the town of
-    /// the houses and streets in it, once, and its boroughs lie below it.
     #[test]
-    fn a_city_boundary_above_the_locality_tier_is_the_locality() {
+    fn a_city_boundary_above_the_locality_tier_is_the_locality_over_its_boroughs() {
         let pack = ADMIN.pack();
         let street = pack
             .find_by_source_id(&format!("osm:way:{}", ADMIN.kept["kaufingerstraße"]))
@@ -7292,11 +7286,8 @@ mod tests {
         map.keep("parkway", parkway);
     }
 
-    /// A borough and its county are drawn over the same ground inside the
-    /// city. Both move below it and want one tier, which the finer level
-    /// takes, and the county stays in the list of areas the house lies in.
     #[test]
-    fn a_borough_and_its_county_inside_a_city_keep_the_borough() {
+    fn a_borough_and_its_county_inside_a_city_keep_the_borough_tier_and_the_county_area() {
         assert_eq!(
             ADMIN.tiers("parkway"),
             named(&[
@@ -7345,11 +7336,8 @@ mod tests {
         map.keep("boulevard", boulevard);
     }
 
-    /// A city district the tiers put in `locality` lies inside the city area
-    /// around it, so the city is the town and the district moves below it,
-    /// under the okrug it lies in.
     #[test]
-    fn a_district_inside_a_city_area_lies_below_the_city() {
+    fn a_district_inside_a_city_area_lies_below_the_city_under_its_okrug() {
         let at = tier_names("boulevard");
         assert_eq!(at(PlaceLayer::Region).as_deref(), Some("Москва"));
         assert_eq!(at(PlaceLayer::Locality).as_deref(), Some("Москва"));
@@ -7381,8 +7369,6 @@ mod tests {
         map.keep("okrug centre", house);
     }
 
-    /// A district lies inside its okrug though it holds the okrug's own
-    /// inner point, as one of the parts an area is made of does.
     #[test]
     fn a_district_holding_its_okrugs_inner_point_still_lies_inside_it() {
         let at = tier_names("okrug centre");
@@ -7421,11 +7407,8 @@ mod tests {
         map.keep("pancé farm", farm);
     }
 
-    /// A city whose tiers already name it keeps its context, and a commune
-    /// holding a hamlet's point stays the town, as a point counts only where
-    /// the tiers name no town.
     #[test]
-    fn a_town_the_tiers_name_keeps_its_context() {
+    fn a_town_the_tiers_name_keeps_its_context_over_a_hamlet_point_inside() {
         assert_eq!(
             ADMIN.tiers("rivoli"),
             named(&[
@@ -7466,10 +7449,8 @@ mod tests {
         map.keep("balclutha road", road);
     }
 
-    /// A district named for a town only by the town's local nickname holds
-    /// no town. The town stays a point of its own, inside the district.
     #[test]
-    fn a_district_named_like_a_town_nickname_is_no_town() {
+    fn a_district_named_like_a_town_nickname_is_no_town_and_the_town_point_stays() {
         let context = ADMIN.tiers("balclutha road");
         assert!(
             context.contains(&(PlaceLayer::Locality, "Balclutha".to_string())),
@@ -7502,11 +7483,8 @@ mod tests {
         map.keep("timaru house", near);
     }
 
-    /// A district named for the town it is run from, which holds the
-    /// district's other towns too, is no town; and a town point lies in no
-    /// other town point, however far that town reaches.
     #[test]
-    fn a_district_named_for_its_seat_is_no_town() {
+    fn a_district_named_for_its_seat_is_no_town_and_town_points_never_nest() {
         assert_eq!(
             ADMIN.tiers("timaru house"),
             named(&[
@@ -7547,8 +7525,6 @@ mod tests {
         map.keep("hessen house", outside);
     }
 
-    /// A state named like a hamlet in it is no town, as it holds bigger
-    /// towns too.
     #[test]
     fn a_state_named_like_a_hamlet_in_it_is_no_town() {
         assert_eq!(
@@ -7571,8 +7547,8 @@ mod tests {
         map.area([48.0, 11.4, 48.3, 11.7], &admin("8", "Dresden"));
         map.point(47.794, 12.534, &[("place", "hamlet"), ("name", "Sachsen")]);
         map.point(48.137, 11.575, &[("place", "city"), ("name", "Dresden")]);
-        // Without a town near it, the hamlet would reach half way to the towns of other cells.
-        map.point(47.794, 13.0, &[("place", "village"), ("name", "Görlitz")]);
+        let _bounds_the_hamlets_reach =
+            map.point(47.794, 13.0, &[("place", "village"), ("name", "Görlitz")]);
         let outside = house(map, 48.5, 11.0);
         map.keep("sachsen house", outside);
     }
@@ -7603,9 +7579,6 @@ mod tests {
         map.keep("kraaistraat", kraaistraat);
     }
 
-    /// A village drawn inside the municipality the tiers put in `locality`
-    /// stays below it, as the municipality is the town its addresses name.
-    /// The village a merged municipality grew from holds its own point.
     #[test]
     fn a_village_inside_the_tiered_town_stays_below_it() {
         assert_eq!(
@@ -7633,8 +7606,6 @@ mod tests {
         );
     }
 
-    /// A boundary's vehicle plate code and default language are kept on
-    /// its area record, as its tags write them.
     #[test]
     fn a_boundary_keeps_its_plate_code_and_default_language() {
         let pack = ADMIN.pack();
@@ -7673,10 +7644,6 @@ mod tests {
             .collect()
     }
 
-    /// Two extracts and an address file, so a build runs every step:
-    /// both inputs' passes, the import, the address book and the houses.
-    /// The entrances wait in the node store and beside the boundary
-    /// geometry between steps, so the first extract maps some too.
     fn resumable_inputs(dir: &Path) -> BuildOsmOptions {
         let (first, second) = (dir.join("town.osm.pbf"), dir.join("other.osm.pbf"));
         let mut town = town_with_pois();
@@ -7722,8 +7689,7 @@ mod tests {
         failed.expect_err("the injected failure stops the build")
     }
 
-    /// Scratch is named by an absolute path, so the copy is pointed at its own.
-    fn copy_stopped_build(pack: &Path, copy: &Path) {
+    fn copy_stopped_build_and_repoint_its_scratch(pack: &Path, copy: &Path) {
         fn copy_tree(from: &Path, to: &Path) {
             fs::create_dir_all(to).expect("create the copy");
             for entry in fs::read_dir(from).expect("read the stopped build") {
@@ -7750,126 +7716,134 @@ mod tests {
         }
     }
 
-    /// A build that stops at any step and is resumed makes the Pack an
-    /// uninterrupted build makes: every record, in the same order, with
-    /// the same context. In memory and spilling everything, coordinates
-    /// mapped from scratch included.
-    #[test]
-    fn a_build_resumed_after_any_step_makes_the_same_pack() {
-        let dir = TempDir::new("resume");
-        let inputs = resumable_inputs(&dir);
+    fn resumed_after_any_step_makes_the_same_pack(name: &str, budget: Option<usize>) {
+        let dir = TempDir::new(name);
         let steps = Step::all(2);
         let after = |step: &Step| step.describe(2);
-        for budget in [Some(4), None] {
-            let options = BuildOsmOptions {
-                memory_budget_bytes: budget,
-                force: budget.is_some(),
-                ..inputs.clone()
-            };
-            let run = dir.join(format!("{budget:?}"));
-            let whole = build_osm_pack(&BuildOsmOptions {
-                pack: run.join("whole"),
-                ..options.clone()
-            })
-            .expect("uninterrupted build");
-            assert_eq!(whole.checkpoints.count, steps.len() as u64);
-            assert!(whole.resumes.is_empty());
-            let expected = records_and_contexts(&run.join("whole"));
-            let with_access = expected
+        let options = BuildOsmOptions {
+            memory_budget_bytes: budget,
+            force: budget.is_some(),
+            ..resumable_inputs(&dir)
+        };
+        let run = dir.join("run");
+        let whole = build_osm_pack(&BuildOsmOptions {
+            pack: run.join("whole"),
+            ..options.clone()
+        })
+        .expect("uninterrupted build");
+        assert_eq!(whole.checkpoints.count, steps.len() as u64);
+        assert!(whole.resumes.is_empty());
+        let expected = records_and_contexts(&run.join("whole"));
+        let with_access = expected
+            .iter()
+            .filter(|(record, _)| record["record"].get("access").is_some())
+            .count();
+        assert_eq!(with_access, 5, "the entrances are in the Pack");
+
+        let pack = run.join("stopped");
+        let options = BuildOsmOptions {
+            pack: pack.clone(),
+            leftover: Leftover::Resume,
+            ..options
+        };
+        let node_location_and_mid_seal_steps = [
+            steps
                 .iter()
-                .filter(|(record, _)| record["record"].get("access").is_some())
-                .count();
-            assert_eq!(with_access, 5, "the entrances are in the Pack");
-
-            // Each stop resumes from the checkpoint before it, so every checkpoint is restored once.
-            let pack = run.join("stopped");
-            let options = BuildOsmOptions {
-                pack: pack.clone(),
-                leftover: Leftover::Resume,
-                ..options
-            };
-            let real = [
-                0,
-                steps
-                    .iter()
-                    .position(|step| {
-                        *step
-                            == Step::Input {
-                                index: 0,
-                                pass: Pass::Ways,
-                            }
-                    })
-                    .expect("the first input's ways"),
-                steps
-                    .iter()
-                    .position(|step| *step == Step::Seal(2))
-                    .expect("a mid-seal part"),
-            ];
-            let mut copies = Vec::new();
-            for (at, step) in steps.iter().enumerate() {
-                let error = fail_before(&options, *step);
-                assert!(format!("{error}").contains("injected"), "{error}");
-                let found = resume::find(&pack).expect("find");
-                if at == 0 {
-                    assert!(found.is_empty(), "nothing is left before a checkpoint");
-                } else {
-                    assert_eq!(found.len(), 1, "{step:?}");
-                    assert_eq!(found[0].stage, Some(after(&steps[at - 1])));
-                    assert!(found[0].bytes > 0);
-                    assert!(!pack.join("CURRENT").exists());
-                }
-                if budget.is_some() && real.contains(&at) {
-                    let copy = run.join(format!("stopped-{at}"));
-                    copy_stopped_build(&pack, &copy);
-                    copies.push((at, copy));
-                }
-            }
-            // Past the last checkpoint, the sealed Pack is trained again.
-            FAIL_BEFORE_TRAINING.set(true);
-            let failed = build_osm_pack(&options);
-            FAIL_BEFORE_TRAINING.set(false);
-            assert!(failed.is_err());
-            let chained = build_osm_pack(&options).expect("resumed before the training");
-            assert_eq!(
-                chained
-                    .resumes
-                    .iter()
-                    .map(|resume| resume.after.as_str())
-                    .collect::<Vec<_>>(),
-                steps.iter().map(after).collect::<Vec<_>>(),
-                "every checkpoint restored once"
-            );
-            assert_eq!(records_and_contexts(&pack), expected);
-            assert_eq!(chained.checkpoints.count, whole.checkpoints.count);
-            assert_eq!(
-                chained.parser_training.trained,
-                whole.parser_training.trained
-            );
-
-            // Copies resume in one go from step 0, from node locations in scratch, and mid-seal.
-            for (at, copy) in copies {
-                let resumed = build_osm_pack(&BuildOsmOptions {
-                    pack: copy.clone(),
-                    ..options.clone()
+                .position(|step| {
+                    *step
+                        == Step::Input {
+                            index: 0,
+                            pass: Pass::Ways,
+                        }
                 })
-                .unwrap_or_else(|error| panic!("resumed before {:?}: {error}", steps[at]));
-                assert_eq!(records_and_contexts(&copy), expected, "{:?}", steps[at]);
-                assert_eq!(resumed.accepted, whole.accepted, "{:?}", steps[at]);
-                assert_eq!(resumed.imports, whole.imports, "{:?}", steps[at]);
-                assert_eq!(resumed.output.record_count, whole.output.record_count);
-                assert_eq!(resumed.output.rejection_count, whole.output.rejection_count);
-                assert_eq!(resumed.checkpoints.count, whole.checkpoints.count);
-                if at > 0 {
-                    let resume = resumed.resumes.last().expect("resumed");
-                    assert_eq!(resume.after, after(&steps[at - 1]));
-                    assert!(resume.reused_bytes > 0, "{resume:?}");
-                }
-                assert!(
-                    resume::find(&copy).expect("find").is_empty(),
-                    "a completed build leaves nothing to resume"
-                );
+                .expect("the first input's ways"),
+            steps
+                .iter()
+                .position(|step| *step == Step::Seal(2))
+                .expect("a mid-seal part"),
+        ];
+        let mut copies = Vec::new();
+        for (at, step) in steps.iter().enumerate() {
+            let error = fail_before(&options, *step);
+            assert!(format!("{error}").contains("injected"), "{error}");
+            let found = resume::find(&pack).expect("find");
+            if at == 0 {
+                assert!(found.is_empty(), "nothing is left before a checkpoint");
+            } else {
+                assert_eq!(found.len(), 1, "{step:?}");
+                assert_eq!(found[0].stage, Some(after(&steps[at - 1])));
+                assert!(found[0].bytes > 0);
+                assert!(!pack.join("CURRENT").exists());
+            }
+            if budget.is_some() && node_location_and_mid_seal_steps.contains(&at) {
+                let copy = run.join(format!("stopped-{at}"));
+                copy_stopped_build_and_repoint_its_scratch(&pack, &copy);
+                copies.push((at, copy));
             }
         }
+        // Past the last checkpoint, the sealed Pack is trained again.
+        FAIL_BEFORE_TRAINING.set(true);
+        let failed = build_osm_pack(&options);
+        FAIL_BEFORE_TRAINING.set(false);
+        assert!(
+            matches!(
+                &failed,
+                Err(Error::Inconsistent(message)) if message == "injected failure before the training"
+            ),
+            "{:?}",
+            failed.map(|_| ())
+        );
+        let chained = build_osm_pack(&options).expect("resumed before the training");
+        assert_eq!(
+            chained
+                .resumes
+                .iter()
+                .map(|resume| resume.after.as_str())
+                .collect::<Vec<_>>(),
+            steps.iter().map(after).collect::<Vec<_>>(),
+            "every checkpoint restored once"
+        );
+        assert_eq!(records_and_contexts(&pack), expected);
+        assert_eq!(chained.checkpoints.count, whole.checkpoints.count);
+        assert_eq!(
+            chained.parser_training.trained,
+            whole.parser_training.trained
+        );
+        assert_eq!(chained.accepted, whole.accepted);
+        assert_eq!(chained.imports, whole.imports);
+        assert_eq!(chained.output.record_count, whole.output.record_count);
+        assert_eq!(chained.output.rejection_count, whole.output.rejection_count);
+
+        for (at, copy) in copies {
+            let resumed = build_osm_pack(&BuildOsmOptions {
+                pack: copy.clone(),
+                ..options.clone()
+            })
+            .unwrap_or_else(|error| panic!("resumed before {:?}: {error}", steps[at]));
+            assert_eq!(records_and_contexts(&copy), expected, "{:?}", steps[at]);
+            assert_eq!(resumed.accepted, whole.accepted, "{:?}", steps[at]);
+            assert_eq!(resumed.imports, whole.imports, "{:?}", steps[at]);
+            assert_eq!(resumed.output.record_count, whole.output.record_count);
+            assert_eq!(resumed.output.rejection_count, whole.output.rejection_count);
+            assert_eq!(resumed.checkpoints.count, whole.checkpoints.count);
+            let resume = resumed.resumes.last().expect("resumed");
+            assert_eq!(resume.after, after(&steps[at - 1]));
+            assert!(resume.reused_bytes > 0, "{resume:?}");
+            assert!(
+                resume::find(&copy).expect("find").is_empty(),
+                "a completed build leaves nothing to resume"
+            );
+        }
+    }
+
+    #[test]
+    fn a_build_resumed_after_any_step_makes_the_same_pack() {
+        resumed_after_any_step_makes_the_same_pack("resume", None);
+    }
+
+    #[test]
+    fn a_build_spilling_coordinates_to_scratch_resumed_after_any_step_makes_the_same_pack() {
+        resumed_after_any_step_makes_the_same_pack("resume-spilling", Some(4));
     }
 
     #[test]
@@ -7970,7 +7944,7 @@ mod tests {
                 moved(renumbered(strongest_links(layout), by), 0.0, east),
             ));
         }
-        Built::new("merged-places", cells)
+        Built::new("merged-places", one_extract(cells))
     });
 
     fn place_coordinates(
@@ -8055,10 +8029,8 @@ mod tests {
         ]
     }
 
-    /// Seattle's relation labels its city node, and Bellevue's shares its
-    /// node's Wikidata item: each becomes one record at its node's point.
     #[test]
-    fn cities_merge_with_their_label_or_wikidata_node() {
+    fn cities_merge_into_one_record_at_their_label_or_wikidata_nodes_point() {
         let reader = Reader::open(MERGED_PLACES.pack()).expect("reader");
         assert!(absent(&reader, "osm:node:1010") && absent(&reader, "osm:node:1011"));
         let mut cities = reader
@@ -8304,10 +8276,8 @@ mod tests {
         ]
     }
 
-    /// A boundary that absorbs a town node is a settlement, so streets inside
-    /// it take the town's name rather than the district's.
     #[test]
-    fn a_boundary_that_absorbs_a_town_node_is_a_settlement() {
+    fn a_boundary_that_absorbs_a_town_node_names_its_streets_as_a_settlement() {
         let reader = Reader::open(MERGED_PLACES.pack()).expect("reader");
         assert!(absent(&reader, "osm:node:5010"));
         let street = reader
@@ -8420,8 +8390,6 @@ mod tests {
         )
     }
 
-    /// One Wikidata item can be two disjoint boundaries. A point of the item
-    /// whose name neither boundary has merges into the one whose box holds it.
     #[test]
     fn a_place_node_merges_into_the_boundary_of_its_item_that_holds_it() {
         let reader = Reader::open(MERGED_PLACES.pack()).expect("reader");
@@ -8453,10 +8421,8 @@ mod tests {
         )
     }
 
-    /// A point that names the boundary brings its item, and another point of
-    /// that item inside the boundary joins it too, whichever comes first.
     #[test]
-    fn a_place_node_joins_the_boundary_another_node_of_its_item_named() {
+    fn a_place_node_joins_the_boundary_another_node_of_its_item_named_in_either_order() {
         let reader = Reader::open(MERGED_PLACES.pack()).expect("reader");
         for (by, item) in [(8000, 110), (9000, 111)] {
             for node in [10, 11] {
@@ -8471,8 +8437,6 @@ mod tests {
     }
 
     fn strongest_links(layout: &str) -> Vec<Vec<TestElement>> {
-        // Points arrive in their build's order, so each layout puts the name
-        // match and the `label` node the other way round.
         let (label_at, named_at, names, items) = match layout {
             "east" => (
                 2.5,
@@ -8519,11 +8483,8 @@ mod tests {
         )
     }
 
-    /// A boundary keeps its own Wikidata item, and takes its point from its
-    /// strongest link. A boundary with no item takes the item of its
-    /// strongest link, whichever point comes first.
     #[test]
-    fn a_boundary_takes_its_strongest_links_point_and_keeps_its_own_item() {
+    fn a_boundary_takes_its_strongest_links_point_and_its_item_when_it_has_none() {
         let reader = Reader::open(MERGED_PLACES.pack()).expect("reader");
         for (by, items, points) in [
             (10_000, (120, 400), ([100.5, 0.5], [102.5, 0.5])),

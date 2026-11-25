@@ -1262,13 +1262,16 @@ async fn upload(router: &Router, csv: &str) -> String {
     file_id
 }
 
+async fn wait_until_the_og_job_ends(router: &Router, og_id: &str) {
+    get(router, &format!("/jobs/{og_id}/results")).await;
+}
+
 async fn finished(router: &Router, job_id: &str) -> Value {
     let og_id = uuid::Uuid::try_parse(job_id)
         .expect("a UUID")
         .simple()
         .to_string();
-    // og streams a job's results until the job ends.
-    get(router, &format!("/jobs/{og_id}/results")).await;
+    wait_until_the_og_job_ends(router, &og_id).await;
     let status = get(router, &format!("/compat/precisely/v2/bulk/jobs/{job_id}")).await;
     assert_eq!(status.status, StatusCode::OK, "{}", status.text());
     let status = status.json();
@@ -1682,6 +1685,17 @@ fn mentions(dir: &Path, needle: &str) -> Vec<std::path::PathBuf> {
     found
 }
 
+fn age_the_upload_record_past_retention_on_disk(jobs: &Path, file_id: &str) {
+    let record = mentions(jobs, &format!("\"fileId\":\"{file_id}\""));
+    let [record] = record.as_slice() else {
+        panic!("one record for {file_id}, found {record:?}");
+    };
+    let mut aged =
+        serde_json::from_slice::<Value>(&std::fs::read(record).expect("record")).expect("JSON");
+    aged["createdNs"] = json!(0);
+    std::fs::write(record, aged.to_string()).expect("write");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn uploads_and_jobs_expire_with_og_jobs() {
     let fixture = Fixture::new("sweep");
@@ -1689,15 +1703,7 @@ async fn uploads_and_jobs_expire_with_og_jobs() {
     let router = build_router(state.clone(), None, None);
     let kept = upload(&router, "addressid|address|country\n1|99 Nowhere Lane|CA\n").await;
     let expired = upload(&router, "addressid|address|country\n2|7 Stale Lane|CA\n").await;
-    // Expiry has no input but the wall clock against a retention of at least an hour, so the record is aged on disk.
-    let record = mentions(&fixture.jobs, &format!("\"fileId\":\"{expired}\""));
-    let [record] = record.as_slice() else {
-        panic!("one record for {expired}, found {record:?}");
-    };
-    let mut aged =
-        serde_json::from_slice::<Value>(&std::fs::read(record).expect("record")).expect("JSON");
-    aged["createdNs"] = json!(0);
-    std::fs::write(record, aged.to_string()).expect("write");
+    age_the_upload_record_past_retention_on_disk(&fixture.jobs, &expired);
 
     let submit = async |file_id: &str| {
         let reply = post(&router, "/v2/bulk-geocode", &json!({"fileId": file_id})).await;

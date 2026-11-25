@@ -546,14 +546,16 @@ mod tests {
         let dir = TempDir::new("og-shell");
         let pack = dir.join("pack");
         write_pack(&pack);
-        // serve binds its own listener, so the OS picks a free port here first.
-        let bind = std::net::TcpListener::bind("127.0.0.1:0")
+        let free_address = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|free| free.local_addr())
             .unwrap();
         let served = pack.clone();
-        std::thread::spawn(move || super::serve_pack(served, bind));
+        std::thread::spawn(move || super::serve_pack(served, free_address));
         let ready = std::time::Instant::now();
-        while ureq::get(&format!("http://{bind}/readyz")).call().is_err() {
+        while ureq::get(&format!("http://{free_address}/readyz"))
+            .call()
+            .is_err()
+        {
             assert!(
                 ready.elapsed() < std::time::Duration::from_secs(30),
                 "the server never got ready"
@@ -562,7 +564,7 @@ mod tests {
         }
         let engine = crate::engine::Engine::open(&pack).unwrap();
         let get = |path: &str| -> serde_json::Value {
-            let text = ureq::get(&format!("http://{bind}{path}"))
+            let text = ureq::get(&format!("http://{free_address}{path}"))
                 .call()
                 .unwrap()
                 .body_mut()
@@ -654,8 +656,7 @@ mod tests {
             tiger: false,
         };
         let progress = crate::job::Progress::of(&request);
-        // Held before the build starts, the steps stop it at its first stage, once its generation is made.
-        let steps = progress.steps.lock().unwrap();
+        let build_held_at_first_stage = progress.steps.lock().unwrap();
         let mut job = crate::job::BuildJob::spawn(
             request,
             std::sync::Arc::new(home),
@@ -671,7 +672,7 @@ mod tests {
         app.job = Some(job);
         app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.quit);
-        drop(steps);
+        drop(build_held_at_first_stage);
         drop(app);
         let stopped = open_geocode::builder::resume::find(&pack).unwrap();
         assert!(

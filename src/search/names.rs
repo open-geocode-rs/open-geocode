@@ -1143,7 +1143,6 @@ mod tests {
         dir
     });
 
-    /// The fixture Pack, built once.
     fn fixture() -> PathBuf {
         FIXTURE.join("pack")
     }

@@ -1664,10 +1664,13 @@ pub(super) async fn finished_job(router: &Router, input: &str) -> String {
     id
 }
 
+async fn wait_until_the_og_job_ends(router: &Router, run: &str) {
+    get(router, &format!("/jobs/{run}/results")).await;
+}
+
 async fn finished(router: &Router, id: &str) -> Value {
     let run = id.strip_prefix("JOB-").expect("JOB- id").replace('-', "");
-    // og streams a job's results until the job ends.
-    get(router, &format!("/jobs/{run}/results")).await;
+    wait_until_the_og_job_ends(router, &run).await;
     let details = get(router, &format!("/compat/here/v7/batch/jobs/{id}"))
         .await
         .json();
@@ -1862,14 +1865,7 @@ async fn a_geocode_batch_runs_on_og_jobs() {
     assert_eq!(listed.json()["count"], 0);
 }
 
-/// A stop answers the job stopped, as HERE does. It never answers the job
-/// still in progress, however soon after the start it comes.
-#[tokio::test]
-async fn a_stopped_batch_answers_stopped_never_in_progress() {
-    let pack = pack("batch-stop");
-    let state = pack.state(Limits::DEFAULT);
-    let router = build_router(state.clone(), None, None);
-    // Every pool thread held, so the job answers no record before the stop.
+fn hold_every_batch_thread(state: &AppState) -> std::sync::mpsc::Sender<()> {
     let threads = state.batch_pool().current_num_threads();
     let (release, gate) = std::sync::mpsc::channel::<()>();
     let gate = std::sync::Arc::new(std::sync::Mutex::new(gate));
@@ -1884,6 +1880,15 @@ async fn a_stopped_batch_answers_stopped_never_in_progress() {
     for _ in 0..threads {
         all_held.recv().expect("a held thread");
     }
+    release
+}
+
+#[tokio::test]
+async fn a_stopped_batch_answers_stopped_never_in_progress() {
+    let pack = pack("batch-stop");
+    let state = pack.state(Limits::DEFAULT);
+    let router = build_router(state.clone(), None, None);
+    let release = hold_every_batch_thread(&state);
     let created = send(
         &router,
         "POST",
@@ -1899,15 +1904,14 @@ async fn a_stopped_batch_answers_stopped_never_in_progress() {
     let uri = format!("/compat/here/v7/batch/jobs/{id}/stop");
     let mut stop = std::pin::pin!(send(&router, "PUT", &uri, None));
     let record = super::batch::store_dir(&state).join(format!("{id}.json"));
-    // The stop records itself and cancels the run with no wait between, so a recorded stop has cancelled.
-    let recorded = || {
+    let stop_recorded_so_run_cancelled = || {
         serde_json::from_slice::<Value>(&std::fs::read(&record).expect("record"))
             .expect("record JSON")["stopped"]
             == true
     };
     std::future::poll_fn(|context| match stop.as_mut().poll(context) {
         std::task::Poll::Ready(reply) => panic!("the stop answered first: {}", reply.text()),
-        std::task::Poll::Pending if recorded() => std::task::Poll::Ready(()),
+        std::task::Poll::Pending if stop_recorded_so_run_cancelled() => std::task::Poll::Ready(()),
         std::task::Poll::Pending => std::task::Poll::Pending,
     })
     .await;
@@ -1934,9 +1938,9 @@ async fn a_start_whose_record_fails_to_save_leaves_no_run_and_starts_again() {
     let run = id.strip_prefix("JOB-").expect("JOB- id").replace('-', "");
     let job = format!("/compat/here/v7/batch/jobs/{id}");
 
-    // A directory where the record's new copy is written fails the save as a full disk would.
-    let blocked = super::batch::store_dir(&state).join(format!("{id}.json.partial"));
-    std::fs::create_dir(&blocked).expect("block the record");
+    let partial_record_path_taken_by_a_directory =
+        super::batch::store_dir(&state).join(format!("{id}.json.partial"));
+    std::fs::create_dir(&partial_record_path_taken_by_a_directory).expect("block the record");
     let failed = send(&router, "PUT", &format!("{job}/start"), None).await;
     assert_eq!(
         failed.status,
@@ -1959,7 +1963,7 @@ async fn a_start_whose_record_fails_to_save_leaves_no_run_and_starts_again() {
     assert_eq!(orphan.status, StatusCode::NOT_FOUND, "{}", orphan.text());
     assert_eq!(get(&router, &job).await.json()["status"], "submitted");
 
-    std::fs::remove_dir(&blocked).expect("unblock the record");
+    std::fs::remove_dir(&partial_record_path_taken_by_a_directory).expect("unblock the record");
     let started = send(&router, "PUT", &format!("{job}/start"), None).await;
     assert_eq!(started.status, StatusCode::OK, "{}", started.text());
     assert_eq!(started.json()["status"], "queued");

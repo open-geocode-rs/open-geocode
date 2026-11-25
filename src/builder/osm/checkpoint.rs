@@ -564,6 +564,15 @@ mod tests {
                 label: Some(29_546_940),
                 tags: BTreeMap::from([("name".to_string(), "Toronto".to_string())]),
             }),
+            GeometryItem::Relation(BoundaryRelationStub {
+                object_id: 901,
+                members: vec![BoundaryRelationMember {
+                    way_id: 502,
+                    role: BoundaryMemberRole::Outer,
+                }],
+                label: None,
+                tags: BTreeMap::new(),
+            }),
             GeometryItem::Feature(605),
             GeometryItem::Way(BoundaryWay {
                 object_id: 605,
@@ -588,5 +597,25 @@ mod tests {
             name: "M5V 1A1".into(),
             point: [-79.4, 43.6],
         }]);
+    }
+
+    #[test]
+    fn steps_run_every_pass_input_by_input_and_end_sealed() {
+        let input = |index, pass| Step::Input { index, pass };
+        let steps = Step::all(2);
+        assert_eq!(
+            steps[..8],
+            [
+                input(0, Pass::Scan),
+                input(0, Pass::Members),
+                input(0, Pass::Nodes),
+                input(0, Pass::Ways),
+                input(1, Pass::Scan),
+                input(1, Pass::Members),
+                input(1, Pass::Nodes),
+                input(1, Pass::Ways),
+            ]
+        );
+        assert_eq!(steps.last(), Some(&Step::Sealed));
     }
 }
