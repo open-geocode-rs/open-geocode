@@ -558,11 +558,9 @@ fn address(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
-    fn temp_file(name: &str, contents: &[u8]) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("open-geocode-addresses-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("dir");
+    fn temp_file(dir: &Path, name: &str, contents: &[u8]) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, contents).expect("write");
         path
@@ -588,6 +586,7 @@ mod tests {
 
     #[test]
     fn reads_openaddresses_geojson_lines_gzipped() {
+        let dir = TempDir::new("addresses");
         let lines = concat!(
             r#"{"type":"Feature","properties":{"hash":"a","number":"12","street":"Queen  Street","unit":"","city":"","district":"Auckland","region":"","postcode":"1010","id":""},"geometry":{"type":"Point","coordinates":[174.76,-36.85]}}"#,
             "\n\n",
@@ -604,7 +603,7 @@ mod tests {
             std::io::Write::write_all(&mut encoder, lines.as_bytes()).expect("gzip");
             encoder.finish().expect("gzip");
         }
-        let (records, report) = read(temp_file("source.geojson.gz", &gzipped));
+        let (records, report) = read(temp_file(&dir, "source.geojson.gz", &gzipped));
         assert_eq!(records.len(), 1);
         let address = &records[0].address;
         assert_eq!(address.number, "12");
@@ -634,6 +633,7 @@ mod tests {
 
     #[test]
     fn a_row_not_in_utf8_is_rejected_and_the_rows_after_it_are_read() {
+        let dir = TempDir::new("addresses");
         let feature = |number: &str, street: &[u8]| {
             [
                 br#"{"type":"Feature","properties":{"number":""#.as_slice(),
@@ -653,8 +653,8 @@ mod tests {
         .concat();
         let csv = b"lon,lat,number,street\n6.13,49.61,1,Rue Test\n6.13,49.61,2,Rue T\xe9st\n6.13,49.61,3,Rue Test\n";
         for path in [
-            temp_file("source.geojson", &geojson),
-            temp_file("source.csv", csv),
+            temp_file(&dir, "source.geojson", &geojson),
+            temp_file(&dir, "source.csv", csv),
         ] {
             let (records, report) = read(path);
             assert_eq!(
@@ -678,8 +678,9 @@ mod tests {
 
     #[test]
     fn reads_openaddresses_csv_with_columns_in_any_order() {
+        let dir = TempDir::new("addresses");
         let csv = "street,NUMBER,Lat,lon,unit\nKing St,10,43.6,-79.4,2\nKing St,11,oops,-79.4,\n";
-        let (records, report) = read(temp_file("addresses.csv", csv.as_bytes()));
+        let (records, report) = read(temp_file(&dir, "addresses.csv", csv.as_bytes()));
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].address.unit.as_deref(), Some("2"));
         assert_eq!(
@@ -687,7 +688,7 @@ mod tests {
             BTreeMap::from([("bad_coordinates".to_string(), 1)])
         );
 
-        let missing = temp_file("addresses.csv", b"lon,lat,number\n1,2,3\n");
+        let missing = temp_file(&dir, "addresses.csv", b"lon,lat,number\n1,2,3\n");
         assert!(
             read_file(
                 &AddressFile {
@@ -704,13 +705,14 @@ mod tests {
 
     #[test]
     fn rows_prepared_on_the_pool_are_taken_in_file_order() {
+        let dir = TempDir::new("addresses");
         let rows = 2 * ROW_BATCH + 3;
         let mut csv = String::from("lon,lat,number,street\n");
         for row in 1..=rows {
             let lat = if row % 7 == 0 { "oops" } else { "43.6" };
             csv.push_str(&format!("-79.4,{lat},{row},King St\n"));
         }
-        let path = temp_file("addresses.csv", csv.as_bytes());
+        let path = temp_file(&dir, "addresses.csv", csv.as_bytes());
         let mut taken = Vec::new();
         let report = read_file_prepared(
             &AddressFile {

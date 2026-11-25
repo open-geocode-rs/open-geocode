@@ -572,6 +572,8 @@ fn io_error(action: &'static str, path: &Path, source: io::Error) -> Error {
 mod tests {
     use std::collections::BTreeSet;
 
+    use crate::test_support::TempDir;
+
     use super::*;
 
     fn source(name: &str, job: u64) -> Source {
@@ -805,8 +807,7 @@ mod tests {
 
     #[test]
     fn reads_the_address_entries_of_the_covered_countries_from_a_collection() {
-        let dir = std::env::temp_dir().join(format!("og-collection-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("dir");
+        let dir = TempDir::new("collection");
         let coverage = Coverage {
             countries: BTreeSet::from(["NZ".to_string()]),
             ..Coverage::default()
@@ -846,13 +847,11 @@ mod tests {
                 ("3".to_string(), Some("Lambton Quay".to_string())),
             ]
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_collection_leaves_out_the_entries_whose_job_licence_a_build_does_not_take() {
-        let dir = std::env::temp_dir().join(format!("og-collection-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("dir");
+        let dir = TempDir::new("collection");
         let archive = collection_with(
             &dir,
             &[
@@ -877,7 +876,6 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let picked = Collection::new(&archive).pick(&us());
-        let _ = fs::remove_dir_all(&dir);
         let picked = picked.expect("picked");
         assert_eq!(datasets(&picked), ["openaddresses:us/ia/polk"]);
         assert_eq!(
@@ -887,8 +885,7 @@ mod tests {
                 "openaddresses:us/wa/spokane left out: its licence forbids commercial use (\"CC BY-NC-SA 4.0\"); --openaddresses-non-commercial takes it for a non-commercial Pack"
             ]
         );
-        let dir = std::env::temp_dir().join(format!("og-collection-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("dir");
+        let dir = TempDir::new("collection");
         let archive = collection_with(
             &dir,
             &[
@@ -901,7 +898,6 @@ mod tests {
             ],
         );
         let picked = Collection::new(&archive).non_commercial(true).pick(&us());
-        let _ = fs::remove_dir_all(&dir);
         let picked = picked.expect("picked");
         assert_eq!(datasets(&picked), ["openaddresses:us/wa/spokane"]);
         assert_eq!(
@@ -938,7 +934,7 @@ mod tests {
 
     #[test]
     fn a_job_record_is_cached_only_once_it_reads_as_one() {
-        let dir = std::env::temp_dir().join(format!("og-job-{}", uuid::Uuid::new_v4()));
+        let dir = TempDir::new("job");
         let path = dir.join("us_wa_spokane").join("42.job.json");
         let cut_off = store_job(&path, r#"{"license":"#);
         let missing = path.exists();
@@ -947,7 +943,6 @@ mod tests {
         fs::write(&path, r#"{"license":"#).expect("garble the cache");
         let garbled = cached_job(&path).is_none();
         let removed = !path.exists();
-        let _ = fs::remove_dir_all(&dir);
         assert_eq!(
             cut_off.err().map(|error| error.to_string()),
             Some(

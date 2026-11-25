@@ -689,6 +689,7 @@ mod tests {
     use geo::{BoundingRect, Covers, LineString, Point, Polygon};
 
     use super::*;
+    use crate::test_support::TempDir;
 
     /// A ring of `points` vertices around a jagged circle.
     fn jagged(center: (f64, f64), radius: f64, points: usize) -> LineString<f64> {
@@ -921,10 +922,8 @@ mod tests {
 
     #[test]
     fn shapes_read_back_from_the_file() {
-        let scratch = Scratch::create(
-            std::env::temp_dir().join(format!("og-shapes-{}", uuid::Uuid::new_v4())),
-        )
-        .expect("scratch");
+        let dir = TempDir::new("shapes");
+        let scratch = Scratch::create(dir.join("scratch")).expect("scratch");
         let square = |x: f64| {
             MultiPolygon::new(vec![Polygon::new(
                 LineString::from(vec![(x, 0.0), (x + 1.0, 0.0), (x + 1.0, 1.0), (x, 0.0)]),

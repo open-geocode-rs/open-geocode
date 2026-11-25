@@ -3663,7 +3663,6 @@ mod tests {
         reverse::{GeocodeOptions, MatchKind, PackReverseGeocoder},
         search::{TextAutocompleteOptions, TextSearchHit, TextSearchOptions, TextSearcher},
         test_support::TempDir,
-        util::temp::TempPath,
     };
 
     use std::sync::LazyLock;
@@ -6781,8 +6780,7 @@ mod tests {
     /// shape is not in the area at all.
     #[test]
     fn a_pack_lists_the_areas_a_record_lies_in_with_their_raw_tags() {
-        let dir = TempPath::new("build-enclosing");
-        fs::create_dir_all(&dir).expect("dir");
+        let dir = temp_dir("enclosing");
         let input = dir.join("enclosing.osm.pbf");
         let mut blocks = town();
         let corners = [
@@ -6979,9 +6977,8 @@ mod tests {
             vec![self.nodes, self.ways, self.relations]
         }
 
-        fn build(self, name: &str) -> (TempPath, Reader) {
-            let dir = TempPath::new(name);
-            fs::create_dir_all(&dir).expect("dir");
+        fn build(self, name: &str) -> (TempDir, Reader) {
+            let dir = TempDir::new(name);
             let input = dir.join("map.osm.pbf");
             write_pbf(&input, &self.blocks());
             build(&dir.join("pack"), &input, None);

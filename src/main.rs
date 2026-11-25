@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod test_support;
+
 use std::{
     fs::File,
     net::SocketAddr,
@@ -1350,8 +1353,7 @@ mod tests {
 
     #[test]
     fn the_non_commercial_flag_reaches_the_openaddresses_source() {
-        let dir = std::env::temp_dir().join(format!("og-flag-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::test_support::TempDir::new("flag");
         let archive = dir.join("collection.zip");
         non_commercial_collection(&archive);
         let picked = |extra: &[&str]| {
@@ -1402,7 +1404,6 @@ mod tests {
         };
         let default = picked(&[]);
         let non_commercial = picked(&["--openaddresses-non-commercial"]);
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             default,
             (

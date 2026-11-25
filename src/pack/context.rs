@@ -492,6 +492,7 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     /// The bits are the on-disk encoding, so every tier has to survive the
     /// round trip and a bit no tier claims has to be refused rather than
@@ -542,8 +543,8 @@ mod tests {
 
     #[test]
     fn a_chain_keeps_the_zone_it_is_given_and_a_zone_alone_is_a_chain() {
-        let path =
-            std::env::temp_dir().join(format!("open-geocode-context-{}", uuid::Uuid::new_v4()));
+        let dir = TempDir::new("context");
+        let path = dir.join("pack");
         let town = AdminContextTuple::from_tiers([(PlaceLayer::Locality, 3)]);
         let context = |admin_context: &AdminContextTuple, zone| RecordContext {
             admin_context: admin_context.clone(),
@@ -579,7 +580,6 @@ mod tests {
         writer.finish(&mut pack).expect("finish");
         pack.finish().expect("pack finish");
         let reader = Reader::open(&Container::open(&path).expect("open")).expect("reader");
-        let _ = std::fs::remove_file(&path);
         let resolve = |tuple_id| {
             reader
                 .resolve(ContextRef {
@@ -596,8 +596,8 @@ mod tests {
 
     #[test]
     fn interns_tuples_and_resolves_references() {
-        let path =
-            std::env::temp_dir().join(format!("open-geocode-context-{}", uuid::Uuid::new_v4()));
+        let dir = TempDir::new("context");
+        let path = dir.join("pack");
         let tuple = AdminContextTuple::from_tiers([
             (PlaceLayer::Country, 1),
             (PlaceLayer::Region, 2),

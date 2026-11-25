@@ -1924,6 +1924,7 @@ mod tests {
             point_geometry,
         },
         search::{TextSearchOptions, TextSearcher},
+        test_support::TempDir,
     };
 
     use super::*;
@@ -2059,10 +2060,6 @@ mod tests {
         assert!(area_codes_from_bytes(&bytes[..bytes.len() - 1]).is_err());
     }
 
-    fn temp_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("open-geocode-{name}-{}", uuid::Uuid::new_v4()))
-    }
-
     fn address_record(object_id: i64, number: &str, street: &str) -> Record {
         Record::Address(AddressRecord {
             building: None,
@@ -2113,7 +2110,8 @@ mod tests {
 
     #[test]
     fn writes_one_file_and_reads_records_by_row_layer_and_source_id() {
-        let root = temp_root("pack");
+        let dir = TempDir::new("pack");
+        let root = dir.join("pack");
         let manifest = write_pack(
             &root,
             &[
@@ -2156,7 +2154,7 @@ mod tests {
         assert_eq!(first_hit(&root, "queen").as_deref(), Some("osm:node:2"));
 
         // The Pack file alone is a complete Pack.
-        let copy = temp_root("copy").with_extension("ogp");
+        let copy = dir.join("copy.ogp");
         fs::copy(reader.path(), &copy).expect("copy");
         assert_eq!(first_hit(&copy, "king").as_deref(), Some("osm:node:1"));
         assert!(!reader.path().parent().unwrap().join(SCRATCH_DIR).exists());
@@ -2164,7 +2162,8 @@ mod tests {
 
     #[test]
     fn failed_osm_rebuild_preserves_published_pack() {
-        let root = temp_root("rebuild");
+        let dir = TempDir::new("rebuild");
+        let root = dir.join("pack");
         write_pack(&root, &[address_record(1, "10", "King Street")]);
         let generations = fs::read_dir(root.join("generations")).expect("dir").count();
 
@@ -2184,7 +2183,8 @@ mod tests {
 
     #[test]
     fn publishes_replacement_without_changing_existing_readers() {
-        let root = temp_root("publish");
+        let dir = TempDir::new("publish");
+        let root = dir.join("pack");
         write_pack(&root, &[address_record(1, "10", "King Street")]);
         let original = Reader::open(&root).expect("original reader");
         let searcher = TextSearcher::open(&root).expect("original searcher");
@@ -2216,7 +2216,8 @@ mod tests {
 
     #[test]
     fn validation_failure_does_not_publish_replacement() {
-        let root = temp_root("validation");
+        let dir = TempDir::new("validation");
+        let root = dir.join("pack");
         write_pack(&root, &[address_record(1, "10", "King Street")]);
         let published = fs::read(root.join("CURRENT")).expect("pointer");
 
@@ -2241,7 +2242,8 @@ mod tests {
 
     #[test]
     fn publishing_refuses_a_pack_corrupted_inside_a_section() {
-        let root = temp_root("checksum");
+        let dir = TempDir::new("checksum");
+        let root = dir.join("pack");
         write_pack(&root, &[address_record(1, "10", "King Street")]);
         let published = fs::read(root.join("CURRENT")).expect("pointer");
 
@@ -2264,7 +2266,8 @@ mod tests {
 
     #[test]
     fn a_failure_after_the_pointer_switch_keeps_the_published_generation() {
-        let root = temp_root("switch-failure");
+        let dir = TempDir::new("switch-failure");
+        let root = dir.join("pack");
         write_pack(&root, &[address_record(1, "10", "King Street")]);
         let mut replacement = Writer::create(&root).expect("replacement");
         replacement
@@ -2282,7 +2285,8 @@ mod tests {
 
     #[test]
     fn text_index_memory_fits_the_budget_and_waits_for_records() {
-        let root = temp_root("text-memory");
+        let dir = TempDir::new("text-memory");
+        let root = dir.join("pack");
         let memory = Budget::new(64 << 20);
         let mut writer = Writer::create_with(
             &root,
@@ -2313,8 +2317,7 @@ mod tests {
 
     #[test]
     fn rejects_paths_without_a_pack() {
-        let root = temp_root("empty");
-        fs::create_dir_all(&root).expect("dir");
+        let root = TempDir::new("empty");
         assert!(Reader::open(&root).is_err());
     }
 }

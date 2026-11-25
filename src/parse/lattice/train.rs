@@ -2692,6 +2692,7 @@ impl Random {
 #[cfg(test)]
 mod tests {
     use super::{super::dictionary::Dictionaries, super::dictionary::Entry, *};
+    use crate::test_support::TempDir;
 
     fn fields() -> Fields {
         Fields {
@@ -3077,10 +3078,8 @@ mod tests {
             }
         })
         .collect::<Vec<_>>();
-        let scratch = Scratch::create(
-            std::env::temp_dir().join(format!("open-geocode-lattices-{}", uuid::Uuid::new_v4())),
-        )
-        .expect("scratch");
+        let dir = TempDir::new("lattices");
+        let scratch = Scratch::create(dir.join("scratch")).expect("scratch");
         for (budget, in_memory) in [(Budget::unlimited(), true), (Budget::new(1), false)] {
             let mut cache = LatticeCache::new(&scratch, &budget);
             for row in &rows {

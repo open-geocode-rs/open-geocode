@@ -465,21 +465,17 @@ impl<'de> Visitor<'de> for Features<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use geo::{BoundingRect, LineString, MultiPolygon, Polygon};
 
     use super::super::containment::encode_shape;
     use super::*;
+    use crate::test_support::TempDir;
 
-    /// A directory removed when the test ends, however it ends.
-    struct Dir(PathBuf);
+    struct Dir(TempDir);
 
     impl Dir {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("og-timezones-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).expect("directory");
-            Self(dir)
+            Self(TempDir::new("timezones"))
         }
 
         fn load(&self, geojson: &str) -> Result<Timezones> {
@@ -504,12 +500,6 @@ mod tests {
                 .strip_suffix(end)
                 .unwrap_or_else(|| panic!("no advice in {error}"))
                 .to_string()
-        }
-    }
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 

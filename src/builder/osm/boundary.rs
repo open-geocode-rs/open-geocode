@@ -3216,6 +3216,7 @@ fn object_type_of(code: u8) -> crate::error::Result<ObjectType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     fn dot_with_reach(point: [f64; 2], reach_m: f64) -> TownDot {
         let mut dot = TownDot::new(
@@ -3441,7 +3442,7 @@ mod tests {
     /// area names of the records inside it.
     #[test]
     fn a_merged_points_names_are_the_records_not_the_areas() {
-        let scratch = test_scratch();
+        let (_dir, scratch) = test_scratch();
         let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
         let vertex = |node_id, lon, lat| Vertex { node_id, lat, lon };
         let ring = vec![
@@ -3861,7 +3862,7 @@ mod tests {
         country: Option<&str>,
         levels: &[(u8, Option<PlaceLayer>, usize)],
     ) -> BTreeMap<u8, PlaceLayer> {
-        let scratch = test_scratch();
+        let (_dir, scratch) = test_scratch();
         let mut shapes = ShapeWriter::create(&scratch, SHAPES_LABEL).expect("shape file");
         let mut candidates = Vec::new();
         let levels = levels
@@ -3977,7 +3978,7 @@ mod tests {
             square(2, "3", "関東地方", None, 4.0),
             square(3, "4", "千葉県", None, 1.0),
         ];
-        let scratch = test_scratch();
+        let (_dir, scratch) = test_scratch();
         let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
         builder.add_ways(&ways).expect("ways");
         let set = builder.finish().expect("boundaries");
@@ -4044,7 +4045,7 @@ mod tests {
         ];
 
         let member_line = |way_id: i64| Ok(member_lines.get(&way_id).cloned().flatten());
-        let scratch = test_scratch();
+        let (_dir, scratch) = test_scratch();
         let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
         builder
             .add_relations(&relations, member_line)
@@ -4121,11 +4122,10 @@ mod tests {
         }
     }
 
-    fn test_scratch() -> Arc<crate::extsort::Scratch> {
-        crate::extsort::Scratch::create(
-            std::env::temp_dir().join(format!("og-boundary-{}", uuid::Uuid::new_v4())),
-        )
-        .expect("scratch")
+    fn test_scratch() -> (TempDir, Arc<crate::extsort::Scratch>) {
+        let dir = TempDir::new("boundary");
+        let scratch = crate::extsort::Scratch::create(dir.join("scratch")).expect("scratch");
+        (dir, scratch)
     }
 
     /// `geometry` written to `shapes` as the boundary stage writes it, with
@@ -4145,7 +4145,7 @@ mod tests {
 
     /// An index of square boundaries, each the square its box is.
     fn test_index(mut boundaries: Vec<AcceptedBoundary>) -> BoundaryIndex {
-        let scratch = test_scratch();
+        let (_dir, scratch) = test_scratch();
         let mut shapes = ShapeWriter::create(&scratch, SHAPES_LABEL).expect("shape file");
         for boundary in &mut boundaries {
             let square = MultiPolygon::new(vec![boundary.bounds.to_polygon()]);

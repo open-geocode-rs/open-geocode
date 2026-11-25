@@ -663,10 +663,11 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use crate::test_support::TempDir;
 
     #[test]
     fn cache_requires_the_requested_entry() {
-        let root = std::env::temp_dir().join(format!("og-tiger-cache-{}", uuid::Uuid::new_v4()));
+        let root = TempDir::new("tiger-cache");
         let cache = root.join("tiger");
         fs::create_dir_all(&cache).unwrap();
         let path = cache.join("fixture.zip");
@@ -688,6 +689,5 @@ mod tests {
         assert!(matches!(load("shp", 1024), Err(Error::Fetch { .. })));
         assert!(matches!(load("dbf", 4), Err(Error::Fetch { .. })));
         assert_eq!(fs::read(&path).unwrap(), bytes);
-        fs::remove_dir_all(root).unwrap();
     }
 }

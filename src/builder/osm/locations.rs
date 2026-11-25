@@ -986,6 +986,7 @@ pub(crate) fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     fn ranked(ids: &[i64]) -> NodeSet {
         let set = NodeSet::new(&Budget::unlimited());
@@ -1034,8 +1035,8 @@ mod tests {
 
     #[test]
     fn mapped_slots_read_back_what_was_written() {
-        let dir = std::env::temp_dir().join(format!("og-locations-{}", uuid::Uuid::new_v4()));
-        let scratch = Scratch::create(&dir).expect("scratch");
+        let dir = TempDir::new("locations");
+        let scratch = Scratch::create(dir.join("scratch")).expect("scratch");
         // A budget of nothing sends the coordinates to the file.
         let mut slots = Slots::new(3, true, &Budget::new(0), &scratch).expect("slots");
         assert!(matches!(slots, Slots::Mapped(_)));
