@@ -1706,7 +1706,10 @@ fn field_and_level(tier: PlaceLayer) -> (Field, u8) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use super::*;
+    use crate::test_support::TempDir;
 
     #[test]
     fn type_words_are_dropped_only_on_the_side_they_are_written() {
@@ -1923,119 +1926,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_name_of_an_area_counts_the_records_in_it() {
-        let mut builder = Builder::default();
-        let context = RecordContext {
-            admin_context: crate::pack::AdminContextTuple::from_tiers([(PlaceLayer::Locality, 9)]),
-            flags: 0,
-            ..Default::default()
-        };
-        for _ in 0..3 {
-            builder.add(RecordNames::default(), Some(&context));
-        }
-        let names = HashMap::from([(9, vec!["千代田区".to_string(), "Chiyoda".to_string()])]);
-        let dir = std::env::temp_dir().join(format!("og-dictionary-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let path = dir.join("pack.ogp");
-        let mut pack = Writer::create(&path).expect("pack");
-        builder
-            .finish(&mut pack, &names, &[context.admin_context])
-            .expect("finish");
-        pack.finish().expect("seal");
-        let dictionaries =
-            Dictionaries::open(&Container::open(&path).expect("open")).expect("dicts");
-        for key in ["千代田区", "chiyoda"] {
-            assert_eq!(
-                dictionaries
-                    .get(Field::Locality, key)
-                    .map(|entry| entry.count),
-                Some(3),
-                "{key}"
-            );
-        }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn admin_areas_are_also_named_without_their_type_word() {
-        let aliases = |key: &str| admin_aliases(key);
-        assert_eq!(aliases("愛知県"), ["愛知"]);
-        assert_eq!(aliases("東京都"), ["東京"]);
-        assert_eq!(aliases("とうきょうと"), ["とうきょう"]);
-        assert_eq!(aliases("freistaat bayern"), ["bayern"]);
-        assert!(aliases("comunidad de madrid").contains(&"madrid".to_string()));
-        assert_eq!(aliases("aichi prefecture"), ["aichi"]);
-        assert_eq!(aliases("경기도"), ["경기"]);
-        assert_eq!(aliases("จังหวัดเชียงใหม่"), ["เชียงใหม่"]);
-        assert!(aliases("北区").is_empty());
-        assert!(aliases("3丁目").is_empty());
-        assert!(aliases("statesville").is_empty());
-    }
-
-    #[test]
-    fn aliases_and_nesting_come_from_the_areas_records_lie_in() {
-        let mut builder = Builder::default();
-        let context = |region: RecordId, locality: RecordId| RecordContext {
-            admin_context: AdminContextTuple::from_tiers([
-                (PlaceLayer::Region, region),
-                (PlaceLayer::Locality, locality),
-            ]),
-            flags: 0,
-            ..Default::default()
-        };
-        let contexts = [(1, 2), (3, 4), (3, 5)].map(|(region, locality)| context(region, locality));
-        for context in &contexts {
-            builder.add(RecordNames::default(), Some(context));
-        }
-        let contexts = contexts.map(|context| context.admin_context);
-        let names = HashMap::from([
-            (1, vec!["愛知県".to_string()]),
-            (2, vec!["名古屋市".to_string()]),
-            (3, vec!["京都府".to_string()]),
-            (4, vec!["京都市".to_string()]),
-            (5, vec!["宇治市".to_string()]),
-        ]);
-        let dir = std::env::temp_dir().join(format!("og-aliases-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let path = dir.join("pack.ogp");
-        let mut pack = Writer::create(&path).expect("pack");
-        builder
-            .finish(&mut pack, &names, &contexts)
-            .expect("finish");
-        pack.finish().expect("seal");
-        let dictionaries =
-            Dictionaries::open(&Container::open(&path).expect("open")).expect("dicts");
-        assert!(dictionaries.contains(Field::Region, "愛知"));
-        assert!(dictionaries.contains(Field::Locality, "名古屋"));
-        // "京都" names a region and a locality: neither.
-        assert!(!dictionaries.contains(Field::Region, "京都"));
-        assert!(!dictionaries.contains(Field::Locality, "京都"));
-        assert_eq!(dictionaries.areas("愛知"), [1]);
-        assert_eq!(dictionaries.areas("名古屋市"), [2]);
-        assert!(dictionaries.nest(&[1], &[2]));
-        assert!(dictionaries.nest(&[3], &[4]) && dictionaries.nest(&[5], &[3]));
-        assert!(!dictionaries.nest(&[1], &[4]), "Kyoto is not in Aichi");
-        assert!(!dictionaries.nest(&[4], &[5]), "two cities of one region");
-        assert!(dictionaries.areas("札幌").is_empty());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn a_name_of_too_many_areas_lists_none() {
-        let many = (0..=MAX_AREAS_PER_NAME as u32).collect::<Vec<_>>();
-        let dictionaries = Dictionaries::empty().with_areas(
-            &[("中央区", &many[..]), ("東京都", &[7]), ("銀座", &[9, 8])],
-            &[(8, 7)],
-        );
-        assert!(dictionaries.areas("中央区").is_empty());
-        assert_eq!(dictionaries.areas("銀座"), [8, 9]);
-        assert!(dictionaries.nest(&[7], &[9, 8]));
-        assert!(!dictionaries.nest(&[7], &[9]));
-    }
-
-    #[test]
-    fn words_many_units_are_written_with_are_unit_words() {
+    static DICTIONARY_SECTIONS: LazyLock<TempDir> = LazyLock::new(|| {
         let address = |unit: &str| {
             Record::Address(crate::record::AddressRecord {
                 building: None,
@@ -2059,26 +1950,122 @@ mod tests {
                 source: crate::record::SourceProvenance::osm(crate::record::ObjectType::Node, 1),
             })
         };
+        let context = |tiers: &[(PlaceLayer, RecordId)]| RecordContext {
+            admin_context: AdminContextTuple::from_tiers(tiers.iter().copied()),
+            flags: 0,
+            ..Default::default()
+        };
         let mut builder = Builder::default();
+        let chiyoda = context(&[(PlaceLayer::Locality, 9)]);
+        for _ in 0..3 {
+            builder.add(RecordNames::default(), Some(&chiyoda));
+        }
+        let nested = [(1, 2), (3, 4), (3, 5)].map(|(region, locality)| {
+            context(&[
+                (PlaceLayer::Region, region),
+                (PlaceLayer::Locality, locality),
+            ])
+        });
+        for context in &nested {
+            builder.add(RecordNames::default(), Some(context));
+        }
         for index in 0..MIN_UNIT_WORD_VALUES {
             builder.add(RecordNames::of(&address(&format!("Bay {index}"))), None);
         }
         builder.add(RecordNames::of(&address("Booth 1")), None);
-        let dir = std::env::temp_dir().join(format!("og-units-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let path = dir.join("pack.ogp");
-        let mut pack = Writer::create(&path).expect("pack");
+        let names = HashMap::from([
+            (1, vec!["愛知県".to_string()]),
+            (2, vec!["名古屋市".to_string()]),
+            (3, vec!["京都府".to_string()]),
+            (4, vec!["京都市".to_string()]),
+            (5, vec!["宇治市".to_string()]),
+            (9, vec!["千代田区".to_string(), "Chiyoda".to_string()]),
+        ]);
+        let contexts = std::iter::once(&chiyoda)
+            .chain(&nested)
+            .map(|context| context.admin_context.clone())
+            .collect::<Vec<_>>();
+        let dir = TempDir::new("dictionary-sections");
+        let mut pack = Writer::create(dir.join("pack.ogp")).expect("pack");
         builder
-            .finish(&mut pack, &HashMap::new(), &[])
+            .finish(&mut pack, &names, &contexts)
             .expect("finish");
         pack.finish().expect("seal");
-        let dictionaries =
-            Dictionaries::open(&Container::open(&path).expect("open")).expect("dicts");
+        dir
+    });
+
+    fn dictionary_sections() -> Dictionaries {
+        let path = DICTIONARY_SECTIONS.join("pack.ogp");
+        Dictionaries::open(&Container::open(&path).expect("open")).expect("dicts")
+    }
+
+    #[test]
+    fn every_name_of_an_area_counts_the_records_in_it() {
+        let dictionaries = dictionary_sections();
+        for key in ["千代田区", "chiyoda"] {
+            assert_eq!(
+                dictionaries
+                    .get(Field::Locality, key)
+                    .map(|entry| entry.count),
+                Some(3),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_areas_are_also_named_without_their_type_word() {
+        let aliases = |key: &str| admin_aliases(key);
+        assert_eq!(aliases("愛知県"), ["愛知"]);
+        assert_eq!(aliases("東京都"), ["東京"]);
+        assert_eq!(aliases("とうきょうと"), ["とうきょう"]);
+        assert_eq!(aliases("freistaat bayern"), ["bayern"]);
+        assert!(aliases("comunidad de madrid").contains(&"madrid".to_string()));
+        assert_eq!(aliases("aichi prefecture"), ["aichi"]);
+        assert_eq!(aliases("경기도"), ["경기"]);
+        assert_eq!(aliases("จังหวัดเชียงใหม่"), ["เชียงใหม่"]);
+        assert!(aliases("北区").is_empty());
+        assert!(aliases("3丁目").is_empty());
+        assert!(aliases("statesville").is_empty());
+    }
+
+    #[test]
+    fn aliases_and_nesting_come_from_the_areas_records_lie_in() {
+        let dictionaries = dictionary_sections();
+        assert!(dictionaries.contains(Field::Region, "愛知"));
+        assert!(dictionaries.contains(Field::Locality, "名古屋"));
+        // "京都" names a region and a locality: neither.
+        assert!(!dictionaries.contains(Field::Region, "京都"));
+        assert!(!dictionaries.contains(Field::Locality, "京都"));
+        assert_eq!(dictionaries.areas("愛知"), [1]);
+        assert_eq!(dictionaries.areas("名古屋市"), [2]);
+        assert!(dictionaries.nest(&[1], &[2]));
+        assert!(dictionaries.nest(&[3], &[4]) && dictionaries.nest(&[5], &[3]));
+        assert!(!dictionaries.nest(&[1], &[4]), "Kyoto is not in Aichi");
+        assert!(!dictionaries.nest(&[4], &[5]), "two cities of one region");
+        assert!(dictionaries.areas("札幌").is_empty());
+    }
+
+    #[test]
+    fn a_name_of_too_many_areas_lists_none() {
+        let many = (0..=MAX_AREAS_PER_NAME as u32).collect::<Vec<_>>();
+        let dictionaries = Dictionaries::empty().with_areas(
+            &[("中央区", &many[..]), ("東京都", &[7]), ("銀座", &[9, 8])],
+            &[(8, 7)],
+        );
+        assert!(dictionaries.areas("中央区").is_empty());
+        assert_eq!(dictionaries.areas("銀座"), [8, 9]);
+        assert!(dictionaries.nest(&[7], &[9, 8]));
+        assert!(!dictionaries.nest(&[7], &[9]));
+    }
+
+    #[test]
+    fn words_many_units_are_written_with_are_unit_words() {
+        let dictionaries = dictionary_sections();
         assert!(dictionaries.contains(Field::Unit, "bay"));
         assert!(!dictionaries.contains(Field::Unit, "booth"), "too few");
         assert!(dictionaries.contains(Field::Unit, "suite"), "vendored");
         assert!(dictionaries.keys(Field::Unit).contains(&"bay".to_string()));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
