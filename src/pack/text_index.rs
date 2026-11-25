@@ -65,11 +65,7 @@ const MAX_INDEX_PARTS: usize = 16;
 /// documents are a few long runs, which pack into far fewer bits than the
 /// one-by-one spread a writer of many threads makes. Each part's queue holds
 /// a whole chunk, so every part is at work while the next is fed.
-#[cfg(not(test))]
 const CHUNK_DOCUMENTS: u64 = 8_192;
-// Small in tests, so a few hundred records span several chunks.
-#[cfg(test)]
-const CHUNK_DOCUMENTS: u64 = 64;
 /// Where in the scratch directory Tantivy writes, and whose bytes they are.
 const DIRECTORY: &str = "text";
 /// The directory of `DIRECTORY` the parts are joined into.
@@ -144,6 +140,7 @@ pub struct Writer {
     path: PathBuf,
     scratch: Arc<Scratch>,
     fields: Fields,
+    chunk_documents: u64,
     document_count: u64,
     /// Documents a checkpoint committed: a checkpoint commits again only
     /// once there are more, so the directory it synced stays as it was.
@@ -413,6 +410,7 @@ impl Writer {
             parts,
             path,
             fields,
+            chunk_documents: CHUNK_DOCUMENTS,
             document_count: 0,
             committed: 0,
             group: None,
@@ -475,6 +473,7 @@ impl Writer {
             parts,
             path,
             fields,
+            chunk_documents: CHUNK_DOCUMENTS,
             document_count: state.document_count,
             committed: state.document_count,
             group: None,
@@ -519,7 +518,7 @@ impl Writer {
 
     fn add_document(&mut self, document: TantivyDocument) -> Result<()> {
         let parts = self.parts.len() as u64;
-        let part = (self.document_count / CHUNK_DOCUMENTS % parts) as usize;
+        let part = (self.document_count / self.chunk_documents % parts) as usize;
         self.writers()?[part].add_document(document)?;
         self.document_count += 1;
         Ok(())
@@ -1815,10 +1814,12 @@ mod tests {
     #[test]
     fn documents_run_in_chunks_of_neighbours_in_one_segment() {
         let dir = TempDir::new("text-parts");
+        let chunk = 64;
         // Each address on a street of its own, so each is a document; past
         // two chunks, so a part's chunk ends inside the index.
-        let count = 2 * CHUNK_DOCUMENTS + 5;
+        let count = 2 * chunk + 5;
         let mut writer = crate::pack::Writer::create(&dir).expect("writer");
+        writer.text.chunk_documents = chunk;
         for index in 0..count {
             let record = AddressRecord {
                 building: None,
@@ -1877,7 +1878,7 @@ mod tests {
             .filter(|pair| pair[1] != pair[0] + 1)
             .count();
         assert!(
-            run_starts < (count / CHUNK_DOCUMENTS) as usize + 1,
+            run_starts < (count / chunk) as usize + 1,
             "documents run in record order but where a part's chunk ends: {run_starts}"
         );
     }
