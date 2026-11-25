@@ -10990,8 +10990,15 @@ mod tests {
         let dir = TempDir::new("search-numbers");
         let mut writer = Writer::create(&dir).expect("writer");
         let street = write_numbers(&mut writer);
+        let scratch = std::sync::Arc::clone(writer.scratch());
         let (mut pack, _) = writer.seal().expect("seal");
-        crate::structured::add_to(&mut pack).expect("structured index");
+        crate::structured::add_to(
+            &mut pack,
+            &scratch,
+            &crate::memory::Budget::unlimited(),
+            usize::MAX,
+        )
+        .expect("structured index");
         crate::ids::add_to(&mut pack).expect("ids");
         let ranges = crate::tiger::encode(vec![crate::tiger::Range {
             street,

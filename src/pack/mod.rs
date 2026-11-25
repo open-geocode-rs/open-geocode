@@ -18,7 +18,7 @@ use crate::{
     enclosing::AreaTags,
     extsort::Scratch,
     labels,
-    memory::Budget,
+    memory::{Budget, MAX_DERIVED_BUDGET_BYTES},
     parse::lattice::{
         CountryCode,
         dictionary::{Builder, RecordNames},
@@ -449,6 +449,7 @@ struct AreaZones {
 #[derive(Debug)]
 pub struct Writer {
     scratch: Arc<Scratch>,
+    memory: Arc<Budget>,
     records: records::Writer,
     contexts: TupleWriter,
     text: text_index::Writer,
@@ -582,6 +583,7 @@ impl Writer {
             )?,
             spatial: spatial_index::Writer::new(&scratch)?,
             scratch,
+            memory: Arc::clone(&options.memory),
             generation,
             layer_counts: BTreeMap::new(),
             context_names: Arc::default(),
@@ -863,8 +865,10 @@ impl Writer {
     }
 
     pub fn finish(self) -> Result<Manifest> {
+        let scratch = Arc::clone(&self.scratch);
+        let memory = Arc::clone(&self.memory);
         let (mut sealed, _) = self.seal()?;
-        crate::structured::add_to(&mut sealed)?;
+        crate::structured::add_to(&mut sealed, &scratch, &memory, MAX_DERIVED_BUDGET_BYTES)?;
         crate::ids::add_to(&mut sealed)?;
         sealed.publish()
     }

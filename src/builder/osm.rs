@@ -2042,7 +2042,7 @@ impl<'a> Run<'a> {
         let parser_training_ms = phase.elapsed().as_millis();
         self.progress.start(BuildStage::StructuredIndex, None)?;
         let structured = Instant::now();
-        crate::structured::add_to(&mut sealed)?;
+        crate::structured::add_to(&mut sealed, &scratch, &self.memory, self.budget)?;
         crate::ids::add_to(&mut sealed)?;
         if self.options.tiger {
             let counties = tiger::counties_for_pack(&sealed.path(), &self.options.pack)?;
@@ -5919,9 +5919,33 @@ mod tests {
         assert_eq!(in_memory.accepted, spilled.accepted);
         assert_eq!(in_memory.rejected, spilled.rejected);
         assert_eq!(in_memory.triage, spilled.triage);
+        let structured = spilled.stages.last().expect("structured index stage");
+        assert_eq!(structured.stage, BuildStage::StructuredIndex.description());
+        assert!(
+            structured
+                .spills
+                .get("structured-keys")
+                .is_some_and(|spill| spill.written_bytes > 0),
+            "{:?}",
+            structured.spills
+        );
 
         let memory = Reader::open(dir.join("memory")).expect("memory pack");
         let spilled = Reader::open(dir.join("spilled")).expect("spilled pack");
+        for (section, _) in crate::structured::SECTIONS {
+            // The meta names the text index's segments, whose ids are random.
+            let section_of = |pack: &Reader| {
+                let bytes = pack.container().raw_section(section).expect(section);
+                if section != "streets/meta" {
+                    return bytes.as_slice().to_vec();
+                }
+                let mut meta: serde_json::Value =
+                    serde_json::from_slice(bytes.as_slice()).expect("meta");
+                meta["segments"].take();
+                meta.to_string().into_bytes()
+            };
+            assert_eq!(section_of(&memory), section_of(&spilled), "{section}");
+        }
         assert_eq!(
             memory.manifest().record_count,
             spilled.manifest().record_count
