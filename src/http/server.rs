@@ -2133,10 +2133,6 @@ pub(crate) mod router_tests {
         writer.finish().expect("finish");
     }
 
-    pub(crate) fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("open-geocode-http-{name}-{}", std::process::id()))
-    }
-
     fn write_pack(dir: &Path) {
         let _ = std::fs::remove_dir_all(dir);
         let mut writer = Writer::create(dir).expect("writer");
@@ -2368,8 +2364,9 @@ pub(crate) mod router_tests {
     #[tokio::test]
     async fn health_endpoints_reflect_readiness() {
         let jobs = TempDir::new("health");
-        let demo = temp_path("health-demo");
-        let no_basemap = temp_path("health-no-basemap");
+        let missing = TempDir::new("health-missing");
+        let demo = missing.join("demo");
+        let no_basemap = missing.join("basemap.pmtiles");
 
         let router = build_router(
             king_state(&jobs, Limits::DEFAULT),
@@ -2470,7 +2467,8 @@ pub(crate) mod router_tests {
         // deployment-layer concern, ADR 0017 Decision 35a). The bare binary hands
         // back exactly what was asked for.
         let jobs = TempDir::new("basemap");
-        let demo = temp_path("basemap-demo");
+        let missing = TempDir::new("basemap-missing");
+        let demo = missing.join("demo");
         let files = TempDir::new("basemap-file");
         let basemap = files.join("basemap.pmtiles");
         std::fs::write(&basemap, vec![0u8; 600_000]).expect("write basemap");
@@ -2591,8 +2589,9 @@ pub(crate) mod router_tests {
     #[tokio::test]
     async fn user_errors_are_not_logged() {
         let jobs = TempDir::new("user-errors");
-        let demo = temp_path("user-errors-demo");
-        let no_basemap = temp_path("user-errors-no-basemap");
+        let missing = TempDir::new("user-errors-missing");
+        let demo = missing.join("demo");
+        let no_basemap = missing.join("basemap.pmtiles");
         let log = ErrorLog::capture();
         let mut state = king_state(&jobs, Limits::DEFAULT);
         state.error_log = log.clone();
