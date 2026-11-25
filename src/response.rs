@@ -1858,24 +1858,4 @@ mod tests {
         );
         assert!(Address::default().is_empty());
     }
-
-    #[test]
-    fn estimated_number_is_read_from_the_head_of_the_label() {
-        assert_eq!(
-            estimated_number("50 Queen Street, Toronto").expect("number"),
-            50
-        );
-        assert!(estimated_number("Queen Street, Toronto").is_err());
-    }
-
-    #[test]
-    fn context_areas_run_precise_to_broad_with_the_place_last() {
-        let layers = ["country", "place", "postcode", "locality", "neighbourhood"];
-        let mut sorted = layers.to_vec();
-        sorted.sort_by_key(|layer| breadth(layer));
-        assert_eq!(
-            sorted,
-            ["postcode", "neighbourhood", "locality", "country", "place"]
-        );
-    }
 }

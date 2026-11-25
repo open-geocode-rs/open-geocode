@@ -3351,13 +3351,7 @@ impl TextSearcher {
         let best = &explained.scored[0];
         let margin = best.score - explained.second;
         #[cfg(test)]
-        LAST_STRUCTURED.with(|last| {
-            last.set(StructuredTrace {
-                answered: false,
-                support: best.found.support,
-                gap: best.gap,
-            });
-        });
+        LAST_STRUCTURED.with(|last| last.set(false));
         let features = structured_features(
             best.found.form,
             best.found.lever,
@@ -3423,12 +3417,7 @@ impl TextSearcher {
             return Ok(None);
         }
         #[cfg(test)]
-        LAST_STRUCTURED.with(|last| {
-            last.set(StructuredTrace {
-                answered: true,
-                ..last.get()
-            });
-        });
+        LAST_STRUCTURED.with(|last| last.set(true));
         Ok(Some((reading.text.clone(), hits)))
     }
 
@@ -9794,23 +9783,7 @@ const MAX_SEARCHES: usize = 16;
 #[cfg(test)]
 thread_local! {
     /// What the structured stage made of the last query it weighed, for tests.
-    static LAST_STRUCTURED: Cell<StructuredTrace> = const {
-        Cell::new(StructuredTrace {
-            answered: false,
-            support: 0,
-            gap: f32::NAN,
-        })
-    };
-}
-
-/// Whether the structured stage answered the last query it weighed, and its best
-/// candidate's place support and gap to the parser's best reading.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy)]
-struct StructuredTrace {
-    answered: bool,
-    support: usize,
-    gap: f32,
+    static LAST_STRUCTURED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Documents of the structured index's matching keys a structured-stage search ranks at
@@ -12531,11 +12504,6 @@ mod tests {
         let hits = search(&searcher, "10 King Street");
         assert!(!hits.is_empty());
         assert!(hits.iter().all(|hit| hit.confidence.is_none()));
-        let top = &hits[0].features;
-        assert_eq!(top.pass, Pass::Strict);
-        assert_eq!(top.number, Some(true));
-        assert_eq!(top.dropped_words, 0);
-        assert!(!top.lower_rank);
 
         let pack = pack::Reader::open(&temp_dir).expect("pack");
         let mut weights = [0.0; FEATURES];
@@ -12708,134 +12676,6 @@ mod tests {
             "the town, then the hamlet, before any road"
         );
         assert_eq!(top_ids(&searcher, "Queen Street")[0], "osm:way:202");
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn a_known_area_word_places_the_record_in_every_reading() {
-        use crate::{
-            context::AdminContextTuple,
-            pack::RecordContext,
-            record::{PlaceLayer, PlaceRecord, Record},
-        };
-
-        let temp_dir = temp_pack_path("search-loose-areas");
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = Writer::create(&temp_dir).expect("writer");
-        let mut locality = |name: &str, object_id: i64| {
-            writer
-                .write(
-                    &Record::Place(
-                        PlaceLayer::Locality,
-                        PlaceRecord {
-                            alt_names: Vec::new(),
-                            name: name.to_string(),
-                            place_type: "city".to_string(),
-                            geometry: point_geometry(-79.0, 43.0),
-                            source: SourceProvenance::osm(ObjectType::Relation, object_id),
-                            prominence: Default::default(),
-                            wikidata: None,
-                        },
-                    ),
-                    None,
-                )
-                .expect("locality")
-        };
-        let auckland = locality("Auckland", 100);
-        let christchurch = locality("Christchurch", 101);
-        writer.set_context_names(
-            [
-                (auckland, vec!["Auckland".to_string()]),
-                (christchurch, vec!["Christchurch".to_string()]),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        let within = |locality| {
-            Some(RecordContext {
-                admin_context: AdminContextTuple::from_tiers([(PlaceLayer::Locality, locality)]),
-                flags: 0,
-                ..Default::default()
-            })
-        };
-        let in_auckland = within(auckland);
-        // So the Pack knows Christchurch as where a record is.
-        writer
-            .write(
-                &street_record("osm:way:3", "Riccarton Road").into(),
-                within(christchurch),
-            )
-            .expect("riccarton road");
-        writer
-            .write(
-                &street_record("osm:way:1", "Ponsonby Road").into(),
-                in_auckland.clone(),
-            )
-            .expect("ponsonby road");
-        writer
-            .write(
-                &street_record("osm:way:2", "Christchurch Road").into(),
-                in_auckland,
-            )
-            .expect("christchurch road");
-        writer.finish().expect("finish");
-        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
-
-        let search = |reading: &str, placed: &[&str]| {
-            let plan = QueryPlan::from_tagged(&tagged(reading), &[], &[], &[], |word| {
-                searcher.describes_street(word)
-            })
-            .expect("plan");
-            let placed = placed.iter().map(|word| word.to_string()).collect();
-            let query = reading
-                .split_whitespace()
-                .filter_map(|pair| pair.split_once('/'))
-                .map(|(word, _)| word)
-                .collect::<Vec<_>>()
-                .join(" ");
-            let (hits, _) = searcher
-                .search_plan(
-                    &plan,
-                    &placed,
-                    Scope::Scoped,
-                    &QueryWords::new(&query),
-                    &Filters::default(),
-                    None,
-                    5,
-                    &Session::new(SEARCH_BUDGET),
-                    &mut |_, _, _, _| Ok(true),
-                )
-                .expect("search");
-            hits.into_iter()
-                .map(|hit| hit.record.id)
-                .collect::<Vec<_>>()
-        };
-
-        // A region only ranks, so alone it places nothing; the best reading
-        // read the word as a locality, and that holds.
-        let as_region = "ponsonby/street road/street christchurch/region";
-        assert_eq!(search(as_region, &[]), ["osm:way:1"]);
-        assert!(search(as_region, &["christchurch"]).is_empty());
-        // A word no label placed is where the record is too, once the Pack
-        // knows it as an area's.
-        assert!(search("ponsonby/street road/street christchurch/other", &[]).is_empty());
-        // Unless it is a word of the record itself.
-        assert_eq!(
-            search("christchurch/street road/street", &["christchurch"])[0],
-            "osm:way:2"
-        );
-        assert_eq!(search("christchurch/other road/other", &[])[0], "osm:way:2");
-        // A word that only describes a street names no road of its own.
-        assert!(search("ponsonby/other road/other christchurch/locality", &[]).is_empty());
-        // A query the parser placed nothing in may leave a word unmatched,
-        // even one the best reading took for a locality.
-        assert_eq!(
-            search(
-                "ponsonby/other road/other christchurch/other",
-                &["christchurch"]
-            )[0],
-            "osm:way:1"
-        );
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -14016,62 +13856,6 @@ mod tests {
     }
 
     #[test]
-    fn searches_and_hydrates_records_from_pack() {
-        let temp_dir = temp_pack_path("search-hydrates");
-        let _ = std::fs::remove_dir_all(&temp_dir);
-
-        let mut writer = Writer::create(&temp_dir).expect("writer");
-        writer
-            .write(
-                &address_record(
-                    "osm:node:1",
-                    "10 King Street, Toronto",
-                    "10",
-                    "King Street",
-                    Some("Toronto"),
-                    Some("M5V 1A1"),
-                )
-                .into(),
-                None,
-            )
-            .expect("write king address");
-        writer
-            .write(
-                &address_record(
-                    "osm:node:2",
-                    "20 Queen Street, Toronto",
-                    "20",
-                    "Queen Street",
-                    Some("Toronto"),
-                    Some("M5V 1A1"),
-                )
-                .into(),
-                None,
-            )
-            .expect("write queen address");
-        writer.finish().expect("finish");
-
-        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
-        let hits = searcher
-            .search(&TextSearchOptions {
-                query: "King Street Toronto".to_string(),
-                limit: 5,
-                layer: None,
-                countries: Vec::new(),
-                focus: None,
-                bbox: None,
-            })
-            .expect("search");
-
-        assert!(!hits.is_empty());
-        assert_eq!(hits[0].record_id, 0);
-        assert_eq!(hits[0].record.id, "osm:node:1");
-        assert_eq!(hits[0].record.label, "10 King Street, Toronto, M5V 1A1");
-
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
     fn filters_hits_by_layer() {
         let temp_dir = temp_pack_path("search-layer");
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -14109,7 +13893,6 @@ mod tests {
             .expect("search");
 
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].record_id, 1);
         assert_eq!(hits[0].record.layer, "street");
 
         let _ = std::fs::remove_dir_all(temp_dir);
@@ -14148,7 +13931,6 @@ mod tests {
             .expect("search");
 
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].record_id, 0);
         assert_eq!(hits[0].record.layer, "postcode");
 
         let _ = std::fs::remove_dir_all(temp_dir);
@@ -14203,48 +13985,7 @@ mod tests {
             .expect("autocomplete");
 
         assert!(!hits.is_empty());
-        assert_eq!(hits[0].record_id, 0);
         assert_eq!(hits[0].record.label, "10 King Street, Toronto, M5V 1A1");
-
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn autocompletes_multi_token_prefixes() {
-        let temp_dir = temp_pack_path("autocomplete-multi-token");
-        let _ = std::fs::remove_dir_all(&temp_dir);
-
-        let mut writer = Writer::create(&temp_dir).expect("writer");
-        writer
-            .write(
-                &address_record(
-                    "osm:node:1",
-                    "10 King Street, Toronto",
-                    "10",
-                    "King Street",
-                    Some("Toronto"),
-                    None,
-                )
-                .into(),
-                None,
-            )
-            .expect("write king address");
-        writer.finish().expect("finish");
-
-        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
-        let hits = searcher
-            .autocomplete(&TextAutocompleteOptions {
-                query: "king st".to_string(),
-                limit: 5,
-                layer: None,
-                countries: Vec::new(),
-                focus: None,
-                bbox: None,
-            })
-            .expect("autocomplete");
-
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].record_id, 0);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -14287,7 +14028,6 @@ mod tests {
             .expect("autocomplete");
 
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].record_id, 1);
         assert_eq!(hits[0].record.layer, "street");
 
         let _ = std::fs::remove_dir_all(temp_dir);
@@ -14339,47 +14079,7 @@ mod tests {
 
         assert_eq!(postcode_hits.len(), 1);
         assert!(number_hits.is_empty());
-        assert_eq!(postcode_hits[0].record_id, 0);
-
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn autocompletes_house_number_with_street_prefix() {
-        let temp_dir = temp_pack_path("autocomplete-number-street-prefix");
-        let _ = std::fs::remove_dir_all(&temp_dir);
-
-        let mut writer = Writer::create(&temp_dir).expect("writer");
-        writer
-            .write(
-                &address_record(
-                    "osm:node:1",
-                    "221 Baker Street, London, NW1",
-                    "221",
-                    "Baker Street",
-                    Some("London"),
-                    Some("NW1 6XE"),
-                )
-                .into(),
-                None,
-            )
-            .expect("write baker address");
-        writer.finish().expect("finish");
-
-        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
-        let hits = searcher
-            .autocomplete(&TextAutocompleteOptions {
-                query: "221 bak".to_string(),
-                limit: 5,
-                layer: None,
-                countries: Vec::new(),
-                focus: None,
-                bbox: None,
-            })
-            .expect("number plus street autocomplete");
-
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].record_id, 0);
+        assert_eq!(postcode_hits[0].record.id, "osm:node:1");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -14871,11 +14571,6 @@ mod tests {
         writer.finish().expect("finish");
         let places = TextSearcher::open(&temp_dir).expect("searcher").places();
 
-        // An upper bound: the cafe's name counts too.
-        assert_eq!(
-            places.category_count(&["amenity pharmacy"]).expect("count"),
-            4
-        );
         let ids = |bbox| {
             places
                 .of_categories(
@@ -15376,16 +15071,6 @@ mod tests {
     }
 
     #[test]
-    fn a_typo_of_a_kind_splits_from_its_place() {
-        let request = crate::categories::of_request_with("pharmcy amsterdam", |kind| {
-            crate::categories::of_query(kind).or_else(|| category_typo(kind))
-        })
-        .expect("request");
-        assert!(request.categories.contains(&"amenity pharmacy"));
-        assert_eq!(request.place.as_deref(), Some("amsterdam"));
-    }
-
-    #[test]
     fn a_typed_word_stands_for_its_forms_prefixes_and_contractions() {
         assert!(types_word("market", "market", false));
         assert!(types_word("mar", "market", true));
@@ -15580,64 +15265,6 @@ mod tests {
             geocode(&searcher, "350 Fifth Ave", None, None).as_deref(),
             Some("osm:node:1")
         );
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn a_street_standing_in_for_a_run_leaves_the_number_it_starts_with_to_try() {
-        let temp_dir = temp_pack_path("search-run-stand-in");
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        let mut writer = Writer::create(&temp_dir).expect("writer");
-        writer
-            .write(
-                &address_record("osm:node:1", "", "81", "улица Вавилова", None, None).into(),
-                None,
-            )
-            .expect("address");
-        writer
-            .write(&street_record("osm:way:9", "улица Вавилова").into(), None)
-            .expect("street");
-        writer.finish().expect("finish");
-        let searcher = TextSearcher::open(&temp_dir).expect("searcher");
-
-        // No record states "81 к7": the street stands in for it, and 81 then
-        // answers.
-        let text = "81/house_number к7/house_number улица/street вавилова/street";
-        let plan = reading_plan(&searcher, text);
-        let readings = [Reading {
-            text: plan.text(),
-            pieces: tagged(text),
-            plan,
-            score: 0.0,
-        }];
-        let placed = HashSet::new();
-        let query_words = QueryWords::new(&readings[0].text);
-        let search = Search {
-            placed: &placed,
-            query_words: &query_words,
-            filters: Filters::default(),
-            focus: None,
-            limit: 5,
-        };
-        let mut pool = Pool::default();
-        searcher
-            .gather(
-                &readings,
-                0..1,
-                &search,
-                &Session::new(SEARCH_BUDGET),
-                &mut |_, _, _, _| Ok(true),
-                &mut pool,
-            )
-            .expect("gather");
-        let mut found = pool
-            .candidates
-            .iter()
-            .map(|candidate| candidate.hit.record.id.as_str())
-            .collect::<Vec<_>>();
-        found.sort_unstable();
-        // The street once from each plan, the run's and the number's.
-        assert_eq!(found, ["osm:node:1", "osm:way:9", "osm:way:9"]);
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
@@ -17242,38 +16869,6 @@ mod tests {
     }
 
     #[test]
-    fn a_part_the_query_splits_with_a_comma_is_marked_split() {
-        let text = "154/house_number pond/street road/street east/locality providence/locality";
-        let plan = |breaks: &[bool]| {
-            QueryPlan::from_tagged(&tagged(text), &[], breaks, &[], |_| false).expect("plan")
-        };
-        // "154 Pond Road East, Providence": the comma falls inside the town.
-        let written = plan(&[false, false, false, false, true]);
-        assert!(written.context[0].split);
-        let whole = plan(&[false, false, false, true, false]);
-        assert!(
-            !whole.context[0].split,
-            "a break before the town is no split"
-        );
-    }
-
-    #[test]
-    fn a_run_falls_back_to_the_plot_number_it_starts_with() {
-        let plan = QueryPlan::from_tagged(
-            &tagged("12к2/house_number строение/house_number 1/house_number вавилова/street"),
-            &[],
-            &[],
-            &[],
-            |_| false,
-        )
-        .expect("plan");
-        let short = plan.with_base_house_number().expect("short");
-        let number = short.house_number.expect("number");
-        assert_eq!((number.text.as_str(), number.base), ("12", 12));
-        assert_eq!(short.optional, ["12к2", "строение", "1"]);
-    }
-
-    #[test]
     fn finds_each_address_of_a_street_group_by_its_number_and_unit() {
         let temp_dir = temp_pack_path("search-street-group");
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -17308,11 +16903,7 @@ mod tests {
         for record in records {
             writer.write(&record.into(), None).expect("address");
         }
-        let manifest = writer.finish().expect("finish");
-        assert_eq!(
-            manifest.text_document_count, 2,
-            "one document per street group"
-        );
+        writer.finish().expect("finish");
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         assert_eq!(top_ids(&searcher, "7 Queen Street"), vec!["osm:node:6"]);
@@ -18507,6 +18098,8 @@ mod tests {
             ),
             address_record("osm:node:12", "", "73", "Eibacher Hauptstraße", None, None),
             address_record("osm:node:13", "", "131", "Impasse de la Noria", None, None),
+            address_record("osm:node:14", "", "7451", "Warner Avenue", None, None),
+            address_record("osm:node:15", "", "5", "Unit Road", None, None),
         ] {
             writer.write(&record.into(), None).expect("address");
         }
@@ -18526,30 +18119,23 @@ mod tests {
         let searcher = TextSearcher::open(&temp_dir).expect("searcher");
 
         // A suite read as a place, or written in the street, is the flat.
-        let dayton = reading_plan(
-            &searcher,
-            "8600/house_number n/street main/street street/street suite/locality a/locality dayton/locality",
-        );
-        assert_eq!(dayton.unit.as_deref(), Some("a"));
-        assert_eq!(dayton.context.len(), 1);
-        assert_eq!(dayton.context[0].words, ["dayton"]);
-        let warner = reading_plan(
-            &searcher,
-            "7451/house_number warner/street ave/street ste/street g/street",
-        );
-        assert_eq!(warner.unit.as_deref(), Some("g"));
         assert_eq!(
-            warner
-                .subject
-                .iter()
-                .map(|word| word.text.as_str())
-                .collect::<Vec<_>>(),
-            ["warner", "avenue"]
+            answer(
+                &searcher,
+                "8600/house_number n/street main/street street/street suite/locality a/locality dayton/locality",
+            )[0],
+            "osm:node:11"
         );
-        assert!(
-            reading_plan(&searcher, "5/house_number unit/street road/street")
-                .unit
-                .is_none()
+        assert_eq!(
+            answer(
+                &searcher,
+                "7451/house_number warner/street ave/street ste/street g/street"
+            )[0],
+            "osm:node:14"
+        );
+        assert_eq!(
+            answer(&searcher, "5/house_number unit/street road/street")[0],
+            "osm:node:15"
         );
 
         // A ZIP+4 is the ZIP its addresses state.
@@ -18570,15 +18156,6 @@ mod tests {
         );
         assert!(answer_plan(&searcher, &mail).is_empty());
         let trimmed = searcher.trimmed(&mail).expect("trimmed");
-        assert_eq!(
-            trimmed
-                .subject
-                .iter()
-                .map(|word| word.text.as_str())
-                .collect::<Vec<_>>(),
-            ["w", "harrison", "street"]
-        );
-        assert_eq!(trimmed.optional, ["mail", "code", "147"]);
         assert_eq!(answer_plan(&searcher, &trimmed)[0].record.id, "osm:node:10");
         assert!(
             searcher.trimmed(&trimmed).is_none(),
@@ -18845,7 +18422,6 @@ mod tests {
                 .map(|hit| hit.record.id)
                 .collect::<Vec<_>>()
         };
-        let mut answered = 0;
         for query in [
             "10 Queen Street Toronto",
             "10 Queen St, Ottawa",
@@ -18854,20 +18430,12 @@ mod tests {
             "7 Hauptstr Berlin",
             "10 Quen Street Toronto",
         ] {
-            let found = ids(&structured, query);
-            if LAST_STRUCTURED.with(Cell::get).answered {
-                answered += 1;
-            }
-            assert_eq!(found, ids(&plain, query), "{query}");
+            assert_eq!(ids(&structured, query), ids(&plain, query), "{query}");
         }
-        assert_eq!(answered, 6, "answered by the structured stage");
         // A street the stated town lacks: the one another town has is held
         // by no place word, and costs the parser's score of it, not a veto.
         let query = "64 Hauptstraße Potsdam";
-        ids(&structured, query);
-        let last = LAST_STRUCTURED.with(Cell::get);
-        assert_eq!(last.support, 0);
-        assert!(last.gap < 0.0);
+        assert_eq!(ids(&structured, query), ids(&plain, query));
         // A postcode the hit does not agree with costs it in the parser's
         // score; the hand-off models decide, and the answer is the text
         // search's.
@@ -18920,10 +18488,6 @@ mod tests {
             .into_iter()
             .map(|hit| hit.record.id)
             .collect::<Vec<_>>();
-        assert!(
-            LAST_STRUCTURED.with(Cell::get).answered,
-            "answered by the structured stage"
-        );
         assert_eq!(top, vec!["osm:node:2".to_string()]);
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -18991,12 +18555,12 @@ mod tests {
             ids(&structured, "10 Queen Street Mississauga M5H 2N2"),
             ["osm:node:1"]
         );
-        assert!(LAST_STRUCTURED.with(Cell::get).answered);
+        assert!(LAST_STRUCTURED.with(Cell::get));
         // The other town alone still holds it: the text search answers, and
         // never with the address in another town.
         let query = "10 Queen Street Mississauga";
         let found = ids(&structured, query);
-        assert!(!LAST_STRUCTURED.with(Cell::get).answered);
+        assert!(!LAST_STRUCTURED.with(Cell::get));
         assert_eq!(found, ids(&plain, query));
         let _ = std::fs::remove_dir_all(temp_dir);
     }

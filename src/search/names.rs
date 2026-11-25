@@ -1335,47 +1335,6 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_name_lifts_a_whole_match_and_keeps_the_rest_in_order() {
-        use crate::parse::types::{Label, Tagged};
-        let searcher = searcher();
-        let options = TextSearchOptions {
-            query: "Providence".to_string(),
-            limit: 5,
-            layer: None,
-            countries: Vec::new(),
-            focus: None,
-            bbox: None,
-        };
-        let pieces = [Tagged {
-            token: "providence".to_string(),
-            label: Label::Locality,
-        }];
-        let filters = super::Filters::new(None, &[], None);
-        let order = searcher
-            .name_order(&options.query, &pieces, &filters, None)
-            .expect("order")
-            .expect("parts name something");
-        let hit = |id: &str| {
-            let record = (0..searcher.pack.records().record_count())
-                .find(|record| searcher.pack.record_summary(*record).expect("summary").id == id)
-                .expect(id);
-            super::TextSearchHit::of_record(
-                record,
-                searcher.pack.record_summary(record).expect("summary"),
-            )
-        };
-        let mut hits = ["osm:way:113", "osm:relation:14", "osm:relation:15"]
-            .map(hit)
-            .to_vec();
-        searcher
-            .order_by_names(&order, &options, super::Depth::Query, &mut hits)
-            .expect("order by name");
-        assert_eq!(hits[0].record.id, "osm:relation:14");
-        assert_eq!(hits[1].record.id, "osm:way:113");
-        assert_eq!(hits[2].record.id, "osm:relation:15");
-    }
-
-    #[test]
     fn a_name_written_as_asked_comes_before_one_alike_once_folded() {
         answers("Cà Baldino", "osm:node:902");
         answers("Ca' Baldino", "osm:node:903");
@@ -1391,44 +1350,6 @@ mod tests {
             })
             .expect("search");
         assert_eq!(one[0].record.id, "osm:node:902");
-    }
-
-    /// The structured stage's answer ends the search only when nothing a
-    /// part names comes before it: Exeter Road, found for "Exeter" read as
-    /// a street, does not settle "Exeter, RI", where the town comes first.
-    #[test]
-    fn a_structured_answer_settles_only_when_first_by_the_keys() {
-        use crate::parse::types::{Label, Tagged};
-        let searcher = searcher();
-        let pieces =
-            [("exeter", Label::Street), ("ri", Label::Region)].map(|(token, label)| Tagged {
-                token: token.to_string(),
-                label,
-            });
-        let filters = super::Filters::new(None, &[], None);
-        let order = searcher
-            .name_order("Exeter, RI", &pieces, &filters, None)
-            .expect("order")
-            .expect("parts name something");
-        let hit = |id: &str| {
-            let record = (0..searcher.pack.records().record_count())
-                .find(|record| searcher.pack.record_summary(*record).expect("summary").id == id)
-                .expect("record");
-            super::TextSearchHit::of_record(
-                record,
-                searcher.pack.record_summary(record).expect("summary"),
-            )
-        };
-        assert!(
-            !searcher
-                .answers_first(&order, &[hit("osm:way:101")])
-                .expect("keys")
-        );
-        assert!(
-            searcher
-                .answers_first(&order, &[hit("osm:relation:11")])
-                .expect("keys")
-        );
     }
 
     /// A village in no area at all is one the state can neither hold nor

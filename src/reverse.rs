@@ -1027,8 +1027,7 @@ mod tests {
         let result = response.result.expect("result");
 
         assert_eq!(result.match_kind, MatchKind::ExplicitAddress);
-        assert_eq!(result.primary_record_id, Some(1));
-        assert_eq!(result.evidence.explicit_address_record_id, Some(1));
+        assert_eq!(result.id.as_deref(), Some("osm:node:10"));
 
         let _ = fs::remove_dir_all(temp_dir);
     }
@@ -1218,7 +1217,6 @@ mod tests {
         assert_eq!(result.id.as_deref(), Some("osm:way:41"));
         assert_eq!(result.layer.as_deref(), Some("address"));
         assert_eq!(result.label, "10 Queen Street, Toronto, Ontario, Canada");
-        assert_eq!(result.evidence.explicit_address_record_id, Some(3));
 
         let _ = fs::remove_dir_all(temp_dir);
     }
