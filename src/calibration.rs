@@ -558,8 +558,7 @@ mod tests {
 
     #[test]
     fn fits_a_model_the_pack_then_rates_answers_with() {
-        let dir =
-            std::env::temp_dir().join(format!("open-geocode-calibration-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_support::TempDir::new("calibration");
         let mut writer = crate::pack::Writer::create(dir.join("pack")).expect("writer");
         let mut lines = vec!["LON,LAT,NUMBER,STREET,CITY,POSTCODE".to_string()];
         for (index, street) in ["King Street West", "Queen Street East"].iter().enumerate() {
@@ -620,7 +619,6 @@ mod tests {
             hit.confidence
                 .is_some_and(|confidence| (0.0..=1.0).contains(&confidence))
         }));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -963,7 +963,7 @@ fn query_fields(query_text: &str, pieces: &[Tagged]) -> Vec<Vec<(Vec<String>, La
 mod tests {
     use std::{
         path::{Path, PathBuf},
-        sync::OnceLock,
+        sync::{LazyLock, OnceLock},
     };
 
     use crate::{
@@ -976,6 +976,7 @@ mod tests {
         },
         calibration,
         search::{TextSearchOptions, TextSearcher},
+        test_support::TempDir,
     };
 
     /// A word no record of the fixture is named by.
@@ -1129,23 +1130,22 @@ mod tests {
         vec![nodes, ways, relations]
     }
 
-    /// The fixture Pack, built once.
-    fn fixture() -> &'static Path {
-        static PACK: OnceLock<PathBuf> = OnceLock::new();
-        PACK.get_or_init(|| {
-            let dir =
-                std::env::temp_dir().join(format!("open-geocode-names-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).expect("dir");
-            let input = dir.join("fixture.osm.pbf");
-            write_pbf(&input, &elements());
-            build_osm_pack(&BuildOsmOptions {
-                inputs: vec![input],
-                pack: dir.join("pack"),
-                ..BuildOsmOptions::default()
-            })
-            .expect("build");
-            dir.join("pack")
+    static FIXTURE: LazyLock<TempDir> = LazyLock::new(|| {
+        let dir = TempDir::new("names");
+        let input = dir.join("fixture.osm.pbf");
+        write_pbf(&input, &elements());
+        build_osm_pack(&BuildOsmOptions {
+            inputs: vec![input],
+            pack: dir.join("pack"),
+            ..BuildOsmOptions::default()
         })
+        .expect("build");
+        dir
+    });
+
+    /// The fixture Pack, built once.
+    fn fixture() -> PathBuf {
+        FIXTURE.join("pack")
     }
 
     fn searcher() -> &'static TextSearcher {
@@ -1403,13 +1403,25 @@ mod tests {
             .collect()
     }
 
+    fn sweep<T: Sync>(cases: &[T], check: impl Fn(&T) -> Option<String> + Sync) -> Vec<String> {
+        let threads = std::thread::available_parallelism().map_or(4, usize::from);
+        std::thread::scope(|scope| {
+            cases
+                .chunks(cases.len().div_ceil(threads).max(1))
+                .map(|chunk| scope.spawn(|| chunk.iter().filter_map(&check).collect::<Vec<_>>()))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("thread"))
+                .collect()
+        })
+    }
+
     /// P1 and P2: where a record lies, and a part that names nothing, never
     /// change which record answers.
     #[test]
     fn where_a_record_lies_and_a_part_naming_nothing_never_change_the_answer() {
         let searcher = searcher();
-        let mut wrong = Vec::new();
-        let mut asked = 0;
+        let mut cases = Vec::new();
         for (record, id, name) in areas_and_streets(searcher) {
             // The parser reads an isolated postcode as a house number in this fixture.
             if record_layer(searcher, &id) == "postcode" {
@@ -1426,16 +1438,16 @@ mod tests {
                 }
             }
             for query in queries {
-                for query in [query.clone(), format!("{query}, {NOTHING}")] {
-                    asked += 1;
-                    let answer = first(searcher, &query);
-                    if answer.as_deref() != Some(id.as_str()) {
-                        wrong.push(format!("{query:?} answers {answer:?}, not {id}"));
-                    }
-                }
+                cases.push((format!("{query}, {NOTHING}"), id.clone()));
+                cases.push((query, id.clone()));
             }
         }
-        assert!(asked > 50, "{asked} queries");
+        assert!(cases.len() > 50, "{} queries", cases.len());
+        let wrong = sweep(&cases, |(query, id)| {
+            let answer = first(searcher, query);
+            (answer.as_deref() != Some(id.as_str()))
+                .then(|| format!("{query:?} answers {answer:?}, not {id}"))
+        });
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
@@ -1444,31 +1456,33 @@ mod tests {
     #[test]
     fn a_street_with_its_town_keeps_its_answer_with_the_areas_holding_the_town() {
         let searcher = searcher();
-        let mut wrong = Vec::new();
-        for (record, id, name) in areas_and_streets(searcher) {
-            if record_layer(searcher, &id) != "street" {
-                continue;
-            }
-            let holding = searcher.areas_holding(record).expect("areas");
-            let Some(town) = holding.iter().find(|area| {
+        let streets = areas_and_streets(searcher)
+            .into_iter()
+            .filter(|(_, id, _)| record_layer(searcher, id) == "street")
+            .collect::<Vec<_>>();
+        let wrong = sweep(&streets, |(record, id, name)| {
+            let holding = searcher.areas_holding(*record).expect("areas");
+            let town = holding.iter().find(|area| {
                 searcher.pack.record_summary(**area).expect("town").layer == "locality"
-            }) else {
-                continue;
-            };
+            })?;
             let town_name = searcher.pack.record_summary(*town).expect("town").name;
             let with_town = format!("{name}, {town_name}");
             if first(searcher, &with_town).as_deref() != Some(id.as_str()) {
-                wrong.push(format!("{with_town:?} does not answer {id}"));
-                continue;
+                return Some(format!("{with_town:?} does not answer {id}"));
             }
-            for area in searcher.areas_holding(*town).expect("areas") {
-                let area_name = searcher.pack.record_summary(area).expect("area").name;
-                let query = format!("{with_town}, {area_name}");
-                if first(searcher, &query).as_deref() != Some(id.as_str()) {
-                    wrong.push(format!("{query:?} does not answer {id}"));
-                }
-            }
-        }
+            let wrong = searcher
+                .areas_holding(*town)
+                .expect("areas")
+                .into_iter()
+                .filter_map(|area| {
+                    let area_name = searcher.pack.record_summary(area).expect("area").name;
+                    let query = format!("{with_town}, {area_name}");
+                    (first(searcher, &query).as_deref() != Some(id.as_str()))
+                        .then(|| format!("{query:?} does not answer {id}"))
+                })
+                .collect::<Vec<_>>();
+            (!wrong.is_empty()).then(|| wrong.join("\n"))
+        });
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
@@ -1495,37 +1509,45 @@ mod tests {
         path
     }
 
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("dir");
+        for entry in std::fs::read_dir(from).expect("read dir") {
+            let entry = entry.expect("entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copy");
+            }
+        }
+    }
+
+    static CALIBRATED: LazyLock<TempDir> = LazyLock::new(|| {
+        let dir = TempDir::new("names-cal");
+        let pack = dir.join("pack");
+        copy_dir(&fixture(), &pack);
+        calibration::run(&calibration::Options {
+            pack,
+            files: vec![AddressFile {
+                dataset: "rows".to_string(),
+                path: rows(&dir),
+                entry: None,
+                area: None,
+            }],
+            rows: 5,
+            variants: 3,
+            seed: 1,
+            radius_m: 100.0,
+        })
+        .expect("calibrate");
+        dir
+    });
+
     /// The fixture calibrated: a ranker and a confidence model beside it.
     fn calibrated() -> &'static TextSearcher {
-        static CALIBRATED: OnceLock<TextSearcher> = OnceLock::new();
-        CALIBRATED.get_or_init(|| {
-            let dir = std::env::temp_dir()
-                .join(format!("open-geocode-names-cal-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).expect("dir");
-            let input = dir.join("fixture.osm.pbf");
-            write_pbf(&input, &elements());
-            let pack = dir.join("pack");
-            build_osm_pack(&BuildOsmOptions {
-                inputs: vec![input],
-                pack: pack.clone(),
-                ..BuildOsmOptions::default()
-            })
-            .expect("build");
-            calibration::run(&calibration::Options {
-                pack: pack.clone(),
-                files: vec![AddressFile {
-                    dataset: "rows".to_string(),
-                    path: rows(&dir),
-                    entry: None,
-                    area: None,
-                }],
-                rows: 5,
-                variants: 3,
-                seed: 1,
-                radius_m: 100.0,
-            })
-            .expect("calibrate");
-            let searcher = TextSearcher::open(&pack).expect("searcher");
+        static SEARCHER: OnceLock<TextSearcher> = OnceLock::new();
+        SEARCHER.get_or_init(|| {
+            let searcher = TextSearcher::open(CALIBRATED.join("pack")).expect("searcher");
             assert!(searcher.confidence_model().is_some(), "calibrated");
             searcher
         })
@@ -1536,39 +1558,35 @@ mod tests {
     #[test]
     fn calibration_never_changes_an_answer_to_a_query_with_no_number() {
         let (plain, calibrated) = (searcher(), calibrated());
-        let mut wrong = Vec::new();
+        let mut queries = Vec::new();
         for (_, id, name) in areas_and_streets(plain) {
             // The postcode sweep uses a Pack that parses isolated postcodes as postcodes.
             if record_layer(plain, &id) == "postcode" {
                 continue;
             }
-            for query in [
+            queries.extend([
                 name.clone(),
                 format!("{name}, RI"),
                 format!("{name} RI"),
                 format!("{name}, USA"),
-            ] {
-                let ids = |searcher: &TextSearcher| {
-                    ask(searcher, &query)
-                        .into_iter()
-                        .map(|hit| hit.record.id)
-                        .collect::<Vec<_>>()
-                };
-                if ids(plain) != ids(calibrated) {
-                    wrong.push(format!(
-                        "{query:?} {:?} != {:?}",
-                        ids(plain),
-                        ids(calibrated)
-                    ));
-                }
-                if ask(calibrated, &query)
-                    .iter()
-                    .any(|hit| hit.confidence.is_some())
-                {
-                    wrong.push(format!("{query:?} carries a confidence"));
-                }
-            }
+            ]);
         }
+        let ids = |hits: &[super::TextSearchHit]| {
+            hits.iter()
+                .map(|hit| hit.record.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let wrong = sweep(&queries, |query| {
+            let rated = ask(calibrated, query);
+            let (plain_ids, rated_ids) = (ids(&ask(plain, query)), ids(&rated));
+            if plain_ids != rated_ids {
+                Some(format!("{query:?} {plain_ids:?} != {rated_ids:?}"))
+            } else if rated.iter().any(|hit| hit.confidence.is_some()) {
+                Some(format!("{query:?} carries a confidence"))
+            } else {
+                None
+            }
+        });
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 

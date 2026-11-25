@@ -370,6 +370,8 @@ impl Scorer for PhrasePrefixScorer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use super::*;
     use tantivy::{
         DocAddress, Index, IndexWriter, Searcher, TantivyDocument,
@@ -383,6 +385,8 @@ mod tests {
 
     /// Two segments. The first holds 1,200 completions of "la" after a
     /// common head, so the cap cuts it. The second holds a cut one again.
+    static INDEX: LazyLock<(Searcher, Field)> = LazyLock::new(index);
+
     fn index() -> (Searcher, Field) {
         let mut schema = Schema::builder();
         let text = schema.add_text_field("text", TEXT);
@@ -445,7 +449,8 @@ mod tests {
 
     #[test]
     fn matches_and_scores_as_tantivy_phrase_prefix() {
-        let (searcher, text) = index();
+        let (searcher, text) = &*INDEX;
+        let text = *text;
         // The 1,024 cap keeps la0000 to la1022 in the first segment.
         let cases: [(&[&str], usize); 6] = [
             (&["rue", "de", "la"], 1_028),
@@ -463,9 +468,9 @@ mod tests {
         };
         for (words, count) in cases {
             let (theirs, ours) = queries(text, words);
-            let expected = scored(&searcher, theirs.as_ref());
+            let expected = scored(searcher, theirs.as_ref());
             assert_eq!(expected.len(), count, "{words:?}");
-            assert_eq!(scored(&searcher, ours.as_ref()), expected, "{words:?}");
+            assert_eq!(scored(searcher, ours.as_ref()), expected, "{words:?}");
             assert_eq!(
                 searcher.search(ours.as_ref(), &DocSetCollector).unwrap(),
                 searcher.search(theirs.as_ref(), &DocSetCollector).unwrap(),
@@ -473,8 +478,8 @@ mod tests {
             );
             let boosted = |query: &dyn Query| BoostQuery::new(query.box_clone(), 2.5);
             assert_eq!(
-                scored(&searcher, &boosted(ours.as_ref())),
-                scored(&searcher, &boosted(theirs.as_ref())),
+                scored(searcher, &boosted(ours.as_ref())),
+                scored(searcher, &boosted(theirs.as_ref())),
                 "{words:?}"
             );
             // Driven by seeks from an intersection, not by advances.
@@ -482,8 +487,8 @@ mod tests {
                 BooleanQuery::new(vec![(Occur::Must, rue()), (Occur::Must, query.box_clone())])
             };
             assert_eq!(
-                scored(&searcher, &within(ours.as_ref())),
-                scored(&searcher, &within(theirs.as_ref())),
+                scored(searcher, &within(ours.as_ref())),
+                scored(searcher, &within(theirs.as_ref())),
                 "{words:?}"
             );
         }
@@ -491,9 +496,10 @@ mod tests {
 
     #[test]
     fn longer_head_scores_how_often_the_head_occurs() {
-        let (searcher, text) = index();
+        let (searcher, text) = &*INDEX;
+        let text = *text;
         let (_, ours) = queries(text, &["rue", "de", "la0007"]);
-        let hits = scored(&searcher, ours.as_ref());
+        let hits = scored(searcher, ours.as_ref());
         assert_eq!(hits.len(), 2);
         let (once, twice) = (f32::from_bits(hits[0].1), f32::from_bits(hits[1].1));
         assert!(twice > once, "{twice} after {once}");
