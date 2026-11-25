@@ -444,10 +444,23 @@ pub(crate) struct Named<R> {
 }
 
 pub async fn serve(options: ServeOptions) -> Result<()> {
+    let listener = TcpListener::bind(options.bind)
+        .await
+        .map_err(|source| Error::IoPath {
+            action: "failed to bind",
+            path: options.bind.to_string().into(),
+            source,
+        })?;
+    serve_on(listener, options).await
+}
+
+/// [`serve`] on a listener the caller already bound, in place of `options.bind`.
+pub async fn serve_on(listener: TcpListener, options: ServeOptions) -> Result<()> {
+    let address = listener.local_addr()?;
     let jobs_dir = options
         .job_dir
         .clone()
-        .unwrap_or_else(|| jobs::default_dir(options.bind.port()));
+        .unwrap_or_else(|| jobs::default_dir(address.port()));
     let state = AppState::open(&options.pack, &jobs_dir, options.limits)?
         .with_hook_hosts(options.hook_hosts.clone())
         .with_public_url(options.public_url.clone());
@@ -457,19 +470,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         options.demo.as_deref(),
         options.basemap.as_deref(),
     );
-
-    let listener = TcpListener::bind(options.bind)
-        .await
-        .map_err(|source| Error::IoPath {
-            action: "failed to bind",
-            path: options.pack.clone(),
-            source,
-        })?;
-    println!(
-        "Serving {} at http://{}",
-        options.pack.display(),
-        options.bind
-    );
+    println!("Serving {} at http://{address}", options.pack.display());
     run(
         listener,
         app,
