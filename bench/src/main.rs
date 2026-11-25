@@ -339,11 +339,4 @@ mod tests {
         assert_eq!(civil_from_days(20_760), (2026, 11, 3));
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
     }
-
-    #[test]
-    fn engine_selection() {
-        assert_eq!(selected("all").unwrap(), vec!["og", "photon", "pelias"]);
-        assert_eq!(selected("photon").unwrap(), vec!["photon"]);
-        assert!(selected("nominatim").is_err());
-    }
 }

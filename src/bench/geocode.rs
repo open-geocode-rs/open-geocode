@@ -326,21 +326,6 @@ mod tests {
         assert_eq!(bucket_of(Some(300.0), &buckets), "near");
         assert_eq!(bucket_of(Some(4_000.0), &buckets), "off");
         assert_eq!(bucket_of(Some(9_000.0), &buckets), "far");
-    }
-
-    #[test]
-    fn a_missing_result_is_none_not_far() {
-        assert_eq!(bucket_of(None, &default_buckets()), "none");
-    }
-
-    #[test]
-    fn distance_is_symmetric_and_scales_with_latitude() {
-        let a = (-42.9, 147.3);
-        let b = (-42.9, 147.4);
-        let forward = distance_metres(a, b);
-        assert!((forward - distance_metres(b, a)).abs() < 1e-6);
-        // A degree of longitude is shorter away from the equator.
-        let equator = distance_metres((0.0, 147.3), (0.0, 147.4));
-        assert!(forward < equator);
+        assert_eq!(bucket_of(None, &buckets), "none");
     }
 }

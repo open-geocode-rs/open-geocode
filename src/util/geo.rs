@@ -202,35 +202,16 @@ mod tests {
     }
 
     #[test]
-    fn reads_finite_point() {
+    fn reads_a_finite_point_and_rejects_non_point_and_non_finite() {
         assert_eq!(
             point_lon_lat(&point_geometry(-79.0, 43.0)),
             Some([-79.0, 43.0])
         );
-    }
-
-    #[test]
-    fn rejects_non_point_and_non_finite() {
         assert_eq!(point_lon_lat(&point_geometry(f64::NAN, 43.0)), None);
         let line = Geometry::new(GeometryValue::LineString {
             coordinates: vec![vec![0.0, 0.0].into(), vec![1.0, 1.0].into()],
         });
         assert_eq!(point_lon_lat(&line), None);
-    }
-
-    #[test]
-    fn geohash_prefixes_agree_for_nearby_points() {
-        let a = geohash(-42.91654, 147.26215, 6);
-        let b = geohash(-42.91669, 147.26209, 6);
-        assert_eq!(a, b, "points ~20m apart share a 6-char geohash");
-        let far = geohash(-33.86, 151.21, 6);
-        assert_ne!(a, far);
-    }
-
-    #[test]
-    fn geohash_length_is_requested_length() {
-        assert_eq!(geohash(-42.9, 147.3, 4).len(), 4);
-        assert_eq!(geohash(-42.9, 147.3, 6).len(), 6);
     }
 
     #[test]

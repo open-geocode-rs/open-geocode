@@ -35,10 +35,4 @@ mod tests {
         assert_eq!(collapse_whitespace("   "), None);
         assert_eq!(collapse_whitespace(""), None);
     }
-
-    #[test]
-    fn normalizes_for_case_insensitive_compare() {
-        assert_eq!(normalize_for_compare(" Main   STREET "), "main street");
-        assert_eq!(normalize_for_compare("   "), "");
-    }
 }

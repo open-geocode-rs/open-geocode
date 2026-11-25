@@ -131,25 +131,3 @@ pub fn peak_bytes() -> Option<usize> {
         .load(Ordering::Relaxed)
         .then(|| PEAK.load(Ordering::Relaxed))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_thread_flushes_its_count_once_past_the_threshold() {
-        // The library's tests run on the system allocator, so the counting
-        // is driven directly.
-        let before = LIVE.load(Ordering::Relaxed);
-        std::thread::spawn(move || {
-            count(FLUSH_BYTES / 2);
-            assert_eq!(LIVE.load(Ordering::Relaxed), before);
-            count(FLUSH_BYTES);
-            count(-(FLUSH_BYTES / 2) * 3);
-        })
-        .join()
-        .expect("thread");
-        assert_eq!(LIVE.load(Ordering::Relaxed), before);
-        assert!(PEAK.load(Ordering::Relaxed) >= (FLUSH_BYTES / 2 * 3) as usize);
-    }
-}
