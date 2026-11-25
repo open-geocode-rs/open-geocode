@@ -23,7 +23,7 @@
 <!-- Every row is filled. A row that does not change says so, and why.
 "Space: unchanged; no Pack section or record field is added." -->
 
-Pack: <!-- planet or region, Pack fingerprint, generation -->
+Pack: <!-- planet or region, Pack fingerprint, generation. Name every flag behind any number stated here. That means the input .osm.pbf and its date, whether OpenAddresses was included (--openaddresses or --openaddresses-zip), --qrank, --memory-budget-mb, threads (RAYON_NUM_THREADS) and the og commit. -->
 Machine: <!-- CPU, cores, disk -->
 Rebuild needed: <!-- no / yes -->
 API contract changed: <!-- no / yes: which field, parameter or error -->

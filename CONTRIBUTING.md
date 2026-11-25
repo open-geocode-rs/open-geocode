@@ -36,6 +36,10 @@ Every template except `chore` ends with these two sections.
 Every row is filled.
 A row that does not change says so, and why.
 The numbers come from main and the pull request run on the same Pack, the same machine and the same fixture registers.
+Any numbers stated in an issue or a pull request name every build and run flag explicitly.
+That means the input `.osm.pbf` files and their date, whether OpenAddresses was included (`--openaddresses` or `--openaddresses-zip`), `--qrank`, `--memory-budget-mb`, the threads (`RAYON_NUM_THREADS`) and the og commit.
+OSM alone is thin on addresses, so leaving the OpenAddresses flag off changes the results drastically.
+Numbers without their flags cannot be compared.
 
 ## Rulebook
 
