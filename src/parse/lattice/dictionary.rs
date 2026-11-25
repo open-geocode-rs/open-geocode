@@ -36,8 +36,12 @@ use std::{
 };
 
 use crate::error::{Error, Result};
-use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
+use fst::{
+    Map, MapBuilder, Streamer,
+    raw::{Fst, Node, Output},
+};
 use levenshtein_automata::{DFA, Distance, SINK_STATE};
+use rustc_hash::FxHashMap;
 
 use unicode_script::{Script, UnicodeScript};
 
@@ -391,33 +395,25 @@ impl Dictionaries {
     }
 
     pub fn fuzzy(&self, field: Field, dfa: &DFA, prefix: &str) -> Option<(String, Match)> {
-        // No key holds the byte 0xFF, which UTF-8 never uses, so every key
-        // with the prefix sorts below it.
-        let mut upper = prefix.as_bytes().to_vec();
-        upper.push(0xFF);
-        let mut stream = self
-            .map(field)
-            .search_with_state(Levenshtein(dfa))
-            .ge(prefix)
-            .lt(upper)
-            .into_stream();
-        let mut best: Option<(Vec<u8>, Match)> = None;
-        while let Some((key, value, state)) = stream.next() {
-            let Distance::Exact(distance) = dfa.distance(state) else {
-                continue;
-            };
-            let found = Match {
-                entry: Entry::decode(value),
-                distance,
-            };
-            if best.as_ref().is_none_or(|(_, best)| {
-                (found.distance, std::cmp::Reverse(found.entry.count))
-                    < (best.distance, std::cmp::Reverse(best.entry.count))
-            }) {
-                best = Some((key.to_vec(), found));
-            }
+        let fst = self.map(field).as_fst();
+        let mut node = fst.root();
+        let mut state = dfa.initial_state();
+        let mut out = Output::zero();
+        for &byte in prefix.as_bytes() {
+            let transition = node.transition(node.find_input(byte)?);
+            state = dfa.transition(state, byte);
+            out = out.cat(transition.out);
+            node = fst.node(transition.addr);
         }
-        best.map(|(key, hit)| (String::from_utf8_lossy(&key).into_owned(), hit))
+        let mut walk = Walk {
+            fst,
+            dfa,
+            key: prefix.as_bytes().to_vec(),
+            best: None,
+        };
+        walk.visit(node, state, out);
+        walk.best
+            .map(|(key, hit)| (String::from_utf8_lossy(&key).into_owned(), hit))
     }
 
     /// The record ids of the areas named `key`; empty when it names none, or
@@ -523,25 +519,43 @@ impl Dictionaries {
     }
 }
 
-struct Levenshtein<'a>(&'a DFA);
+/// An FST stream decodes the node behind every transition; this drops dead ones on the byte alone.
+struct Walk<'a> {
+    fst: &'a Fst<Bytes>,
+    dfa: &'a DFA,
+    key: Vec<u8>,
+    best: Option<(Vec<u8>, Match)>,
+}
 
-impl Automaton for Levenshtein<'_> {
-    type State = u32;
-
-    fn start(&self) -> u32 {
-        self.0.initial_state()
-    }
-
-    fn is_match(&self, state: &u32) -> bool {
-        matches!(self.0.distance(*state), Distance::Exact(_))
-    }
-
-    fn can_match(&self, state: &u32) -> bool {
-        *state != SINK_STATE
-    }
-
-    fn accept(&self, state: &u32, byte: u8) -> u32 {
-        self.0.transition(*state, byte)
+impl Walk<'_> {
+    fn visit(&mut self, node: Node<'_>, state: u32, out: Output) {
+        if node.is_final()
+            && let Distance::Exact(distance) = self.dfa.distance(state)
+        {
+            let found = Match {
+                entry: Entry::decode(out.cat(node.final_output()).value()),
+                distance,
+            };
+            if self.best.as_ref().is_none_or(|(_, best)| {
+                (found.distance, std::cmp::Reverse(found.entry.count))
+                    < (best.distance, std::cmp::Reverse(best.entry.count))
+            }) {
+                self.best = Some((self.key.clone(), found));
+            }
+        }
+        for transition in node.transitions() {
+            let next = self.dfa.transition(state, transition.inp);
+            if next == SINK_STATE {
+                continue;
+            }
+            self.key.push(transition.inp);
+            self.visit(
+                self.fst.node(transition.addr),
+                next,
+                out.cat(transition.out),
+            );
+            self.key.pop();
+        }
     }
 }
 
@@ -1172,8 +1186,18 @@ enum Attach {
     Before,
 }
 
-fn admin_types() -> &'static [(String, Attach)] {
-    static TYPES: OnceLock<Vec<(String, Attach)>> = OnceLock::new();
+/// The admin type words of [`LIBPOSTAL_QUALIFIERS`] and [`ADMIN_TYPES`] as
+/// dictionary keys with how they attach to a name. In [`ADMIN_TYPES`] and
+/// [`LIBPOSTAL_ADMIN_AFFIXES`] a leading `-` attaches a word after the name
+/// and a trailing `-` before it, `word ~` is a word of its own before the
+/// name and `~ word` one after it, and a bare word is either. A libpostal
+/// qualifier of a script written without spaces, or of Hangul, whose words
+/// carry their type attached, attaches after the name; any other is a word
+/// of its own after it, the side libpostal's qualifiers do not state and a
+/// word before a name cannot be told from the end of the field before it
+/// ("2 chome taitoku" is no "taitoku" chome).
+fn admin_types() -> &'static FxHashMap<String, Vec<(usize, Attach)>> {
+    static TYPES: OnceLock<FxHashMap<String, Vec<(usize, Attach)>>> = OnceLock::new();
     TYPES.get_or_init(|| {
         let phrases = |list: &'static str| {
             list.lines()
@@ -1213,7 +1237,11 @@ fn admin_types() -> &'static [(String, Attach)] {
         }
         types.sort();
         types.dedup();
-        types
+        let mut index = FxHashMap::<String, Vec<(usize, Attach)>>::default();
+        for (rank, (phrase, attach)) in types.into_iter().enumerate() {
+            index.entry(phrase).or_default().push((rank, attach));
+        }
+        index
     })
 }
 
@@ -1222,7 +1250,7 @@ pub fn designates_unit(key: &str) -> bool {
 }
 
 pub(super) fn is_admin_type(key: &str) -> bool {
-    admin_types().iter().any(|(phrase, _)| phrase == key)
+    admin_types().contains_key(key)
 }
 
 pub(crate) fn same_admin_name(left: &str, right: &str) -> bool {
@@ -1232,43 +1260,36 @@ pub(crate) fn same_admin_name(left: &str, right: &str) -> bool {
 }
 
 pub(crate) fn admin_aliases(key: &str) -> Vec<String> {
-    let mut aliases = Vec::new();
-    for (phrase, attach) in admin_types() {
-        let rests = match attach {
-            Attach::Word => [
-                key.strip_suffix(phrase.as_str())
-                    .and_then(|rest| rest.strip_suffix(' ')),
-                key.strip_prefix(phrase.as_str())
-                    .and_then(|rest| rest.strip_prefix(' ')),
-            ],
-            Attach::WordBefore => [
-                key.strip_prefix(phrase.as_str())
-                    .and_then(|rest| rest.strip_prefix(' ')),
-                None,
-            ],
-            Attach::WordAfter => [
-                key.strip_suffix(phrase.as_str())
-                    .and_then(|rest| rest.strip_suffix(' ')),
-                None,
-            ],
-            Attach::After => [
-                key.strip_suffix(phrase.as_str())
-                    .filter(|rest| !rest.ends_with(' ')),
-                None,
-            ],
-            Attach::Before => [
-                key.strip_prefix(phrase.as_str())
-                    .filter(|rest| !rest.starts_with(' ')),
-                None,
-            ],
-        };
-        for rest in rests.into_iter().flatten() {
-            let usable = rest.chars().count() >= 2
-                && !rest.chars().any(is_numeral)
-                && rest.chars().any(char::is_alphabetic);
-            if usable && !aliases.iter().any(|alias| alias == rest) {
-                aliases.push(rest.to_string());
-            }
+    let types = admin_types();
+    let mut rests = Vec::new();
+    for at in key.char_indices().map(|(at, _)| at).chain([key.len()]) {
+        let (head, tail) = key.split_at(at);
+        for (rank, attach) in types.get(head).into_iter().flatten() {
+            let rest = match attach {
+                Attach::Word | Attach::WordBefore => tail.strip_prefix(' '),
+                Attach::Before => Some(tail).filter(|rest| !rest.starts_with(' ')),
+                Attach::WordAfter | Attach::After => None,
+            };
+            let order = (*rank, u8::from(*attach == Attach::Word));
+            rests.extend(rest.map(|rest| (order, rest)));
+        }
+        for (rank, attach) in types.get(tail).into_iter().flatten() {
+            let rest = match attach {
+                Attach::Word | Attach::WordAfter => head.strip_suffix(' '),
+                Attach::After => Some(head).filter(|rest| !rest.ends_with(' ')),
+                Attach::WordBefore | Attach::Before => None,
+            };
+            rests.extend(rest.map(|rest| ((*rank, 0), rest)));
+        }
+    }
+    rests.sort_unstable_by_key(|(order, _)| *order);
+    let mut aliases = Vec::<String>::new();
+    for (_, rest) in rests {
+        let usable = rest.chars().count() >= 2
+            && !rest.chars().any(is_numeral)
+            && rest.chars().any(char::is_alphabetic);
+        if usable && !aliases.iter().any(|alias| alias == rest) {
+            aliases.push(rest.to_string());
         }
     }
     aliases
@@ -1584,6 +1605,14 @@ mod tests {
                 .fuzzy(Field::Street, &two.build_dfa("toronto"), "t")
                 .is_none()
         );
+        let tied = Dictionaries::from_entries([
+            (Field::Locality, "berm", entry(5, None)),
+            (Field::Locality, "bern", entry(5, None)),
+        ]);
+        let (name, _) = tied
+            .fuzzy(Field::Locality, &one.build_dfa("berx"), "b")
+            .expect("one edit");
+        assert_eq!(name, "berm");
         assert_eq!(
             dictionaries.country_weight(CountryCode::parse("CA").unwrap()),
             0.0

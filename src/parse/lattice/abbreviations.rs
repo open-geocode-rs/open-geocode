@@ -1,7 +1,17 @@
-use std::{
-    collections::{BTreeSet, HashMap},
-    sync::OnceLock,
-};
+//! Street-type and direction abbreviations of every language libpostal lists,
+//! read both ways: a query's "str" is also looked up as "straße", and
+//! training writes a name's "straße" as "str" some of the time.
+//!
+//! The phrases are libpostal's street types and directionals (MIT, see
+//! `NOTICE`), each line a phrase and its `|`-separated variants. The languages that
+//! glue a street type onto the name ("hauptstraße", "kerkstraat") are those
+//! libpostal lists concatenated suffixes for, and in them a name ending in a
+//! variant also ends in each other form of it ("hauptstr" is "hauptstraße").
+//! Nothing here names a language: every list is read the same way.
+
+use std::{collections::BTreeSet, sync::OnceLock};
+
+use rustc_hash::FxHashMap;
 
 use crate::util::fold::search_key;
 
@@ -14,9 +24,13 @@ const MIN_GLUED_STEM_CHARS: usize = 3;
 
 #[derive(Debug, Default)]
 pub(super) struct Abbreviations {
-    full: HashMap<String, Vec<String>>,
-    short: HashMap<String, Vec<String>>,
-    glued: Vec<(String, Vec<String>)>,
+    /// A variant to its full forms ("str" to "straße").
+    full: FxHashMap<String, Vec<String>>,
+    /// A full form to its variants ("straße" to "str", "strasse").
+    short: FxHashMap<String, Vec<String>>,
+    /// The forms of the street types of languages that glue them onto the
+    /// name, each with the other forms of its phrase.
+    glued: FxHashMap<String, Vec<String>>,
 }
 
 pub(super) fn abbreviations() -> &'static Abbreviations {
@@ -24,7 +38,7 @@ pub(super) fn abbreviations() -> &'static Abbreviations {
     TABLE.get_or_init(|| {
         let gluing = languages(CONCATENATED_SUFFIXES);
         let mut table = Abbreviations::default();
-        let mut glued = HashMap::<String, BTreeSet<String>>::new();
+        let mut glued = FxHashMap::<String, BTreeSet<String>>::default();
         for (list, glues) in [(STREET_TYPES, true), (DIRECTIONALS, false)] {
             for (language, forms) in phrases(list) {
                 let [full, variants @ ..] = &forms[..] else {
@@ -48,9 +62,6 @@ pub(super) fn abbreviations() -> &'static Abbreviations {
             .into_iter()
             .map(|(form, others)| (form, others.into_iter().collect()))
             .collect();
-        table
-            .glued
-            .sort_by(|left, right| right.0.len().cmp(&left.0.len()).then(left.0.cmp(&right.0)));
         table
     })
 }
@@ -80,7 +91,7 @@ impl Abbreviations {
             spellings = next;
         }
         if let [head @ .., stem, form] = &words[..]
-            && self.glued.iter().any(|(glued, _)| glued == form)
+            && self.glued.contains_key(*form)
         {
             for other in
                 std::iter::once(*form).chain(self.glued_forms(form).iter().map(String::as_str))
@@ -119,23 +130,18 @@ impl Abbreviations {
     }
 
     pub(super) fn split_glued<'w>(&self, word: &'w str) -> Option<(&'w str, &'w str)> {
-        let (form, _) = self.glued.iter().find(|(form, _)| {
-            word.len() > form.len()
-                && word.ends_with(form.as_str())
-                && word[..word.len() - form.len()].chars().count() >= MIN_GLUED_STEM_CHARS
-        })?;
-        Some(word.split_at(word.len() - form.len()))
+        word.char_indices()
+            .skip(MIN_GLUED_STEM_CHARS)
+            .map(|(at, _)| word.split_at(at))
+            .find(|(_, form)| self.glued.contains_key(*form))
     }
 
     fn glued_forms(&self, form: &str) -> &[String] {
-        self.glued
-            .iter()
-            .find(|(glued, _)| glued == form)
-            .map_or(&[], |(_, others)| others.as_slice())
+        self.glued.get(form).map_or(&[], Vec::as_slice)
     }
 }
 
-fn push(map: &mut HashMap<String, Vec<String>>, key: &str, value: &str) {
+fn push(map: &mut FxHashMap<String, Vec<String>>, key: &str, value: &str) {
     let values = map.entry(key.to_string()).or_default();
     if !values.iter().any(|existing| existing == value) {
         values.push(value.to_string());
