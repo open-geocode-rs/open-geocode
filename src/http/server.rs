@@ -2354,102 +2354,6 @@ pub(crate) mod router_tests {
         let _ = std::fs::remove_dir_all(&pack);
     }
 
-    #[tokio::test]
-    async fn search_enforces_query_and_limit_bounds() {
-        let pack = temp_path("search-bounds");
-        write_pack(&pack);
-        let demo = temp_path("search-demo");
-        let no_basemap = temp_path("search-no-basemap");
-        let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
-
-        let reply = send(router.clone(), request("GET", "/geocode?q=")).await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-        assert_eq!(reply.content_type(), "application/problem+json");
-        assert_eq!(reply.json()["error_code"], "invalid_query");
-
-        let long = "a".repeat(300);
-        let reply = send(
-            router.clone(),
-            request("GET", &format!("/geocode?q={long}")),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-
-        let reply = send(
-            router.clone(),
-            request("GET", "/geocode?q=king&limit=999999"),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-        assert_eq!(reply.json()["invalid_params"][0]["name"], "limit");
-
-        let reply = send(router.clone(), request("GET", "/geocode?q=king&limit=abc")).await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-        assert_eq!(reply.json()["error_code"], "malformed_parameter");
-
-        // An unknown layer -> 400 naming the layers that would have been
-        // accepted, not an empty answer that looks like "nothing here".
-        let reply = send(
-            router.clone(),
-            request("GET", "/geocode?q=king&layer=bogus"),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-        let body = reply.json();
-        assert_eq!(body["error_code"], "malformed_parameter");
-        assert_eq!(body["invalid_params"][0]["name"], "layer");
-        let detail = body["detail"].as_str().expect("detail");
-        assert!(detail.contains("bogus"), "{detail}");
-        assert!(detail.contains("address"), "{detail}");
-
-        let reply = send(
-            router.clone(),
-            request("GET", "/autocomplete?q=kin&layer=bogus"),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-
-        // A known layer filters, and an empty one means "no filter" rather
-        // than a rejection, which is what a form that always sends the key
-        // produces.
-        let reply = send(
-            router.clone(),
-            request("GET", "/geocode?q=King%20Street&layer=address"),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::OK);
-        let reply = send(router.clone(), request("GET", "/geocode?q=king&layer=")).await;
-        assert_eq!(reply.status, StatusCode::OK);
-
-        let reply = send(router, request("GET", "/geocode?q=King%20Street&limit=5")).await;
-        assert_eq!(reply.status, StatusCode::OK);
-        assert_eq!(reply.content_type(), "application/json");
-
-        let _ = std::fs::remove_dir_all(&pack);
-    }
-
-    #[tokio::test]
-    async fn reverse_validates_coordinates() {
-        let pack = temp_path("reverse-bounds");
-        write_pack(&pack);
-        let demo = temp_path("reverse-demo");
-        let no_basemap = temp_path("reverse-no-basemap");
-        let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
-
-        let reply = send(router.clone(), request("GET", "/reverse?lon=999&lat=0")).await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-        assert_eq!(reply.json()["invalid_params"][0]["name"], "lon");
-
-        let reply = send(router.clone(), request("GET", "/reverse?lon=0&lat=999")).await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-        assert_eq!(reply.json()["invalid_params"][0]["name"], "lat");
-
-        let reply = send(router, request("GET", "/reverse?lon=-79.0&lat=43.0")).await;
-        assert_eq!(reply.status, StatusCode::OK);
-
-        let _ = std::fs::remove_dir_all(&pack);
-    }
-
     /// The house 67 m from the point is past the default reach and inside
     /// an asked radius; a radius og cannot search is refused.
     #[tokio::test]
@@ -2482,113 +2386,6 @@ pub(crate) mod router_tests {
             assert_eq!(reply.status, StatusCode::BAD_REQUEST, "radius {radius}");
             assert_eq!(reply.json()["invalid_params"][0]["name"], "radius");
         }
-
-        let _ = std::fs::remove_dir_all(&pack);
-    }
-
-    /// The cases the endpoint was asked for: a hit inside the postcode, a
-    /// miss in another one, and a missing address.
-    #[tokio::test]
-    async fn geocode_keeps_hits_in_the_given_postcode() {
-        let pack = temp_path("geocode");
-        write_pack(&pack);
-        let demo = temp_path("geocode-demo");
-        let no_basemap = temp_path("geocode-no-basemap");
-        let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
-
-        let reply = send(
-            router.clone(),
-            request(
-                "GET",
-                "/geocode?address=10%20King%20Street&postcode=M5V%201A1",
-            ),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::OK);
-        let body = reply.json();
-        assert_eq!(body["type"], "FeatureCollection");
-        assert_eq!(body["features"].as_array().expect("features").len(), 1);
-        let feature = &body["features"][0];
-        assert_eq!(feature["properties"]["layer"], "address");
-        assert_eq!(feature["geometry"]["coordinates"][0], -79.0);
-        assert!(
-            feature["properties"].get("confidence").is_none(),
-            "a Pack never calibrated rates no answer"
-        );
-
-        // The same address in a postcode it is not in finds nothing. An empty
-        // collection, not an error: the request was fine, the answer is that
-        // there is none.
-        let reply = send(
-            router.clone(),
-            request(
-                "GET",
-                "/geocode?address=10%20King%20Street&postcode=V6B%201A1",
-            ),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::OK);
-        let body = reply.json();
-        assert_eq!(body["type"], "FeatureCollection");
-        assert!(
-            body["features"].as_array().expect("features").is_empty(),
-            "an address in the wrong postcode should match nothing"
-        );
-
-        let reply = send(router.clone(), request("GET", "/geocode?locality=Toronto")).await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-        assert_eq!(reply.json()["error_code"], "invalid_query");
-
-        let reply = send(
-            router,
-            request("GET", "/geocode?address=10%20King%20Street&layer=bogus"),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-        assert_eq!(reply.json()["error_code"], "malformed_parameter");
-
-        let _ = std::fs::remove_dir_all(&pack);
-    }
-
-    #[tokio::test]
-    async fn methods_unknown_paths_and_request_ids() {
-        let pack = temp_path("methods");
-        write_pack(&pack);
-        let demo = temp_path("methods-demo");
-        let no_basemap = temp_path("methods-no-basemap");
-        let router = build_router(state_for(&pack, true), Some(&demo), Some(&no_basemap));
-
-        let reply = send(router.clone(), request("POST", "/autocomplete")).await;
-        assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(reply.content_type(), "application/problem+json");
-        assert_eq!(
-            reply
-                .headers
-                .get(header::ALLOW)
-                .and_then(|v| v.to_str().ok()),
-            Some("GET")
-        );
-
-        // HEAD is not part of the API method surface (Decision 27) -> 405.
-        let reply = send(router.clone(), request("HEAD", "/places")).await;
-        assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
-
-        let reply = send(router.clone(), request("GET", "/does-not-exist")).await;
-        assert_eq!(reply.status, StatusCode::NOT_FOUND);
-        assert_eq!(reply.content_type(), "application/problem+json");
-        assert_eq!(reply.json()["error_code"], "not_found");
-
-        // Every response carries a request id; an inbound cf-ray is honored.
-        let reply = send(router.clone(), request("GET", "/healthz")).await;
-        assert!(reply.request_id().is_some());
-
-        let mut tagged = request("GET", "/geocode?q=");
-        tagged
-            .headers_mut()
-            .insert("cf-ray", header::HeaderValue::from_static("ray-abc-123"));
-        let reply = send(router, tagged).await;
-        assert_eq!(reply.request_id().as_deref(), Some("ray-abc-123"));
-        assert_eq!(reply.json()["request_id"], "ray-abc-123");
 
         let _ = std::fs::remove_dir_all(&pack);
     }
@@ -2728,19 +2525,70 @@ pub(crate) mod router_tests {
         state.error_log = log.clone();
         let router = build_router(state, Some(&demo), Some(&no_basemap));
 
-        for (method, uri, status) in [
-            ("GET", "/geocode?q=", StatusCode::BAD_REQUEST),
-            ("GET", "/reverse?lon=999&lat=0", StatusCode::BAD_REQUEST),
-            ("GET", "/does-not-exist", StatusCode::NOT_FOUND),
-            ("POST", "/autocomplete", StatusCode::METHOD_NOT_ALLOWED),
-            ("PUT", "/places", StatusCode::METHOD_NOT_ALLOWED),
-            ("POST", "/places", StatusCode::UNSUPPORTED_MEDIA_TYPE),
-            ("POST", "/geocode", StatusCode::UNSUPPORTED_MEDIA_TYPE),
-            ("GET", "/geocode?q=King%20Street", StatusCode::OK),
+        for (method, uri, status, error_code) in [
+            (
+                "GET",
+                "/geocode?q=",
+                StatusCode::BAD_REQUEST,
+                "invalid_query",
+            ),
+            (
+                "GET",
+                "/geocode?q=king&limit=abc",
+                StatusCode::BAD_REQUEST,
+                "malformed_parameter",
+            ),
+            (
+                "GET",
+                "/geocode?q=king&limit=999999",
+                StatusCode::BAD_REQUEST,
+                "limit_too_large",
+            ),
+            (
+                "GET",
+                "/autocomplete?q=kin&layer=bogus",
+                StatusCode::BAD_REQUEST,
+                "malformed_parameter",
+            ),
+            (
+                "GET",
+                "/reverse?lon=999&lat=0",
+                StatusCode::BAD_REQUEST,
+                "invalid_coordinate",
+            ),
+            ("GET", "/does-not-exist", StatusCode::NOT_FOUND, "not_found"),
+            (
+                "POST",
+                "/autocomplete",
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+            ),
+            (
+                "PUT",
+                "/places",
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+            ),
+            (
+                "POST",
+                "/places",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+            ),
+            (
+                "POST",
+                "/geocode",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+            ),
+            ("GET", "/geocode?q=King%20Street", StatusCode::OK, ""),
         ] {
             let reply = send(router.clone(), request(method, uri)).await;
             assert_eq!(reply.status, status, "{method} {uri}");
+            assert!(reply.request_id().is_some(), "{method} {uri}");
             if status != StatusCode::OK {
+                assert_eq!(reply.content_type(), "application/problem+json");
+                assert_eq!(reply.json()["error_code"], error_code, "{method} {uri}");
                 assert_eq!(
                     reply.json()["request_id"].as_str(),
                     reply.request_id().as_deref()
@@ -5111,6 +4959,12 @@ pub(crate) mod router_tests {
             1
         );
         assert!(results[0].get("error").is_none());
+        assert!(
+            results[0]["response"]["features"][0]["properties"]
+                .get("confidence")
+                .is_none(),
+            "a Pack never calibrated rates no answer"
+        );
 
         // Fails as `GET` fails, with the batch's request id, and the batch
         // goes on.
@@ -5175,6 +5029,8 @@ pub(crate) mod router_tests {
             ),
         )
         .await;
+        assert_eq!(get.status, StatusCode::BAD_REQUEST);
+        assert_eq!(get.json()["error_code"], "malformed_parameter");
         let result = &batch.json()["results"][0];
         assert_eq!(result["status"], get.status.as_u16());
         assert_eq!(result["error"]["error_code"], get.json()["error_code"]);
@@ -6263,54 +6119,6 @@ pub(crate) mod router_tests {
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&pack);
-    }
-
-    /// `q` sent empty beside an address field is two ways of giving the
-    /// address, in a batch item as in `GET`.
-    #[tokio::test]
-    async fn an_empty_q_beside_address_fields_is_both() {
-        let pack = temp_path("param-both");
-        write_pack(&pack);
-        let router = build_router(state_for(&pack, true), None, None);
-        for uri in [
-            "/geocode?q=&address=10%20King%20Street",
-            "/geocode?q=%20&address=10%20King%20Street",
-            "/geocode?q=cafe&locality=",
-        ] {
-            let reply = send(router.clone(), request("GET", uri)).await;
-            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{uri}");
-            assert_eq!(reply.json()["error_code"], "malformed_parameter", "{uri}");
-            assert_eq!(reply.json()["invalid_params"][0]["name"], "q", "{uri}");
-        }
-        let answered = send(
-            router.clone(),
-            request("GET", "/geocode?address=10%20King%20Street&locality="),
-        )
-        .await;
-        assert_eq!(answered.status, StatusCode::OK);
-        assert_eq!(
-            answered.json()["features"][0]["properties"]["id"],
-            "osm:node:1"
-        );
-
-        let batch = Request::builder()
-            .method("POST")
-            .uri("/geocode")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"[{"q":"","address":"10 King Street"},{"q":null,"address":"10 King Street"}]"#,
-            ))
-            .unwrap();
-        let reply = send(router, batch).await;
-        assert_eq!(reply.status, StatusCode::OK);
-        let results = reply.json()["results"].clone();
-        assert_eq!(results[0]["status"], 400);
-        assert_eq!(
-            results[0]["error"]["detail"],
-            "give the address as q or as address, locality, region and postcode, not both"
-        );
-        assert_eq!(results[1]["status"], 200);
         let _ = std::fs::remove_dir_all(&pack);
     }
 

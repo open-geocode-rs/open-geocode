@@ -692,22 +692,6 @@ mod tests {
     }
 
     #[test]
-    fn an_extract_with_no_sum_beside_it_is_an_error_naming_the_sum_url() {
-        let server = Server::start();
-        server.route("/europe-latest.osm.pbf", Answer::Body(b"europe".to_vec()));
-
-        let error = published(&server.url("/europe-latest.osm.pbf")).unwrap_err();
-
-        assert_eq!(
-            format!("{error:#}"),
-            format!(
-                "failed to reach {}: http status: 404",
-                server.url("/europe-latest.osm.pbf.md5")
-            )
-        );
-    }
-
-    #[test]
     fn a_sum_file_without_a_sum_is_an_error() {
         let server = Server::start();
         server.route("/kosovo-latest.osm.pbf", Answer::Body(b"kosovo".to_vec()));

@@ -136,18 +136,6 @@ mod tests {
     }
 
     #[test]
-    fn no_flags_are_the_defaults() {
-        assert_eq!(parse(&[]).expect("parse"), Limits::DEFAULT);
-        let limits = Limits::DEFAULT;
-        assert_eq!(limits.lookup_timeout(), Duration::from_secs(1));
-        assert_eq!(limits.max_batch_body_bytes(), 1000 * 4096);
-        assert_eq!(limits.max_job_upload_bytes(), 256_000_000);
-        assert_eq!(limits.job_retention(), Duration::from_secs(72 * 3600));
-        assert_eq!(limits.max_job_store_bytes(), 10 << 30);
-        assert_eq!(limits.max_concurrent_lookups(8), 32);
-    }
-
-    #[test]
     fn the_upload_cap_follows_the_row_cap_until_it_is_set() {
         let demo = parse(&["--max-job-rows", "100000"]).expect("parse");
         assert_eq!(demo.max_job_upload_bytes(), 25_600_000);

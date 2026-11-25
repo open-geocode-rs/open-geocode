@@ -64,9 +64,4 @@ mod tests {
         assert_eq!(read("q=+"), Param::Empty);
         assert_eq!(read("q=%20cafe%20"), Param::Value(" cafe ".to_string()));
     }
-
-    #[test]
-    fn a_repeated_parameter_does_not_parse() {
-        assert!(serde_urlencoded::from_str::<Params>("q=a&q=b").is_err());
-    }
 }

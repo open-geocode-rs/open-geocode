@@ -777,25 +777,37 @@ mod tests {
                 .map(|value| value.as_str().expect("string").to_string())
                 .collect();
 
-        for code in [
-            RuntimeErrorCode::InvalidQuery,
-            RuntimeErrorCode::InvalidCoordinate,
-            RuntimeErrorCode::LimitTooLarge,
-            RuntimeErrorCode::MalformedParameter,
-            RuntimeErrorCode::MalformedBody,
-            RuntimeErrorCode::NotFound,
-            RuntimeErrorCode::MethodNotAllowed,
-            RuntimeErrorCode::TooManyItems,
-            RuntimeErrorCode::BodyTooLarge,
-            RuntimeErrorCode::UnsupportedMediaType,
-            RuntimeErrorCode::InternalError,
-            RuntimeErrorCode::Busy,
-        ] {
-            assert!(
-                documented.contains(code.as_str()),
-                "{} is not in the published contract",
-                code.as_str()
+        // Exhaustive, so a new code does not compile until it joins this walk.
+        fn after(code: RuntimeErrorCode) -> Option<RuntimeErrorCode> {
+            match code {
+                RuntimeErrorCode::InvalidQuery => Some(RuntimeErrorCode::InvalidCoordinate),
+                RuntimeErrorCode::InvalidCoordinate => Some(RuntimeErrorCode::LimitTooLarge),
+                RuntimeErrorCode::LimitTooLarge => Some(RuntimeErrorCode::MalformedParameter),
+                RuntimeErrorCode::MalformedParameter => Some(RuntimeErrorCode::MalformedBody),
+                RuntimeErrorCode::MalformedBody => Some(RuntimeErrorCode::NotFound),
+                RuntimeErrorCode::NotFound => Some(RuntimeErrorCode::MethodNotAllowed),
+                RuntimeErrorCode::MethodNotAllowed => Some(RuntimeErrorCode::TooManyItems),
+                RuntimeErrorCode::TooManyItems => Some(RuntimeErrorCode::BodyTooLarge),
+                RuntimeErrorCode::BodyTooLarge => Some(RuntimeErrorCode::UnsupportedMediaType),
+                RuntimeErrorCode::UnsupportedMediaType => Some(RuntimeErrorCode::InternalError),
+                RuntimeErrorCode::InternalError => Some(RuntimeErrorCode::Busy),
+                RuntimeErrorCode::Busy => Some(RuntimeErrorCode::Timeout),
+                RuntimeErrorCode::Timeout => Some(RuntimeErrorCode::PackOutdated),
+                RuntimeErrorCode::PackOutdated => None,
+            }
+        }
+        let mut codes = vec![RuntimeErrorCode::InvalidQuery];
+        while let Some(code) = after(codes[codes.len() - 1]) {
+            codes.push(code);
+        }
+        for (position, code) in codes.iter().enumerate() {
+            assert_eq!(
+                *code as usize, position,
+                "{code:?} is skipped or out of order"
             );
         }
+        let sent: std::collections::BTreeSet<String> =
+            codes.iter().map(|code| code.as_str().to_string()).collect();
+        assert_eq!(sent, documented);
     }
 }

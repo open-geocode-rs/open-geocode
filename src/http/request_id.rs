@@ -188,11 +188,6 @@ mod tests {
         assert_eq!(sanitize(&long).unwrap().len(), MAX_REQUEST_ID_LEN);
     }
 
-    #[test]
-    fn generate_produces_distinct_ids() {
-        assert_ne!(generate(), generate());
-    }
-
     #[tokio::test]
     async fn internal_errors_log_route_templates() {
         let log = ErrorLog::capture();

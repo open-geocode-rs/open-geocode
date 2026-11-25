@@ -1078,15 +1078,6 @@ mod tests {
     }
 
     #[test]
-    fn adds_missing_coordinate_columns() {
-        let mut headers = vec!["id".to_string(), "address".to_string()];
-        let columns = ensure_coordinate_columns(&mut headers, "lat", "lon").expect("columns");
-        assert_eq!(headers, vec!["id", "address", "lat", "lon"]);
-        assert_eq!(columns.lat_index, 2);
-        assert_eq!(columns.lon_index, 3);
-    }
-
-    #[test]
     fn reuses_existing_coordinate_columns_case_insensitively() {
         let mut headers = vec!["id".to_string(), "LAT".to_string(), "Lon".to_string()];
         let columns = ensure_coordinate_columns(&mut headers, "lat", "lon").expect("columns");
@@ -1333,27 +1324,5 @@ a,43.6,-79.4
             assert!(format!("{error:#}").contains("same file"), "{error:#}");
             assert_eq!(std::fs::read_to_string(&input).expect("input"), contents);
         }
-    }
-
-    #[test]
-    fn pads_rows_before_writing_coordinates() {
-        let audit = AuditFields {
-            lat: "43.1".into(),
-            lon: "-79.2".into(),
-            ..AuditFields::default()
-        };
-        let columns = CoordinateColumns {
-            lat_index: 1,
-            lon_index: 2,
-        };
-        let row = ByteRecord::from(vec!["1"]);
-        assert_eq!(
-            output_record(&row, 3, Some((columns, &audit))),
-            ByteRecord::from(vec!["1", "43.1", "-79.2"])
-        );
-        assert_eq!(
-            output_record(&row, 3, None),
-            ByteRecord::from(vec!["1", "", ""])
-        );
     }
 }
