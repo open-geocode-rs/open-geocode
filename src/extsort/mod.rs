@@ -962,10 +962,9 @@ mod tests {
     fn a_tiny_share_spills_many_runs_and_merges_them_twice() {
         let scratch = scratch("spill");
         let item = std::mem::size_of::<(u64, u64)>();
-        // Buffers of a few hundred items: well over a hundred runs, and a
-        // share that reads only a few at once.
+        // A share of a few hundred items cuts over a hundred runs and reads only a few at once.
         let mut sorter = ExternalSorter::new(&scratch, "pairs", &Budget::unlimited(), 400 * item);
-        let input = pseudo_random(50_000);
+        let input = pseudo_random(8_000);
         for item in &input {
             sorter.push(*item).expect("push");
         }

@@ -260,12 +260,15 @@ impl Catalogue {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use crate::{
         pack::{Reader, Writer},
         record::{
             AddressComponents, AddressRecord, LocationPrecision, PlaceLayer, PlaceRecord,
             PoiRecord, Record, RoadClass, SourceProvenance, StreetRecord, point_geometry,
         },
+        test_support::TempDir,
         util::geo::line_geometry,
     };
 
@@ -290,10 +293,29 @@ mod tests {
         }
     }
 
-    #[test]
-    fn finds_an_object_written_as_records_in_two_blocks() {
-        let dir = std::env::temp_dir().join(format!("open-geocode-ids-{}", uuid::Uuid::new_v4()));
+    static IDS_PACK: LazyLock<TempDir> = LazyLock::new(|| {
+        let dir = TempDir::new("ids");
         let mut writer = Writer::create(&dir).expect("writer");
+        for record in two_blocks_records()
+            .into_iter()
+            .chain(every_place_records())
+            .chain(street_records())
+        {
+            writer.write(&record, None).expect("write");
+        }
+        writer.finish().expect("finish");
+        dir
+    });
+
+    fn open_catalogue() -> (Reader, Arc<Catalogue>) {
+        let pack = Reader::open(&*IDS_PACK).expect("pack");
+        let catalogue = Catalogue::open(pack.container())
+            .expect("open")
+            .expect("a catalogue");
+        (pack, catalogue)
+    }
+
+    fn two_blocks_records() -> Vec<Record> {
         let district = SourceProvenance::osm(ObjectType::Way, 7);
         let poi = |name: &str, source: SourceProvenance, lon: f64| -> Record {
             PoiRecord {
@@ -313,152 +335,89 @@ mod tests {
             .into()
         };
         // The way as a POI, many records, then the same way as a district.
-        writer
-            .write(&poi("Historic District", district.clone(), -79.0), None)
-            .expect("poi");
+        let mut records = vec![poi("Historic District", district.clone(), -79.0)];
         for index in 0..2_000 {
-            let source = SourceProvenance::osm(ObjectType::Node, i64::from(index) + 100);
-            writer
-                .write(&poi("Cafe", source, -78.0), None)
-                .expect("filler");
+            let source = SourceProvenance::osm(ObjectType::Node, i64::from(index) + 100_000);
+            records.push(poi("Old Mill", source, -78.0));
         }
-        writer
-            .write(
-                &Record::Place(
-                    PlaceLayer::Neighbourhood,
-                    PlaceRecord {
-                        alt_names: Vec::new(),
-                        name: "Historic District".to_string(),
-                        place_type: "neighbourhood".to_string(),
-                        geometry: point_geometry(-79.0, 43.0),
-                        source: district,
-                        prominence: Default::default(),
-                        wikidata: None,
-                    },
-                ),
-                None,
-            )
-            .expect("district");
-        writer.finish().expect("finish");
-        let pack = Reader::open(&dir).expect("pack");
-        let catalogue = Catalogue::open(pack.container())
-            .expect("open")
-            .expect("a catalogue");
-        let found = catalogue
-            .find(pack.records(), ObjectType::Way, 7)
-            .expect("find");
-        let layers = found
-            .iter()
-            .map(|id| pack.record_summary(*id).expect("summary").layer)
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            layers,
-            ["neighbourhood".to_string(), "poi".to_string()].into(),
-            "the object's records in every block"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        records.push(Record::Place(
+            PlaceLayer::Neighbourhood,
+            PlaceRecord {
+                alt_names: Vec::new(),
+                name: "Historic District".to_string(),
+                place_type: "neighbourhood".to_string(),
+                geometry: point_geometry(-79.0, 43.0),
+                source: district,
+                prominence: Default::default(),
+                wikidata: None,
+            },
+        ));
+        records
     }
 
-    #[test]
-    fn finds_every_place_by_its_id_and_nothing_else() {
-        let dir = std::env::temp_dir().join(format!("open-geocode-ids-{}", uuid::Uuid::new_v4()));
-        let mut writer = Writer::create(&dir).expect("writer");
-        for index in 0..300 {
-            let lon = -79.0 + f64::from(index) * 1e-4;
-            let record: Record = match index % 3 {
-                0 => PoiRecord {
-                    alt_names: Vec::new(),
-                    name: format!("Cafe {index}"),
-                    category: "amenity:cafe".to_string(),
-                    address: None,
-                    geometry: point_geometry(lon, 43.0),
-                    location_precision: LocationPrecision::Point,
-                    source: SourceProvenance::osm(ObjectType::Node, i64::from(index) + 1),
-                    prominence: Default::default(),
-                    wikidata: None,
-                    brand: None,
-                    details: None,
-                    aliases: Vec::new(),
-                }
-                .into(),
-                1 => Record::Place(
-                    PlaceLayer::Locality,
-                    PlaceRecord {
+    fn every_place_records() -> Vec<Record> {
+        (0..300)
+            .map(|index| {
+                let lon = 10.0 + f64::from(index) * 1e-4;
+                match index % 3 {
+                    0 => PoiRecord {
                         alt_names: Vec::new(),
-                        name: format!("Town {index}"),
-                        place_type: "town".to_string(),
-                        geometry: point_geometry(lon, 43.0),
-                        source: SourceProvenance::osm(ObjectType::Relation, i64::from(index) + 1),
+                        name: format!("Cafe {index}"),
+                        category: "amenity:cafe".to_string(),
+                        address: None,
+                        geometry: point_geometry(lon, 50.0),
+                        location_precision: LocationPrecision::Point,
+                        source: SourceProvenance::osm(ObjectType::Node, i64::from(index) + 1),
                         prominence: Default::default(),
                         wikidata: None,
-                    },
-                ),
-                _ => AddressRecord {
-                    building: None,
-                    access: Vec::new(),
-                    disputed: false,
-                    street_postcodes: Vec::new(),
-                    address: AddressComponents {
-                        block_number_len: None,
-                        areas: Vec::new(),
-                        number: index.to_string(),
-                        street: Some("King Street".to_string()),
-                        place: None,
-                        unit: None,
-                        locality: None,
-                        region: None,
-                        postcode: None,
-                        country: None,
-                    },
-                    geometry: point_geometry(lon, 43.0),
-                    location_precision: LocationPrecision::Point,
-                    source: SourceProvenance::osm(ObjectType::Node, i64::from(index) + 1),
+                        brand: None,
+                        details: None,
+                        aliases: Vec::new(),
+                    }
+                    .into(),
+                    1 => Record::Place(
+                        PlaceLayer::Locality,
+                        PlaceRecord {
+                            alt_names: Vec::new(),
+                            name: format!("Town {index}"),
+                            place_type: "town".to_string(),
+                            geometry: point_geometry(lon, 50.0),
+                            source: SourceProvenance::osm(
+                                ObjectType::Relation,
+                                i64::from(index) + 1,
+                            ),
+                            prominence: Default::default(),
+                            wikidata: None,
+                        },
+                    ),
+                    _ => AddressRecord {
+                        building: None,
+                        access: Vec::new(),
+                        disputed: false,
+                        street_postcodes: Vec::new(),
+                        address: AddressComponents {
+                            block_number_len: None,
+                            areas: Vec::new(),
+                            number: index.to_string(),
+                            street: Some("King Street".to_string()),
+                            place: None,
+                            unit: None,
+                            locality: None,
+                            region: None,
+                            postcode: None,
+                            country: None,
+                        },
+                        geometry: point_geometry(lon, 50.0),
+                        location_precision: LocationPrecision::Point,
+                        source: SourceProvenance::osm(ObjectType::Node, i64::from(index) + 1),
+                    }
+                    .into(),
                 }
-                .into(),
-            };
-            writer.write(&record, None).expect("write");
-        }
-        writer.finish().expect("finish");
-        let pack = Reader::open(&dir).expect("pack");
-        let catalogue = Catalogue::open(pack.container())
-            .expect("open")
-            .expect("a catalogue");
-        assert_eq!(catalogue.len(), 200);
-        for index in 0..300 {
-            let (object_type, layer) = match index % 3 {
-                0 => (ObjectType::Node, "poi"),
-                1 => (ObjectType::Relation, "locality"),
-                _ => (ObjectType::Node, "address"),
-            };
-            let object_id = i64::from(index) + 1;
-            let found = catalogue
-                .find(pack.records(), object_type, object_id)
-                .expect("find");
-            if layer == "address" {
-                assert!(found.is_empty(), "an address is not catalogued");
-                continue;
-            }
-            let id = crate::labels::osm_record_id(object_type, object_id);
-            let oracle = pack
-                .find_by_source_id(&id)
-                .expect("scan")
-                .expect("a record");
-            assert_eq!(found, vec![oracle], "{id}");
-            assert_eq!(pack.record_summary(found[0]).expect("summary").layer, layer);
-        }
-        assert!(
-            catalogue
-                .find(pack.records(), ObjectType::Way, 12_345)
-                .expect("find")
-                .is_empty(),
-            "an id no record has"
-        );
-        let _ = std::fs::remove_dir_all(dir);
+            })
+            .collect()
     }
-    #[test]
-    fn a_street_answers_to_each_of_its_ways_and_a_place_comes_first() {
-        let dir = std::env::temp_dir().join(format!("open-geocode-ids-{}", uuid::Uuid::new_v4()));
-        let mut writer = Writer::create(&dir).expect("writer");
+
+    fn street_records() -> Vec<Record> {
         let street = |own: i64, other_ways: Vec<i64>, lon: f64| -> Record {
             Record::Street(StreetRecord {
                 name: "Ponsonby Road".to_string(),
@@ -474,38 +433,86 @@ mod tests {
                 other_ways,
             })
         };
-        writer
-            .write(&street(700, vec![701, 702], 174.74), None)
-            .expect("write");
-        let market: Record = PoiRecord {
-            alt_names: Vec::new(),
-            name: "Ponsonby Market".to_string(),
-            category: "amenity:marketplace".to_string(),
-            address: None,
-            geometry: point_geometry(174.7405, -36.85),
-            location_precision: LocationPrecision::Point,
-            source: SourceProvenance::osm(ObjectType::Way, 701),
-            prominence: Default::default(),
-            wikidata: None,
-            brand: None,
-            details: None,
-            aliases: Vec::new(),
-        }
-        .into();
-        writer.write(&market, None).expect("write");
+        let mut records = vec![
+            street(700, vec![701, 702], 174.74),
+            PoiRecord {
+                alt_names: Vec::new(),
+                name: "Ponsonby Market".to_string(),
+                category: "amenity:marketplace".to_string(),
+                address: None,
+                geometry: point_geometry(174.7405, -36.85),
+                location_precision: LocationPrecision::Point,
+                source: SourceProvenance::osm(ObjectType::Way, 701),
+                prominence: Default::default(),
+                wikidata: None,
+                brand: None,
+                details: None,
+                aliases: Vec::new(),
+            }
+            .into(),
+        ];
         for index in 0..100 {
-            writer
-                .write(&street(10_000 + index, Vec::new(), 175.0), None)
-                .expect("write");
+            records.push(street(10_000 + index, Vec::new(), 175.0));
         }
-        writer
-            .write(&street(20_000, vec![1_400_000_000], 175.1), None)
-            .expect("write");
-        writer.finish().expect("finish");
-        let pack = Reader::open(&dir).expect("pack");
-        let catalogue = Catalogue::open(pack.container())
-            .expect("open")
-            .expect("a catalogue");
+        records.push(street(20_000, vec![1_400_000_000], 175.1));
+        records
+    }
+
+    #[test]
+    fn finds_an_object_written_as_records_in_two_blocks() {
+        let (pack, catalogue) = open_catalogue();
+        let found = catalogue
+            .find(pack.records(), ObjectType::Way, 7)
+            .expect("find");
+        let layers = found
+            .iter()
+            .map(|id| pack.record_summary(*id).expect("summary").layer)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            layers,
+            ["neighbourhood".to_string(), "poi".to_string()].into(),
+            "the object's records in every block"
+        );
+    }
+
+    #[test]
+    fn finds_every_place_by_its_id_and_nothing_else() {
+        let (pack, catalogue) = open_catalogue();
+        let mut by_source = std::collections::HashMap::new();
+        for record_id in 0..pack.records().record_count() {
+            let summary = pack.record_summary(record_id).expect("summary");
+            by_source.entry(summary.id).or_insert(record_id);
+        }
+        for index in 0..300 {
+            let (object_type, layer) = match index % 3 {
+                0 => (ObjectType::Node, "poi"),
+                1 => (ObjectType::Relation, "locality"),
+                _ => (ObjectType::Node, "address"),
+            };
+            let object_id = i64::from(index) + 1;
+            let found = catalogue
+                .find(pack.records(), object_type, object_id)
+                .expect("find");
+            if layer == "address" {
+                assert!(found.is_empty(), "an address is not catalogued");
+                continue;
+            }
+            let id = crate::labels::osm_record_id(object_type, object_id);
+            assert_eq!(found, vec![by_source[&id]], "{id}");
+            assert_eq!(pack.record_summary(found[0]).expect("summary").layer, layer);
+        }
+        assert!(
+            catalogue
+                .find(pack.records(), ObjectType::Way, 12_345)
+                .expect("find")
+                .is_empty(),
+            "an id no record has"
+        );
+    }
+
+    #[test]
+    fn a_street_answers_to_each_of_its_ways_and_a_place_comes_first() {
+        let (pack, catalogue) = open_catalogue();
         let find = |object_id| {
             catalogue
                 .find(pack.records(), ObjectType::Way, object_id)
@@ -525,6 +532,5 @@ mod tests {
         );
         assert_eq!(find(1_400_000_000)[0].1, "Ponsonby Road");
         assert!(find(703).is_empty(), "a way of no street");
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1576,33 +1576,30 @@ mod tests {
     fn early_stopping_scan_matches_the_full_scan() {
         // Points scattered over ~60 km, denser near the centre.
         let points = scattered(5_000);
-        let postcodes = points
+        let records = points
             .iter()
             .enumerate()
-            .map(|(index, [lon, lat])| {
-                Record::Postcode(PostcodeRecord {
-                    postcode: format!("P{index}"),
-                    country: None,
-                    geometry: point_geometry(*lon, *lat),
-                    source: DerivedSourceProvenance::osm_address_records(1),
-                })
+            .flat_map(|(index, [lon, lat])| {
+                [
+                    Record::Postcode(PostcodeRecord {
+                        postcode: format!("P{index}"),
+                        country: None,
+                        geometry: point_geometry(*lon, *lat),
+                        source: DerivedSourceProvenance::osm_address_records(1),
+                    }),
+                    address(*lon, *lat, index as i64),
+                ]
             })
             .collect::<Vec<_>>();
-        let addresses = points
-            .iter()
-            .enumerate()
-            .map(|(index, [lon, lat])| address(*lon, *lat, index as i64))
-            .collect::<Vec<_>>();
-        let (postcodes, _) = build(&postcodes);
-        let (addresses, _) = build(&addresses);
+        let (reader, _) = build(&records);
         let distances =
             |hits: &[PointCandidate]| hits.iter().map(|hit| hit.distance_m).collect::<Vec<_>>();
         for (lon, lat) in [(-79.4, 43.7), (-79.6, 43.9), (-79.1, 43.5), (-78.0, 43.0)] {
             for limit in [1, 16, 100] {
-                let early = postcodes
+                let early = reader
                     .context_candidates(lon, lat, 50_000.0, limit)
                     .expect("early");
-                let mut full = postcodes
+                let mut full = reader
                     .context_candidates(lon, lat, 50_000.0, 0)
                     .expect("full");
                 full.truncate(limit);
@@ -1612,10 +1609,10 @@ mod tests {
                     "{lon},{lat} limit {limit}"
                 );
 
-                let early = addresses
+                let early = reader
                     .point_candidates(lon, lat, Layer::Address, 50_000.0, limit)
                     .expect("early");
-                let mut full = addresses
+                let mut full = reader
                     .point_candidates(lon, lat, Layer::Address, 50_000.0, 0)
                     .expect("full");
                 full.truncate(limit);

@@ -65,7 +65,11 @@ const MAX_INDEX_PARTS: usize = 16;
 /// documents are a few long runs, which pack into far fewer bits than the
 /// one-by-one spread a writer of many threads makes. Each part's queue holds
 /// a whole chunk, so every part is at work while the next is fed.
+#[cfg(not(test))]
 const CHUNK_DOCUMENTS: u64 = 8_192;
+// Small in tests, so a few hundred records span several chunks.
+#[cfg(test)]
+const CHUNK_DOCUMENTS: u64 = 64;
 /// Where in the scratch directory Tantivy writes, and whose bytes they are.
 const DIRECTORY: &str = "text";
 /// The directory of `DIRECTORY` the parts are joined into.
@@ -1806,11 +1810,11 @@ mod tests {
     };
 
     use super::*;
+    use crate::test_support::TempDir;
 
     #[test]
     fn documents_run_in_chunks_of_neighbours_in_one_segment() {
-        let dir =
-            std::env::temp_dir().join(format!("open-geocode-text-parts-{}", uuid::Uuid::new_v4()));
+        let dir = TempDir::new("text-parts");
         // Each address on a street of its own, so each is a document; past
         // two chunks, so a part's chunk ends inside the index.
         let count = 2 * CHUNK_DOCUMENTS + 5;
@@ -1853,7 +1857,6 @@ mod tests {
             .map(|(_, bytes)| bytes)
             .sum::<u64>();
         let segments = searcher.segment_readers();
-        let _ = fs::remove_dir_all(&dir);
         assert!(
             store_bytes < 1_024,
             "{count} documents keep no store of their own: {store_bytes} bytes"
