@@ -11,7 +11,7 @@ use crate::{
     util::geo::point_lon_lat,
 };
 
-pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 23;
+pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 24;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ReportInput {
@@ -339,10 +339,8 @@ pub struct StageReport {
     pub peak_scratch_bytes: u64,
     pub peak_rss_bytes: u64,
     pub peak_budget_bytes: u64,
-    /// Most bytes the heap held at once, as the global allocator counts
-    /// them; 0 when it does not count.
     #[serde(default)]
-    pub peak_heap_bytes: u64,
+    pub peak_heap_bytes: Option<u64>,
     pub shares: BoundShares,
     pub bound: Bound,
 }
@@ -378,7 +376,7 @@ impl BuilderReport {
                 0.0
             };
             table.push_str(&format!(
-                "{:<28} {:>8.1} {:>6.1} {:>9.0} {:>8.0} ({:>6.0}) {:>8.0} ({:>6.0}) {:>8.0}M {:>7.0}M {:>7.0}M {:>7.0}M  {}\n",
+                "{:<28} {:>8.1} {:>6.1} {:>9.0} {:>8.0} ({:>6.0}) {:>8.0} ({:>6.0}) {:>8.0}M {:>7.0}M {:>8} {:>7.0}M  {}\n",
                 stage.stage,
                 secs,
                 stage.shares.cores,
@@ -389,7 +387,9 @@ impl BuilderReport {
                 mib(stage.scratch_raw_read_bytes),
                 mib(stage.peak_scratch_bytes),
                 mib(stage.peak_rss_bytes),
-                mib(stage.peak_heap_bytes),
+                stage
+                    .peak_heap_bytes
+                    .map_or_else(|| "n/a".to_string(), |bytes| format!("{:.0}M", mib(bytes))),
                 mib(stage.peak_budget_bytes),
                 stage.bound.as_str(),
             ));
@@ -1535,6 +1535,30 @@ mod tests {
             serde_json::to_value(Bound::ReadIo).expect("json"),
             serde_json::json!("read-io")
         );
+    }
+
+    #[test]
+    fn the_stage_table_shows_an_uncounted_heap_as_n_a() {
+        let stage = |peak_heap_bytes| StageReport {
+            stage: "parse".into(),
+            peak_heap_bytes,
+            ..StageReport::default()
+        };
+        let report = BuilderReport {
+            stages: vec![stage(Some(5 << 20)), stage(None), stage(Some(0))],
+            ..BuilderReport::default()
+        };
+        let table = report.stage_table();
+        let rows: Vec<&str> = table.lines().skip(1).take(3).collect();
+        assert!(rows[0].contains("      5M "), "{}", rows[0]);
+        assert!(rows[1].contains("     n/a "), "{}", rows[1]);
+        assert!(rows[2].contains("      0M "), "{}", rows[2]);
+        let mut old = serde_json::to_value(stage(Some(1))).expect("json");
+        old.as_object_mut()
+            .expect("object")
+            .remove("peak_heap_bytes");
+        let old: StageReport = serde_json::from_value(old).expect("json");
+        assert_eq!(old.peak_heap_bytes, None);
     }
 
     #[test]

@@ -414,7 +414,7 @@ impl Meter {
             peak_scratch_bytes: self.scratch.stage_peak_bytes(),
             peak_rss_bytes: self.peak_rss.load(Ordering::Relaxed),
             peak_budget_bytes: self.budget.stage_peak() as u64,
-            peak_heap_bytes: alloc::stage_peak_bytes().unwrap_or_default() as u64,
+            peak_heap_bytes: alloc::stage_peak_bytes().map(|bytes| bytes as u64),
             shares,
             bound,
         };
