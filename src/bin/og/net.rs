@@ -781,12 +781,10 @@ mod tests {
         let published = published(index.link(id)?)?;
         let dir = TempDir::new("og-net-download");
         let path = dir.join("region.osm.pbf");
-        let result =
-            download(&published, &path, &AtomicBool::new(false), |_, _| {}).and_then(|partial| {
-                check_md5(&partial, &published.md5, &AtomicBool::new(false), |_| {})?;
-                Ok(fs::read(&partial)?)
-            });
-        result
+        download(&published, &path, &AtomicBool::new(false), |_, _| {}).and_then(|partial| {
+            check_md5(&partial, &published.md5, &AtomicBool::new(false), |_| {})?;
+            Ok(fs::read(&partial)?)
+        })
     }
 
     #[test]
