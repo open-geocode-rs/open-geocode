@@ -2,8 +2,8 @@ reviews:
   path_instructions:
     - path: "**/*.rs"
       instructions: |
-        Review added or changed comments in the diff using pstack's Comment Sicko
-        rules and this repository's AGENTS.md.
+        Review added or changed comments in the diff using the Comments rules in
+        this repository's AGENTS.md.
 
         Flag narration, banners, commented-out code, and workaround sermons.
         A long justification without a proven keep-list exception is a
