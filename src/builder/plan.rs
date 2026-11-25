@@ -62,8 +62,17 @@ const HOUSE_SPILL_BYTES: f64 = 50.0;
 const PACK_BYTES_PER_RECORD: f64 = 102.0;
 const PACK_BYTES_PER_IMPORTED_ROW: f64 = 25.0;
 
-const WORKER_BYTES: u64 = 64 << 20;
-const BASE_UNTRACKED_BYTES: u64 = 256 << 20;
+/// A worker's batch of PBF blobs and its own allocator pages.
+pub const WORKER_BYTES: u64 = 64 << 20;
+/// Four extracts of 2 to 12 GB held at most 760 MiB beyond their budget with 6 workers (2026-11).
+pub const BASE_UNTRACKED_BYTES: u64 = 512 << 20;
+/// Heap the boundaries hold per boundary vertex, inside the memory budget:
+/// what describes each area, and the index of the ways' lines while they
+/// are assembled. The vertices themselves stay on disk, the ways' until the
+/// boundary stage reads them back by way id and the shapes' in a file they
+/// are mapped from. The planet (2026-10) held 409 MB of descriptions for
+/// 203.6 million vertices, 2.0 B each; twice that leaves room for the line
+/// index.
 const BOUNDARY_HEAP_BYTES_PER_REF: f64 = 4.0;
 const BOUNDARY_SHAPE_BYTES_PER_REF: f64 = 30.0;
 const BUDGET_PERCENT: u64 = 75;
@@ -351,8 +360,6 @@ fn derived_budget(resources: &Resources, threads: usize) -> u64 {
         .max(MIN_BUDGET_BYTES as u64)
 }
 
-/// Worker threads the build's pool runs: as many as `RAYON_NUM_THREADS`
-/// names, as the pool reads it, else every usable CPU.
 fn worker_threads(resources: &Resources) -> usize {
     std::env::var("RAYON_NUM_THREADS")
         .ok()
