@@ -7,7 +7,7 @@
 //! fails here until its examples are regenerated, with
 //! `OG_UPDATE_CONTRACT=1 cargo test contract`, and committed with it.
 
-use std::path::{Path, PathBuf};
+use std::{path::Path, sync::LazyLock};
 
 use axum::{
     Router,
@@ -29,6 +29,7 @@ use crate::{
         PlaceRecord, PoiDetails, PoiRecord, Record, SourceProvenance, StreetRecord, point_geometry,
     },
     runtime::{AppState, build_router},
+    test_support::TempDir,
 };
 
 /// Set to write the live answers and columns over the committed files.
@@ -71,17 +72,8 @@ async fn committed_openapi_is_the_served_contract() {
         crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
     assert_committed("openapi.json", &document);
 
-    let pack = contract_pack();
-    let router = build_router(
-        AppState::open(
-            &pack,
-            &pack.with_extension("jobs"),
-            crate::limits::Limits::DEFAULT,
-        )
-        .expect("open pack"),
-        Some(&pack.join("demo")),
-        Some(&pack.join("basemap.pmtiles")),
-    );
+    let jobs = TempDir::new("contract-openapi");
+    let router = served(&CONTRACT, &jobs);
     let response = router
         .oneshot(
             Request::get("/openapi.json")
@@ -99,7 +91,6 @@ async fn committed_openapi_is_the_served_contract() {
         document,
         "/openapi.json differs from the committed contract"
     );
-    let _ = std::fs::remove_dir_all(&pack);
 }
 
 /// Release Please uses JSON.stringify, which writes integral floats as integers.
@@ -193,36 +184,24 @@ fn committed_audit_columns_are_the_batch_columns() {
     assert_committed(batch::AUDIT_COLUMNS_FILE, &batch::audit_columns_text());
 }
 
-/// A Pack holding the handful of records the examples are built from, in a
-/// directory of its own so tests can run side by side.
-fn contract_pack() -> PathBuf {
-    let pack = std::env::temp_dir().join(format!(
-        "open-geocode-contract-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    write_pack(&pack);
-    pack
+static CONTRACT: LazyLock<TempDir> = LazyLock::new(|| {
+    let dir = TempDir::new("contract");
+    write_pack(&dir);
+    dir
+});
+
+fn served(pack: &Path, jobs: &Path) -> Router {
+    build_router(
+        AppState::open(pack, jobs, crate::limits::Limits::DEFAULT).expect("open pack"),
+        Some(&pack.join("demo")),
+        Some(&pack.join("basemap.pmtiles")),
+    )
 }
 
 #[tokio::test]
 async fn responses_match_the_committed_examples() {
-    let pack = std::env::temp_dir().join(format!(
-        "open-geocode-contract-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    write_pack(&pack);
-    let router = build_router(
-        AppState::open(
-            &pack,
-            &pack.with_extension("jobs"),
-            crate::limits::Limits::DEFAULT,
-        )
-        .expect("open pack"),
-        Some(&pack.join("demo")),
-        Some(&pack.join("basemap.pmtiles")),
-    );
+    let jobs = TempDir::new("contract-examples");
+    let router = served(&CONTRACT, &jobs);
 
     let address = get(&router, "/geocode?q=10%20King%20Street").await;
     assert_example("geocode-text", &address);
@@ -495,8 +474,6 @@ async fn responses_match_the_committed_examples() {
         assert_eq!(matched.remove("country"), Some(json!("matched")));
     }
     assert_eq!(unfiltered["features"], filtered["features"]);
-
-    let _ = std::fs::remove_dir_all(&pack);
 }
 
 /// One batch result, its answer kept as the bytes it was sent as.
@@ -517,17 +494,8 @@ struct RawBatch {
 /// a batch alike, byte for byte too.
 #[tokio::test]
 async fn batch_results_are_their_get_answers() {
-    let pack = contract_pack();
-    let router = build_router(
-        AppState::open(
-            &pack,
-            &pack.with_extension("jobs"),
-            crate::limits::Limits::DEFAULT,
-        )
-        .expect("open pack"),
-        Some(&pack.join("demo")),
-        Some(&pack.join("basemap.pmtiles")),
-    );
+    let jobs = TempDir::new("contract-batch");
+    let router = served(&CONTRACT, &jobs);
 
     let batches = [
         (
@@ -620,8 +588,6 @@ async fn batch_results_are_their_get_answers() {
     let example: Value = serde_json::from_slice(&example).expect("batch is JSON");
     assert_example("batch-geocode", &example);
     batch_schemas_match_the_rendered_body(&example);
-
-    let _ = std::fs::remove_dir_all(&pack);
 }
 
 /// The batch schemas in the contract are mirrors, like `Problem`'s, so this
@@ -756,7 +722,7 @@ async fn get(router: &Router, uri: &str) -> Value {
 
 /// Canada > Ontario > Toronto, an address, a POI with an address, a street
 /// and an interpolation range in Toronto.
-fn write_pack(dir: &PathBuf) {
+fn write_pack(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
     let mut writer = Writer::create(dir).expect("writer");
     let place = |writer: &mut Writer, layer, name: &str, id| {
@@ -950,7 +916,7 @@ fn line(from_lon: f64, from_lat: f64, to_lon: f64, to_lat: f64) -> Geometry {
 
 /// Geneva in Switzerland, each area with its names in other languages, and
 /// an address in Geneva.
-fn write_geneva_pack(dir: &PathBuf) {
+fn write_geneva_pack(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
     let mut writer = Writer::create(dir).expect("writer");
     let mut place = |layer, name: &str, alt_names: &[&str], id, context| {
@@ -1058,31 +1024,14 @@ fn write_geneva_pack(dir: &PathBuf) {
     writer.finish().expect("finish");
 }
 
-fn geneva_router() -> Router {
-    let pack = std::env::temp_dir().join(format!(
-        "open-geocode-geneva-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    write_geneva_pack(&pack);
-    build_router(
-        AppState::open(
-            &pack,
-            &pack.with_extension("jobs"),
-            crate::limits::Limits::DEFAULT,
-        )
-        .expect("open pack"),
-        Some(&pack.join("demo")),
-        Some(&pack.join("basemap.pmtiles")),
-    )
-}
-
 /// `lang` names results and their areas. The first language gives `name`,
 /// with the local name standing in where there is none, and each other one
 /// gives `translations`.
 #[tokio::test]
 async fn lang_names_results_and_areas_in_the_languages_asked() {
-    let router = geneva_router();
+    let dir = TempDir::new("geneva");
+    write_geneva_pack(&dir.join("pack"));
+    let router = served(&dir.join("pack"), &dir.join("jobs"));
 
     let local = get(&router, "/places?ids=osm:relation:1685488").await;
     let city = &local["features"][0]["properties"];
