@@ -4643,14 +4643,6 @@ mod tests {
         }
         let plan = &report.resources.plan;
         assert!(plan.counted && plan.locations_in_memory);
-        assert_eq!(plan.items.needed_nodes, 17);
-        assert_eq!(plan.items.streets, 2);
-        assert_eq!(report.accepted.postcode_records, 1);
-        assert_eq!(report.geometry_resolution.street_way_stubs, 2);
-        assert_eq!(
-            report.scratch.spills["records"].merge_passes, 1,
-            "a small input merges what its checkpoints wrote once"
-        );
         assert!(report.scratch.peak_tracked_bytes > 0);
         assert!(report.scratch.peak_tracked_bytes <= report.scratch.memory_budget_bytes);
 

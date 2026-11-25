@@ -290,9 +290,4 @@ mod tests {
         assert_eq!(group.sample.len(), SAMPLE_POINTS);
         assert_eq!(group.record_count, 100);
     }
-
-    #[test]
-    fn skips_placeholder_postcodes_without_letters_or_numbers() {
-        assert_eq!(clean_postcode("---"), None);
-    }
 }

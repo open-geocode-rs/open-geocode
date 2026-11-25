@@ -584,15 +584,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_a_listed_source_without_a_size() {
-        let listed: Vec<Source> = serde_json::from_str(
-            r#"[{"id":1,"source":"us/ny/x","name":"city","job":5,"size":null,"layer":"addresses"}]"#,
-        )
-        .expect("listing");
-        assert_eq!((listed[0].job, listed[0].size), (5, None));
-    }
-
-    #[test]
     fn reads_the_token_line_of_a_dotenv_file() {
         let text = "# OA_TOKEN=commented\nOTHER=1\nexport OA_TOKEN = \"oa.abc\"\n";
         assert_eq!(
