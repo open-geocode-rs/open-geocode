@@ -1739,6 +1739,27 @@ mod tests {
     }
 
     #[test]
+    fn a_word_ending_exactly_the_least_number_of_street_names_is_learned_as_a_type() {
+        let mut ends = HashMap::new();
+        for index in 0..MIN_STREET_TYPE_NAMES {
+            count_street_ends(&mut ends, &format!("name{index} zorblax"));
+        }
+        for index in 0..MIN_STREET_TYPE_NAMES - 1 {
+            count_street_ends(&mut ends, &format!("name{index} quorlane"));
+        }
+        let types = street_types(ends, 1000);
+        assert_eq!(
+            types.get("zorblax"),
+            Some(&Entry {
+                count: MIN_STREET_TYPE_NAMES,
+                country: None,
+                levels: 0,
+            })
+        );
+        assert!(!types.contains_key("quorlane"));
+    }
+
+    #[test]
     fn places_are_named_by_every_name_with_unspaced_scripts_glued() {
         let place = Record::Place(
             PlaceLayer::Locality,
