@@ -1,50 +1,3 @@
-//! Streaming OSM build.
-//!
-//! Memory stays bounded whatever the input size. Ways get their geometry
-//! from a node store: the scan marks the nodes kept ways need in a bitmap
-//! over the id space, the node pass keeps only their coordinates, in id
-//! order, and the way pass reads the kept ways again and finds each node by
-//! its rank among the marked ids. Finished records flow through scratch
-//! files and external sorts. A region's sorts fit in memory, reaching
-//! scratch only once, compressed, as the checkpoints write them; a planet
-//! maps its coordinates from scratch when the budget cannot hold them, and
-//! spills and merges records through the same code. The budget
-//! and the worker threads are sized to the machine before the build starts,
-//! and the rest of the build to what each scan counted (see [`plan_build`]).
-//!
-//! One Pack can cover several extracts. The four PBF passes below run once
-//! per input, because the node pass stores coordinates in id order, which
-//! only holds within one sorted PBF. Their records all land in the same
-//! sorters, so the stages after them -- boundaries, the record write, the
-//! seal and the parser training -- run once over everything. That keeps one
-//! text index with one set of collection statistics, so BM25 scores stay
-//! comparable across regions, which is what searching several countries as
-//! one requires.
-//!
-//! ```text
-//! per input:
-//! pass 1  scan every block (parallel)     -> records for nodes, needed node ids,
-//!                                            boundary relations
-//! pass 2  read way blocks                 -> boundary relation member ways
-//! pass 3  read node blocks (parallel)     -> coordinates of needed nodes
-//! pass 4  reread kept way blocks          -> address, POI, street, interpolation
-//!         (parallel)                         records, boundary ways
-//!
-//! once:
-//! order   context records, given their ids; streets joined; addresses
-//!         written to the address book, repeated houses found, addresses
-//!         placed
-//! write   context records, then the rest, each in Hilbert order,
-//!         drawing a sample of each country's records
-//! seal    text, spatial and parser dictionary indexes into the Pack file
-//! train   the address parser on the sample, its weights added to the Pack
-//! ```
-//!
-//! Every step above ends in a checkpoint ([`checkpoint::Step`]): its
-//! outputs are durable in scratch and a manifest names them, so a build
-//! that stops goes on from the last one (see [`crate::builder::resume`]).
-//! Stopping costs the step it stopped in, never the steps before.
-
 mod address;
 pub(crate) use address::LOCALITY_KEYS;
 mod admin_levels;
@@ -151,62 +104,30 @@ use spill::{
 };
 use timezone::Timezones;
 
-/// Records written per parallel batch.
 const WRITE_BATCH_RECORDS: usize = 16_384;
 
-/// Heap a boundary vertex takes at most while its area is assembled: the
-/// member way's vertex as read back, the stitched ring and the polygon made
-/// of it, and the shape block with its band entries.
 pub(crate) const BOUNDARY_BUILD_BYTES_PER_VERTEX: usize = 160;
-/// The least of the budget a batch of boundaries is assembled in, taken
-/// past the budget when it has less free: enough for a large country.
 pub(crate) const MIN_BOUNDARY_BATCH_BYTES: usize = 128 << 20;
-/// The most a batch takes: past it, batches only wait longer on their
-/// largest area.
 const MAX_BOUNDARY_BATCH_BYTES: usize = 1 << 30;
 
 #[derive(Clone)]
 pub struct BuildOsmOptions {
-    /// The extracts to build from, in the order they are read. Several make
-    /// one Pack covering them all: the passes below run per input and their
-    /// records accumulate into one set of indexes, so the Tantivy index and
-    /// its collection statistics stay global and scores stay comparable
-    /// across every region in the Pack.
     pub inputs: Vec<PathBuf>,
     pub pack: PathBuf,
-    /// Memory for the build's buffers; inputs that need more spill to
-    /// scratch files. Derived from the memory the process can use when not
-    /// set.
     pub memory_budget_bytes: Option<usize>,
-    /// Directory for scratch files; defaults to inside the new Pack generation.
     pub scratch_dir: Option<PathBuf>,
-    /// The most scratch disk the build may hold at once. The scratch
-    /// volume's free space caps it whether set or not.
     pub scratch_budget_bytes: Option<u64>,
-    /// Build even when the pre-flight check finds too little memory or disk.
     pub force: bool,
-    /// What to do with a build of the same Pack that stopped: refuse, go on
-    /// from its last checkpoint, or clear it.
     pub leftover: Leftover,
-    /// What the inputs are, for example region ids, kept in the build
-    /// report. One per input, in the same order.
     pub input_sources: Vec<String>,
-    /// Told about each stage as it starts, advances and finishes, and about
-    /// the plan's warnings.
     pub observer: Arc<dyn BuildObserver>,
     /// Set to stop the build: it then fails with
     /// [`crate::builder::BuildCancelled`] and publishes nothing, keeping its
     /// last checkpoint to resume from.
     pub cancel: Arc<AtomicBool>,
-    /// Address points to add to the inputs' own, such as OpenAddresses.
     pub addresses: Option<Arc<dyn AddressSource>>,
-    /// How many addresses `addresses` is expected to add, for the plan to
-    /// size disk by; 0 when not known before they are fetched.
     pub imported_rows: u64,
-    /// QRank file (see [`crate::builder::qrank`]).
     pub qrank: Option<PathBuf>,
-    /// Timezone boundaries, the GeoJSON of timezone-boundary-builder. With
-    /// them a record carries the timezone it lies in.
     pub timezones: Option<PathBuf>,
     pub tiger: bool,
 }
@@ -254,10 +175,6 @@ impl fmt::Debug for BuildOsmOptions {
     }
 }
 
-/// Plan a build of `options` on this machine: probe it, size the budget and
-/// the threads, and check the memory and disk the input needs. A build of
-/// the Pack that stopped is refused, cleared or counted toward the disk the
-/// build has, as `options.leftover` says.
 pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
     if options.inputs.is_empty() {
         return Err(Error::BadInput(
@@ -274,9 +191,6 @@ pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
     }
     let held = settle_leftovers(options)?.map_or(0, |found| found.bytes);
     let scratch = options.scratch_dir.as_deref().unwrap_or(&options.pack);
-    // The passes run per input but the sorters, the heap the boundary stage
-    // holds and the Pack are shared, so the build is sized to every input
-    // together.
     plan_build_holding(
         total_input_bytes(&options.inputs)?,
         options.imported_rows,
@@ -289,8 +203,6 @@ pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
     )
 }
 
-/// Refuse or clear the stopped builds of the Pack, as `options.leftover`
-/// says: the one to resume, if any.
 fn settle_leftovers(options: &BuildOsmOptions) -> Result<Option<Found>> {
     let found = resume::find(&options.pack)?;
     match options.leftover {
@@ -303,8 +215,6 @@ fn settle_leftovers(options: &BuildOsmOptions) -> Result<Option<Found>> {
             Ok(None)
         }
         Leftover::Resume => {
-            // Nothing can go on from a build that reached no checkpoint, and
-            // what it left only takes the disk this one needs.
             let (resumable, unusable): (Vec<_>, Vec<_>) =
                 found.into_iter().partition(Found::resumable);
             for found in &unusable {
@@ -320,18 +230,12 @@ fn settle_leftovers(options: &BuildOsmOptions) -> Result<Option<Found>> {
     }
 }
 
-/// The bytes of every input together.
 fn total_input_bytes(inputs: &[PathBuf]) -> Result<u64> {
     inputs
         .iter()
         .try_fold(0, |total, input| Ok(total + pbf::input_bytes(input)?))
 }
 
-/// The least time between two checkpoints. A checkpoint syncs every scratch
-/// file it names, spills every sorter and saves the node store: seconds a
-/// country's build spends to save it the minutes a crash would cost, while
-/// a planet's steps run longer than this and keep a checkpoint each. Tests
-/// checkpoint every step, to go on from each.
 const CHECKPOINT_EVERY: Duration = if cfg!(test) {
     Duration::ZERO
 } else {
@@ -345,12 +249,8 @@ pub fn build_osm_pack(options: &BuildOsmOptions) -> Result<BuilderReport> {
 
 #[cfg(test)]
 thread_local! {
-    /// Fails a build once the step's work is done but before its checkpoint
-    /// is written, as a crash there would.
     static FAIL_BEFORE_CHECKPOINT: std::cell::Cell<Option<Step>> =
         const { std::cell::Cell::new(None) };
-    /// Fails a build after its last checkpoint, as the parser's training
-    /// starts.
     static FAIL_BEFORE_TRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -382,78 +282,47 @@ pub fn build_planned_osm_pack(options: &BuildOsmOptions, plan: BuildPlan) -> Res
     run.finish()
 }
 
-/// One run of a build: every step from the first, or from the checkpoint
-/// a run before this one left.
 struct Run<'a> {
     options: &'a BuildOsmOptions,
     plan: BuildPlan,
-    /// The most one sorter may hold.
     budget: usize,
     memory: Arc<Budget>,
     scratch: Arc<Scratch>,
     progress: Progress,
     fingerprint: Fingerprint,
     started: Instant,
-    /// Build time the runs before this one spent up to its checkpoint.
     elapsed_before: Duration,
-    /// The last step a run before this one completed.
     done: Option<Step>,
-    /// What every stage of the runs before this one cost.
     stages_before: Vec<StageReport>,
     build: Build,
-    /// Sorters already read, as the report counts them.
     sorted: BTreeMap<String, SorterReport>,
     scanned: Option<ScanCounts>,
-    /// Boundary geometry gathered across inputs, for the boundary stage: a
-    /// relation and the ways it is made of can only be assembled once all
-    /// of them are known. Each input's part is saved beside it.
     geometry: Geometry,
     geometry_saved: Vec<SpoolFile<GeometryItem>>,
     input: Option<InputPasses>,
-    /// From the boundary stage until context ordering consumes it.
     boundaries: Option<BoundarySet>,
-    /// The boundary set as saved, until the record write: what the context
-    /// index is derived from again.
     boundaries_saved: Option<SpoolFile<SetItem>>,
-    /// The shape file the boundary set and its index read, until the
-    /// record write.
     boundary_shapes: Option<Arc<Shapes>>,
-    /// The boundaries' hold on the memory budget, for as long as they are
-    /// held: they cannot spill.
     boundary_memory: Option<Reservation>,
     imports: Option<Vec<AddressFile>>,
     contexts: Option<Contexts>,
-    /// The addresses in street order, when imported rows are matched
-    /// against them before they are placed.
     address_book: Option<BookFile<PendingAddress>>,
-    /// What matching them decided, sorted by position in the book.
     verdicts: Option<ExternalSorter<(u64, u64)>>,
-    /// The books the placed addresses are read back from as they are
-    /// written.
     books: Option<AddressBook>,
     postcodes: Option<SpoolFile<NamedPoint>>,
     sample: Option<Sampler>,
     sample_saved: Option<ScratchFile>,
     sealing: Option<Sealing>,
     sealed: Option<(SealedPack, BuildStats)>,
-    /// When the Pack's indexes started, in this run.
     indexing: Option<Instant>,
     checkpoints: CheckpointReport,
-    /// Until the record write takes it. Last, so it drops last: a failed
-    /// build removes its generation's directory as it drops, and Windows
-    /// keeps a directory while a file in it is still open, as the audit
-    /// and the sorters' runs are until the fields before this one drop.
     generation: Option<Generation>,
 }
 
-/// Context records in their order, the ids they were given, and what
-/// the index derived from them answers.
 struct Contexts {
     ordered: SpoolFile<PendingRecord>,
     boundary_ids: Vec<RecordId>,
     country_ids: HashMap<String, RecordId>,
-    /// The areas that are settlements, by their own tags or by holding a
-    /// settlement of their name.
     settled: HashSet<RecordId>,
     index: BoundaryIndex,
     area_names: HashMap<RecordId, Vec<String>>,
@@ -467,17 +336,12 @@ struct Contexts {
     region_groups: HashMap<RecordId, Vec<RecordId>>,
 }
 
-/// How far each town point reaches, measured from the towns the addresses
-/// name or as a checkpoint saved it.
 enum TownReach {
     Votes(Vec<SpoolFile<NamedPoint>>),
     Measured(HashMap<RecordId, u32>),
 }
 
 impl Contexts {
-    /// What the boundary set answers once its records have ids. Cheaper to
-    /// derive again from the saved set than to save: it is the polygons
-    /// indexed, and names and codes looked up.
     fn derive(
         boundaries: BoundarySet,
         ordered: SpoolFile<PendingRecord>,
@@ -525,7 +389,6 @@ impl Contexts {
                 })
             })
             .collect::<Vec<_>>();
-        // A bigger town inside means no town, as Bayern holds hamlet Bayern and every Bavarian city.
         let held = holders.iter().flatten().copied().collect::<HashSet<_>>();
         let mut towns_in = points
             .par_iter()
@@ -554,7 +417,6 @@ impl Contexts {
                 }
                 left
             });
-        // A city merged into its boundary has no point left, so its boundary competes in its place.
         for (own, rank, [lon, lat]) in index.settlement_areas() {
             for area in index
                 .areas_at(lon, lat)
@@ -636,8 +498,6 @@ impl Contexts {
 }
 
 impl<'a> Run<'a> {
-    /// A run from the first step, or from the last checkpoint of a build
-    /// of the Pack that stopped, when `options.leftover` asks for that.
     fn start(options: &'a BuildOsmOptions, plan: BuildPlan) -> Result<Self> {
         let mut fingerprint = Fingerprint::of(
             &options.inputs,
@@ -667,8 +527,6 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// The parts every run shares: the memory budget, the scratch it
-    /// streams to and the meter.
     fn new(
         options: &'a BuildOsmOptions,
         plan: BuildPlan,
@@ -677,19 +535,8 @@ impl<'a> Run<'a> {
         scratch: Arc<Scratch>,
         build: Build,
     ) -> Self {
-        // The sorters and the parser's lattice cache split what the others
-        // leave of the pool by fair shares, each at most `budget`; the node
-        // store takes what it needs of the rest. While records are written
-        // the text index is what every record waits on, so it takes half a
-        // sorter's: more indexing threads, fewer segments. The context
-        // record and spatial sorters hold a few times less than the others,
-        // and are capped to stay so.
         let budget = usize::try_from(plan.sorter_bytes).unwrap_or(usize::MAX);
         scratch.cancel_on(Arc::clone(&options.cancel));
-        // Spill files stay in the page cache while they fit in a quarter of
-        // what the build leaves free: the rest keeps the Pack and the input
-        // it rereads, and dirty pages the lazy writer holds back are not
-        // free.
         scratch.set_cache_bytes(
             plan.resources
                 .available_memory_bytes
@@ -760,8 +607,6 @@ impl<'a> Run<'a> {
         let mut generation = Generation::create(&options.pack)?;
         let scratch = generation
             .create_scratch(options.scratch_dir.as_deref(), options.scratch_budget_bytes)?;
-        // Written first, so a build killed before its first checkpoint is
-        // found too, and can be cleared.
         let pointer = generation.path().join(SCRATCH_POINTER_FILE);
         File::create(&pointer)
             .and_then(|mut file| {
@@ -813,9 +658,6 @@ impl<'a> Run<'a> {
         ))
     }
 
-    /// Go on from the checkpoint `found` left: check it was a build of the
-    /// same inputs, options and og, reopen its scratch and generation, and
-    /// restore what the steps after it need.
     fn resume(
         options: &'a BuildOsmOptions,
         mut plan: BuildPlan,
@@ -867,8 +709,6 @@ impl<'a> Run<'a> {
         let memory = budget_of(&plan);
         let budget = usize::try_from(plan.sorter_bytes).unwrap_or(usize::MAX);
 
-        // The plan is counted again from what the scans counted, on the
-        // machine as it is now.
         if let Some(scanned) = &state.scanned {
             let resources = Resources::probe();
             memory.sample(&resources);
@@ -902,7 +742,6 @@ impl<'a> Run<'a> {
                 &memory,
                 context_share(budget),
             )?,
-            // The votes are read once the contexts exist, and not again.
             town_votes: if state.contexts.is_none() {
                 Some(Spool::create(&scratch, TOWN_VOTES)?)
             } else {
@@ -1050,7 +889,6 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// Pass 1: classify everything, and mark the nodes kept ways reference.
     fn scan(&mut self, index: usize) -> Result<()> {
         let input = &self.options.inputs[index];
         let phase = Instant::now();
@@ -1137,8 +975,6 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Pass 2: the ways boundary relations are made of. They often carry no
-    /// tags of their own, so pass 1 could not know to keep them.
     fn members(&mut self, index: usize) -> Result<()> {
         let input_path = &self.options.inputs[index];
         let phase = Instant::now();
@@ -1169,8 +1005,6 @@ impl<'a> Run<'a> {
                         kept_blobs.push(offset);
                     }
                     for (way_id, refs) in found {
-                        // A way the input repeats is read where it first
-                        // appears.
                         if !members.insert(way_id) {
                             continue;
                         }
@@ -1187,8 +1021,6 @@ impl<'a> Run<'a> {
         build.report.phases.boundary_member_scan_ms += phase.elapsed().as_millis();
         input.changed = true;
 
-        // The scan has counted what the rest of the build holds, and the
-        // machine has moved since the build started.
         let resources = Resources::probe();
         self.memory.sample(&resources);
         let accepted = &build.report.accepted;
@@ -1223,7 +1055,6 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Pass 3: the coordinates of every marked node.
     fn nodes(&mut self, index: usize) -> Result<()> {
         let phase = Instant::now();
         let input = self.input.as_mut().ok_or_else(|| missing("the scan"))?;
@@ -1246,8 +1077,6 @@ impl<'a> Run<'a> {
             &self.progress,
         )?;
         input.locations = Some(locations);
-        // Their saved copies go at the next checkpoint: the store holds
-        // what is left of them.
         input.saved.node_set = None;
         input.saved.tag_ids = None;
         self.build.report.geometry_passes.add(&stored);
@@ -1255,7 +1084,6 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Pass 4: the kept ways and member ways again, now with coordinates.
     fn ways(&mut self, index: usize) -> Result<()> {
         let phase = Instant::now();
         let mut input = self.input.take().ok_or_else(|| missing("the scan"))?;
@@ -1265,7 +1093,6 @@ impl<'a> Run<'a> {
             .ok_or_else(|| missing("the node store"))?;
         input.kept_blobs.sort_unstable();
         input.kept_blobs.dedup();
-        // Retaining a whole input's boundary vertices crowds the mapped node store.
         let mut input_members = HashSet::new();
         let mut part = Spool::create(&self.scratch, "geometry")?;
         let build = &mut self.build;
@@ -1304,8 +1131,6 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Keep an input's part of the boundary geometry on disk until the
-    /// boundary stage, for a run that goes on after it.
     fn save_geometry(&mut self, part: &[GeometryItem]) -> Result<()> {
         let mut spool = Spool::create(&self.scratch, "geometry")?;
         for item in part {
@@ -1315,9 +1140,6 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Admin boundaries and their place records. Every input has been read,
-    /// so a relation whose ways span two extracts is assembled from all of
-    /// them.
     fn boundaries(&mut self) -> Result<()> {
         let phase = Instant::now();
         self.progress.start(BuildStage::Boundaries, None)?;
@@ -1326,9 +1148,6 @@ impl<'a> Run<'a> {
             boundary_feature_ids,
         } = std::mem::take(&mut self.geometry);
         drop(boundary_feature_ids);
-        // Shapes are assembled a batch at a time, in parallel, and written to
-        // the shape file as they are built. A batch takes what the budget has
-        // free, and at least enough for a few large areas.
         let batch_bytes = self
             .memory
             .limit()
@@ -1340,10 +1159,6 @@ impl<'a> Run<'a> {
         }
         let batch_vertices = batch_memory.bytes() / BOUNDARY_BUILD_BYTES_PER_VERTEX;
         let mut builder = BoundaryBuilder::new(&self.scratch)?;
-        // Every boundary way's and member way's vertices go to one scratch
-        // file read back by way id, so only the ids stay in memory. A way
-        // with no line (a missing node, or a feature that was incomplete)
-        // has none, as a relation needing it then has no shape.
         let mut lines = IndexedSpool::<GeometryItem>::create(&self.scratch, "boundary-lines")?;
         struct BoundaryLine {
             way_id: i64,
@@ -1353,16 +1168,12 @@ impl<'a> Run<'a> {
         let mut line_at = Vec::<BoundaryLine>::new();
         let mut ways = Vec::new();
         let mut way_vertices = 0;
-        // The entrance nodes on the member ways, for the places relations
-        // draw.
         let mut entrances = HashMap::new();
         for part in &self.geometry_saved {
             for item in part.reader()? {
                 let (way_id, line) = match item? {
                     GeometryItem::Way(mut way) => {
                         let way_id = way.object_id;
-                        // Only a way that may close an area is kept beside
-                        // its line; any other gives its vertices up.
                         let vertices = if boundary::may_be_area(&way) {
                             way_vertices += way.vertices.len();
                             let vertices = way.vertices.clone();
@@ -1418,9 +1229,6 @@ impl<'a> Run<'a> {
                 _ => Err(Error::Decode("a boundary line file holds only lines")),
             }
         };
-        // What the boundaries describe stays on the heap, so it holds a share
-        // of the budget as it grows: the sorters spill sooner instead of the
-        // build growing past it.
         let mut held = Reservation::empty(&self.memory);
         let mut start = 0;
         let mut vertices = 0;
@@ -1470,17 +1278,11 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Merges place points into the boundaries they name, dropping their own
-    /// records. Every point is matched before any merges, so a point can
-    /// join the boundary another point of its Wikidata item named, and each
-    /// boundary takes its point and item from its strongest link, whatever
-    /// order the points come in.
     fn merge_place_points(&mut self, boundaries: &mut BoundarySet) -> Result<()> {
         let mut links = boundaries.place_links();
         if links.is_empty() {
             return Ok(());
         }
-        // The links grow with the points, so the budget holds them and spills the sorters for them.
         let mut link_memory = Reservation::forced(&self.memory, links.heap_bytes());
         let Some(points) = self.build.context_records.take() else {
             return Ok(());
@@ -1516,9 +1318,6 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Addresses from outside OSM join the OSM ones before they are
-    /// ordered. The source is asked only now, knowing the countries the
-    /// Pack covers.
     fn import_addresses(&mut self) -> Result<()> {
         let phase = Instant::now();
         let boundaries = self
@@ -1537,9 +1336,6 @@ impl<'a> Run<'a> {
             .iter()
             .map(addresses::AddressFile::bytes)
             .sum::<Result<u64>>()?;
-        // A source can cover more than the extracts: a country's file for a
-        // Pack of one province. Rows outside every extract's stated bounds
-        // are left out; an extract that states none keeps every row.
         let extracts = self
             .options
             .inputs
@@ -1595,8 +1391,6 @@ impl<'a> Run<'a> {
                     Ok(Ok(PendingAddress::new(&record, 0, 0)?))
                 },
                 |address| {
-                    // Given at the file's first address, as for OSM's. A
-                    // file whose rows are all left out names no dataset.
                     let id = *dataset.get_or_insert_with(|| build.datasets.id(&file.dataset));
                     build.push_address(address, id)?;
                     Ok(None)
@@ -1610,7 +1404,6 @@ impl<'a> Run<'a> {
                 build.report.datasets.push(imported.dataset.clone());
             }
             build.report.imports.push(imported);
-            // The entries of one archive share its stamp.
             let stamp = FileStamp::of(&file.path)?;
             if !self.fingerprint.imported.contains(&stamp) {
                 self.fingerprint.imported.push(stamp);
@@ -1622,9 +1415,6 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Context records first: once their ids are known, the boundary index
-    /// can describe every other record, and tell the country each address
-    /// lies in.
     fn order_contexts(&mut self) -> Result<()> {
         let phase = Instant::now();
         let boundaries = self
@@ -1644,7 +1434,6 @@ impl<'a> Run<'a> {
         let mut boundary_ids = vec![0; boundaries.len()];
         let mut country_ids = HashMap::new();
         let mut settled = HashSet::new();
-        // Context records are the first the Pack holds.
         for (index, item) in context_records.finish()?.enumerate() {
             let item = item?;
             let record_id = index as u64;
@@ -1732,15 +1521,10 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Whether imported rows are matched against the addresses the Pack
-    /// already has before they are placed.
     fn imported(&self) -> bool {
         self.imports.as_ref().is_some_and(|files| !files.is_empty())
     }
 
-    /// The addresses in street order, with their slash numbers read, to
-    /// the address book, when imported rows are to be matched against
-    /// them. Without imported rows they are written as they are placed.
     fn write_address_book(&mut self) -> Result<()> {
         if !self.imported() {
             return Ok(());
@@ -1809,7 +1593,6 @@ impl<'a> Run<'a> {
                     lent,
                     Some(Book::create(&self.scratch, "address-book")?),
                 );
-                // Slash numbers are read before the addresses are placed.
                 let slash_numbers = &mut self.build.report.slash_numbers;
                 overlapped(
                     |emit| slash::read_slash_numbers(addresses.finish()?, slash_numbers, emit),
@@ -1843,7 +1626,6 @@ impl<'a> Run<'a> {
             datasets: Datasets::from_names(self.build.datasets.names().to_vec()),
         });
         let report = &mut self.build.report;
-        // Every address is placed, so each postcode's points are all known.
         let mut points = Spool::create(&self.scratch, "postcode-points")?;
         for record in postcodes.into_records() {
             report.accept_postcode();
@@ -1868,8 +1650,6 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Write context records, then every other record, then the parts of
-    /// the Pack the writer held in memory.
     fn write_records(&mut self) -> Result<()> {
         let phase = Instant::now();
         let Contexts {
@@ -1921,8 +1701,6 @@ impl<'a> Run<'a> {
         writer.set_region_groups(region_groups);
         let mut sample = Sampler::default();
         let context_count = ordered.len();
-        // Before the context records: the admin areas among them are places
-        // QRank ranks too.
         let qrank = match &self.options.qrank {
             Some(path) => Some(QRank::load(path, &self.memory)?),
             None => None,
@@ -2032,7 +1810,6 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Start the Pack's index stage, when a run goes on in the middle of it.
     fn indexing(&mut self) -> Result<()> {
         if self.indexing.is_none() {
             self.progress.start(BuildStage::Indexes, None)?;
@@ -2060,8 +1837,6 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Save what the steps after `step` need and name it in the manifest,
-    /// then make that the checkpoint a stopped build goes on from.
     fn checkpoint(&mut self, step: Step) -> Result<()> {
         let started = Instant::now();
         let scratch = Arc::clone(&self.scratch);
@@ -2211,12 +1986,10 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// The build's time, every run's up to this one's checkpoint together.
     fn elapsed(&self) -> Duration {
         self.elapsed_before + self.started.elapsed()
     }
 
-    /// The report as it stands, every run's stages in it.
     fn report(&self) -> BuilderReport {
         let mut report = self.build.report.clone();
         report.stages.clone_from(&self.stages_before);
@@ -2224,7 +1997,6 @@ impl<'a> Run<'a> {
         report
     }
 
-    /// Train the parser on the sealed Pack and publish it.
     fn finish(mut self) -> Result<BuilderReport> {
         let phase = Instant::now();
         let (mut sealed, mut stats) = self.sealed.take().ok_or_else(|| missing("the Pack"))?;
@@ -2235,12 +2007,7 @@ impl<'a> Run<'a> {
                 "injected failure before the training".into(),
             ));
         }
-        // The parser learns from the sealed Pack's dictionaries and the
-        // records drawn while they were written, and its weights join the
-        // Pack before it is published.
         self.progress.start(BuildStage::Parser, None)?;
-        // By now the build has used memory and page cache a fresh process
-        // would have: sample again what is left.
         let resources = Resources::probe();
         self.memory.sample(&resources);
         self.build.report.resources.at_training = resources;
@@ -2260,8 +2027,6 @@ impl<'a> Run<'a> {
                 .insert(WEIGHTS_SECTION.to_string(), bytes.len() as u64);
         }
         let scratch = Arc::clone(&self.scratch);
-        // Done with every checkpoint: a build that fails from here on goes
-        // on from nothing, at the cost of training again.
         self.sample_saved = None;
         scratch.complete();
         let report = &mut self.build.report;
@@ -2275,8 +2040,6 @@ impl<'a> Run<'a> {
         self.checkpoints.voided = scratch.voided();
         self.progress.finish(BuildStage::Parser);
         let parser_training_ms = phase.elapsed().as_millis();
-        // The structured index keys the sealed Pack's text index with its
-        // dictionaries, and joins the Pack before it is published.
         self.progress.start(BuildStage::StructuredIndex, None)?;
         let structured = Instant::now();
         crate::structured::add_to(&mut sealed)?;
@@ -2370,7 +2133,6 @@ impl<'a> Run<'a> {
     }
 }
 
-/// Write what `sorter` buffers as a run, and name its runs in `states`.
 fn save_sorter<T: Spill + Ord + Send + Sync + 'static>(
     sorter: &mut Option<ExternalSorter<T>>,
     states: &mut Vec<SorterState>,
@@ -2381,7 +2143,6 @@ fn save_sorter<T: Spill + Ord + Send + Sync + 'static>(
     Ok(())
 }
 
-/// The sorter labelled `label` a checkpoint named, if it did.
 fn sorter_of<T: Spill + Ord + Send + Sync + 'static>(
     states: &[SorterState],
     label: &str,
@@ -2396,7 +2157,6 @@ fn sorter_of<T: Spill + Ord + Send + Sync + 'static>(
         .transpose()
 }
 
-/// The memory budget a plan sizes.
 fn budget_of(plan: &BuildPlan) -> Arc<Budget> {
     let memory = Budget::new(usize::try_from(plan.memory_budget_bytes).unwrap_or(usize::MAX));
     memory.sample(&plan.resources);
@@ -2413,7 +2173,6 @@ fn sorter_report<T: Spill + Ord + Send + Sync + 'static>(
     }
 }
 
-/// The sorter in `sorter`, unless a step read it already.
 fn open<'s, T>(
     sorter: &'s mut Option<ExternalSorter<T>>,
     label: &str,
@@ -2425,12 +2184,10 @@ fn open<'s, T>(
 
 const CONTEXT_RECORDS: &str = "context-records";
 
-/// The context-record sorter gets a sixteenth of a share, since context records are few.
 fn context_share(budget: usize) -> usize {
     (budget / 16).max(1)
 }
 
-/// The place a pending context record is, with its layer.
 fn place_point(pending: &PendingRecord) -> Option<(PlaceLayer, &PlaceRecord)> {
     match &pending.body {
         Body::Record(record) => match record.as_ref() {
@@ -2451,34 +2208,20 @@ fn context_sorter(
 
 const TOWN_VOTES: &str = "town-votes";
 
-/// A step ran before the one that makes what it needs.
 fn missing(what: &str) -> Error {
     Error::Inconsistent(format!("{what} is missing: a build step ran out of order"))
 }
 
-/// Build state shared by the passes.
 struct Build {
     report: BuilderReport,
     audit: Audit,
-    /// POIs, interpolations and streets, then the addresses.
     records: Option<ExternalSorter<PendingRecord>>,
-    /// Addresses, until every one is known and they can join `records` a
-    /// street at a time.
     addresses: Option<ExternalSorter<PendingAddress>>,
-    /// The ways of streets, until every one is known and the ways of one
-    /// street can join (see [`join_streets`]).
     streets: Option<ExternalSorter<PendingNamed>>,
-    // Held until all are known: merging needs every POI of a name.
     places: Option<ExternalSorter<PendingNamed>>,
-    /// Places: everything a context tuple can point at.
     context_records: Option<ExternalSorter<PendingRecord>>,
-    /// The towns the addresses name, which measure how far each town
-    /// mapped as a point reaches.
     town_votes: Option<Spool<NamedPoint>>,
-    /// The votes of the checkpoints before, as the scans cast them. Their
-    /// order does not matter, as a town reaches as far as its farthest vote.
     town_votes_saved: Vec<SpoolFile<NamedPoint>>,
-    /// The datasets of the imported addresses.
     datasets: Datasets,
     seq: u64,
     memory: Arc<Budget>,
@@ -2489,7 +2232,6 @@ impl Build {
         &self.memory
     }
 
-    /// Merge one worker's output, in input order.
     fn absorb(&mut self, emitted: Emitted) -> Result<()> {
         let Emitted {
             report,
@@ -2522,8 +2264,6 @@ impl Build {
         open(&mut self.places, "places")?.push(PendingNamed::place(place, self.seq - 1)?)
     }
 
-    /// An address cut into its sort key off this thread, numbered as it
-    /// takes its place in input order.
     fn push_address(&mut self, address: PendingAddress, dataset: u32) -> Result<()> {
         let fields = address.fields();
         for name in [fields.locality, fields.place].into_iter().flatten() {
@@ -2577,12 +2317,6 @@ impl Build {
     }
 }
 
-/// Addresses on their way into the record sorter, in street order: each
-/// group placed in the Hilbert order by its first address, so the group
-/// stays one run for the record store and the text index to share what its
-/// addresses state; lent its street's postcodes when it states none; and
-/// counted toward its postcode's point in the country it lies in. The record
-/// sorter takes where each waits in the address book, not the address.
 struct AddressRuns<'a> {
     records: &'a mut ExternalSorter<PendingRecord>,
     seq: &'a mut u64,
@@ -2590,14 +2324,8 @@ struct AddressRuns<'a> {
     country_codes: &'a HashMap<RecordId, CountryCode>,
     postcodes: postcode::Accumulator,
     lending: StreetLending,
-    /// Where the addresses not yet in an address book are written as they
-    /// are placed.
     book: Option<Book<PendingAddress>>,
-    /// Each address, and where it is in the book and whether it is disputed
-    /// when it is already there.
     batch: Vec<(PendingAddress, Option<(u64, bool)>)>,
-    /// The group key of the last address placed, its Hilbert key, and the
-    /// country it lies in.
     group: Option<(Vec<u8>, u64, Option<CountryCode>)>,
 }
 
@@ -2623,8 +2351,6 @@ impl<'a> AddressRuns<'a> {
         }
     }
 
-    /// Place `address`: `shelved` says where it is in the address book and
-    /// whether it is disputed, or it is written to this one's book.
     fn push(&mut self, address: PendingAddress, shelved: Option<(u64, bool)>) -> Result<()> {
         self.batch.push((address, shelved));
         if self.batch.len() == WRITE_BATCH_RECORDS {
@@ -2633,8 +2359,6 @@ impl<'a> AddressRuns<'a> {
         Ok(())
     }
 
-    /// The postcode points, the street postcodes lent, and the book the
-    /// addresses were written to, if they were.
     fn finish(
         mut self,
     ) -> Result<(
@@ -2660,9 +2384,6 @@ impl<'a> AddressRuns<'a> {
                 _ => !batch[at - 1].0.same_group(address),
             })
             .collect::<Vec<_>>();
-        // One lookup per group, not per address: a group is one street in
-        // one cell, which a border runs through too rarely to matter. Only
-        // a group stating a postcode needs its country.
         let countries = batch
             .par_iter()
             .zip(&starts)
@@ -2761,8 +2482,6 @@ impl StreetLending {
         });
         self.lend_postcodes |= postcode;
         self.lend_spellings |= spelling;
-        // Spelling can come from a later row. Reserve one entry for the whole
-        // street so postcode-first order and bounded address batches stay intact.
         Ok((postcode || spelling).then(|| self.book.next_position()))
     }
 
@@ -2789,8 +2508,6 @@ impl StreetLending {
     }
 }
 
-/// The addresses in street order and the postcodes lent to their streets,
-/// read back as the records standing for them are written.
 struct AddressBook {
     addresses: BookFile<PendingAddress>,
     lent: BookFile<Lent>,
@@ -2798,9 +2515,6 @@ struct AddressBook {
 }
 
 impl AddressBook {
-    /// The records of `batch`, each address read from the book. A batch
-    /// comes in record order, where an address group is one run, so each
-    /// chunk it needs is read once.
     fn records(&self, batch: Vec<PendingRecord>) -> Result<Vec<(Record, Option<ContextOrigin>)>> {
         let mut address_chunks = Vec::new();
         let mut lending_chunks = Vec::new();
@@ -2851,7 +2565,6 @@ impl AddressBook {
     }
 }
 
-/// The chunks of `book` numbered in `chunks`, each read once.
 fn read_chunks<T: book::Entry + Send + Sync>(
     book: &BookFile<T>,
     mut chunks: Vec<usize>,
@@ -2864,17 +2577,6 @@ fn read_chunks<T: book::Entry + Send + Sync>(
         .collect()
 }
 
-/// The ways of each street name, joined into one street record per street
-/// of each area and pushed to `records`; how many streets that makes. OSM
-/// draws a road as a way per stretch between its junctions, so one road was
-/// as many answers as it has stretches, told apart only by their ids.
-///
-/// Ways join within the area their street is labelled with: the locality
-/// they lie in when that is a settlement (see `settled`), else its
-/// district, so a street in a city's ward or local board is named by the
-/// city and joins across the wards; else the locality. One name is many
-/// streets across a country, and a road crossing a town line is a street in
-/// each town. `area_names` are the names of each area, its own first.
 fn resolve_places(
     places: ExternalSorter<PendingNamed>,
     records: &mut ExternalSorter<PendingRecord>,
@@ -2968,7 +2670,6 @@ fn join_streets(
         }
         Ok(())
     };
-    // Whole names at a time, a batch of ways or so per parallel join.
     let mut runs = Vec::<Vec<StreetRecord>>::new();
     let mut ways = 0;
     let mut name = None::<Vec<u8>>;
@@ -2994,32 +2695,15 @@ fn join_streets(
     Ok(count)
 }
 
-/// An imported address within this distance of an earlier address of the
-/// same house (street, number and unit) repeats it. Sources place one house a
-/// few metres apart, at the door, the parcel or the building's middle.
 const REPEATED_HOUSE_RADIUS_M: f64 = 100.0;
 
-/// An imported address farther than [`REPEATED_HOUSE_RADIUS_M`] from a kept
-/// address of the same house, but within this, still names that house: two
-/// sources disagree on where it is, or one places it at several points. Below half the 2 km street-group cell, so
-/// it never joins what the cell grid keeps apart as two runs of one street,
-/// and far below the spacing of the places a street name repeats in (two
-/// villages' Hauptstrasse, a rural road crossing a county line where the
-/// numbers start over). A large rural parcel's centroid lies a few hundred
-/// metres from its house; a row geocoded to the wrong end of a street or to
-/// another town does not, and is kept as the house it says it is.
 pub(crate) const DISPUTED_HOUSE_RADIUS_M: f64 = 1_000.0;
 
-/// What finding repeated houses decided about an address: dropped, or kept
-/// and disputed. Sorted after its position in the address book.
 const DROPPED: u64 = 0;
 const DISPUTED: u64 = 1;
 
-/// Positions in the address book, each with what was decided about it.
 type Verdicts = Sorted<(u64, u64)>;
 
-/// The addresses in street order, with their slash numbers read, written
-/// to an address book.
 fn write_address_book(
     addresses: ExternalSorter<PendingAddress>,
     scratch: &Arc<Scratch>,
@@ -3033,7 +2717,6 @@ fn write_address_book(
     book.finish()
 }
 
-/// Place the addresses of `book` that `verdicts` keeps, in street order.
 fn replay_address_book(
     book: &BookFile<PendingAddress>,
     verdicts: Verdicts,
@@ -3059,28 +2742,6 @@ fn replay_address_book(
     Ok(())
 }
 
-/// Sorted by position in the address book, which addresses are imported
-/// rows repeating an address the Pack already has, OSM ones first, and
-/// which kept ones a row disputes. The houses are found in house order,
-/// from a hash of each house and its point, not the address. Each dropped
-/// row is counted on its file.
-///
-/// One record answers for one house. A row within
-/// [`REPEATED_HOUSE_RADIUS_M`] of a kept address of its house agrees with it
-/// and is dropped. One beyond that, but within [`DISPUTED_HOUSE_RADIUS_M`] of
-/// a kept address it does not contradict, is dropped too. When the kept
-/// address came from another source, the two sources disagree: the kept
-/// address keeps its point, OSM's when OSM has the house, and is marked
-/// [`crate::record::AddressRecord::disputed`]. When it came from the row's
-/// own source, nothing disagrees: one source places one house at several
-/// points, as Japan's land ministry does a block or lot cut by a road or a
-/// river, flagging one point representative in a column OpenAddresses drops.
-/// The row only repeats the house. Only a row farther still, or
-/// one stating another postcode, locality or area than every kept address
-/// near it, is a house of its own. Two houses of one street name and number
-/// lie apart by the distance between the places that repeat the name, which
-/// the radius stays below; where they lie closer, the postcode or the
-/// locality tells them apart.
 fn find_repeated_houses(
     book: &BookFile<PendingAddress>,
     scratch: &Arc<Scratch>,
@@ -3089,16 +2750,11 @@ fn find_repeated_houses(
     datasets: &Datasets,
     report: &mut BuilderReport,
 ) -> Result<ExternalSorter<(u64, u64)>> {
-    // Read from the book once the street order's runs are gone, so the
-    // houses never share the disk with them.
     let mut houses = ExternalSorter::<House>::new(scratch, "houses", memory, budget);
     for (at, address) in book.items().enumerate() {
         houses.push(address?.house(at as u64))?;
     }
     let mut verdicts = ExternalSorter::new(scratch, "house-verdicts", memory, budget);
-    // Dropped rows find their file by dataset id, not by name. A planet
-    // build drops 332 million rows from 3,141 files. Scanning names per row
-    // costs 3.2e11 string comparisons on this one thread.
     let import_of = datasets
         .names()
         .iter()
@@ -3162,17 +2818,13 @@ fn find_repeated_houses(
     Ok(verdicts)
 }
 
-/// Boundary geometry gathered across inputs, for the boundary stage.
 #[derive(Debug, Default)]
 struct Geometry {
     relations: Vec<BoundaryRelationStub>,
-    /// Boundary ways kept by the scan. When one is also a relation member,
-    /// its vertices are reused instead of being read a second time.
     boundary_feature_ids: HashSet<i64>,
 }
 
 impl Geometry {
-    /// Add an input's part as saved, as its passes added it.
     fn add(&mut self, part: impl Iterator<Item = Result<GeometryItem>>) -> Result<()> {
         for item in part {
             match item? {
@@ -3180,8 +2832,6 @@ impl Geometry {
                 GeometryItem::Feature(way_id) => {
                     self.boundary_feature_ids.insert(way_id);
                 }
-                // Their vertices stay on disk, in the input's spool, until
-                // the boundary stage reads them, as the entrances do.
                 GeometryItem::Way(_) | GeometryItem::Member(..) | GeometryItem::Entrance(..) => {}
             }
         }
@@ -3189,29 +2839,20 @@ impl Geometry {
     }
 }
 
-/// What the passes over one input hand from one to the next.
 struct InputPasses {
     index: usize,
-    /// The nodes kept ways need, until the node pass stores them.
     nodes: Option<NodeSet>,
-    /// Nodes whose address tags interpolation ways read.
     tag_ids: Vec<i64>,
     node_blobs: Vec<u64>,
     way_blobs: Vec<u64>,
-    /// Blobs holding a kept way or a member way: all the way pass rereads.
     kept_blobs: Vec<u64>,
     kept: KeptWays,
-    /// Boundary relation member ways the input has.
     members: HashSet<i64>,
-    /// The node store, from the node pass.
     locations: Option<Locations>,
     saved: InputSaved,
-    /// The node set, the kept blobs or the members changed since they were
-    /// saved.
     changed: bool,
 }
 
-/// What a checkpoint saved of an input's passes.
 #[derive(Default)]
 struct InputSaved {
     node_blobs: Option<SpoolFile<Id>>,
@@ -3222,7 +2863,6 @@ struct InputSaved {
     members: Option<SpoolFile<Id>>,
 }
 
-/// `values` saved to a spool.
 fn save_ids(
     scratch: &Arc<Scratch>,
     label: &str,
@@ -3235,13 +2875,11 @@ fn save_ids(
     spool.finish()
 }
 
-/// The values a spool of [`save_ids`] holds.
 fn load_ids(saved: &SpoolFile<Id>) -> Result<Vec<i64>> {
     saved.reader()?.map(|id| id.map(|Id(id)| id)).collect()
 }
 
 impl InputPasses {
-    /// Save what changed since the last checkpoint, and name all of it.
     fn save(&mut self, scratch: &Arc<Scratch>) -> Result<(InputState, Vec<PathBuf>)> {
         let offsets = |values: &[u64]| values.iter().map(|value| *value as i64).collect::<Vec<_>>();
         let saved = &mut self.saved;
@@ -3304,7 +2942,6 @@ impl InputPasses {
         Ok((input, files))
     }
 
-    /// The passes a checkpoint saved, to go on with.
     fn restore(scratch: &Arc<Scratch>, memory: &Arc<Budget>, state: &InputState) -> Result<Self> {
         let spool = |run: &RunState| SpoolFile::<Id>::restore(scratch, run);
         let unsigned = |values: Vec<i64>| values.into_iter().map(|value| value as u64).collect();
@@ -3370,10 +3007,6 @@ fn member_ways(block: &osmpbf::PrimitiveBlock, member_ids: &HashSet<i64>) -> Vec
         .collect()
 }
 
-/// Run `read` on a thread of its own and hand what it emits to `take` on
-/// this one, in order, a batch at a time: a sorter's merge is read and
-/// decoded on one thread, and would otherwise wait while what it read is
-/// placed or joined, and that wait while the merge is read.
 fn overlapped<T: Send>(
     read: impl FnOnce(&mut dyn FnMut(T) -> Result<()>) -> Result<()> + Send,
     mut take: impl FnMut(T) -> Result<()>,
@@ -3397,8 +3030,6 @@ fn overlapped<T: Send>(
             }
             Ok(())
         });
-        // Dropping the receiver on an error here stops the reader at its
-        // next batch.
         for batch in receiver {
             batch.into_iter().try_for_each(&mut take)?;
         }
@@ -3408,11 +3039,8 @@ fn overlapped<T: Send>(
     })
 }
 
-/// The timezones of a build given timezone boundaries, and how each
-/// record came by its.
 struct Zoning {
     zones: Timezones,
-    /// The zone of each area that lies wholly in one, by record id.
     areas: HashMap<RecordId, u16>,
     area_count: u64,
     by_area: AtomicU64,
@@ -3421,9 +3049,6 @@ struct Zoning {
 }
 
 impl Zoning {
-    /// Gives `context` the zone at the record's point, unless an area of
-    /// its chain already says the zone. Every record of such an area reads
-    /// it from there, and the chain stays one for them all.
     fn stamp(&self, record: &Record, context: &mut RecordContext) {
         let chain = context.admin_context.entries();
         let count = if chain
@@ -3445,9 +3070,6 @@ impl Zoning {
     }
 }
 
-/// Write sorted records in batches, computing admin context in parallel, and
-/// offer each record to the parser's training sample under the country it
-/// lies in. An area record's context holds only the areas broader than it.
 #[allow(clippy::too_many_arguments)]
 fn write_ordered(
     writer: &mut Writer,
@@ -3465,9 +3087,6 @@ fn write_ordered(
     let ranked_ref = &ranked;
     progress.start(stage, Some(total))?;
     let mut preparer = writer.preparer();
-    // One thread reads and prepares the next batch while this one appends the
-    // batch before: the store, the text index and the spatial pairs take
-    // records in order, and would otherwise wait on the preparing.
     std::thread::scope(|scope| -> Result<()> {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         scope.spawn(move || {
@@ -3518,7 +3137,6 @@ fn write_ordered(
                                 let country = located
                                     .as_ref()
                                     .and_then(|context| context.admin_context.country_record_id());
-                                // A country derived from regions has none around it.
                                 let mut context = match origin {
                                     Some(ContextOrigin::DerivedCountry(_)) => None,
                                     Some(ContextOrigin::Boundary(_)) => {
@@ -3537,7 +3155,6 @@ fn write_ordered(
                                     }
                                     None => located,
                                 };
-                                // A centroid can fall in a zone that does not contain the whole area.
                                 if let (Some(zoning), Some(context)) = (zoning, &mut context)
                                     && !matches!(record, Record::Place(..))
                                 {
@@ -3572,7 +3189,6 @@ fn write_ordered(
     Ok(ranked.into_inner())
 }
 
-/// Build audit outputs written next to the Pack file, outside it.
 struct Audit {
     dir: PathBuf,
     rejections: BufWriter<File>,
@@ -3600,8 +3216,6 @@ impl Audit {
         })
     }
 
-    /// The audit as a checkpoint left it: rejections a failed run wrote
-    /// after it are cut off.
     fn reopen(generation: &Path, state: &AuditState) -> Result<Self> {
         let dir = generation.join(AUDIT_DIR);
         let path = dir.join(REJECTIONS_FILE);
@@ -3623,7 +3237,6 @@ impl Audit {
         })
     }
 
-    /// Flush and sync the rejections so far, for a checkpoint.
     fn state(&mut self) -> Result<AuditState> {
         self.rejections.flush()?;
         let file = self.rejections.get_mut();
@@ -3750,9 +3363,6 @@ mod tests {
         )
     });
 
-    /// A small town: a locality inside a region, addresses, a street, a
-    /// building, an interpolation range, and a few objects that must be
-    /// rejected. Split over several blocks like a real extract.
     fn town() -> Vec<Vec<TestElement>> {
         vec![
             vec![
@@ -3848,7 +3458,6 @@ mod tests {
                     &[20, 9999],
                     &[("highway", "residential"), ("name", "Ghost Road")],
                 ),
-                // A named boundary way that is also a relation member.
                 way(
                     605,
                     &[30, 31, 32, 33, 30],
@@ -3892,9 +3501,6 @@ mod tests {
         ]
     }
 
-    /// A second country, far from `town`, so a Pack of both covers two.
-    /// Its region states `NZ-WGN`, from which a New Zealand country record is
-    /// derived exactly as `CA-ON` derives Canada's.
     fn other_country() -> Vec<Vec<TestElement>> {
         vec![vec![
             node(
@@ -3932,10 +3538,6 @@ mod tests {
         ]]
     }
 
-    /// One Pack from two extracts holds the records of both, in one text
-    /// index: a search with no country filter finds either, and `country`
-    /// narrows it to one. This is what covering several countries without a
-    /// router rests on, so scores stay comparable across them.
     #[test]
     fn builds_one_pack_covering_two_extracts() {
         let both = &TWO_COUNTRIES.report;
@@ -3973,19 +3575,12 @@ mod tests {
             "every hit lies in exactly one of the two countries"
         );
 
-        // Several codes are a union, and an uncovered country matches nothing
-        // rather than erroring: a legitimate empty answer.
         assert_eq!(
             search(vec!["CA".to_string(), "NZ".to_string()]).len(),
             any.len()
         );
         assert!(search(vec!["FR".to_string()]).is_empty());
 
-        // The filter narrows, it does not rank: a hit keeps the score it had
-        // unfiltered. This is what makes one Pack over several countries
-        // worth more than a Runtime per country behind a router, where the
-        // scores being merged come from different indexes and are not
-        // comparable at all.
         for filtered in [&ca, &nz] {
             for hit in filtered {
                 let unfiltered = any
@@ -4005,7 +3600,6 @@ mod tests {
         build_all(root, &[input], memory_budget_bytes)
     }
 
-    /// Build one Pack from several extracts, as a multi-region build does.
     fn build_all(
         root: &Path,
         inputs: &[&Path],
@@ -4015,15 +3609,12 @@ mod tests {
             inputs: inputs.iter().map(|input| input.to_path_buf()).collect(),
             pack: root.to_path_buf(),
             memory_budget_bytes,
-            // A budget small enough to spill everything cannot also hold the
-            // node set and the boundary shapes the plan sets inside it.
             force: memory_budget_bytes.is_some(),
             ..BuildOsmOptions::default()
         })
         .expect("build")
     }
 
-    /// Hands out fixed files, keeping the countries it was asked for.
     #[derive(Debug, Default)]
     struct RecordingSource {
         files: Vec<addresses::AddressFile>,
@@ -4314,9 +3905,6 @@ mod tests {
         assert_eq!(top("3 Queen Street"), vec!["openaddresses:test:row:4"]);
     }
 
-    /// A source's rows lie in the area it names. A row outside is left out;
-    /// a source most of whose rows lie outside, as one with longitude and
-    /// latitude swapped, is left out whole.
     #[test]
     fn leaves_out_the_rows_of_a_source_outside_its_area() {
         let rejected = |dataset: &str| {
@@ -4344,9 +3932,6 @@ mod tests {
         assert!(imported_address("openaddresses:ca/on/swapped:row:3").is_none());
     }
 
-    /// A region one of whose rings is left open, as Russia's mainland in
-    /// the planet, keeps only the rings that closed: a source is not judged
-    /// by them, and its rows on the open part are kept.
     #[test]
     fn keeps_a_source_whose_area_left_a_ring_open() {
         let dir = temp_dir("open-ring-area");
@@ -4360,7 +3945,6 @@ mod tests {
         ]);
         for element in elements.iter_mut().flatten() {
             match element {
-                // Ontario's mainland ring, its closing node dropped.
                 TestElement::Way { id: 502, refs, .. } => *refs = vec![1011, 1012, 1013, 1014],
                 TestElement::Relation {
                     id: 901, members, ..
@@ -4401,9 +3985,6 @@ mod tests {
         assert_eq!(reader.manifest().layer_counts["address"], 5 + 2);
     }
 
-    /// A row naming a house OSM has, placed a few hundred metres away, is
-    /// the same house in the wrong place: one record, OSM's, marked disputed.
-    /// Farther, or in another postcode, it is a house of its own.
     #[test]
     fn keeps_one_record_of_a_house_two_sources_place_apart() {
         let [imported] = imports_of("disputed")[..] else {
@@ -4450,10 +4031,6 @@ mod tests {
         }
     }
 
-    /// One source placing one house at several points a few hundred metres
-    /// apart, as Japan's land ministry does a lot cut by a road, repeats
-    /// the house: one record, not disputed. Two sources placing it so
-    /// apart still dispute it.
     #[test]
     fn a_house_one_source_places_apart_is_repeated_not_disputed() {
         let counts = ["apart-lots", "apart-register"]
@@ -4487,9 +4064,6 @@ mod tests {
         );
     }
 
-    /// A dropped row counts on the first file of its dataset, whatever ids
-    /// the datasets got. A file with no address takes none, and a second
-    /// file of a dataset adds to the first one's counts.
     #[test]
     fn a_dropped_row_counts_on_the_first_file_of_its_dataset() {
         let counts = TOWN_IMPORTS
@@ -4511,9 +4085,6 @@ mod tests {
         );
     }
 
-    /// The first [`addresses::SAMPLE_ROWS`] rows judge a source; rows past
-    /// them are judged one by one, or go with the source. Half outside is
-    /// not most; a sample with no point judges nothing.
     #[test]
     fn judges_a_source_by_its_first_rows_alone() {
         let judged = ["cutoff", "late", "half", "most", "unplaced", "empty"]
@@ -4646,11 +4217,7 @@ mod tests {
         assert_eq!(count("region"), 1);
         assert_eq!(count("country"), 1, "derived from ISO3166-2");
         assert_eq!(report.output.record_count, 14);
-        // Each way's nodes are requested once, even when a boundary way is also
-        // a relation member: 3 + 3 + 5 + 2 + 5 + 2 + 2 + 5.
         assert_eq!(report.geometry_resolution.required_node_refs, 27);
-        // 17 distinct nodes, of which the extract lacks Ghost Road's 9999;
-        // the interpolation's two anchors keep their address tags.
         let passes = &report.geometry_passes;
         assert_eq!(
             (
@@ -4676,9 +4243,6 @@ mod tests {
         assert!(report.scratch.peak_tracked_bytes > 0);
         assert!(report.scratch.peak_tracked_bytes <= report.scratch.memory_budget_bytes);
 
-        // Places come first, and each group is in Hilbert order, a street's
-        // addresses placed at the first of them. Postcodes are placed with
-        // the rest: they wait on every address.
         let headers = (0..reader.manifest().record_count)
             .map(|id| reader.records().header(id).expect("header"))
             .collect::<Vec<_>>();
@@ -4849,8 +4413,6 @@ mod tests {
         ]
     }
 
-    /// A ward with names in several scripts, a block scheme address in it
-    /// and a street with an English name.
     #[test]
     fn indexes_every_name_and_accepts_block_scheme_addresses() {
         let reader = ADMIN.pack();
@@ -4976,9 +4538,6 @@ mod tests {
         ]
     }
 
-    /// Places drawn as areas: an island multipolygon, a suburb drawn as a
-    /// closed way, and a route relation with a `place` tag that draws no
-    /// area. The address inside them lies in both.
     #[test]
     fn places_drawn_as_areas_are_places_and_context() {
         let reader = ADMIN.pack();
@@ -5024,8 +4583,6 @@ mod tests {
         }
     }
 
-    /// The town plus named POIs: one with an address, one without, a station
-    /// building, a namesake outside the town, and objects that are not POIs.
     fn town_with_pois() -> Vec<Vec<TestElement>> {
         let mut blocks = town();
         blocks.insert(
@@ -5178,8 +4735,6 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // By name and the locality it lies in, though its tags name none. The
-        // locality leaves out the others, unless it matches nothing at all.
         let hits = search("Tim Hortons, Toronto", None);
         assert_eq!(ids(&hits), vec!["osm:node:2001"]);
         assert_eq!(search("Tim Hortons, Atlantis", None).len(), 2);
@@ -5278,8 +4833,6 @@ mod tests {
 
     fn cafes() -> Vec<Vec<TestElement>> {
         let cafe = [("name", "Cafetaria De Pindol"), ("amenity", "cafe")];
-        // Its building, its point inside it with its address, and a cafe of
-        // that name across the street that shares nothing with them.
         vec![
             vec![
                 node(
@@ -5337,7 +4890,6 @@ mod tests {
     }
 
     fn stadium() -> Vec<Vec<TestElement>> {
-        // Plain centre lies in the hole.
         let nodes = vec![
             node(1, 52.300, 4.930, &[]),
             node(2, 52.300, 4.950, &[]),
@@ -5546,8 +5098,6 @@ mod tests {
                     4.13,
                     &[("addr:housenumber", "8"), ("addr:street", "Kadeweg")],
                 ),
-                // An island group over the antimeridian, drawn as OSM
-                // draws one, a ring each side that meet at 180.
                 node(40, -17.0, 179.0, &[]),
                 node(41, -17.0, 180.0, &[]),
                 node(42, -16.0, 180.0, &[]),
@@ -5712,15 +5262,11 @@ mod tests {
                 .unwrap_or_default()
         };
         let (town, suburb) = (record("osm:relation:900"), record("osm:way:101"));
-        // The suburb lies in the town, the town in nothing broader, and
-        // neither names itself or the finer area its point falls in.
         assert_eq!(chain("osm:way:101"), [town]);
         assert_eq!(chain("osm:relation:900"), Vec::<RecordId>::new());
         assert!(chain("osm:node:10").contains(&suburb));
     }
 
-    /// Every section a built Pack holds, by name and format version, a group
-    /// of one format (`records/*`) as one.
     fn section_formats(pack: &Path) -> Vec<(String, u32)> {
         let reader = Reader::open(pack).expect("reader");
         let mut formats = reader
@@ -5741,7 +5287,6 @@ mod tests {
 
     #[test]
     fn the_schema_moves_with_every_section() {
-        // Bump PACK_SCHEMA_VERSION when changing a required section format.
         let formats = section_formats(&TOWN.pack());
         let expected = [
             ("context/*", 1),
@@ -5770,8 +5315,6 @@ mod tests {
     }
 
     fn island_town() -> Vec<Vec<TestElement>> {
-        // A town on an island that reaches past it on both sides, with the
-        // island's point in the town.
         vec![
             vec![
                 node(1, 52.0, 4.0, &[]),
@@ -5956,9 +5499,6 @@ mod tests {
         );
     }
 
-    /// A house and a theatre drawn as buildings and a school drawn as a
-    /// multipolygon, each with entrances on its outline, a house and a cafe
-    /// mapped on an entrance node, and a house and a hall with none.
     fn buildings_with_entrances() -> Vec<Vec<TestElement>> {
         let house =
             |number: &'static str| [("addr:housenumber", number), ("addr:street", "Kadeweg")];
@@ -5967,7 +5507,6 @@ mod tests {
                 node(1, 52.0000, 4.0000, &[("entrance", "main")]),
                 node(2, 52.0000, 4.0004, &[]),
                 node(3, 52.0003, 4.0004, &[("entrance", "service")]),
-                // The tag says nothing, so the node is no entrance.
                 node(4, 52.0003, 4.0000, &[("entrance", " ")]),
                 node(10, 52.0010, 4.0010, &[("entrance", "yes")]),
                 node(11, 52.0010, 4.0014, &[]),
@@ -6145,8 +5684,6 @@ mod tests {
         nodes.extend(square(111, 0.1, 0.4));
         nodes.extend(square(121, 0.6, 0.9));
         nodes.extend([
-            // The town Kingston's point names the boundary it lies in; no
-            // point names the local board.
             node(130, 0.75, 0.75, &[("place", "town"), ("name", "Kingston")]),
             node(201, 0.2, 0.2, &[]),
             node(202, 0.2, 0.201, &[]),
@@ -6166,7 +5703,6 @@ mod tests {
         ways.extend(board_ways);
         ways.extend(town_ways);
         ways.extend([
-            // One road drawn as three ways, then a road of its name far off.
             way(700, &[201, 202], &road("Ponsonby Road")),
             way(701, &[202, 203], &road("Ponsonby Road")),
             way(702, &[203, 204], &road("Ponsonby Road")),
@@ -6239,13 +5775,11 @@ mod tests {
             node(2, 2.5, 2.501, &[]),
             node(3, 3.5, 3.5, &[]),
             node(4, 3.5, 3.501, &[]),
-            // Each commune's point names it, as in OSM.
             node(5, 2.6, 2.6, &[("place", "city"), ("name", "Poitiers")]),
             node(6, 3.6, 3.6, &[("place", "village"), ("name", "Ligugé")]),
         ];
         let mut ways = Vec::new();
         let mut relations = Vec::new();
-        // Admin level, the corners of its square, its tags.
         type Area<'a> = (&'a str, f64, f64, &'a [(&'a str, &'a str)]);
         let areas: [Area; 8] = [
             ("3", 0.5, 9.5, &[("name", "France métropolitaine")]),
@@ -6337,9 +5871,6 @@ mod tests {
         let input = dir.join("town.osm.pbf");
         write_pbf(&input, &town_with_pois());
         let in_memory = build(&dir.join("memory"), &input, None);
-        // A 4-byte budget leaves every sorter one item of memory, so everything
-        // goes through run files and multi-round merges, and the node
-        // coordinates through a scratch file.
         let spilled = build(&dir.join("spilled"), &input, Some(4));
         let spilling_sorters = spilled
             .scratch
@@ -6364,7 +5895,6 @@ mod tests {
             assert!(spill.written_bytes > 0, "{owner}: {spill:?}");
         }
         let records = &ledger.spills["records"];
-        // Every run written, merged ones too, is read back once.
         assert_eq!(records.items_read, records.items_written);
         assert!(records.merge_passes >= 1);
         let stages = spilled
@@ -6420,13 +5950,11 @@ mod tests {
             scratch_budget_bytes: Some(1),
             ..BuildOsmOptions::default()
         };
-        // The plan sees the budget cannot hold the build before it starts.
         let refused = build_osm_pack(&options);
         let Err(Error::OutOfResources(message)) = refused else {
             panic!("expected the plan to refuse the scratch budget, got {refused:?}");
         };
         assert!(message.contains("--scratch-budget-mb"), "{message}");
-        // Forced past the plan, the ledger stops it at the first write.
         let failed = build_osm_pack(&BuildOsmOptions {
             force: true,
             ..options
@@ -6466,7 +5994,6 @@ mod tests {
         assert!(!dir.join("pack").join("CURRENT").exists());
     }
 
-    /// Records what an observer is told, in order.
     #[derive(Default)]
     struct Recorder(std::sync::Mutex<Vec<(BuildStage, &'static str, Option<u64>)>>);
 
@@ -6560,8 +6087,6 @@ mod tests {
         assert!(!dir.join("pack").join("CURRENT").exists());
     }
 
-    /// Eruera Street with flats written "N/M", some addresses stating a
-    /// postcode, and a second street in another cell.
     fn flats() -> Vec<Vec<TestElement>> {
         let address = |id, lon, number: &'static str, postcode: Option<&'static str>| {
             let mut tags = vec![
@@ -6598,8 +6123,6 @@ mod tests {
         ]]
     }
 
-    /// Rows over `flats`: repeats, disputes, other houses, slash numbers and
-    /// postcodes to lend, in two files.
     fn flat_rows(dir: &Path) -> Vec<addresses::AddressFile> {
         let first = dir.join("first.csv");
         fs::write(
@@ -6643,8 +6166,6 @@ mod tests {
         ]
     }
 
-    /// Every record of the Pack `inputs` and `files` build into under
-    /// `root`, its context, and what the report counted.
     fn pack_contents(
         root: &Path,
         inputs: &[&Path],
@@ -6697,12 +6218,6 @@ mod tests {
         (contents, report)
     }
 
-    /// Imported rows over OSM flats written "N/M": a row naming a flat by
-    /// its unit repeats the OSM flat once its slash number is read, rows
-    /// repeat each other across files, rows a few hundred metres off
-    /// dispute OSM's house, a row's slash number is read too, and only the
-    /// postcodes of the addresses kept are lent to their street. Spilling
-    /// every sorter builds the same Pack.
     #[test]
     fn imported_rows_repeat_dispute_and_lend_by_their_place_in_the_address_book() {
         let dir = temp_dir("address-book");
@@ -6743,9 +6258,7 @@ mod tests {
             }
         };
         for dropped in [
-            // Unit 10 of 1367: OSM's "10/1367".
             "openaddresses:first:row:1",
-            // 330 m from OSM's 1182, which states no locality or postcode.
             "openaddresses:first:row:2",
             "openaddresses:first:row:3",
             "openaddresses:first:row:4",
@@ -6779,10 +6292,6 @@ mod tests {
         }
     }
 
-    /// The ward is a way and a relation of one outline, so only the
-    /// tie-break orders them. An area lists the
-    /// larger areas only, whatever lies around its point, which for a hook
-    /// shape is not in the area at all.
     #[test]
     fn a_pack_lists_the_areas_a_record_lies_in_with_their_raw_tags() {
         let dir = temp_dir("enclosing");
@@ -6808,8 +6317,6 @@ mod tests {
             ("name", "Metro"),
         ];
         blocks[2].push(way(700, &[2001, 2002, 2003, 2004, 2001], &city));
-        // The centroid of the hook lies in its hollow, in the pocket, which is
-        // larger than the hook yet not around it.
         let hook = [
             (43.85, -79.95),
             (43.85, -79.75),
@@ -6865,7 +6372,6 @@ mod tests {
             context.admin_context.get(PlaceLayer::SubLocality),
             Some(toronto)
         );
-        // The country is derived from the region's code and shares its source id.
         let canada = context.admin_context.country_record_id().expect("country");
 
         let lists = [
@@ -6884,7 +6390,6 @@ mod tests {
         for (record, list) in lists {
             assert_eq!(pack.enclosing_areas(record).unwrap(), list, "{record}");
         }
-        // Metro is King's town, so the parser knows it; a place outside every area keeps its own.
         let dictionaries = Dictionaries::open(pack.container()).expect("dictionaries");
         assert_eq!(dictionaries.areas("metro"), [metro as u32]);
         assert_eq!(dictionaries.areas("lonely"), [id("osm:node:2011") as u32]);
@@ -6907,7 +6412,6 @@ mod tests {
         }
     }
 
-    /// Square areas and points, written as one extract.
     struct Map {
         nodes: Vec<TestElement>,
         ways: Vec<TestElement>,
@@ -6949,8 +6453,6 @@ mod tests {
             id
         }
 
-        /// A closed way around `[south, west, north, east]`, and the ids of
-        /// its ring, which another area may be drawn over.
         fn area(
             &mut self,
             [south, west, north, east]: [f64; 4],
@@ -6963,7 +6465,6 @@ mod tests {
             ring
         }
 
-        /// A relation of id `id` around `bounds`, for a rule that names it.
         fn relation(&mut self, id: i64, bounds: [f64; 4], tags: &[(&'static str, &'static str)]) {
             self.area(bounds, &[]);
             let TestElement::Way { id: outer, .. } = self.ways.last().expect("way") else {
@@ -7073,7 +6574,6 @@ mod tests {
         [boundary, level, name, ("ISO3166-1:alpha2", code)]
     }
 
-    /// The name in each tier of a record's context, outermost first.
     fn tiers(pack: &Reader, node: i64) -> Vec<(PlaceLayer, String)> {
         let record = pack
             .find_by_source_id(&format!("osm:node:{node}"))
@@ -7115,7 +6615,6 @@ mod tests {
             -0.137,
             &[("place", "city"), ("name", "City of Westminster")],
         );
-        // Admin level table ranks the City of London's level 6 at locality.
         map.relation(
             51800,
             [51.51, -0.11, 51.52, -0.08],
@@ -7213,7 +6712,6 @@ mod tests {
         );
     }
 
-    /// An extract with no area boundary still has its village points.
     #[test]
     fn a_village_point_names_a_house_in_an_extract_with_no_boundary() {
         let mut map = Map::new();
@@ -7233,7 +6731,6 @@ mod tests {
         map.area([48.06, 11.36, 48.25, 11.72], &admin("6", "München"));
         map.area([48.13, 11.57, 48.15, 11.6], &admin("9", "Altstadt-Lehel"));
         map.point(48.137, 11.575, &[("place", "city"), ("name", "München")]);
-        // Type-word name only, so not the city though smaller and holding its point.
         map.area(
             [48.1365, 11.574, 48.1372, 11.5752],
             &admin("11", "Stadt München"),
@@ -7553,8 +7050,6 @@ mod tests {
         map.keep("sachsen house", outside);
     }
 
-    /// A city drawn as an area counts against the state named like a hamlet
-    /// as a city point does.
     #[test]
     fn a_state_named_like_a_hamlet_in_it_is_no_town_with_the_city_an_area() {
         assert_eq!(
@@ -7628,8 +7123,6 @@ mod tests {
         assert_eq!(pack.default_languages(germany).collect::<Vec<_>>(), ["de"]);
     }
 
-    /// Every record and the context of each, in Pack order, with the areas
-    /// each lies in and its own tags.
     fn records_and_contexts(pack: &Path) -> Vec<(serde_json::Value, Option<RecordContext>)> {
         let reader = Reader::open(pack).expect("reader");
         (0..reader.manifest().record_count)
@@ -7680,8 +7173,6 @@ mod tests {
         }
     }
 
-    /// Build `options`, failing just before the checkpoint of `step` as a
-    /// crash there would.
     fn fail_before(options: &BuildOsmOptions, step: Step) -> Error {
         FAIL_BEFORE_CHECKPOINT.set(Some(step));
         let failed = build_osm_pack(options);
@@ -7781,7 +7272,6 @@ mod tests {
                 copies.push((at, copy));
             }
         }
-        // Past the last checkpoint, the sealed Pack is trained again.
         FAIL_BEFORE_TRAINING.set(true);
         let failed = build_osm_pack(&options);
         FAIL_BEFORE_TRAINING.set(false);
@@ -7884,7 +7374,6 @@ mod tests {
         };
         fail_before(&options, Step::Contexts);
 
-        // Neither resumed nor cleared, it is reported, with both commands.
         let refused = build_osm_pack(&options).expect_err("refused");
         let message = refused.to_string();
         assert!(message.contains("import addresses"), "{message}");
@@ -8087,8 +7576,6 @@ mod tests {
         ]
     }
 
-    /// A county's relation may name its seat as both `label` and
-    /// `admin_centre`, but the seat is a town of its own and stays separate.
     #[test]
     fn a_countys_seat_stays_its_own_place() {
         let reader = Reader::open(MERGED_PLACES.pack()).expect("reader");
@@ -8139,9 +7626,6 @@ mod tests {
         ]
     }
 
-    /// A suburb tagged with its city's Wikidata item is on another layer, and
-    /// a city node far outside the boundary must not be pulled in by a
-    /// mistagged item: both stay separate.
     #[test]
     fn a_shared_item_merges_only_on_its_layer_and_within_bounds() {
         let reader = Reader::open(MERGED_PLACES.pack()).expect("reader");
@@ -8203,9 +7687,6 @@ mod tests {
         ]
     }
 
-    /// Ballard has no label or item, so the suburb node of its name inside it
-    /// merges and lends it its item. A Ballard node outside it, and a
-    /// differently named node inside, stay separate.
     #[test]
     fn a_place_node_merges_into_the_boundary_of_its_name_around_it() {
         let reader = Reader::open(MERGED_PLACES.pack()).expect("reader");
@@ -8290,8 +7771,6 @@ mod tests {
         );
     }
 
-    /// The corners of a unit square from `west`, as nodes `first` to `first + 3`,
-    /// and the closed way `first` over them.
     fn unit_square(first: i64, west: f64) -> (Vec<TestElement>, TestElement) {
         let corners = [
             (west, 0.0),
@@ -8342,7 +7821,6 @@ mod tests {
         }
     }
 
-    /// The point and Wikidata item of the record `id`.
     fn point_and_item(reader: &Reader, id: &str) -> (serde_json::Value, Option<u32>) {
         let record = reader.find_by_source_id(id).expect("lookup").expect(id);
         let point = reader
@@ -8401,7 +7879,6 @@ mod tests {
     }
 
     fn named_items(layout: &str) -> Vec<Vec<TestElement>> {
-        // Points match in spatial order, so swapping the places swaps which is matched first.
         let (first, second, item) = match layout {
             "alpha" => ("Alpha", "Beta", "Q110"),
             _ => ("Delta", "Gamma", "Q111"),

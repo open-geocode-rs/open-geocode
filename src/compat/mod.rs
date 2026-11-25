@@ -1,20 +1,3 @@
-//! Vendor-compatible routes under `/compat/<vendor>/`.
-//!
-//! Each vendor module translates its vendor's request into og's own lookups
-//! and og's answer into the vendor's response shape, so a client written for
-//! the vendor reads og unchanged. Translation only: every lookup goes through
-//! og's native handlers, with their validation, limits and lookup slots, so
-//! `/compat` can never answer what og itself would not.
-//!
-//! Shared rules (decision record 10 to 15f):
-//! - A field og has no value for is sent as the vendor sends a missing value.
-//! - Request parameters og cannot honour are ignored.
-//! - Vendor credentials are never checked: auth belongs to the gateway og
-//!   sits behind.
-//! - Errors use the vendor's own body and status.
-//! - Vendor id fields carry og's id as URL-safe base64.
-//! - An endpoint og lacks answers the vendor's own "not implemented".
-
 pub(crate) mod fieldmask;
 pub(crate) mod google;
 pub(crate) mod here;
@@ -61,7 +44,6 @@ fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-/// Every vendor's routes, each under its own prefix.
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .nest("/compat/google", google::router())
@@ -70,29 +52,18 @@ pub(crate) fn router() -> Router<AppState> {
         .nest("/compat/precisely", precisely::router())
 }
 
-/// An og reference for a record in a vendor-compatible response.
 pub(crate) fn encode_id(common: &crate::api::Common) -> String {
     encode_parts(&common.id, Some(common.layer), &common.label)
 }
 
-/// A vendor id of its parts: an og id, the layer of a record (`None` for
-/// a context area), and its label or name.
 pub(crate) fn encode_parts(id: &str, layer: Option<Layer>, label: &str) -> String {
     OgRef::of(id, layer, label).encode()
 }
 
-/// An area's id as a vendor id. A context area's tier is no one layer, and
-/// its id names one area, so it carries no layer.
 pub(crate) fn encode_area_id(area: &crate::api::ContextArea) -> String {
     encode_parts(&area.id, None, &area.name)
 }
 
-/// What a vendor id names. og's id alone does not name one record: an OSM
-/// node is a POI and the address it states, and og's catalogue holds no
-/// address, estimate or derived postcode. So the layer travels with the id,
-/// and a record the catalogue cannot look up carries its label, which finds
-/// it again (see [`native::lookup`]). Only a [`CatalogueId`] reaches
-/// `/places?ids`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OgRef {
     Catalogued {
@@ -106,15 +77,10 @@ pub(crate) enum OgRef {
     },
 }
 
-/// An og id the catalogue looks up: an OSM place, area or street. Built
-/// only by [`CatalogueId::of`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatalogueId(String);
 
 impl CatalogueId {
-    /// `id` when the catalogue can hold a record of it on `layer`. An
-    /// address or a range of one shares its OSM id with a POI or a street
-    /// the catalogue holds, but is none of them.
     fn of(id: &str, layer: Option<Layer>) -> Option<Self> {
         let held = matches!(crate::ids::parse(id), Ok(Some(_)))
             && !matches!(layer, Some(Layer::Address | Layer::Interpolation));
@@ -126,15 +92,12 @@ impl CatalogueId {
     }
 }
 
-/// Between the parts of a vendor id. No id, layer or label holds a line
-/// break.
 const SEPARATOR: char = '\n';
 
 const OG_ID_PREFIX: &str = "og_";
 
 impl OgRef {
     fn of(id: &str, layer: Option<Layer>, label: &str) -> Self {
-        // An area's id is the same whether it is the answer or holds it.
         let layer = layer.filter(|layer| !layer.is_context());
         match CatalogueId::of(id, layer) {
             Some(id) => Self::Catalogued { id, layer },
@@ -166,8 +129,6 @@ impl OgRef {
         }
     }
 
-    /// URL-safe base64, so it survives a path segment and a query string
-    /// unescaped.
     fn encode(&self) -> String {
         let mut text = self.id().to_string();
         if self.layer().is_some() || self.label().is_some() {
@@ -184,17 +145,13 @@ impl OgRef {
     }
 }
 
-/// What a vendor id names, or `None` for one og never issued: one whose id
-/// is not og's, or that asks the catalogue for a record it cannot hold.
 pub(crate) fn decode_id(vendor_id: &str) -> Option<OgRef> {
     let id = vendor_id.trim();
-    // Keep references issued before the provider prefix was added usable.
     let payload = id.strip_prefix(OG_ID_PREFIX).unwrap_or(id);
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let text = String::from_utf8(bytes).ok()?;
     let mut parts = text.splitn(3, SEPARATOR);
     let id = parts.next()?;
-    // Every og id is `dataset:kind:number`; anything else is not one of ours.
     if id.split(':').count() < 3 {
         return None;
     }
@@ -215,7 +172,6 @@ pub(crate) fn decode_id(vendor_id: &str) -> Option<OgRef> {
     })
 }
 
-/// The parameters of one native lookup, as its query string would carry them.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Args(Vec<(&'static str, String)>);
 
@@ -229,8 +185,6 @@ impl Args {
         self
     }
 
-    /// Sets `name` only when there is a value: an absent vendor parameter is
-    /// an absent og one, never an empty one, which og reads differently.
     pub(crate) fn maybe(self, name: &'static str, value: Option<impl Into<String>>) -> Self {
         match value {
             Some(value) => self.set(name, value),
@@ -249,7 +203,6 @@ impl Args {
         Self(self.0.clone())
     }
 
-    /// These parameters with `name` set to `value` in place of what it was.
     fn with(&self, name: &'static str, value: String) -> Self {
         let mut args = Self(
             self.0
@@ -273,13 +226,6 @@ impl Args {
     }
 }
 
-/// Names each area named in several languages at once, as OSM writes a
-/// country of several (`Schweiz/Suisse/Svizzera/Svizra`), in the language of
-/// the place, as a vendor names it when no language is asked. That language
-/// is the one the nearest area named once is named in: Conthey is Conthey in
-/// French and Gundis in German, so a house in it is French-speaking and its
-/// country is Suisse. An area whose parts name it in no such language keeps
-/// its name.
 pub(crate) fn name_joined_areas(pack: &crate::pack::Reader, context: &mut crate::api::Context) {
     let Some(languages) = place_languages(pack, context) else {
         return;
@@ -310,20 +256,13 @@ pub(crate) fn name_joined_areas(pack: &crate::pack::Reader, context: &mut crate:
             })
             .map(|part| (*part).to_string());
         if let Some(local) = local {
-            // The joined name stays its local name, so it tells no language
-            // the part was picked by ([`place_language`]).
             let joined = std::mem::replace(&mut area.name, local);
             area.local_name.get_or_insert(joined);
         }
     }
 }
 
-/// The languages an area's name is written in, those that name it so:
-/// Conthey is Conthey in French and Italian and Gundis in German, so it
-/// speaks French or Italian. None for a name joined from several
-/// languages, or one no language names it by.
 fn speaking(pack: &crate::pack::Reader, area: &crate::api::ContextArea) -> Option<Vec<String>> {
-    // An area renamed in the language asked is read by its local name.
     let local = area.local_name.as_deref().unwrap_or(&area.name);
     if local.contains('/') {
         return None;
@@ -337,10 +276,6 @@ fn speaking(pack: &crate::pack::Reader, area: &crate::api::ContextArea) -> Optio
     (!speaking.is_empty()).then_some(speaking)
 }
 
-/// The languages a place speaks, which its local names are written in.
-/// They are the languages its nearest area is named in ([`speaking`]),
-/// narrowed by each area farther out while that leaves more than one. None
-/// when no area tells a language.
 fn place_languages(
     pack: &crate::pack::Reader,
     context: &crate::api::Context,
@@ -368,12 +303,6 @@ fn place_languages(
     languages
 }
 
-/// The one language a place speaks. It is the default language the nearest
-/// boundary stating one names (`default_language`), when some area of the
-/// place is named in it by its local name: the United States state English,
-/// and a town named alike only in Occitan still speaks it. A default no area
-/// is named in tells nothing (Switzerland's is Latin), and then the areas'
-/// names alone tell it ([`place_languages`]), when they leave one.
 pub(crate) fn place_language(
     pack: &crate::pack::Reader,
     context: &crate::api::Context,
@@ -397,11 +326,6 @@ pub(crate) fn place_language(
     }
 }
 
-/// An area's name without the word for its kind, as an address writes it:
-/// `Suffolk` of `Suffolk County`, `Oder-Spree` of `Landkreis Oder-Spree`.
-/// The kind words are og's parser's, from libpostal's lists in every
-/// language. A name with none, or whose rest is not whole words of it,
-/// stays as it is.
 pub(crate) fn without_kind(name: &str) -> String {
     let Some(key) = crate::util::fold::search_key(name) else {
         return name.to_string();
@@ -424,15 +348,6 @@ pub(crate) fn without_kind(name: &str) -> String {
     best.unwrap_or_else(|| name.to_string())
 }
 
-/// Keeps the results that match the query no worse than the first, when
-/// the first matches every part the query states, fully or in part: a
-/// vendor answers the address it found, not the near misses og also holds
-/// ("Back Bay, Boston" is the district, not Back Bay Road in Newark). A
-/// first result that leaves a stated part unmatched is no sure match, and
-/// every result stays. Of the areas kept, one that holds another kept area
-/// goes too, so the narrowest of nested matches answers. Paris the city
-/// answers, not the department of the same name that holds it, while Köln
-/// and the Cologne in Italy both stay.
 pub(crate) fn best_matches(features: &mut Vec<crate::api::ForwardFeature>) {
     use crate::api::{PartMatch, QueryMatch};
     fn parts(found: QueryMatch) -> [Option<PartMatch>; 7] {
@@ -484,9 +399,6 @@ pub(crate) fn best_matches(features: &mut Vec<crate::api::ForwardFeature>) {
     });
 }
 
-/// og's native lookups, called as their routes would be.
-/// Gives an address whose source states no postcode the one the other
-/// addresses of its street agree on (`street_postcode`).
 fn with_street_postcode(address: &mut crate::api::Address, street_postcode: Option<&String>) {
     if address.postcode.is_none() {
         address.postcode = street_postcode.cloned();
@@ -497,7 +409,6 @@ pub(crate) mod native {
     pub(super) use super::house::ask_again;
     use super::*;
 
-    /// The answer as a vendor writes it ([`as_vendors_write`]).
     fn local_forward(
         state: &AppState,
         asked: bool,
@@ -509,11 +420,6 @@ pub(crate) mod native {
         found
     }
 
-    /// A result as a vendor writes it. Each area named in several languages
-    /// at once is named in the place's own when no language was asked
-    /// ([`name_joined_areas`]). An address whose source states no postcode
-    /// has the one the other addresses of its street agree on, since a
-    /// vendor writes every address with its postcode.
     fn as_vendors_write(state: &AppState, asked: bool, common: &mut crate::api::Common) {
         if !asked {
             name_joined_areas(state.pack(), &mut common.context);
@@ -527,10 +433,6 @@ pub(crate) mod native {
         );
     }
 
-    /// Runs a lookup and keeps one copy of each house in its answer. Where
-    /// the caller asked for a number of answers and copies leave fewer, og
-    /// is asked for more, up to `most`, the route's own limit, so the answer
-    /// holds as many houses as og has.
     async fn one_per_house<C, A, Fut>(
         args: Args,
         most: usize,
@@ -599,13 +501,6 @@ pub(crate) mod native {
             .map(|json| local_forward(state, args_lang, json.0))
     }
 
-    /// Free text answered with addresses, areas and places together, as a
-    /// vendor search that knows no split between them does. og keeps them
-    /// apart (`/geocode`, `/places`), so both run. An address or an area
-    /// joins the answer only when it is what the query names, its street or
-    /// its own part matched and no part it states unmatched, since
-    /// `/geocode` answers any text with its nearest reading. A geography
-    /// qualifier follows the place it locates.
     pub(crate) async fn search(state: &AppState, args: Args) -> Result<ForwardCollection, Problem> {
         let limit = args
             .get("limit")
@@ -697,8 +592,6 @@ pub(crate) mod native {
         qualified_places
     }
 
-    /// Whether a `/geocode` answer is the address, street or area the query
-    /// names, which is so when its street, or the part the area is, matched.
     fn names_answer(feature: &ForwardFeature) -> bool {
         use crate::api::PartMatch;
         use crate::record::Layer;
@@ -742,7 +635,6 @@ pub(crate) mod native {
             return false;
         }
 
-        // Block addresses have no street, and the parser can read their neighbourhood as a locality.
         let mut query_parts = query.split([',', '、', '，']).map(normalize_for_compare);
         if query_parts.next().as_deref() != Some(normalize_for_compare(&common.name).as_str()) {
             return false;
@@ -776,9 +668,6 @@ pub(crate) mod native {
         })
     }
 
-    /// The places og holds within `radius_m` of `point`, the most prominent
-    /// first (QRank, a Wikidata link, names in many languages), then the
-    /// nearest, as many as `limit`, the place `except` left out.
     pub(crate) async fn landmarks(
         state: &AppState,
         point: [f64; 2],
@@ -819,7 +708,6 @@ pub(crate) mod native {
             .collect())
     }
 
-    /// The places of `categories`, as the catalog writes each one.
     pub(crate) async fn of_categories(
         state: &AppState,
         categories: Vec<&'static str>,
@@ -831,8 +719,6 @@ pub(crate) mod native {
             .map(|json| local_forward(state, args_lang, json.0))
     }
 
-    /// The record a vendor id names, or `None` when no record has it,
-    /// named in `lang` when it is given.
     pub(crate) async fn by_id(
         state: &AppState,
         named: &OgRef,
@@ -843,12 +729,6 @@ pub(crate) mod native {
             .and_then(|collection| collection.features.into_iter().next()))
     }
 
-    /// The answer holding the record a vendor id names, named in `lang`
-    /// when it is given: none when og could never have issued the id, no
-    /// feature when no record has it. The catalogue looks up an OSM id.
-    /// Any other is found by geocoding the label it carries: the record
-    /// with that id, or else the one with that very label, since an
-    /// imported row's id renumbers with each release of its data.
     pub(crate) async fn lookup(
         state: &AppState,
         named: &OgRef,
@@ -857,8 +737,6 @@ pub(crate) mod native {
         let label = match named {
             OgRef::Labelled { label, .. } => label,
             OgRef::Catalogued { id, .. } => {
-                // `/places?ids` answers every record of the id, and of the
-                // relation of a region also the country it derives.
                 return match places(
                     state,
                     Args::new().set("ids", id.as_str()).maybe("lang", lang),
@@ -887,11 +765,6 @@ pub(crate) mod native {
         Ok(Some(collection))
     }
 
-    /// Keeps of the answers only the record a vendor id names, on its
-    /// layer: the one with its id and label, else its id, else its label.
-    /// An id alone can be read otherwise: a range the label names whole is
-    /// also the house its last number names. A label alone is a row whose
-    /// id a newer release of its data renumbered.
     pub(crate) fn keep_named(collection: &mut ForwardCollection, named: &OgRef) {
         let same_id = |feature: &ForwardFeature| feature.properties.common.id == named.id();
         let same_label = |feature: &ForwardFeature| {
@@ -914,13 +787,9 @@ pub(crate) mod native {
             .collect();
     }
 
-    /// Answers read for the record a label names: enough that the record
-    /// is among them though the label also names its neighbours.
     pub(crate) const LABEL_CANDIDATES: usize = 10;
 }
 
-/// What a vendor route answers with on failure: the vendor's body and
-/// status, and the Problem behind it, so a 500's cause is still logged.
 #[derive(Debug)]
 pub(crate) struct VendorError {
     pub(crate) status: StatusCode,
@@ -957,22 +826,18 @@ impl IntoResponse for VendorError {
             response.headers_mut().insert(name, value);
         }
         if let Some(problem) = self.cause {
-            // Not a `Problem` extension: the request-id middleware would
-            // rewrite the body into og's own problem document.
             response.extensions_mut().insert(Logged(problem));
         }
         response
     }
 }
 
-/// The `Retry-After` og set on a 503, for a vendor error to carry.
 pub(crate) fn retry_after(problem: &Problem) -> Option<(HeaderName, HeaderValue)> {
     problem
         .retry_after()
         .map(|seconds| (axum::http::header::RETRY_AFTER, HeaderValue::from(seconds)))
 }
 
-/// A header's value as text, when it is sent and readable.
 pub(crate) fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get(name)
@@ -981,20 +846,12 @@ pub(crate) fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> 
         .filter(|value| !value.is_empty())
 }
 
-/// The ISO 3166-1 alpha-2 code of the country a feature lies in.
 pub(crate) fn country_code(context: &crate::api::Context) -> Option<&str> {
     context.country.as_ref()?.code.as_deref()
 }
 
-/// How far a vendor that states no distance looks for the house nearest a
-/// point. The vendors answer the nearest house wherever the point falls on
-/// its lot or the street before it, and a lot runs to about 100 m deep.
 pub(crate) const NEAREST_HOUSE_RADIUS_M: f64 = 150.0;
 
-/// A vendor's search distance as og's reverse `radius`. It only widens
-/// og's search, up to the farthest og looks: a nearer limit is the
-/// vendor's filter on what og finds, so og still answers the house and
-/// areas it would answer without one.
 pub(crate) fn radius(metres: f64) -> String {
     metres
         .clamp(
@@ -1004,13 +861,6 @@ pub(crate) fn radius(metres: f64) -> String {
         .to_string()
 }
 
-/// The town a vendor's city slot names: the one the record's address is
-/// written with, else the locality holding it. The stated one comes first
-/// since it is often the postal town where the holding area names a wider
-/// municipality. A stated name that is another tier's area holding the
-/// record is no town, and the locality holding the record is: a county
-/// (OpenAddresses `district` stands in for an empty `city`) or a district
-/// of the town (`Paris 2e Arrondissement`).
 pub(crate) fn town<'a>(
     stated: Option<&'a str>,
     holding: Option<&'a str>,
@@ -1024,14 +874,11 @@ pub(crate) fn town<'a>(
     };
     match stated {
         Some(name) if holding.is_some() && names_other(name) => holding,
-        // The locality's own spelling, where the source shouts it (`BOSTON`).
         Some(name) if holding.is_some_and(|holding| holding.eq_ignore_ascii_case(name)) => holding,
         stated => stated.or(holding),
     }
 }
 
-/// The town of a result as a vendor writes it, by [`town`] over the areas
-/// holding it.
 pub(crate) fn town_of<'a>(
     address: &'a crate::api::Address,
     context: &'a crate::api::Context,
@@ -1051,8 +898,6 @@ pub(crate) fn town_of<'a>(
     )
 }
 
-/// A US street in the postal abbreviation, by og's split of it where og
-/// made one: `Amphitheatre Pkwy`, `W El Camino Real`.
 pub(crate) fn us_street(address: &crate::api::Address) -> Option<String> {
     let street = address.street.as_deref()?;
     let parts = address.street_parts.as_ref();
@@ -1064,10 +909,6 @@ pub(crate) fn us_street(address: &crate::api::Address) -> Option<String> {
     ))
 }
 
-/// A result's postal lines in its country's form, as a vendor writes them.
-/// They are rendered again from og's parts with the town a vendor writes
-/// ([`town_of`]) and, in the US, the street in the postal abbreviation, so
-/// no rendered text is rewritten. Empty where og has no lines for it.
 pub(crate) fn postal_lines(
     layer: Layer,
     address: &crate::api::Address,
@@ -1134,8 +975,6 @@ mod tests {
         }
     }
 
-    /// og is asked for more answers only while copies leave too few houses,
-    /// og had more to give, and never past the route's own limit.
     #[test]
     fn an_address_stating_no_postcode_takes_the_one_its_street_agrees_on() {
         let filled = |postcode: Option<&str>, street: Option<&str>| {
@@ -1157,19 +996,13 @@ mod tests {
 
     #[test]
     fn og_is_asked_again_only_while_it_can_answer_more_houses() {
-        // Asked 3, og answered 3 of which 2 houses: ask 6.
         assert_eq!(native::ask_again(3, 3, 3, 2, 50), Some(6));
         assert_eq!(native::ask_again(3, 3, 3, 3, 50), None);
-        // og had fewer than asked, so it has no more.
         assert_eq!(native::ask_again(3, 6, 5, 2, 50), None);
-        // Never past the route's limit, and not again at it.
         assert_eq!(native::ask_again(15, 15, 15, 9, 20), Some(20));
         assert_eq!(native::ask_again(20, 20, 20, 9, 20), None);
     }
 
-    /// A house's lines are rendered from its parts in its country's form,
-    /// with the town a vendor writes: the locality holding it where the
-    /// source wrote a district of it or shouted its name.
     #[test]
     fn postal_lines_are_rendered_in_the_town_a_vendor_writes() {
         let vienna = crate::api::Context {
@@ -1216,8 +1049,6 @@ mod tests {
         );
     }
 
-    /// With no language asked, a country OSM names in several languages at
-    /// once is named in the language of the place, on every vendor.
     #[tokio::test]
     async fn a_country_named_in_several_languages_takes_the_places_own() {
         use crate::runtime::router_tests::state_for;
@@ -1256,10 +1087,6 @@ mod tests {
         );
     }
 
-    /// A name says the language it is written in. A local name is in the
-    /// language its place speaks, told by its areas' names, and a name og
-    /// holds in the language asked is in that one. A number or a code is in
-    /// none.
     #[tokio::test]
     async fn a_local_name_is_in_the_language_its_place_speaks() {
         use crate::runtime::router_tests::state_for;
@@ -1321,9 +1148,6 @@ mod tests {
         let seen = languages(&english);
         assert_eq!(of(&seen, "country").as_deref(), Some("en"), "{english}");
         assert_eq!(of(&seen, "route").as_deref(), Some("de"), "{english}");
-        // A place whose areas are named alike in French and Italian, under a
-        // country named in four languages at once, speaks no one language
-        // og can tell, asked in a language or not.
         let swiss = "addressQuery=67%20Route%20de%20la%20T%C3%A9l%C3%A9cabine";
         for asked in ["", "&languageCode=de"] {
             let answer = get(format!("/compat/google/v4/geocode/address?{swiss}{asked}")).await;
@@ -1331,9 +1155,6 @@ mod tests {
         }
     }
 
-    /// A country and a state named alike in English and Jamaican Patois,
-    /// above a county and town named in no other language, under a country
-    /// whose default language is English, and a county with plate code SIM.
     fn write_defaults_pack(dir: &std::path::Path) {
         use crate::{
             pack::{RecordContext, Writer},
@@ -1362,7 +1183,6 @@ mod tests {
         let state = area(PlaceLayer::Region, "California", 2);
         let county = area(PlaceLayer::District, "Rhein-Hunsrück-Kreis", 3);
         let town = area(PlaceLayer::Locality, "Mountain View", 4);
-        // A county with an ISO code and no plate code.
         let paris = area(PlaceLayer::District, "Paris", 5);
         let named = |names: &[(&str, &str)]| {
             names
@@ -1380,8 +1200,6 @@ mod tests {
                         ("fr", "États-Unis"),
                     ]),
                 ),
-                // A minor language copying the town's local name tells
-                // nothing of what the town speaks.
                 (town, named(&[("oc", "Mountain View"), ("zh", "山景城")])),
                 (
                     state,
@@ -1550,9 +1368,6 @@ mod tests {
         area(PlaceLayer::Locality, "Cologne", &[], 104, [10.4, 45.6], &[]);
     }
 
-    /// Where a place's areas are named alike in several languages, the
-    /// default language its boundary states picks among them, and a
-    /// county's plate code is HERE's county code.
     #[tokio::test]
     async fn a_default_language_picks_among_alike_names_and_a_plate_code_is_the_county_code() {
         use crate::runtime::router_tests::state_for;
@@ -1586,7 +1401,6 @@ mod tests {
         assert_eq!(route["languageCode"], "en", "{google}");
         let here = get("/compat/here/v1/geocode?q=1600%20Amphitheatre%20Parkway").await;
         assert_eq!(here["items"][0]["address"]["countyCode"], "SIM", "{here}");
-        // A county's ISO code is no county code HERE writes.
         let paris = get("/compat/here/v1/geocode?q=5%20Rue%20Daunou").await;
         assert_eq!(paris["items"][0]["address"]["county"], "Paris", "{paris}");
         assert_eq!(
@@ -1596,9 +1410,6 @@ mod tests {
         );
     }
 
-    /// An address drawn as a named building names it as Google's premise,
-    /// and Precisely says its point stands on the building, or on a door
-    /// when the point is the address's own main entrance.
     #[tokio::test]
     async fn a_building_is_the_premise_and_a_door_is_a_door() {
         use crate::runtime::router_tests::state_for;
@@ -1665,9 +1476,6 @@ mod tests {
         }
     }
 
-    /// A town inside a county of the same name answers alone, as the
-    /// narrowest of nested matches, while two towns far apart that a name
-    /// matches whole both answer, one by another of its names.
     #[tokio::test]
     async fn the_narrowest_of_nested_areas_answers_and_unrelated_ones_stay() {
         use crate::runtime::router_tests::state_for;
@@ -1700,9 +1508,6 @@ mod tests {
         assert_eq!(titles("Cologne").await, ["Cologne", "Köln"]);
     }
 
-    /// Every vendor names a house's town and country as og's answer in the
-    /// language asked does, never the source's spelling beside translated
-    /// areas.
     #[tokio::test]
     async fn every_vendor_names_a_stated_town_in_the_language_asked() {
         use crate::runtime::router_tests::state_for;
@@ -1798,12 +1603,10 @@ mod tests {
             ),
             Some("Montoursville")
         );
-        // A postal town the holding township does not name stays.
         assert_eq!(
             town(Some("Montoursville"), Some("Loyalsock Township"), &[county]),
             Some("Montoursville")
         );
-        // A district of the town is no town either.
         assert_eq!(
             town(
                 Some("Paris 2e Arrondissement"),
@@ -1812,7 +1615,6 @@ mod tests {
             ),
             Some("Paris")
         );
-        // With no town holding it, the stated name is all og has.
         assert_eq!(town(county, None, &[county]), county);
         assert_eq!(town(None, Some("Troy"), &[]), Some("Troy"));
     }
@@ -1835,8 +1637,6 @@ mod tests {
                 label: "25 Dorrance Street".to_string(),
             })
         );
-        // An address id without its label would ask the catalogue for a
-        // record it never holds, so og never issued it.
         let forged = URL_SAFE_NO_PAD.encode("osm:node:7\naddress");
         assert_eq!(decode_id(&forged), None);
         let row = encode_parts(

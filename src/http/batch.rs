@@ -1,10 +1,3 @@
-//! Batch lookups: many items in one request, on the routes that answer one.
-//!
-//! `QUERY` (RFC 10008) is the batch method, and `POST` an alias for clients
-//! that cannot send `QUERY` yet. Each item is read exactly as a `GET` of the
-//! same route reads its query string, so an item's answer, or its error, is
-//! the one that `GET` would return. A bad item never fails the batch.
-
 use std::{
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -40,24 +33,12 @@ use crate::{
     stop::{self, CancelOnDrop, Stop},
 };
 
-/// The methods a batchable route takes, as its `Allow` header lists them.
 pub(crate) const METHODS: &str = "GET, QUERY, POST";
 
-/// The one media type a batch body is read as, as `Accept-Query` lists it.
 pub(crate) const MEDIA_TYPE: &str = "application/json";
 
-/// Seconds a refused batch is told to wait. Batches of a thousand items
-/// finish in well under that on a warm Pack.
 const RETRY_AFTER_SECONDS: u32 = 1;
 
-/// One route's lookup, split where a batch needs it: `prepare` checks
-/// parameters by the rules `GET` checks them with, `place` says where the
-/// lookup will read in the Pack, and `answer` looks it up. The `GET` handler
-/// runs `prepare` and `answer` too.
-///
-/// `prepare` sees the server, not only the parameters: a rule can hang on an
-/// operator limit or on what the Pack holds, and an item is refused by it as
-/// its `GET` is.
 pub(crate) struct Lookup<P, Q, A, K> {
     pub(crate) route: &'static str,
     pub(crate) prepare: fn(&AppState, P) -> Result<Q, Problem>,
@@ -81,7 +62,6 @@ struct Batch<A> {
     summary: Summary,
 }
 
-/// One item's result: its `GET` answer, or the Problem that `GET` returns.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Item<A> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -111,11 +91,8 @@ struct Summary {
     failed: usize,
 }
 
-/// An item as sent: its fields in order, or what made it unreadable.
 pub(crate) enum RawItem {
     Fields(Vec<(String, Value)>),
-    /// A field named twice. `GET` with a repeated parameter fails to parse,
-    /// so the item fails the same way rather than keeping the last value.
     Repeated,
     NotAnObject,
 }
@@ -179,12 +156,9 @@ impl<'de> Visitor<'de> for RawItemVisitor {
     }
 }
 
-/// An item checked and ready to look up, or already failed.
 pub(crate) enum Prepared<Q> {
     Ready {
         id: Option<String>,
-        /// The query string the item's `GET` would carry: items with the
-        /// same key have the same answer.
         key: String,
         query: Q,
     },
@@ -194,7 +168,6 @@ pub(crate) enum Prepared<Q> {
     },
 }
 
-/// Answer a batch request on `lookup`'s route.
 pub(crate) async fn run<P, Q, A, K>(
     state: AppState,
     lookup: Lookup<P, Q, A, K>,
@@ -230,14 +203,10 @@ where
         .map(|id| id.0.clone());
     let shared = shared_parameters(request.uri().query())?;
     let items = read_items(request, state.limits()).await?;
-    // Taken before any thread is, so a refused batch holds nothing while it
-    // waits to be told no.
     let Ok(permit) = Arc::clone(state.batch_slots()).try_acquire_owned() else {
         return Err(Problem::busy(RETRY_AFTER_SECONDS));
     };
 
-    // Dropped with this future when the client disconnects, which stops the
-    // items not yet started and the ones running at their next check.
     let cancel = Arc::new(AtomicBool::new(false));
     let _cancel = CancelOnDrop(Arc::clone(&cancel));
     let worker = state.clone();
@@ -259,8 +228,6 @@ where
         .into_response())
 }
 
-/// Every item's result, in input order. Items are looked up in the order of
-/// where they read in the Pack, so neighbours share the pages they fault in.
 fn answer_items<P, Q, A, K>(
     state: &AppState,
     lookup: Lookup<P, Q, A, K>,
@@ -296,8 +263,6 @@ where
     )
 }
 
-/// Count the outcomes, and log and stamp the failures. Inside a 200 the
-/// request-id middleware sees no Problem, so the batch does both itself.
 fn finish<A>(
     state: &AppState,
     route: &str,
@@ -337,8 +302,6 @@ fn finish<A>(
     Batch { results, summary }
 }
 
-/// Check one item by the rules its `GET` is checked with. A panic fails the
-/// item, not the batch.
 pub(crate) fn prepare<P, Q, A, K>(
     state: &AppState,
     lookup: Lookup<P, Q, A, K>,
@@ -356,8 +319,6 @@ where
                 problem: Problem::unparsable_parameters(),
             };
         }
-        // A `QUERY` body with one is refused whole; a `/jobs` line fails
-        // alone.
         RawItem::NotAnObject => {
             return Prepared::Failed {
                 id: None,
@@ -382,8 +343,6 @@ where
     }
 }
 
-/// One item looked up, stopped past the server's lookup timeout or once
-/// `cancel` is set. A panic fails the item, not the batch.
 pub(crate) fn look_up<P, Q, A, K>(
     state: &AppState,
     lookup: Lookup<P, Q, A, K>,
@@ -409,18 +368,11 @@ pub(crate) fn look_up<P, Q, A, K>(
     }
 }
 
-/// The request's own query string, which every item starts from.
 pub(crate) fn shared_parameters(query: Option<&str>) -> Result<Vec<(String, String)>, Problem> {
     serde_urlencoded::from_str(query.unwrap_or_default())
         .map_err(|_| Problem::unparsable_parameters())
 }
 
-/// The query string `GET` would have been sent for this item: the shared
-/// parameters, each overridden by the item's own of the same name.
-///
-/// Going through the query string, rather than reading the item as JSON into
-/// the parameters, is what makes an item mean what the same `GET` means: one
-/// parser, one set of rules, one set of errors.
 fn item_query(shared: &[(String, String)], item: &[(String, Value)]) -> Result<String, Problem> {
     let mut own = Vec::with_capacity(item.len());
     for (name, value) in item {
@@ -452,7 +404,6 @@ fn item_query(shared: &[(String, String)], item: &[(String, Value)]) -> Result<S
     serde_urlencoded::to_string(&pairs).map_err(|error| Problem::internal(error.into()))
 }
 
-/// The item's `id`, echoed in its result.
 fn item_id(item: &[(String, Value)]) -> Result<Option<String>, Problem> {
     let invalid = |reason: &str| {
         Problem::malformed_parameter(format!("id {reason}"))
@@ -468,7 +419,6 @@ fn item_id(item: &[(String, Value)]) -> Result<Option<String>, Problem> {
     }
 }
 
-/// The body's items, checked before any is looked up.
 async fn read_items(request: Request, limits: &Limits) -> Result<Vec<RawItem>, Problem> {
     let max_bytes = limits.max_batch_body_bytes();
     if !is_json(request.headers()) {
@@ -479,8 +429,6 @@ async fn read_items(request: Request, limits: &Limits) -> Result<Vec<RawItem>, P
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    // A declared length is refused before a byte is read. A chunked body
-    // declares none, and the route's body limit stops it while it is read.
     if declared.is_some_and(|length| length > max_bytes as u64) {
         return Err(Problem::body_too_large(max_bytes));
     }
@@ -509,12 +457,10 @@ async fn read_items(request: Request, limits: &Limits) -> Result<Vec<RawItem>, P
     Ok(items)
 }
 
-/// `application/json`, with or without parameters such as `charset`.
 fn is_json(headers: &HeaderMap) -> bool {
     media_type(headers).is_some_and(|media_type| media_type.eq_ignore_ascii_case(MEDIA_TYPE))
 }
 
-/// The `Content-Type` without its parameters, such as `charset`.
 pub(crate) fn media_type(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::CONTENT_TYPE)
@@ -523,8 +469,6 @@ pub(crate) fn media_type(headers: &HeaderMap) -> Option<&str> {
         .map(str::trim)
 }
 
-/// The headers every response of a batchable route carries, so a client can
-/// find the batch methods from any answer.
 pub(crate) async fn advertise(mut response: Response) -> Response {
     let headers = response.headers_mut();
     headers.insert(header::ALLOW, HeaderValue::from_static(METHODS));

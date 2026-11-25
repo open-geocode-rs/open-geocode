@@ -1,23 +1,3 @@
-//! Pack writer and reader.
-//!
-//! A Pack is one container file (see [`crate::container`]) holding the record
-//! store, admin context table, text index, spatial index and the address
-//! parser's dictionaries and weights (see [`crate::parse::lattice`]). Builds write a new
-//! generation next to the published one and switch the `CURRENT` pointer only
-//! after the new Pack passes validation, so running servers never see a
-//! partial Pack.
-//!
-//! ```text
-//! <pack dir>/CURRENT                         id of the published generation
-//! <pack dir>/generations/<id>/pack.ogp       the Pack
-//! <pack dir>/generations/<id>/audit/         build report and rejections
-//! ```
-//!
-//! Sealing writes the parts the writer holds in memory into the Pack file
-//! first, then copies in the parts it streamed to scratch one at a time
-//! ([`Sealing`]), so a build can checkpoint between parts and go on from
-//! there.
-
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
@@ -70,8 +50,6 @@ pub const PACK_FILE: &str = "pack.ogp";
 pub const AUDIT_DIR: &str = "audit";
 pub const REJECTIONS_FILE: &str = "rejections.jsonl";
 pub const BUILD_REPORT_FILE: &str = "build-report.json";
-/// Moves whenever any section's format does, so a Pack another og wrote is
-/// told apart by its schema alone (see `the_schema_moves_with_every_section`).
 pub const PACK_SCHEMA_VERSION: u32 = 11;
 
 const MANIFEST_SECTION: &str = "manifest";
@@ -118,16 +96,9 @@ pub struct SpatialManifest {
     pub context_point_count: u64,
 }
 
-/// How many addresses state a postcode, per country: what one postcode's
-/// addresses are a share of, so search weighs agreeing on a postcode by how
-/// few records it covers in its country. Summed from the postcode records as
-/// they are written, each counting the addresses it was derived from. `None`
-/// holds the postcodes no country holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PostcodeAddresses(BTreeMap<Option<CountryCode>, u64>);
 
-/// Bytes of one [`PostcodeAddresses`] entry: the country as a `u16` (0 for
-/// none) and the count, little-endian.
 const POSTCODE_ADDRESSES_ENTRY_BYTES: usize = 10;
 
 impl PostcodeAddresses {
@@ -135,12 +106,10 @@ impl PostcodeAddresses {
         *self.0.entry(country).or_default() += addresses;
     }
 
-    /// The addresses of `country` that state a postcode.
     pub fn of(&self, country: Option<CountryCode>) -> u64 {
         self.0.get(&country).copied().unwrap_or_default()
     }
 
-    /// Every country some postcode is in.
     pub fn countries(&self) -> impl Iterator<Item = CountryCode> + '_ {
         self.0.keys().flatten().copied()
     }
@@ -174,8 +143,6 @@ impl PostcodeAddresses {
     }
 }
 
-/// Bytes of one country code entry: the country record's id and its code as a
-/// `u16`, little-endian.
 const COUNTRY_CODES_ENTRY_BYTES: usize = 10;
 
 fn country_codes_to_bytes(codes: &HashMap<RecordId, CountryCode>) -> Vec<u8> {
@@ -207,10 +174,6 @@ fn country_codes_from_bytes(bytes: &[u8]) -> Result<HashMap<RecordId, CountryCod
         .collect()
 }
 
-/// A short text of each area record that has one, such as its ISO 3166-2
-/// code (`CA-ON`), its vehicle plate code (`SIM`) or its default language
-/// (`de`). Each entry is the area record's id, little-endian, then the
-/// text's length in one byte and the text itself.
 fn area_codes_to_bytes(codes: &HashMap<RecordId, String>) -> Vec<u8> {
     let mut sorted = codes
         .iter()
@@ -244,14 +207,8 @@ fn area_codes_from_bytes(mut bytes: &[u8]) -> Result<HashMap<RecordId, String>> 
     Ok(codes)
 }
 
-/// The name of an area in each language it has one in, as pairs of a
-/// language code as its tag writes it (`de`, `zh-Hant`) and the name, in code
-/// order.
 pub type LanguageNames = Vec<(String, String)>;
 
-/// Each entry is the record's id, little-endian, then its name count as a
-/// little-endian `u16`, then each name as its code's length in one byte, the
-/// code, the name's length as a little-endian `u16` and the name.
 fn language_names_to_bytes(names: &HashMap<RecordId, LanguageNames>) -> Vec<u8> {
     let fits = |(code, name): &&(String, String)| {
         u8::try_from(code.len()).is_ok() && u16::try_from(name.len()).is_ok()
@@ -315,8 +272,6 @@ fn language_names_from_bytes(mut bytes: &[u8]) -> Result<HashMap<RecordId, Langu
     Ok(all)
 }
 
-/// Bytes of one extent entry, which is the area record's id, then its west,
-/// south, east and north sides in 1e-7 degrees, all little-endian.
 const EXTENT_ENTRY_BYTES: usize = 24;
 
 fn extents_to_bytes(mut extents: Vec<(RecordId, Extent)>) -> Vec<u8> {
@@ -332,8 +287,6 @@ fn extents_to_bytes(mut extents: Vec<(RecordId, Extent)>) -> Vec<u8> {
     bytes
 }
 
-/// The box around each area record, in id order and read where the Pack
-/// holds it, as a planet has an area for every town and suburb.
 #[derive(Debug, Default)]
 struct Extents(Option<container::Bytes>);
 
@@ -367,13 +320,8 @@ impl Extents {
     }
 }
 
-/// Bytes of one area's timezone, which is the area record's id, then the
-/// zone's index in the names, both little-endian.
 const AREA_ZONE_BYTES: usize = 10;
 
-/// The zone names as a little-endian `u16` count, then each name's length
-/// in one byte and the name, then an entry per area that lies wholly in one
-/// zone, in id order.
 fn timezones_to_bytes(names: &[String], mut areas: Vec<(RecordId, u16)>) -> Result<Vec<u8>> {
     let count = u16::try_from(names.len())
         .map_err(|_| Error::Inconsistent("more timezones than the Pack names".into()))?;
@@ -399,12 +347,9 @@ fn timezones_to_bytes(names: &[String], mut areas: Vec<(RecordId, u16)>) -> Resu
     Ok(bytes)
 }
 
-/// The timezone names of a Pack built with timezone boundaries, and the
-/// zone of each area that lies wholly in one, read where the Pack holds it.
 #[derive(Debug, Default)]
 struct Timezones {
     names: Vec<String>,
-    /// The section, and where its area entries start.
     areas: Option<(container::Bytes, usize)>,
 }
 
@@ -443,7 +388,6 @@ impl Timezones {
         })
     }
 
-    /// The zone the area record lies wholly in, by its index in the names.
     fn of_area(&self, record_id: RecordId) -> Option<u16> {
         let (bytes, at) = self.areas.as_ref()?;
         let entries = bytes[*at..].as_chunks::<AREA_ZONE_BYTES>().0;
@@ -462,9 +406,7 @@ fn zone_of(entry: &[u8; AREA_ZONE_BYTES]) -> u16 {
 
 #[derive(Debug, Clone)]
 pub struct WriterOptions {
-    /// Pool every buffer of the build reserves from.
     pub memory: Arc<Budget>,
-    /// Memory for Tantivy's indexing buffers, taken from the pool.
     pub text_index_memory_bytes: usize,
 }
 
@@ -477,11 +419,6 @@ impl Default for WriterOptions {
     }
 }
 
-/// The names of the areas a record lies in that its text document carries:
-/// every name of each area but its country and the place area it lies in
-/// (an island), which are indexed by their `name` alone. A country or an
-/// island has hundreds of names, one per language, and every record in it
-/// would carry them all; the parser's dictionaries still hold every one.
 fn indexed_area_names<'a>(
     context: &RecordContext,
     names: &'a HashMap<RecordId, Vec<String>>,
@@ -503,15 +440,12 @@ fn indexed_area_names<'a>(
         .map(String::as_str)
 }
 
-/// The timezone names, and the zone of each area record that lies wholly
-/// in one, by its index in them.
 #[derive(Debug)]
 struct AreaZones {
     names: Vec<String>,
     areas: Vec<(RecordId, u16)>,
 }
 
-/// Writes records in their final order. Record ids are assigned sequentially.
 #[derive(Debug)]
 pub struct Writer {
     scratch: Arc<Scratch>,
@@ -528,29 +462,21 @@ pub struct Writer {
     default_languages: HashMap<RecordId, String>,
     language_names: HashMap<RecordId, LanguageNames>,
     extents: Vec<(RecordId, Extent)>,
-    /// When the build was given timezone boundaries.
     timezones: Option<AreaZones>,
     postcode_areas: Arc<PostcodeAreas>,
     postcode_addresses: PostcodeAddresses,
     dictionaries: Builder,
-    /// Last, so it drops after every writer of a file in it (see
-    /// [`Generation`]'s drop).
     generation: Generation,
 }
 
-/// A finished, unpublished Pack.
 #[derive(Debug)]
 pub struct SealedPack {
     generation: Generation,
     manifest: Manifest,
     bytes: u64,
-    /// Where the sections end, before the table of contents.
     sections: container::State,
 }
 
-/// A Pack generation being built, beside the published one. Removed when
-/// dropped unless it was published, or its build's scratch holds a
-/// checkpoint the build may go on from: no reader can be using it.
 #[derive(Debug)]
 pub struct Generation {
     destination: PathBuf,
@@ -559,12 +485,9 @@ pub struct Generation {
     scratch: Option<Arc<Scratch>>,
 }
 
-/// A file in an unpublished generation naming its build's scratch
-/// directory, so a later build of the Pack finds a build to go on from.
 pub const SCRATCH_POINTER_FILE: &str = "scratch";
 
 impl Generation {
-    /// A new, empty generation of the Pack at `destination`.
     pub fn create(destination: impl AsRef<Path>) -> Result<Self> {
         let destination = destination.as_ref().to_path_buf();
         Ok(Self {
@@ -575,8 +498,6 @@ impl Generation {
         })
     }
 
-    /// The unpublished generation at `path`, of the Pack at `destination`,
-    /// to go on building.
     pub fn reopen(destination: impl AsRef<Path>, path: impl AsRef<Path>) -> Self {
         Self {
             destination: destination.as_ref().to_path_buf(),
@@ -586,8 +507,6 @@ impl Generation {
         }
     }
 
-    /// Create the build's scratch directory: in `scratch_dir` when given,
-    /// else inside the generation. Its bytes are capped by `budget`.
     pub fn create_scratch(
         &mut self,
         scratch_dir: Option<&Path>,
@@ -599,15 +518,12 @@ impl Generation {
         Ok(scratch)
     }
 
-    /// Where the build's scratch directory goes.
     pub fn scratch_path(&self, scratch_dir: Option<&Path>) -> PathBuf {
         scratch_dir
             .map(|dir| dir.join(self.path.file_name().expect("generation name")))
             .unwrap_or_else(|| self.path.join(SCRATCH_DIR))
     }
 
-    /// Tie the generation to `scratch`: it outlives a failed build while
-    /// `scratch` holds a checkpoint.
     pub fn attach(&mut self, scratch: &Arc<Scratch>) {
         self.scratch = Some(Arc::clone(scratch));
     }
@@ -621,9 +537,6 @@ impl Generation {
     }
 }
 
-/// A generation no build keeps is removed as it drops. Windows keeps a
-/// directory while a file in it is open, so whatever holds one drops first:
-/// the structs holding a generation declare it last.
 impl Drop for Generation {
     fn drop(&mut self) {
         let resumable = self
@@ -636,7 +549,6 @@ impl Drop for Generation {
     }
 }
 
-/// Statistics a build reports after sealing the Pack.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildStats {
     pub bytes: u64,
@@ -655,7 +567,6 @@ impl Writer {
         Self::create_in(generation, scratch, options)
     }
 
-    /// Write into `generation`, streaming to `scratch`.
     pub fn create_in(
         generation: Generation,
         scratch: Arc<Scratch>,
@@ -688,13 +599,10 @@ impl Writer {
         })
     }
 
-    /// Scratch directory shared with the builder's own sorters.
     pub fn scratch(&self) -> &Arc<Scratch> {
         &self.scratch
     }
 
-    /// Directory of the generation being built, for build outputs that live
-    /// beside the Pack file.
     pub fn generation(&self) -> &Path {
         &self.generation.path
     }
@@ -703,31 +611,19 @@ impl Writer {
         self.records.record_count()
     }
 
-    /// Names of the records admin contexts point at, each area's `name`
-    /// first, so the records written after this can be indexed under the
-    /// areas they lie in.
     pub fn set_context_names(&mut self, names: HashMap<RecordId, Vec<String>>) {
         self.context_names = Arc::new(names);
     }
 
-    /// The OSM tags of the areas records lie in, by record id.
     pub fn set_area_tags(&mut self, tags: BTreeMap<RecordId, AreaTags>) {
         self.contexts.set_area_tags(tags);
     }
 
-    /// Country codes of the country records admin contexts point at, so the
-    /// parser's dictionaries know which country each name is used in.
     pub fn set_country_codes(&mut self, codes: HashMap<RecordId, CountryCode>) {
-        // The same map indexes each record's country, so a Pack covering
-        // several countries can be searched one at a time. Cloned rather
-        // than shared: the dictionary builder consumes its copy, and the map
-        // holds one entry per country record, not per record.
         self.country_codes = Arc::new(codes.clone());
         self.dictionaries.set_country_codes(codes);
     }
 
-    /// The ISO 3166-2 code of each area record below a country that has one
-    /// (`CA-ON`), by the area's id.
     pub fn set_subdivision_codes(&mut self, codes: HashMap<RecordId, String>) {
         self.subdivision_codes = codes;
     }
@@ -736,43 +632,30 @@ impl Writer {
         self.census_codes = codes;
     }
 
-    /// The vehicle plate code of each area record whose boundary states one
-    /// (`SIM`), by the area's id.
     pub fn set_plate_codes(&mut self, codes: HashMap<RecordId, String>) {
         self.plate_codes = codes;
     }
 
-    /// The default language of each area record whose boundary states one,
-    /// as it writes it (`en`, `nl;fr`), by the area's id.
     pub fn set_default_languages(&mut self, languages: HashMap<RecordId, String>) {
         self.default_languages = languages;
     }
 
-    /// The names of each area record in the languages it has one in, by the
-    /// area's id.
     pub fn set_language_names(&mut self, names: HashMap<RecordId, LanguageNames>) {
         self.language_names = names;
     }
 
-    /// The box around each area record, by the area's id.
     pub fn set_extents(&mut self, extents: Vec<(RecordId, Extent)>) {
         self.extents = extents;
     }
 
-    /// The timezone names a record's context may point at by index (see
-    /// [`RecordContext::zone`]), and the zone of each area record that lies
-    /// wholly in one, by the area's id.
     pub fn set_timezones(&mut self, names: Vec<String>, areas: Vec<(RecordId, u16)>) {
         self.timezones = Some(AreaZones { names, areas });
     }
 
-    /// The groups of regions each region lies in, by the region's id.
     pub fn set_region_groups(&mut self, groups: HashMap<RecordId, Vec<RecordId>>) {
         self.dictionaries.set_region_groups(groups);
     }
 
-    /// Postcode centroids, so the records written after this that have no
-    /// postcode of their own are ranked by the nearest one.
     pub fn set_postcode_areas(&mut self, areas: PostcodeAreas) {
         self.postcode_areas = Arc::new(areas);
     }
@@ -783,15 +666,11 @@ impl Writer {
         Ok(first)
     }
 
-    /// Write records in order: [`BatchPreparer::prepare`], then [`Self::commit`].
     pub fn write_batch(&mut self, batch: &[(Record, Option<RecordContext>)]) -> Result<()> {
         let prepared = self.preparer().prepare(batch.to_vec())?;
         self.commit(prepared)
     }
 
-    /// What computes the text documents, spatial cells and dictionary names
-    /// of the records written next, apart from the writer, so a builder can
-    /// prepare one batch while the writer appends the one before.
     pub fn preparer(&self) -> BatchPreparer {
         BatchPreparer {
             next: self.records.record_count(),
@@ -802,8 +681,6 @@ impl Writer {
         }
     }
 
-    /// Append a prepared batch. The dictionaries, the text index and the
-    /// store with its spatial pairs each take every record in order.
     pub fn commit(&mut self, batch: PreparedBatch) -> Result<()> {
         let first = self.records.record_count();
         if batch.first != first {
@@ -831,9 +708,6 @@ impl Writer {
             ..
         } = self;
         let placed = &placed;
-        // None of the three reads another's state, and one thread feeding
-        // them in turn bound the whole step. Each runs on its own, joined
-        // per batch, so each still takes records in order.
         std::thread::scope(|scope| {
             let named = scope.spawn(move || {
                 for (offset, (names, (_, context))) in names.into_iter().zip(placed).enumerate() {
@@ -882,17 +756,12 @@ impl Writer {
         })
     }
 
-    /// Write the Pack file without publishing it.
     pub fn seal(self) -> Result<(SealedPack, BuildStats)> {
         let mut sealing = self.into_sealing()?;
         while sealing.seal_part()?.is_some() {}
         sealing.finish()
     }
 
-    /// Start the Pack file with the parts held in memory, the context
-    /// table, the parser's dictionaries and the postcode counts, once every
-    /// record is written. The parts streamed to scratch follow, one
-    /// [`Sealing::seal_part`] at a time.
     pub fn into_sealing(self) -> Result<Sealing> {
         let Self {
             generation,
@@ -915,8 +784,6 @@ impl Writer {
             dictionaries,
             ..
         } = self;
-        // Merging the text index's segments is most of the sealing, and on
-        // one thread: it starts now, beside the parts sealed before it.
         let text = Merging::start(text);
         let mut pack = container::Writer::create(generation.path.join(PACK_FILE))?;
         let counts = SealCounts {
@@ -995,7 +862,6 @@ impl Writer {
         })
     }
 
-    /// Seal, add the structured index, and publish.
     pub fn finish(self) -> Result<Manifest> {
         let (mut sealed, _) = self.seal()?;
         crate::structured::add_to(&mut sealed)?;
@@ -1004,8 +870,6 @@ impl Writer {
     }
 }
 
-/// A Pack file being sealed: the parts held in memory are in it, and the
-/// parts streamed to scratch are copied in one at a time.
 #[derive(Debug)]
 pub struct Sealing {
     scratch: Arc<Scratch>,
@@ -1014,13 +878,9 @@ pub struct Sealing {
     text: Option<Merging>,
     spatial: Option<spatial_index::Writer>,
     counts: SealCounts,
-    /// Last, so it drops after every writer of a file in it (see
-    /// [`Generation`]'s drop).
     generation: Generation,
 }
 
-/// The text index, its segments merging on a thread of their own until the
-/// index is asked for.
 #[derive(Debug)]
 struct Merging {
     path: PathBuf,
@@ -1031,7 +891,6 @@ struct Merging {
 enum MergeState {
     Running(std::thread::JoinHandle<(text_index::Writer, Result<()>)>),
     Done(Box<text_index::Writer>),
-    /// The merge failed or panicked, and its error was handed on.
     Failed,
 }
 
@@ -1046,7 +905,6 @@ impl Merging {
         }
     }
 
-    /// The index once its merge is over.
     fn writer(&mut self) -> Result<&mut text_index::Writer> {
         if matches!(self.state, MergeState::Running(_))
             && let MergeState::Running(merging) =
@@ -1076,8 +934,6 @@ impl Merging {
 }
 
 impl Drop for Merging {
-    /// A sealing dropped on an error waits for the merge: the scratch it
-    /// writes to goes only after it.
     fn drop(&mut self) {
         if let MergeState::Running(merging) = std::mem::replace(&mut self.state, MergeState::Failed)
         {
@@ -1086,7 +942,6 @@ impl Drop for Merging {
     }
 }
 
-/// What the Pack manifest counts, gathered as the parts are sealed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SealCounts {
     record_count: u64,
@@ -1097,8 +952,6 @@ struct SealCounts {
     spatial: Option<spatial_index::Commit>,
 }
 
-/// A Pack file being sealed, as a checkpoint names it: how far the file
-/// was written, and the parts left to copy in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealingState {
     pack: container::State,
@@ -1109,8 +962,6 @@ pub struct SealingState {
 }
 
 impl Sealing {
-    /// Copy the next part streamed to scratch into the Pack file, removing
-    /// its scratch: its name, or `None` once every part is in.
     pub fn seal_part(&mut self) -> Result<Option<&'static str>> {
         self.scratch.check_cancelled()?;
         if let Some(records) = self.records.take() {
@@ -1128,7 +979,6 @@ impl Sealing {
         Ok(None)
     }
 
-    /// Where the sealing stands, for a checkpoint: the Pack file is synced.
     pub fn state(&mut self) -> Result<SealingState> {
         Ok(SealingState {
             pack: self.pack.state()?,
@@ -1149,7 +999,6 @@ impl Sealing {
         })
     }
 
-    /// The scratch files and directories the parts left to copy are in.
     pub fn files(&self) -> Vec<PathBuf> {
         let mut files = Vec::new();
         if let Some(records) = &self.records {
@@ -1164,8 +1013,6 @@ impl Sealing {
         files
     }
 
-    /// The sealing a checkpoint left, in `generation`, its parts in
-    /// `scratch`.
     pub fn restore(
         generation: Generation,
         scratch: Arc<Scratch>,
@@ -1204,7 +1051,6 @@ impl Sealing {
         })
     }
 
-    /// Write the manifest and the table of contents, once every part is in.
     pub fn finish(mut self) -> Result<(SealedPack, BuildStats)> {
         if self.records.is_some() || self.text.is_some() || self.spatial.is_some() {
             return Err(Error::Inconsistent(
@@ -1264,7 +1110,6 @@ impl Sealing {
     }
 }
 
-/// A sealed Pack as a checkpoint names it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedState {
     manifest: Manifest,
@@ -1273,7 +1118,6 @@ pub struct SealedState {
 }
 
 impl SealedPack {
-    /// The sealed Pack and what sealing it reported, for a checkpoint.
     pub fn state(&self, stats: &BuildStats) -> SealedState {
         SealedState {
             manifest: self.manifest.clone(),
@@ -1282,8 +1126,6 @@ impl SealedPack {
         }
     }
 
-    /// The Pack a checkpoint sealed, in `generation`. Sections a failed
-    /// build added after the checkpoint are cut off again.
     pub fn restore(generation: Generation, state: &SealedState) -> Result<(Self, BuildStats)> {
         let pack = container::Writer::resume(generation.path.join(PACK_FILE), &state.sections)?;
         let bytes = pack.finish()?;
@@ -1310,13 +1152,10 @@ impl SealedPack {
         self.bytes
     }
 
-    /// The Pack file, to read before it is published.
     pub fn path(&self) -> PathBuf {
         self.generation.path.join(PACK_FILE)
     }
 
-    /// Add a section made from the sealed Pack itself, such as the parser
-    /// weights trained on its records. Nothing reads the Pack file yet.
     pub fn add_section(&mut self, name: &str, version: u32, bytes: &[u8]) -> Result<()> {
         let mut pack = container::Writer::append(self.path())?;
         pack.add(name, version, bytes)?;
@@ -1324,8 +1163,6 @@ impl SealedPack {
         Ok(())
     }
 
-    /// Add sections made from the sealed Pack, each copied from a file, such
-    /// as its structured index (see [`crate::structured::add_to`]).
     pub fn add_section_files(&mut self, sections: &[(&str, u32, PathBuf)]) -> Result<()> {
         let mut pack = container::Writer::append(self.path())?;
         for (name, version, path) in sections {
@@ -1335,7 +1172,6 @@ impl SealedPack {
         Ok(())
     }
 
-    /// Validate the Pack with the serving readers, then point `CURRENT` at it.
     pub fn publish(mut self) -> Result<Manifest> {
         publication::publish(
             &self.generation.destination,
@@ -1353,19 +1189,13 @@ pub struct Reader {
     manifest: Manifest,
     records: records::Reader,
     context: context::Reader,
-    /// `None` for a Pack built before enclosing areas.
     enclosing: Option<enclosing::Reader>,
     postcode_addresses: PostcodeAddresses,
-    /// The code of each country record, by its id.
     country_codes: HashMap<RecordId, CountryCode>,
-    /// The ISO 3166-2 code of each area record that has one, by its id.
     subdivision_codes: HashMap<RecordId, String>,
-    /// The vehicle plate code of each area record that has one, by its id.
     plate_codes: HashMap<RecordId, String>,
     census_codes: HashMap<RecordId, String>,
-    /// The default language of each area record that states one, by its id.
     default_languages: HashMap<RecordId, String>,
-    /// The names of each area record in other languages, by its id.
     language_names: HashMap<RecordId, LanguageNames>,
     extents: Extents,
     timezones: Timezones,
@@ -1388,7 +1218,6 @@ impl std::fmt::Debug for Reader {
 }
 
 impl Reader {
-    /// Open a Pack directory (its published generation) or a Pack file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = resolve_pack_path(path)?;
         let container = Container::open(&path)?;
@@ -1414,8 +1243,6 @@ impl Reader {
         let postcode_addresses = PostcodeAddresses::from_bytes(
             &container.section(POSTCODE_ADDRESSES_SECTION, POSTCODE_ADDRESSES_VERSION)?,
         )?;
-        // Optional: a Pack sealed before the section has none, and answers
-        // without country codes rather than failing to open.
         let country_codes = if container.sections().contains_key(COUNTRY_CODES_SECTION) {
             country_codes_from_bytes(
                 &container.section(COUNTRY_CODES_SECTION, COUNTRY_CODES_VERSION)?,
@@ -1493,7 +1320,6 @@ impl Reader {
         &self.manifest
     }
 
-    /// The Pack file opened by this reader.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -1502,7 +1328,6 @@ impl Reader {
         &self.container
     }
 
-    /// Check every section of the Pack file against its checksum.
     pub fn verify(&self) -> Result<()> {
         self.container.verify()
     }
@@ -1513,7 +1338,6 @@ impl Reader {
         self.country_codes.get(&record_id).copied()
     }
 
-    /// The country records of the ISO 3166-1 code `code`.
     pub fn countries_of(&self, code: CountryCode) -> Vec<RecordId> {
         self.country_codes
             .iter()
@@ -1562,9 +1386,6 @@ impl Reader {
             .map(|(_, name)| name)
     }
 
-    /// Every name an area record has in a language of its own, as
-    /// [`Self::language_name`] reads them one at a time.
-    /// A record's names by language, as `(code, name)`.
     pub fn names_by_language(&self, record_id: RecordId) -> &[(String, String)] {
         self.language_names
             .get(&record_id)
@@ -1579,8 +1400,6 @@ impl Reader {
             .map(|(_, name)| name.as_str())
     }
 
-    /// [`Self::language_name`], with the code the name is held under. That is
-    /// `de` when `de-CH` reads its base language.
     pub fn language_name_as(&self, record_id: RecordId, language: &str) -> Option<(&str, &str)> {
         let names = self.language_names.get(&record_id)?;
         let find = |wanted: &str| {
@@ -1596,7 +1415,6 @@ impl Reader {
                 return None;
             }
             let found = find(base)?;
-            // A base-language name may use another script, such as Cyrillic for sr-Latn.
             match subtags.find(|subtag| is_script_subtag(subtag)) {
                 Some(script) => written_in(found.1, script).then_some(found),
                 None => Some(found),
@@ -1636,7 +1454,6 @@ impl Reader {
         .transpose()
     }
 
-    /// See [`PostcodeAddresses`].
     pub fn postcode_addresses(&self) -> &PostcodeAddresses {
         &self.postcode_addresses
     }
@@ -1645,7 +1462,6 @@ impl Reader {
         &self.records
     }
 
-    /// Section sizes in bytes, by section name.
     pub fn section_sizes(&self) -> BTreeMap<String, u64> {
         self.container
             .sections()
@@ -1710,7 +1526,6 @@ impl Reader {
         Ok(records)
     }
 
-    /// Full scan: a test oracle for the id catalogue, too slow to serve.
     #[cfg(test)]
     pub(crate) fn find_by_source_id(&self, source_id: &str) -> Result<Option<RecordId>> {
         for record_id in 0..self.records.record_count() {
@@ -1764,14 +1579,12 @@ impl Reader {
         }
     }
 
-    /// The tags of an area record; `None` when it has none.
     pub fn area_tags(&self, area: RecordId) -> Result<Option<AreaTags>> {
         self.enclosing
             .as_ref()
             .map_or(Ok(None), |enclosing| enclosing.tags(area))
     }
 
-    /// Rejected source objects recorded by the build that produced this Pack.
     pub fn rejections(&self, limit: usize) -> Result<Vec<RejectedRecord>> {
         let path = self
             .path
@@ -1794,8 +1607,6 @@ impl Reader {
     }
 }
 
-/// Computes what a batch of records adds to the Pack's indexes, in parallel,
-/// for the record ids they will be written at. See [`Writer::preparer`].
 #[derive(Debug)]
 pub struct BatchPreparer {
     next: RecordId,
@@ -1806,7 +1617,6 @@ pub struct BatchPreparer {
 }
 
 impl BatchPreparer {
-    /// Prepare the records that follow the last batch this prepared.
     pub fn prepare(
         &mut self,
         batch: Vec<(Record, Option<RecordContext>)>,
@@ -1821,9 +1631,6 @@ impl BatchPreparer {
                     .iter()
                     .flat_map(|context| indexed_area_names(context, &self.context_names))
                     .collect::<Vec<_>>();
-                // The country the record lies in, from the country record its
-                // admin context points at. A record outside every country
-                // boundary has none and no country filter finds it.
                 let country = context
                     .as_ref()
                     .and_then(|context| context.admin_context.country_record_id())
@@ -1848,8 +1655,6 @@ impl BatchPreparer {
     }
 }
 
-/// Records with their text documents, spatial cells and dictionary names,
-/// ready for [`Writer::commit`].
 #[derive(Debug)]
 pub struct PreparedBatch {
     first: RecordId,
@@ -1865,7 +1670,6 @@ impl PreparedBatch {
         self.records.is_empty()
     }
 
-    /// The records with the ids they will be written at.
     pub fn records(&self) -> impl Iterator<Item = (RecordId, &Record)> {
         self.records
             .iter()
@@ -1882,15 +1686,10 @@ struct PreparedRecord {
     names: RecordNames,
 }
 
-/// Whether a language tag's subtag is an ISO 15924 script code: four
-/// letters, such as `Latn` of `sr-Latn`.
 fn is_script_subtag(subtag: &str) -> bool {
     subtag.len() == 4 && subtag.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
-/// Whether `name` is written in the ISO 15924 script `code`: its letters
-/// are all of it. Simplified and traditional Chinese are both Han, and a
-/// script og cannot tell apart from another is never claimed.
 fn written_in(name: &str, code: &str) -> bool {
     use unicode_script::{Script, UnicodeScript};
     let wanted = match code.to_ascii_lowercase().as_str() {
@@ -2153,7 +1952,6 @@ mod tests {
         assert!(sections.contains_key("spatial/blocks"));
         assert_eq!(first_hit(&root, "queen").as_deref(), Some("osm:node:2"));
 
-        // The Pack file alone is a complete Pack.
         let copy = dir.join("copy.ogp");
         fs::copy(reader.path(), &copy).expect("copy");
         assert_eq!(first_hit(&copy, "king").as_deref(), Some("osm:node:1"));
@@ -2279,7 +2077,6 @@ mod tests {
         let result = sealed.publish();
         publication::FAIL_AFTER_SWITCH.set(false);
         assert!(result.is_err());
-        // CURRENT already names the new generation, so it must still exist.
         assert_eq!(first_hit(&root, "queen").as_deref(), Some("osm:node:2"));
     }
 

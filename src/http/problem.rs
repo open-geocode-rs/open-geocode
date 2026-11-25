@@ -1,13 +1,3 @@
-//! RFC 9457 Problem Details (`application/problem+json`) error responses.
-//!
-//! ADR 0017 Decisions 29 and 31: public-demo API errors use correct status codes
-//! and a standard problem shape instead of an ad hoc error body, and must not
-//! leak stack traces, filesystem paths, or Pack internals.
-//!
-//! An internal error still keeps its cause, privately: the Problem carries it
-//! into the response extensions, never the body, so the request-id middleware
-//! can log it under the request id (issue #2).
-
 use std::{any::Any, sync::Arc};
 
 use axum::{
@@ -17,7 +7,6 @@ use axum::{
 use serde::Serialize;
 use tokio::task::JoinError;
 
-/// One `invalid_params` entry, a safe extension member naming a rejected field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct InvalidParam {
     pub name: String,
@@ -77,14 +66,10 @@ impl ErrorCode {
         }
     }
 
-    /// The slug this code uses in its `type` URI: the code with underscores
-    /// as hyphens, so the URI reads as a path.
     fn slug(self) -> String {
         self.as_str().replace('_', "-")
     }
 
-    /// The `type` member: a documentation URI once [`DOCS_BASE`] is set, and
-    /// RFC 9457's `about:blank` until then.
     fn type_uri(self) -> String {
         match DOCS_BASE {
             Some(base) => format!("{base}/{}", self.slug()),
@@ -93,33 +78,8 @@ impl ErrorCode {
     }
 }
 
-/// Where the problem types are documented, once they are.
-///
-/// `None` until then, which renders `type` as `about:blank`: RFC 9457's
-/// default, and the only honest value while there is nothing to dereference.
-/// A `type` that looks like a link but 404s is worse than one that never
-/// promised anything.
-///
-/// Giving this a base URL turns every `type` into a real link: somewhere to
-/// read next to the code that branches on it. No separate link member is
-/// needed, because `type` already is one.
-///
-/// That change is additive — `about:blank` promises nothing, so replacing it
-/// breaks no client — but it does change every error body, so it lands with
-/// the pages, not before. `error_code` is the stable value either way.
 const DOCS_BASE: Option<&str> = None;
 
-/// The RFC 9457 problem document fields.
-///
-/// `instance` is not among them: it identifies the specific occurrence, and
-/// `request_id` already does that here, with a value the logs are indexed by.
-/// RFC 9457 makes every member optional, so leaving it out stays compliant.
-///
-/// `error_code` is an extension member: the stable value to branch on, where
-/// `title` and `detail` are prose that may be reworded. RFC 9457 requires
-/// clients to ignore extensions they do not know, so adding it stays
-/// compliant. The companion link those APIs provide is [`DOCS_BASE`], carried
-/// by `type` rather than a second member.
 #[derive(Debug, Clone, Serialize)]
 struct ProblemInner {
     #[serde(rename = "type")]
@@ -133,22 +93,14 @@ struct ProblemInner {
     request_id: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     invalid_params: Vec<InvalidParam>,
-    /// Value for the `Allow` response header (405 only); never serialized.
     #[serde(skip)]
     allow: Option<String>,
-    /// Seconds for the `Retry-After` response header (503 only); never
-    /// serialized.
     #[serde(skip)]
     retry_after: Option<u32>,
-    /// What went wrong behind a 500, for the log only; never serialized
-    /// (Decision 31). An `Arc` because response extensions must be `Clone`.
     #[serde(skip)]
     cause: Option<Arc<anyhow::Error>>,
 }
 
-/// An RFC 9457 problem response. Boxed so it stays small in the `Err` position of
-/// the many `Result<_, Problem>` returned across the boundary (clippy
-/// `result_large_err`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
 pub(crate) struct Problem(Box<ProblemInner>);
@@ -179,13 +131,11 @@ impl Problem {
         self
     }
 
-    /// Attach a request id (a safe Problem extension member, Decision 30).
     pub(crate) fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
         self.0.request_id = Some(request_id.into());
         self
     }
 
-    /// The private cause of an internal error, for the log only.
     pub(crate) fn cause(&self) -> Option<&anyhow::Error> {
         self.0.cause.as_deref()
     }
@@ -202,7 +152,6 @@ impl Problem {
         self.0.detail.as_deref()
     }
 
-    /// Seconds a 503 tells the client to wait.
     pub(crate) fn retry_after(&self) -> Option<u32> {
         self.0.retry_after
     }
@@ -231,8 +180,6 @@ impl Problem {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::MalformedParameter).with_detail(detail)
     }
 
-    /// A query string, or a batch item read as one, that does not parse. Its
-    /// parser's own text is not shown.
     pub(crate) fn unparsable_parameters() -> Self {
         Self::malformed_parameter("could not parse query parameters")
     }
@@ -263,7 +210,6 @@ impl Problem {
             .with_detail(format!("the body must be at most {max_bytes} bytes"))
     }
 
-    /// `expected` names the media types the route reads.
     pub(crate) fn unsupported_media_type(expected: &str) -> Self {
         Self::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -272,9 +218,6 @@ impl Problem {
         .with_detail(format!("the body must be sent as Content-Type: {expected}"))
     }
 
-    /// The server runs as much of this kind of work as it allows. Refused at
-    /// once rather than queued, so a client learns to come back instead of
-    /// holding a connection open.
     pub(crate) fn busy(retry_after: u32) -> Self {
         let mut problem = Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Busy)
             .with_detail("the server is answering as many requests as it can; retry shortly");
@@ -282,8 +225,6 @@ impl Problem {
         problem
     }
 
-    /// A lookup that ran past the server's lookup timeout, and stopped. No
-    /// `Retry-After`: the same lookup takes as long the next time.
     pub(crate) fn timed_out(after: std::time::Duration) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Timeout).with_detail(format!(
             "the lookup took longer than the server allows, {} ms",
@@ -291,8 +232,6 @@ impl Problem {
         ))
     }
 
-    /// A generic 500. The body carries no detail so internal errors never
-    /// leak; the cause rides along privately for the log.
     pub(crate) fn pack_outdated(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_IMPLEMENTED, ErrorCode::PackOutdated).with_detail(detail)
     }
@@ -303,10 +242,7 @@ impl Problem {
         problem
     }
 
-    /// A 500 for work that panicked, its cause the panic message, so the log
-    /// says what broke rather than just that something did.
     pub(crate) fn panicked(payload: &(dyn Any + Send)) -> Self {
-        // `panic!` with a literal carries a `&str`, with a format a `String`.
         let message = payload
             .downcast_ref::<&str>()
             .copied()
@@ -315,8 +251,6 @@ impl Problem {
         Problem::internal(anyhow::anyhow!("blocking task panicked: {message}"))
     }
 
-    /// The problem document with its status and headers. Unlike
-    /// [`IntoResponse`], this leaves the Problem out of the extensions.
     pub(crate) fn render(&self) -> Response {
         let status =
             StatusCode::from_u16(self.0.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -341,9 +275,6 @@ impl Problem {
     }
 }
 
-/// The response also carries the Problem itself as an extension, so the
-/// request-id middleware can put the request id in the body and log the cause
-/// of a 500 without any handler having to remember either.
 impl IntoResponse for Problem {
     fn into_response(self) -> Response {
         let mut response = self.render();
@@ -352,13 +283,6 @@ impl IntoResponse for Problem {
     }
 }
 
-/// Map a geocoder error into a Problem without leaking internals, so handlers
-/// can just use `?`.
-///
-/// A failure the caller could have avoided is a 400 that says what was wrong;
-/// everything else is a 500 whose body carries no detail and whose cause goes
-/// to the log. `Error::is_caller_error` draws the line, so a new variant is
-/// classified there rather than by matching on its message here.
 impl From<crate::Error> for Problem {
     fn from(error: crate::Error) -> Self {
         if let crate::Error::TimedOut { after } = error {
@@ -371,7 +295,6 @@ impl From<crate::Error> for Problem {
     }
 }
 
-/// A blocking task that panicked is a 500 whose cause is the panic message.
 impl From<JoinError> for Problem {
     fn from(error: JoinError) -> Self {
         if !error.is_panic() {

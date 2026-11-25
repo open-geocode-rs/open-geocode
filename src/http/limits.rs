@@ -1,10 +1,3 @@
-//! What one server lets its clients ask of it: the capacity limits an
-//! operator sets for their machine and their users, each a `serve` flag and an
-//! `OG_*` environment variable.
-//!
-//! Bounds that guard parsing rather than capacity, such as the longest query,
-//! are fixed in `http::bounds`.
-
 use std::{
     num::{NonZeroU64, NonZeroUsize},
     time::Duration,
@@ -12,13 +5,8 @@ use std::{
 
 use crate::http::bounds::BATCH_ITEM_BYTES;
 
-/// Bytes an average job row may take when the upload size follows the row
-/// cap: an address with an id and a few columns beside it.
 const JOB_ROW_BYTES: u64 = 256;
 
-/// Single lookups run at once per CPU when the operator sets none. More than
-/// one: a lookup on a Pack larger than memory waits on page faults, and the
-/// core is free meanwhile.
 const LOOKUPS_PER_CPU: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::Args)]

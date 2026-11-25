@@ -1,15 +1,3 @@
-//! A place's OpenStreetMap `opening_hours` read as a week of spans, for
-//! every vendor translator to write in its own shape.
-//!
-//! Only the plain weekly forms are read: `24/7`, and rules of days and
-//! times such as `Mo-Fr 08:00-18:00; Sa 09:00-13:00,14:00-02:00; Su off`.
-//! A rule with times alone holds every day. A rule after a `;` replaces
-//! what earlier rules said of its days, and one after a `,` adds to them.
-//! A value with anything else (holidays, months, weeks, sunrise, comments,
-//! open ends) states hours a week cannot hold, so it is not read at all and
-//! every vendor slot for it stays empty.
-
-/// A day of the week, Monday first as OpenStreetMap lists them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Weekday {
     Monday,
@@ -22,7 +10,6 @@ pub(crate) enum Weekday {
 }
 
 impl Weekday {
-    /// Every day, Monday first.
     pub(crate) const ALL: [Self; 7] = [
         Self::Monday,
         Self::Tuesday,
@@ -33,12 +20,10 @@ impl Weekday {
         Self::Sunday,
     ];
 
-    /// Its place in the week counting from 0 for Monday.
     fn monday_index(self) -> usize {
         self as usize
     }
 
-    /// Its number counting from 0 for Sunday.
     pub(crate) fn sunday_number(self) -> u8 {
         match self {
             Self::Sunday => 0,
@@ -46,12 +31,10 @@ impl Weekday {
         }
     }
 
-    /// The day after it.
     pub(crate) fn next(self) -> Self {
         Self::ALL[(self.monday_index() + 1) % 7]
     }
 
-    /// Its OpenStreetMap name, `Mo` to `Su`.
     fn osm(self) -> &'static str {
         ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"][self.monday_index()]
     }
@@ -61,14 +44,8 @@ impl Weekday {
     }
 }
 
-/// Minutes in a day.
 pub(crate) const DAY_MINUTES: u16 = 24 * 60;
 
-/// One stretch a place is open, starting on the day that holds it.
-///
-/// `open` is minutes after that day's midnight, below 24:00. `close` is
-/// minutes after the same midnight, after `open` and at most a day later,
-/// so a span past midnight closes above 24:00.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Span {
     open: u16,
@@ -94,24 +71,19 @@ impl Span {
         (close - open <= DAY_MINUTES).then_some(Self { open, close })
     }
 
-    /// Minutes after its day's midnight that it opens, below 24:00.
     pub(crate) fn open(self) -> u16 {
         self.open
     }
 
-    /// Minutes after its day's midnight that it closes, above 24:00 when
-    /// it closes on the next day.
     pub(crate) fn close(self) -> u16 {
         self.close
     }
 
-    /// How long it stays open, in minutes, at most a day.
     pub(crate) fn minutes(self) -> u16 {
         self.close - self.open
     }
 }
 
-/// `HH:MM` as minutes after midnight, up to `48:00`.
 fn clock(text: &str) -> Option<u16> {
     let (hours, minutes) = text.split_once(':')?;
     if hours.len() != 2 || minutes.len() != 2 {
@@ -122,20 +94,14 @@ fn clock(text: &str) -> Option<u16> {
     (minutes < 60 && total <= 2 * DAY_MINUTES).then_some(total)
 }
 
-/// The spans a place is open on each day of a week, with at least one day
-/// open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Week {
-    /// Monday first, each day's spans by opening time.
     days: [Vec<Span>; 7],
 }
 
-/// The days one rule names and the spans open on each.
 type Rule = (Vec<Weekday>, Vec<Span>);
 
 impl Week {
-    /// The week `value` states, or `None` when it is not one of the plain
-    /// forms or opens on no day.
     pub(crate) fn parse(value: &str) -> Option<Self> {
         let value = value.trim();
         let mut days: [Vec<Span>; 7] = Default::default();
@@ -192,7 +158,6 @@ impl Week {
             .then_some(Self { days })
     }
 
-    /// Each day and its spans, Monday first, closed days included.
     pub(crate) fn days(&self) -> impl Iterator<Item = (Weekday, &[Span])> {
         Weekday::ALL
             .into_iter()
@@ -217,8 +182,6 @@ impl Week {
         )
     }
 
-    /// Whether the place never closes: open from midnight to midnight on
-    /// every day.
     pub(crate) fn is_always_open(&self) -> bool {
         let whole_day = Span {
             open: 0,
@@ -230,15 +193,12 @@ impl Week {
     }
 }
 
-/// Whether `text` starts with a time, as a span does and a day never does.
 fn starts_with_time(text: &str) -> bool {
     text.bytes()
         .next()
         .is_some_and(|byte| byte.is_ascii_digit())
 }
 
-/// One rule, `Mo-Fr 08:00-18:00`, `Sa off` or `05:00-19:00`, as the days it
-/// names and the spans open on each. A rule naming no day is every day.
 fn rule_of(text: &str) -> Option<Rule> {
     let (days, times) = match starts_with_time(text) {
         true => (Weekday::ALL.to_vec(), text),
@@ -254,7 +214,6 @@ fn rule_of(text: &str) -> Option<Rule> {
     Some((days, spans))
 }
 
-/// The days of `Mo-Fr,Su`. A range may wrap past Sunday (`Sa-Mo`).
 fn days_of(text: &str) -> Option<Vec<Weekday>> {
     let mut days = Vec::new();
     for part in text.split(',') {
@@ -279,7 +238,6 @@ fn days_of(text: &str) -> Option<Vec<Weekday>> {
 mod tests {
     use super::*;
 
-    /// Each day's spans as `(open, close)` minutes, Monday first.
     fn week(value: &str) -> Option<Vec<Vec<(u16, u16)>>> {
         Week::parse(value).map(|week| {
             week.days()

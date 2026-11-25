@@ -1,22 +1,3 @@
-//! Stable id to record block.
-//!
-//! Only OSM places, areas and streets: OpenAddresses row ids renumber every
-//! release, so a saved one would open another house. A street answers to any
-//! of its ways' ids: a tile names the way a tap lands on.
-//!
-//! Stores no id. A minimal perfect hash (FMPHGO, `ph` crate, ~2-3 bits an id)
-//! maps each id to a slot holding its first block number. The hash sends
-//! unknown ids to some slot too, so a lookup checks the record's own id.
-//! One object can be records in several blocks (a way that is a POI and a
-//! district): its other blocks are listed apart, by key, few as they are.
-//!
-//! ```text
-//! places/ids   width u8 (bytes of a block number) | count u64 | count block
-//!              numbers, `width` bytes each, little-endian | more u64 | more
-//!              (key, block number) pairs, by key, the key 8 bytes and the
-//!              block `width` | the hash, as `ph` writes it
-//! ```
-
 use std::sync::Arc;
 
 use ph::fmph::GOFunction;
@@ -33,7 +14,6 @@ use crate::{
 pub const SECTION: &str = "places/ids";
 const VERSION: u32 = 3;
 
-// Little-endian: a Pack hashes alike on every machine.
 fn key(object_type: ObjectType, object_id: i64) -> Option<[u8; 8]> {
     let kind: u64 = match object_type {
         ObjectType::Node => 0,
@@ -98,9 +78,6 @@ fn entries(records: &records::Reader) -> Result<Vec<([u8; 8], bool, u64)>> {
 
 fn build(records: &records::Reader) -> Result<Vec<u8>> {
     let mut places = entries(records)?;
-    // One object can be two records (a node that is a town and a POI, a way
-    // that is a market and a road), in one block or in two. A place's block
-    // comes before a street's, and every block holding the object is kept.
     places.sort_unstable_by_key(|(key, street, block)| (*key, *street, *block));
     let mut more = Vec::new();
     places.dedup_by(|(key, _, block), (held_key, _, held_block)| {
@@ -145,7 +122,6 @@ pub struct Catalogue {
     width: usize,
     count: usize,
     values: Bytes,
-    /// The other blocks of an object in several, `(key, block)` by key.
     more: Bytes,
 }
 
@@ -334,7 +310,6 @@ mod tests {
             }
             .into()
         };
-        // The way as a POI, many records, then the same way as a district.
         let mut records = vec![poi("Historic District", district.clone(), -79.0)];
         for index in 0..2_000 {
             let source = SourceProvenance::osm(ObjectType::Node, i64::from(index) + 100_000);

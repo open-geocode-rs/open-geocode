@@ -1,21 +1,3 @@
-//! Latin forms of names written in kana, Cyrillic or Greek.
-//!
-//! A query names a place in the script its writer types, and a Pack holds
-//! the Latin form only when a `name:*-Latn` or `name:en` tag states it. Kana
-//! (Hepburn romanization, long vowels written short as signs and maps write
-//! them: `とうきょう` is `tokyo`), Cyrillic and Greek are read sound by sound,
-//! so the builder adds the Latin form of every such name as one more name.
-//! Han characters have no one reading, so a name holding any is left alone,
-//! as is a name of any other script without a table here.
-//!
-//! Hand tables, not CLDR's script-to-Latin transforms: those write scholarly
-//! forms nobody types ("selkovo" for "щёлково", "athḗna", "toukyou"), read
-//! Japanese kanji as Mandarin, and have no Thai or any-script form. The Latin
-//! written here is then folded to ASCII like every other Latin name
-//! ([`crate::util::fold::search_key`]).
-
-/// The Latin form of `name`, lower case, or `None` when it holds no kana,
-/// Cyrillic or Greek letter, or a letter of a script this does not read.
 pub(crate) fn to_latin(name: &str) -> Option<String> {
     let lower = name.to_lowercase();
     let mut out = String::with_capacity(lower.len());
@@ -56,8 +38,6 @@ fn is_latin(character: char) -> bool {
     matches!(u32::from(character), 0..=0x24F | 0x1E00..=0x1EFF)
 }
 
-/// Kana as hiragana: katakana are the same syllables 0x60 code points up.
-/// The long vowel mark and the middle dot are kept as they are.
 fn as_hiragana(character: char) -> Option<char> {
     match u32::from(character) {
         0x3041..=0x3096 | 0x309D | 0x309E | 0x30FB | 0x30FC => Some(character),
@@ -66,7 +46,6 @@ fn as_hiragana(character: char) -> Option<char> {
     }
 }
 
-/// The Hepburn syllable of one hiragana that is not a small one.
 fn syllable(kana: char) -> Option<&'static str> {
     Some(match kana {
         'あ' => "a",
@@ -142,7 +121,6 @@ fn syllable(kana: char) -> Option<&'static str> {
     })
 }
 
-/// The vowel of a small kana, and whether it is a glide (small ya, yu, yo).
 fn small(kana: char) -> Option<(&'static str, bool)> {
     Some(match kana {
         'ぁ' => ("a", false),
@@ -158,7 +136,6 @@ fn small(kana: char) -> Option<(&'static str, bool)> {
     })
 }
 
-/// Hepburn romanization of a run of hiragana, long vowels written short.
 fn romanize_kana(kana: &[char]) -> Option<String> {
     let mut syllables: Vec<String> = Vec::with_capacity(kana.len());
     let mut double_next = false;
@@ -168,7 +145,6 @@ fn romanize_kana(kana: &[char]) -> Option<String> {
                 double_next = true;
                 continue;
             }
-            // The long vowel mark: long vowels are written short.
             'ー' => continue,
             '・' => {
                 syllables.push(" ".to_string());
@@ -189,7 +165,6 @@ fn romanize_kana(kana: &[char]) -> Option<String> {
         }
         let syllable = syllable(character)?;
         let previous = syllables.last().map(String::as_str).unwrap_or_default();
-        // A long o or u is written as one vowel: "tou" is "to", "oo" is "o".
         let long = match syllable {
             "u" => previous.ends_with('o') || previous.ends_with('u'),
             "o" => previous.ends_with('o'),
@@ -211,8 +186,6 @@ fn romanize_kana(kana: &[char]) -> Option<String> {
     Some(syllables.concat())
 }
 
-/// A syllable followed by a small kana: "ki" and "ya" is "kya", "shi" and
-/// "ya" is "sha", "te" and "i" is "ti", "u" and "i" is "wi".
 fn join_small(last: &str, vowel: &str, glide: bool) -> String {
     if last.is_empty() || last == " " {
         let small = if glide {
@@ -313,7 +286,6 @@ fn greek(character: char) -> Option<&'static str> {
     })
 }
 
-/// The Greek vowel pairs read as one sound: "ου" is "ou", "αυ" "av".
 fn greek_digraph(character: char, next: Option<char>) -> Option<&'static str> {
     if !matches!(next?, 'υ' | 'ύ') {
         return None;

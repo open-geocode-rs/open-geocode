@@ -1,14 +1,3 @@
-//! Where `og` keeps its files: downloaded extracts, the Packs built from
-//! them, and a record of each finished build.
-//!
-//! ```text
-//! <home>/pbf/<region id>.osm.pbf    an extract, as Geofabrik names it
-//! <home>/packs/<region slug>/       a Pack
-//! <home>/builds.jsonl               one line per finished build
-//! ```
-//!
-//! The home is `OG_HOME` when set, else the platform's local data directory.
-
 use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
@@ -48,17 +37,14 @@ impl Home {
         self.packs_dir().join(region.slug())
     }
 
-    /// Where a Pack of several regions goes: under the name it was given.
     pub(crate) fn named_pack_dir(&self, name: &str) -> PathBuf {
         self.packs_dir().join(slugify(name))
     }
 
-    /// Where downloaded OpenAddresses data is kept between builds.
     pub(crate) fn openaddresses_dir(&self) -> PathBuf {
         self.root.join("openaddresses")
     }
 
-    /// Where the region's extract is kept.
     pub(crate) fn extract_path(&self, region: &Region) -> PathBuf {
         let mut path = self.root.join("pbf");
         for part in region.id.split('/') {
@@ -68,7 +54,6 @@ impl Home {
         path
     }
 
-    /// The extract of a region when it is on disk.
     pub(crate) fn extract(&self, region: &Region) -> Option<Extract> {
         let path = self.extract_path(region);
         let bytes = fs::metadata(&path)
@@ -82,7 +67,6 @@ impl Home {
         self.root.join("builds.jsonl")
     }
 
-    /// Every build finished on this machine, oldest first.
     pub(crate) fn history(&self) -> Vec<BuildRecord> {
         let Ok(file) = fs::File::open(self.history_path()) else {
             return Vec::new();
@@ -107,7 +91,6 @@ impl Home {
             .with_context(|| format!("failed to write {}", path.display()))
     }
 
-    /// The Packs in the home, by name.
     pub(crate) fn packs(&self) -> Vec<PackInfo> {
         let Ok(entries) = fs::read_dir(self.packs_dir()) else {
             return Vec::new();
@@ -127,23 +110,16 @@ pub(crate) struct Extract {
     pub bytes: u64,
 }
 
-/// A Pack on disk, as the home screen lists it.
 pub(crate) struct PackInfo {
     pub name: String,
     pub dir: PathBuf,
-    /// The catalog regions it was built from, when og built it. More than
-    /// one is a Pack covering them all, served by one process.
     pub regions: Vec<&'static Region>,
     pub records: u64,
     pub bytes: u64,
     pub built_at: i64,
-    /// When its data is from.
     pub data_at: Option<i64>,
-    /// The datasets its records come from, by id, as its build report
-    /// names them; empty when the report is gone.
     pub datasets: Vec<String>,
     pub layers: Vec<(Layer, u64)>,
-    /// How long the build took, from its report.
     pub build_secs: Option<f64>,
 }
 
@@ -167,8 +143,6 @@ impl PackInfo {
                     .collect()
             })
             .unwrap_or_default();
-        // One region names the Pack; several leave the directory name, which
-        // is what the person called the Pack when they built it.
         let name = match regions.as_slice() {
             [region] => region.name.clone(),
             _ => dir.file_name()?.to_string_lossy().into_owned(),
@@ -180,8 +154,6 @@ impl PackInfo {
             records: manifest.record_count,
             bytes: reader.container().file_size(),
             built_at: manifest.built_at_unix as i64,
-            // The oldest input's date: the Pack is only as fresh as the
-            // least fresh region in it.
             data_at: report.as_ref().and_then(|report| {
                 report
                     .inputs
@@ -204,7 +176,6 @@ impl PackInfo {
         })
     }
 
-    /// Records in the layers `pick` takes.
     pub(crate) fn records_in(&self, pick: impl Fn(Layer) -> bool) -> u64 {
         self.layers
             .iter()
@@ -214,44 +185,28 @@ impl PackInfo {
     }
 }
 
-/// One finished build, as `builds.jsonl` keeps it: what a later build of
-/// another region is estimated from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BuildRecord {
     pub region: String,
     pub input_bytes: u64,
-    /// The build itself, without the download.
     pub build_secs: f64,
     pub pack_bytes: u64,
     pub memory_budget_bytes: u64,
     pub threads: usize,
     pub finished_at: i64,
-    /// The Pack format it built, [`open_geocode::pack::PACK_SCHEMA_VERSION`];
-    /// 0 for records from before the field. A build of another format did
-    /// other work, so its time estimates nothing.
     #[serde(default)]
     pub pack_format: u32,
-    /// Whether it imported OpenAddresses, which a build without them skips.
     #[serde(default)]
     pub openaddresses: bool,
 }
 
-/// Furthest apart, as a ratio of input sizes, a past build and the one it
-/// estimates may be. Build time is not linear in input size over a wider
-/// range: a small build is mostly fixed costs, a large one spills to disk.
 const ESTIMATE_RANGE: f64 = 4.0;
 
-/// How long a build of `input_bytes` is expected to take on this machine,
-/// scaled from the finished build closest in input size, of the current Pack
-/// format and with OpenAddresses as `openaddresses` says. What it needs of
-/// memory and disk is the build plan's to say.
 pub(crate) struct Estimate {
     pub secs: f64,
-    /// The build it is scaled from.
     pub from: BuildRecord,
 }
 
-/// None when no build on this machine is within [`ESTIMATE_RANGE`] of it.
 pub(crate) fn estimate(
     history: &[BuildRecord],
     input_bytes: u64,
@@ -275,9 +230,6 @@ pub(crate) fn estimate(
     })
 }
 
-/// A typed Pack name as a directory name: lower case, with runs of anything
-/// but letters and digits as single dashes, so what the person typed is still
-/// recognisable in the path.
 pub(crate) fn slugify(name: &str) -> String {
     let mut slug = String::new();
     for c in name.chars() {

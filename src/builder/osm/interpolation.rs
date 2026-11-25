@@ -13,8 +13,6 @@ use super::{
     address::LOCALITY_KEYS, emitted::Emitted, geometry::line_string_geometry, tags::OsmTags,
 };
 
-/// A vertex of an interpolation way with the address tags of its node, which
-/// make it a numbered anchor.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct InterpolationNode {
     pub node_id: i64,
@@ -48,8 +46,6 @@ pub(crate) fn has_interpolation_tag(tags: &BTreeMap<String, String>) -> bool {
     tags.has("addr:interpolation")
 }
 
-/// Emit one interpolation record per pair of consecutive numeric anchors.
-/// `nodes` is `None` when any vertex could not be resolved.
 pub(crate) fn emit_interpolation(
     way_id: i64,
     tags: &BTreeMap<String, String>,

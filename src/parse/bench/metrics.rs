@@ -1,6 +1,3 @@
-//! Parse accuracy over gold rows: whole-row and per-token accuracy, and
-//! per-label precision, recall and F1 over tokens.
-
 use serde::Serialize;
 
 use crate::parse::types::Label;
@@ -11,14 +8,12 @@ use crate::parse::types::Label;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Counts {
     pub rows: usize,
-    /// Rows with every token labelled correctly.
     pub rows_correct: usize,
     /// Rows the system tokenized differently from the gold or failed on,
     /// scored as all wrong.
     pub rows_misaligned: usize,
     pub tokens: usize,
     pub tokens_correct: usize,
-    /// Per label, indexed by `Label as usize`.
     pub true_positives: [usize; Label::ALL.len()],
     pub false_positives: [usize; Label::ALL.len()],
     pub false_negatives: [usize; Label::ALL.len()],
@@ -75,7 +70,6 @@ impl Counts {
         ratio(self.tokens_correct, self.tokens)
     }
 
-    /// Gold tokens with this label.
     pub fn support(&self, label: Label) -> usize {
         self.true_positives[label as usize] + self.false_negatives[label as usize]
     }

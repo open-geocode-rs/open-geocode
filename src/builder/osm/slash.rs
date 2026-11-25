@@ -18,16 +18,10 @@ use crate::{builder::report::SlashNumberCounts, error::Result, util::geo::havers
 
 use super::spill::PendingAddress;
 
-/// Plain numbers further away than this are on another stretch of the street.
 const NEIGHBOUR_RADIUS_M: f64 = 250.0;
-/// Plain numbers an address is compared with, nearest first.
 const NEIGHBOURS: usize = 8;
-/// One side misses the street's numbers when it is further from them than
-/// this, and than `OFF_STREET_RATIO` times the other side.
 const OFF_STREET_GAP: u32 = 10;
 const OFF_STREET_RATIO: u32 = 3;
-/// Clear readings a street, then a cell, needs before it settles an address
-/// its neighbours leave open, and the share of them that must agree.
 const STREET_VOTES: usize = 2;
 const CELL_VOTES: usize = 5;
 const AGREEMENT: f64 = 0.8;
@@ -38,12 +32,9 @@ enum Reading {
     NumberFirst,
 }
 
-/// What the neighbours of one address say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fit {
     Clear(Reading),
-    /// Both sides meet the street's numbers: a range, unless its street says
-    /// otherwise.
     Both,
     Alone,
 }
@@ -56,8 +47,6 @@ struct Slash<'a> {
     number: &'a str,
 }
 
-/// "10/1367", "1b/567" or "3/12A": digits, an optional letter, then the same
-/// again after the slash. Anything else ("12 1/2", "12-14/3") is not one.
 fn parse_slash(number: &str) -> Option<Slash<'_>> {
     let (unit, rest) = number.split_once('/')?;
     let (unit, rest) = (unit.trim(), rest.trim());
@@ -69,7 +58,6 @@ fn parse_slash(number: &str) -> Option<Slash<'_>> {
     })
 }
 
-/// The number of "12" or "12A".
 fn leading_number(value: &str) -> Option<u32> {
     let digits = value
         .find(|character: char| !character.is_ascii_digit())
@@ -92,8 +80,6 @@ fn fit(slash: Slash<'_>, at: [f64; 2], plain: &[(u32, [f64; 2])]) -> Fit {
     }
     near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     near.truncate(NEIGHBOURS);
-    // Each side against its nearest number: the two ends of a range each meet
-    // the numbers on their own side of the building.
     let miss = |side: u32| {
         near.iter()
             .map(|(_, number)| side.abs_diff(*number))
@@ -103,9 +89,6 @@ fn fit(slash: Slash<'_>, at: [f64; 2], plain: &[(u32, [f64; 2])]) -> Fit {
     let (left, right) = (miss(slash.left), miss(slash.right));
     let off = |bad: u32, good: u32| bad > OFF_STREET_GAP.max(OFF_STREET_RATIO * good);
     if off(left, right) {
-        // A unit's building is one of the street's numbers. A range starting
-        // the street ("2/14" before 18 and 20) meets none between its ends,
-        // as its building holds them.
         let building_among = near
             .iter()
             .any(|(_, number)| (slash.left..=slash.right).contains(number));
@@ -136,7 +119,6 @@ impl Votes {
         }
     }
 
-    /// The reading at least `least` clear readings agree on.
     fn settled(self, least: usize) -> Option<Reading> {
         let total = self.unit_first + self.number_first;
         if total < least {
@@ -153,8 +135,6 @@ impl Votes {
     }
 }
 
-/// Read the slash numbers of one grid cell's addresses, given in street
-/// order, and leave them in street order again.
 pub(super) fn read_cell(cell: &mut [PendingAddress], counts: &mut SlashNumberCounts) -> Result<()> {
     let mut groups = Vec::new();
     let mut start = 0;
@@ -233,8 +213,6 @@ pub(super) fn read_cell(cell: &mut [PendingAddress], counts: &mut SlashNumberCou
     Ok(())
 }
 
-/// The addresses, given in street order, with their slash numbers read, in
-/// street order: each grid cell is read whole, as its streets vote together.
 pub(super) fn read_slash_numbers(
     addresses: impl Iterator<Item = Result<PendingAddress>>,
     counts: &mut SlashNumberCounts,
@@ -287,8 +265,6 @@ mod tests {
         PendingAddress::new(&record, id as u64, 0).expect("pending")
     }
 
-    /// Read one cell of `(number, street, lat)` and return each address's
-    /// number and unit, in street order.
     fn read(addresses: &[(&str, &str, f64)]) -> (Vec<(String, Option<String>)>, SlashNumberCounts) {
         let mut cell = addresses
             .iter()
@@ -357,12 +333,10 @@ mod tests {
 
     #[test]
     fn a_range_keeps_its_numbers() {
-        // Marszałkowska 55/73 spans the numbers between its neighbours.
         let (numbers, counts) = read(&[
             ("53", "Marszałkowska", 52.2300),
             ("55/73", "Marszałkowska", 52.2302),
             ("75", "Marszałkowska", 52.2304),
-            // A range starting the street meets no number between its ends.
             ("2/14", "Prosta", 52.2300),
             ("18", "Prosta", 52.2302),
         ]);
@@ -383,8 +357,6 @@ mod tests {
 
     #[test]
     fn a_street_settles_the_flats_its_neighbours_leave_open() {
-        // Both sides of 2/7 miss the street's numbers alike; its street's
-        // other flats are units.
         let (numbers, _) = read(&[
             ("120", "Opawa Road", -43.5500),
             ("1/124", "Opawa Road", -43.5501),

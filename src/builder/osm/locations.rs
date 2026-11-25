@@ -1,20 +1,3 @@
-//! Coordinates of the nodes ways need, found by node id.
-//!
-//! The scan marks every node a kept way or a boundary member references in
-//! a bitmap over the id space ([`NodeSet`]). The node pass then keeps the
-//! coordinates of marked nodes only, appended in id order, so a node's slot
-//! is the number of marked ids below it: its rank, which a popcount index
-//! answers in a few word reads ([`Locations`]). og needs about one node in
-//! seven, so this stores 8 B per needed node plus 0.13 B per id of the id
-//! space, against the 21 B per reference that sorting references and
-//! coordinates by way wrote to scratch twice over (osmium's dense and sparse
-//! indexes, Planetiler's LongLongMap and osm2pgsql's flat nodes store every
-//! node, or 16 B per stored one).
-//!
-//! The bitmap is reserved in the memory budget. The coordinates are too when
-//! they fit; otherwise they live in a memory-mapped scratch file, which the
-//! page cache serves much like memory as long as it can hold it.
-
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{File, OpenOptions},
@@ -44,36 +27,22 @@ use super::{
     pbf::for_each_block,
 };
 
-/// Ids per chunk of the bitmap. Chunks are allocated when an id in them is
-/// first marked, so an extract whose ways reference a few id ranges holds
-/// those ranges only; 8 KiB chunks keep that granularity fine while the
-/// chunk table stays at 16 MiB.
 const CHUNK_BITS: u32 = 16;
 const CHUNK_IDS: u64 = 1 << CHUNK_BITS;
 const WORDS: usize = (CHUNK_IDS / 64) as usize;
-/// Words per rank block: a lookup popcounts at most this many words.
 const BLOCK_WORDS: usize = 8;
 const BLOCKS: usize = WORDS / BLOCK_WORDS;
-/// Node ids the set covers, from 0. OSM handed out 14.3 billion by October
-/// 2026, about a billion a year; 2^36 leaves room for decades.
 pub(crate) const ID_LIMIT: u64 = 1 << 36;
 const CHUNKS: usize = (ID_LIMIT / CHUNK_IDS) as usize;
-/// Bytes one allocated chunk holds: its bitmap and its rank index.
 pub(crate) const CHUNK_BYTES: u64 = std::mem::size_of::<Chunk>() as u64;
-/// Bytes of the chunk table, allocated with the set whatever it holds.
 pub(crate) const TABLE_BYTES: u64 = (CHUNKS * std::mem::size_of::<OnceLock<Box<Chunk>>>()) as u64;
-/// Bytes one stored coordinate takes: latitude and longitude in the PBF's
-/// 1e-7 degree fixed point.
 pub(crate) const LOCATION_BYTES: u64 = 8;
 const LOCATIONS_LABEL: &str = "node-locations";
 
 #[derive(Debug)]
 struct Chunk {
     words: [AtomicU64; WORDS],
-    /// Marked ids in every chunk before this one, once ranked.
     base: u64,
-    /// Marked ids in this chunk before each block, once ranked. A chunk has
-    /// at most 65,024 before its last block, so u16 holds them.
     blocks: [u16; BLOCKS],
 }
 
@@ -91,14 +60,12 @@ impl Chunk {
     }
 }
 
-/// The node ids ways need. Marked from many threads at once.
 #[derive(Debug)]
 pub(crate) struct NodeSet {
     chunks: Box<[OnceLock<Box<Chunk>>]>,
     reservation: Mutex<Reservation>,
 }
 
-/// Where an id falls: its chunk, its word in the chunk and its bit.
 fn position(id: i64) -> Option<(usize, usize, u32)> {
     let id = u64::try_from(id).ok().filter(|id| *id < ID_LIMIT)?;
     let within = id % CHUNK_IDS;
@@ -113,13 +80,10 @@ impl NodeSet {
     pub(crate) fn new(memory: &Arc<Budget>) -> Self {
         Self {
             chunks: (0..CHUNKS).map(|_| OnceLock::new()).collect(),
-            // The set cannot spill: it is what lets the node pass skip
-            // every node no way needs.
             reservation: Mutex::new(Reservation::forced(memory, TABLE_BYTES as usize)),
         }
     }
 
-    /// Mark the nodes `ids` names.
     pub(crate) fn mark(&self, ids: &[i64]) -> Result<()> {
         for &id in ids {
             let (chunk, word, bit) = position(id).ok_or_else(|| {
@@ -129,8 +93,6 @@ impl NodeSet {
                 ))
             })?;
             let word = &self.chunk(chunk).words[word];
-            // Most marks repeat a set bit; reading first keeps the cache
-            // line shared between the threads marking it.
             if word.load(Ordering::Relaxed) & (1 << bit) == 0 {
                 word.fetch_or(1 << bit, Ordering::Relaxed);
             }
@@ -156,7 +118,6 @@ impl NodeSet {
         })
     }
 
-    /// How many ids are marked.
     pub(crate) fn len(&self) -> u64 {
         self.chunks
             .par_iter()
@@ -169,7 +130,6 @@ impl NodeSet {
             .sum()
     }
 
-    /// Bytes the set holds: its table and the chunks marked so far.
     pub(crate) fn bytes(&self) -> u64 {
         self.reservation
             .lock()
@@ -177,7 +137,6 @@ impl NodeSet {
             .bytes() as u64
     }
 
-    /// Unmark every id from `low` up to, not including, `high`.
     fn clear(&self, low: u64, high: u64) {
         let high = high.min(ID_LIMIT);
         let mut id = low;
@@ -206,7 +165,6 @@ impl NodeSet {
         }
     }
 
-    /// Write every chunk marked so far to a spool, for a checkpoint.
     pub(crate) fn save(&self, scratch: &Arc<Scratch>) -> Result<SpoolFile<ChunkBits>> {
         let mut spool = Spool::create(scratch, "node-set")?;
         for (index, chunk) in self.chunks.iter().enumerate() {
@@ -220,7 +178,6 @@ impl NodeSet {
         spool.finish()
     }
 
-    /// The set a checkpoint saved.
     pub(crate) fn load(memory: &Arc<Budget>, saved: &SpoolFile<ChunkBits>) -> Result<Self> {
         let set = Self::new(memory);
         for chunk in saved.reader()? {
@@ -237,7 +194,6 @@ impl NodeSet {
         Ok(set)
     }
 
-    /// Index ranks, once no id is marked or unmarked any more.
     fn rank(&mut self) {
         let counts = self
             .chunks
@@ -265,7 +221,6 @@ impl NodeSet {
         }
     }
 
-    /// The slot of a marked id, once ranked.
     fn slot(&self, id: i64) -> Option<usize> {
         let (chunk, word, bit) = position(id)?;
         let chunk = self.chunks[chunk].get()?;
@@ -282,8 +237,6 @@ impl NodeSet {
     }
 }
 
-/// One marked chunk of a [`NodeSet`], as a checkpoint saves it. Its words
-/// are written whole: the spool's compression takes the runs of zeros.
 #[derive(Debug)]
 pub(crate) struct ChunkBits {
     index: u64,
@@ -331,7 +284,6 @@ impl Spill for ChunkBits {
     }
 }
 
-/// A node's coordinates in the PBF's fixed point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Location {
     pub lat_e7: i32,
@@ -355,7 +307,6 @@ pub(crate) fn degrees(value: i32) -> f64 {
     1e-9 * (i64::from(value) * 100) as f64
 }
 
-/// Where the coordinates live.
 #[derive(Debug)]
 pub(crate) enum Slots {
     Memory {
@@ -365,14 +316,12 @@ pub(crate) enum Slots {
     Mapped(MappedSlots),
 }
 
-/// Coordinates in a scratch file, mapped into memory.
 #[derive(Debug)]
 pub(crate) struct MappedSlots {
     map: Option<MmapMut>,
     file: Option<File>,
     path: PathBuf,
     len: usize,
-    /// The ledger's hold on the file's bytes, returned when it is removed.
     scratch: Arc<Scratch>,
     owner: Arc<Owner>,
     bytes: u64,
@@ -429,7 +378,6 @@ impl MappedSlots {
         Ok(())
     }
 
-    /// The file a checkpoint saved, `len` coordinates in it, mapped again.
     fn reopen(scratch: &Arc<Scratch>, name: &str, len: usize) -> Result<Self> {
         let path = scratch.path().join(name);
         let failed = |source| Error::IoPath {
@@ -491,8 +439,6 @@ impl Drop for MappedSlots {
 }
 
 impl Slots {
-    /// Room for `capacity` coordinates: in memory when `in_memory` and the
-    /// budget grants it, else in a scratch file.
     pub(crate) fn new(
         capacity: u64,
         in_memory: bool,
@@ -537,14 +483,9 @@ impl Slots {
     }
 }
 
-/// The entrances among the needed nodes, which are the ones tagged
-/// `entrance`. Each takes twelve bytes, as a planet has millions on the
-/// outlines of its buildings.
 #[derive(Debug, Default)]
 struct Entrances {
-    /// In id order, as the input is.
     ids: Vec<i64>,
-    /// Each one's `entrance` value, by its index in `values`.
     kinds: Vec<u32>,
     values: Vec<String>,
     index: HashMap<String, u32>,
@@ -578,41 +519,32 @@ impl Entrances {
     }
 }
 
-/// The coordinates of every needed node the input has, the address tags
-/// of the few whose tags a way reads, and which of them are entrances.
 #[derive(Debug)]
 pub(crate) struct Locations {
     set: NodeSet,
     slots: Slots,
     tags: Vec<(i64, BTreeMap<String, String>)>,
     entrances: Entrances,
-    /// What a checkpoint saved of them, kept on disk while they are used.
     saved: Option<Saved>,
 }
 
-/// The store as a checkpoint saved it.
 #[derive(Debug)]
 struct Saved {
     set: SpoolFile<ChunkBits>,
     tags: SpoolFile<Tagged>,
     entrances: SpoolFile<EntranceNode>,
-    /// The coordinates, when they were in memory; mapped ones are saved in
-    /// their own file.
     slots: Option<ScratchFile>,
 }
 
-/// The store as a checkpoint names it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LocationsState {
     set: RunState,
     tags: RunState,
     entrances: RunState,
-    /// The file the coordinates are in, and how many.
     slots: String,
     len: usize,
 }
 
-/// A node's address tags, as a checkpoint saves them.
 #[derive(Debug)]
 pub(crate) struct Tagged(i64, BTreeMap<String, String>);
 
@@ -647,7 +579,6 @@ impl Spill for Tagged {
     }
 }
 
-/// An entrance node as a checkpoint saves it, by its id and its kind.
 #[derive(Debug)]
 pub(crate) struct EntranceNode(i64, String);
 
@@ -669,27 +600,19 @@ impl Spill for EntranceNode {
     }
 }
 
-/// What the node pass stored and read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct LoadStats {
-    /// Ids marked before the pass.
     pub needed: u64,
-    /// Needed nodes the input has.
     pub stored: u64,
     pub set_bytes: u64,
     pub location_bytes: u64,
-    /// Whether the coordinates lie in a scratch file.
     pub mapped: bool,
     pub tagged: u64,
-    /// Needed nodes tagged `entrance`.
     pub entrances: u64,
     pub read_bytes: u64,
 }
 
 impl Locations {
-    /// Save the store for a checkpoint, once: the bitmap and the tags to
-    /// spools, the coordinates to a file when they are in memory, or their
-    /// mapped file flushed. Kept until the store is dropped.
     pub(crate) fn save(&mut self, scratch: &Arc<Scratch>) -> Result<LocationsState> {
         if self.saved.is_none() {
             let set = self.set.save(scratch)?;
@@ -751,7 +674,6 @@ impl Locations {
         })
     }
 
-    /// The files a checkpoint names for the store.
     pub(crate) fn files(&self, scratch: &Scratch) -> Vec<PathBuf> {
         let Some(saved) = &self.saved else {
             return Vec::new();
@@ -767,8 +689,6 @@ impl Locations {
         files
     }
 
-    /// The store a checkpoint saved. Its coordinates are mapped from the
-    /// saved file, which the page cache serves as it would memory.
     pub(crate) fn restore(
         scratch: &Arc<Scratch>,
         memory: &Arc<Budget>,
@@ -807,12 +727,10 @@ impl Locations {
         self.set.slot(id).map(|slot| self.slots.get(slot))
     }
 
-    /// The value of a stored node's `entrance` tag, when it has one.
     pub(crate) fn entrance(&self, id: i64) -> Option<&str> {
         self.entrances.get(id)
     }
 
-    /// The address tags of a node whose tags were asked for, when it has any.
     pub(crate) fn tags(&self, id: i64) -> Option<&BTreeMap<String, String>> {
         self.tags
             .binary_search_by_key(&id, |(node, _)| *node)
@@ -821,7 +739,6 @@ impl Locations {
     }
 }
 
-/// Nodes of one PBF block the set marks, in file order.
 #[derive(Debug, Default)]
 struct Found {
     nodes: Vec<(i64, Location)>,
@@ -829,7 +746,6 @@ struct Found {
     entrances: Vec<(i64, String)>,
     first: Option<i64>,
     last: Option<i64>,
-    /// Two ids out of order within the block.
     unsorted: Option<(i64, i64)>,
 }
 
@@ -884,7 +800,6 @@ fn find(block: &PrimitiveBlock, set: &NodeSet, tag_ids: &[i64]) -> Found {
     found
 }
 
-/// The value of the `entrance` tag among `tags`, when it says anything.
 pub(crate) fn entrance_kind<'a>(
     mut tags: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> Option<String> {
@@ -910,9 +825,6 @@ fn unsorted(earlier: i64, later: i64) -> Error {
     ))
 }
 
-/// Read the node blocks of `input` and keep in `slots`, which has room for
-/// every id `set` marks, the coordinates of the nodes `set` marks, and the
-/// address tags of those of them `tag_ids` (sorted) names.
 pub(crate) fn load(
     input: &Path,
     node_blobs: &[u64],
@@ -925,8 +837,6 @@ pub(crate) fn load(
     let mut tags = Vec::new();
     let mut entrances = Entrances::default();
     let mut last: Option<i64> = None;
-    // Marked ids the input lacks are unmarked as the pass goes, so that
-    // every marked id below a stored node has a slot, and ranks stay dense.
     let mut cleared_to = 0u64;
     let read_bytes = for_each_block(
         input,
@@ -945,7 +855,6 @@ pub(crate) fn load(
             }
             last = found.last.or(last);
             for (id, location) in found.nodes {
-                // A stored id is marked, so it lies in 0..ID_LIMIT.
                 let id = id as u64;
                 set.clear(cleared_to, id);
                 cleared_to = id + 1;
@@ -1037,7 +946,6 @@ mod tests {
     fn mapped_slots_read_back_what_was_written() {
         let dir = TempDir::new("locations");
         let scratch = Scratch::create(dir.join("scratch")).expect("scratch");
-        // A budget of nothing sends the coordinates to the file.
         let mut slots = Slots::new(3, true, &Budget::new(0), &scratch).expect("slots");
         assert!(matches!(slots, Slots::Mapped(_)));
         for value in [-900_000_000, 0, 1_800_000_000] {

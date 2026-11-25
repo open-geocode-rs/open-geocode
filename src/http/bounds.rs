@@ -1,48 +1,19 @@
-//! Runtime request bounds (ADR 0017 Decision 26).
-//!
-//! Cloudflare reduces bad traffic before it reaches the Runtime, but the Runtime
-//! must still defend itself if edge rules change or a route is exposed
-//! differently — and, since cloudflared connects directly to the Runtime with no
-//! Nginx layer (ADR 0017 amended 2026-06-03b), the Runtime is the only
-//! server-side enforcement point. The bounds here are fixed: they guard
-//! parsing and response size. The capacity limits an operator sets are in
-//! [`crate::limits`].
-
 use crate::http::{
     param::Param,
     problem::{InvalidParam, Problem},
 };
 use crate::search::{BoundingBox, MAX_AUTOCOMPLETE_LIMIT};
 
-/// Maximum length (in Unicode scalar values) of a `q` query string.
 pub(crate) const MAX_QUERY_CHARS: usize = 256;
 
-/// Maximum `limit` a `/geocode` or `/places` request may ask for. `search.rs` has no internal
-/// cap of its own (it only defaults a `limit` of 0), so this is the boundary.
 pub(crate) const MAX_SEARCH_LIMIT: usize = 50;
 
-/// Bytes of batch body read per item the server allows: an item with every
-/// field at full length is about 1.2 KiB of ASCII, so this leaves room for
-/// escapes and non-Latin text without letting one request hold the server's
-/// memory.
 pub(crate) const BATCH_ITEM_BYTES: usize = 4096;
 
-/// Longest `id` a batch item may carry, in Unicode scalar values.
 pub(crate) const MAX_BATCH_ID_CHARS: usize = 128;
 
-/// Seconds an upload may send nothing before it is cut off, so a client
-/// that stalls does not hold a job slot.
 pub(crate) const UPLOAD_STALL_SECONDS: u64 = 30;
 
-/// Trim and bound a query by length, returning it with each run of
-/// whitespace written as one space. Empty is allowed (autocomplete treats
-/// short/empty queries as "no suggestions").
-///
-/// Length is counted in Unicode scalar values, not bytes, so multibyte queries
-/// are bounded by visible length rather than UTF-8 encoding size. It is
-/// counted after the whitespace is collapsed: an address pasted from a web
-/// page can carry hundreds of spaces and line breaks of its layout between
-/// a few words, and is no longer a query for them.
 pub(crate) fn validate_query_length(raw: &str) -> Result<String, Problem> {
     let query = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     if query.chars().count() > MAX_QUERY_CHARS {
@@ -53,8 +24,6 @@ pub(crate) fn validate_query_length(raw: &str) -> Result<String, Problem> {
     Ok(query)
 }
 
-/// Like [`validate_query_length`] but additionally rejects an empty query, for
-/// `/geocode` and `/places`, where an empty `q` is a client error.
 pub(crate) fn validate_query(raw: &str) -> Result<String, Problem> {
     let query = validate_query_length(raw)?;
     if query.is_empty() {
@@ -63,12 +32,10 @@ pub(crate) fn validate_query(raw: &str) -> Result<String, Problem> {
     Ok(query)
 }
 
-/// The error for a `q` that was sent with no words.
 pub(crate) fn empty_query() -> Problem {
     Problem::invalid_query("q must not be empty")
 }
 
-/// Reject a `/geocode` or `/places` `limit` above [`MAX_SEARCH_LIMIT`].
 pub(crate) fn validate_search_limit(limit: usize) -> Result<(), Problem> {
     if limit > MAX_SEARCH_LIMIT {
         return Err(Problem::limit_too_large(vec![InvalidParam::new(
@@ -79,7 +46,6 @@ pub(crate) fn validate_search_limit(limit: usize) -> Result<(), Problem> {
     Ok(())
 }
 
-/// Reject a `/autocomplete` `limit` above the searcher's hard cap.
 pub(crate) fn validate_autocomplete_limit(limit: usize) -> Result<(), Problem> {
     if limit > MAX_AUTOCOMPLETE_LIMIT {
         return Err(Problem::limit_too_large(vec![InvalidParam::new(
@@ -90,8 +56,6 @@ pub(crate) fn validate_autocomplete_limit(limit: usize) -> Result<(), Problem> {
     Ok(())
 }
 
-/// Validate WGS84 coordinate ranges for reverse geocoding. Out-of-range values,
-/// NaN, and infinities are all rejected (`(-180..=180).contains` is false for NaN).
 pub(crate) fn validate_coords(lon: f64, lat: f64) -> Result<(), Problem> {
     let mut invalid = Vec::new();
     if !(-180.0..=180.0).contains(&lon) {
@@ -107,12 +71,8 @@ pub(crate) fn validate_coords(lon: f64, lat: f64) -> Result<(), Problem> {
     }
 }
 
-/// The degrees of a comma-separated list of `count` numbers, as `focus`
-/// and `bbox` write them.
 fn degrees(name: &str, value: &Param, count: usize) -> Result<Option<Vec<f64>>, Problem> {
     let value = match value {
-        // A map that always sends the key sends it blank when the caller has
-        // no point or box.
         Param::Missing | Param::Empty => return Ok(None),
         Param::Value(value) => value.trim(),
     };
@@ -156,14 +116,10 @@ fn degrees(name: &str, value: &Param, count: usize) -> Result<Option<Vec<f64>>, 
     }
 }
 
-/// Validate `focus`, the caller's `lon,lat`, like a reverse point.
 pub(crate) fn parse_focus(value: &Param) -> Result<Option<[f64; 2]>, Problem> {
     Ok(degrees("focus", value, 2)?.map(|numbers| [numbers[0], numbers[1]]))
 }
 
-/// Validate `bbox`, `min_lon,min_lat,max_lon,max_lat`: each corner a valid
-/// point, west of east and south of north. A box across the antimeridian is
-/// two requests, as its west edge would lie east of its east edge.
 pub(crate) fn parse_bbox(value: &Param) -> Result<Option<BoundingBox>, Problem> {
     let Some(numbers) = degrees("bbox", value, 4)? else {
         return Ok(None);
@@ -254,8 +210,6 @@ mod tests {
 
     #[test]
     fn query_length_counts_chars_not_bytes() {
-        // Each 'é' is two UTF-8 bytes but one scalar value; MAX_QUERY_CHARS of
-        // them must be accepted, one more rejected.
         let at_limit = "é".repeat(MAX_QUERY_CHARS);
         assert!(validate_query(&at_limit).is_ok());
         let over = "é".repeat(MAX_QUERY_CHARS + 1);

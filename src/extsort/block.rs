@@ -1,19 +1,3 @@
-//! The on-disk form of runs and spools: compressed blocks in chunk files.
-//!
-//! Items are coded into blocks of about [`BLOCK_BYTES`], each against the
-//! item before it in the block ([`Spill::encode_after`]), so a block decodes
-//! on its own. Each block is one zstd frame behind a header:
-//!
-//! ```text
-//! frame  = compressed_len u32 LE | raw_len u32 LE | items u32 LE | zstd frame
-//! ```
-//!
-//! Blocks are compressed in parallel and written in order to chunk files of
-//! about [`CHUNK_BYTES`]. A run read once deletes each chunk as soon as it
-//! is read: exFAT cannot punch holes, so this is how reading frees disk
-//! while a merge is still going. Readers decompress ahead of the consumer
-//! on their own threads.
-
 use std::{
     collections::VecDeque,
     fs::File,
@@ -39,23 +23,12 @@ use crate::{
     util::codec::Delta,
 };
 
-/// Raw bytes a block holds before it is compressed: large enough for zstd
-/// to find its matches, small enough that thousands of runs can each hold
-/// two while they are merged. A sorter with a small share writes smaller
-/// ones.
 pub(super) const BLOCK_BYTES: usize = 256 << 10;
 pub(super) const MIN_BLOCK_BYTES: usize = 16 << 10;
-/// Bytes on disk a chunk file holds before the next one starts. A merge
-/// frees its inputs a chunk at a time, so it holds up to one partly read
-/// chunk per run on top of what it writes; small chunks keep that low, and
-/// large ones keep the directory short for exFAT, which searches it in
-/// order on every create.
 const CHUNK_BYTES: u64 = 8 << 20;
 const HEADER_BYTES: usize = 12;
-/// Raw blocks a stream gathers before compressing them side by side.
 const STREAM_BATCH_BLOCKS: usize = 4;
 
-/// Why a write stopped: the ledger refused it, or something failed.
 #[derive(Debug)]
 pub(super) enum Failure {
     Full(Shortfall),
@@ -83,7 +56,6 @@ impl From<Failure> for Error {
     }
 }
 
-/// Code `items` into one block, each against the one before.
 pub(super) fn encode_block<T: Spill>(items: &[T], raw: &mut Vec<u8>) {
     let mut delta = Delta::default();
     for item in items {
@@ -91,8 +63,6 @@ pub(super) fn encode_block<T: Spill>(items: &[T], raw: &mut Vec<u8>) {
     }
 }
 
-/// A block, compressed and ready to write. Keeps its raw bytes so it can be
-/// compressed again at a higher level when the ledger refuses it.
 #[derive(Debug)]
 pub(super) struct Frame {
     raw: Vec<u8>,
@@ -148,8 +118,6 @@ struct Chunk {
     bytes: u64,
 }
 
-/// A sorted run or a spool on disk. Its chunk files are removed, and their
-/// bytes returned to the ledger, when it is dropped or as it is read.
 #[derive(Debug)]
 pub(super) struct Run {
     scratch: Arc<Scratch>,
@@ -157,17 +125,12 @@ pub(super) struct Run {
     chunks: VecDeque<Chunk>,
     pub(super) items: u64,
     pub(super) bytes: u64,
-    /// Largest block, raw and as on disk: what reading it holds at once.
     max_raw: usize,
     max_frame: usize,
-    /// The lowest zstd level of its blocks.
     pub(super) level: i32,
-    /// How often its items have been merged.
     pub(super) depth: u64,
 }
 
-/// A run or a spool as a checkpoint names it: its chunk files, by name in
-/// the scratch directory, and what reading it back needs to know.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunState {
     pub label: String,
@@ -181,7 +144,6 @@ pub struct RunState {
 }
 
 impl RunState {
-    /// The chunk files, as paths in `scratch`.
     pub fn files<'a>(&'a self, scratch: &'a Scratch) -> impl Iterator<Item = PathBuf> + 'a {
         self.chunks
             .iter()
@@ -190,8 +152,6 @@ impl RunState {
 }
 
 impl Run {
-    /// Memory a reader of this run holds: the block being read, the one
-    /// read ahead and the compressed bytes behind it.
     pub(super) fn read_bytes(&self) -> usize {
         2 * self.max_raw + self.max_frame
     }
@@ -220,7 +180,6 @@ impl Run {
         }
     }
 
-    /// The run a checkpoint named, its chunks counted on the ledger again.
     pub(super) fn restore(scratch: &Arc<Scratch>, state: &RunState) -> Result<Self> {
         let owner = scratch.owner(&state.label);
         let mut chunks = VecDeque::new();
@@ -261,7 +220,6 @@ impl Drop for Run {
     }
 }
 
-/// Writes frames, in order, into a new run.
 #[derive(Debug)]
 pub(super) struct RunWriter {
     label: String,
@@ -292,9 +250,6 @@ impl RunWriter {
         self.run.depth = depth;
     }
 
-    /// Write `frame`, compressing it harder while the ledger refuses it and
-    /// a higher level is left. A refusal raises the level for every block
-    /// written after it, not only this one.
     pub(super) fn write(&mut self, mut frame: Frame) -> std::result::Result<(), Failure> {
         let scratch = Arc::clone(&self.run.scratch);
         let bytes = loop {
@@ -318,8 +273,6 @@ impl RunWriter {
             self.file = None;
             let path = scratch.new_file(&self.label);
             let file = scratch.create_file(&path);
-            // The chunk is listed before it is written, so a failed write
-            // still removes it and returns what it held.
             self.run.chunks.push_back(Chunk { path, bytes: 0 });
             match file {
                 Ok(file) => self.file = Some(file),
@@ -366,8 +319,6 @@ impl RunWriter {
     }
 }
 
-/// Items written one at a time, coded into blocks that are compressed a
-/// batch at a time on the pool.
 #[derive(Debug)]
 pub(super) struct Stream<T> {
     writer: RunWriter,
@@ -437,7 +388,6 @@ impl<T: Spill> Stream<T> {
     }
 }
 
-/// One block read back, decoded item by item.
 #[derive(Debug)]
 pub(super) struct Block {
     raw: Vec<u8>,
@@ -463,12 +413,9 @@ impl Block {
     }
 }
 
-/// Where a reader's chunks come from.
 #[derive(Debug)]
 enum Chunks {
-    /// A run read once: each chunk is removed once read.
     Consumed(Run),
-    /// A spool read as often as needed: chunks stay.
     Kept {
         paths: Vec<PathBuf>,
         next: usize,
@@ -476,13 +423,9 @@ enum Chunks {
     },
 }
 
-/// Reads one run's blocks in order. The chunk is opened for each block and
-/// closed after it, so a merge of thousands of runs holds no file open
-/// between reads and stays under any limit on open files.
 #[derive(Debug)]
 pub(super) struct Cursor {
     chunks: Chunks,
-    /// The chunk being read and where its next block starts.
     chunk: Option<(PathBuf, u64)>,
     compressed: Vec<u8>,
 }
@@ -515,7 +458,6 @@ impl Cursor {
         }
     }
 
-    /// Move to the next chunk, after removing the one read when consumed.
     fn next_chunk(&mut self) -> bool {
         let finished = self.chunk.take();
         let path = match &mut self.chunks {
@@ -537,7 +479,6 @@ impl Cursor {
         self.chunk.is_some()
     }
 
-    /// The next block, or `None` past the last.
     pub(super) fn next_block(&mut self) -> Result<Option<Block>> {
         loop {
             if self.chunk.is_none() && !self.next_chunk() {
@@ -610,7 +551,6 @@ impl Cursor {
     }
 }
 
-/// Fill `buffer` from `file`, or stop at its end: the bytes read.
 fn read_full(file: &mut File, buffer: &mut [u8]) -> Result<usize> {
     let mut filled = 0;
     while filled < buffer.len() {
@@ -626,9 +566,6 @@ fn read_full(file: &mut File, buffer: &mut [u8]) -> Result<usize> {
 
 type Fetched = Result<Option<Block>>;
 
-/// Reads and decompresses blocks of several runs ahead of their consumer,
-/// one block ahead per run, on threads of its own: the merge that consumes
-/// them may itself run on the pool.
 pub(super) struct Prefetch {
     scratch: Arc<Scratch>,
     blocks: Vec<Receiver<Fetched>>,
@@ -681,7 +618,6 @@ impl Prefetch {
         }
     }
 
-    /// Source `source`'s next block, and a request for the one after.
     pub(super) fn next(&self, source: usize) -> Fetched {
         let started = Instant::now();
         let block = self.blocks[source]
@@ -699,8 +635,6 @@ impl Prefetch {
 
 impl Drop for Prefetch {
     fn drop(&mut self) {
-        // Closing the queue ends the threads; a block in flight is never
-        // blocked on, since each source has at most one outstanding.
         drop(self.requests.take());
         for thread in self.threads.drain(..) {
             let _ = thread.join();

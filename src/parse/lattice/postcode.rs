@@ -12,9 +12,7 @@ use regex::{RegexSet, RegexSetBuilder};
 
 use super::CountryCode;
 
-/// `CC<TAB>pattern` rows.
 const POSTCODES: &str = include_str!("data/postcodes.tsv");
-/// The most tokens a postcode spans once normalized ("sw1a 1aa", "1234 ab").
 pub const MAX_TOKENS: usize = 3;
 /// Room for the set's lazy DFA cache, per thread. The crate builds a lazy
 /// DFA only when its cache can hold the minimum the reverse NFA asks, and the
@@ -23,7 +21,6 @@ pub const MAX_TOKENS: usize = 3;
 /// on every query with a digit. The cache grows only as far as it is used.
 const DFA_CACHE_BYTES: usize = 8 << 20;
 
-/// Every country's postcode pattern, matched in one pass.
 #[derive(Debug)]
 pub struct Table {
     countries: Vec<CountryCode>,
@@ -31,7 +28,6 @@ pub struct Table {
 }
 
 impl Table {
-    /// The table compiled once per process.
     pub fn global() -> &'static Self {
         static TABLE: OnceLock<Table> = OnceLock::new();
         TABLE.get_or_init(|| Self::parse(POSTCODES))
@@ -57,7 +53,6 @@ impl Table {
         }
     }
 
-    /// Countries with a pattern.
     pub fn len(&self) -> usize {
         self.countries.len()
     }
@@ -66,8 +61,6 @@ impl Table {
         self.countries.is_empty()
     }
 
-    /// The countries whose pattern matches all of `text`, in code order.
-    /// Case does not matter.
     pub fn matches(&self, text: &str) -> Vec<CountryCode> {
         let mut countries = self
             .patterns
@@ -79,7 +72,6 @@ impl Table {
         countries
     }
 
-    /// Whether `country`'s pattern matches all of `text`.
     pub fn matches_country(&self, country: CountryCode, text: &str) -> bool {
         self.matches(text).contains(&country)
     }
@@ -107,15 +99,11 @@ mod tests {
         assert!(!table.matches_country(ca, "670"));
         assert!(table.matches_country(CountryCode::parse("GB").unwrap(), "sw1a 1aa"));
         assert!(table.matches_country(CountryCode::parse("NL").unwrap(), "1234 ab"));
-        // Five digits are a postcode in many countries, so a pattern match
-        // alone does not decide the country.
         let five = codes(table, "72100");
         for code in ["DE", "FR", "US", "IT", "ES"] {
             assert!(five.contains(&code.to_string()), "{five:?}");
         }
         assert!(!five.contains(&"CA".to_string()));
-        // Some patterns match plain words (Bermuda's "AB 12" also matches
-        // "king"), which is why the parser tries only spans with a digit.
         assert!(table.matches("toronto").is_empty());
     }
 

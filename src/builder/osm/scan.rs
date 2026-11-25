@@ -1,13 +1,3 @@
-//! Pass 1: classify every OSM object in one parallel scan.
-//!
-//! Address, POI and place nodes become records immediately, because a node
-//! carries its own coordinates. Ways that need geometry become [`WayFeature`]s plus
-//! their node references; boundary relations are kept as stubs. Each block is
-//! classified independently, so blocks are processed in parallel and merged in
-//! file order. The way pass classifies the ways again ([`way_features`])
-//! rather than keeping them between the passes: a reread of the way blocks
-//! costs less than writing every kept way's tags to scratch and back.
-
 use std::{cell::OnceCell, collections::BTreeMap};
 
 use osmpbf::{Element, PrimitiveBlock, RelMemberType};
@@ -34,12 +24,6 @@ use super::{
     street::{has_highway_tag, is_street, missing_street_name_issue, street_name, street_tags},
 };
 
-/// Whether an element tagged with `keys` may be anything the scan keeps or
-/// reports: a place, an address, a street, an area, or a POI, which needs a
-/// name and a POI key. It reads the keys alone, before any tag is copied,
-/// and is looser than the classifiers it guards: an element it stops is one
-/// they would drop, and most tagged elements (buildings, trees, unnamed
-/// paths) are.
 pub(crate) fn may_matter<'a>(keys: impl Iterator<Item = &'a str>) -> bool {
     let (mut named, mut category) = (false, false);
     for key in keys {
@@ -54,11 +38,9 @@ pub(crate) fn may_matter<'a>(keys: impl Iterator<Item = &'a str>) -> bool {
     named && category
 }
 
-/// Classification of one PBF block.
 #[derive(Debug, Default)]
 pub(crate) struct ScanOutput {
     pub emitted: Emitted,
-    /// Kept ways with their node references.
     pub ways: Vec<(WayFeature, Vec<i64>)>,
     pub relations: Vec<BoundaryRelationStub>,
     pub has_nodes: bool,
@@ -208,8 +190,6 @@ fn scan_node(
     }
 }
 
-/// The node's `addr:*` tags when they state a valid address. Invalid ones are
-/// rejected whether or not the node is also a POI.
 fn node_address_tags(
     object_id: i64,
     all_tags: &BTreeMap<String, String>,
@@ -246,8 +226,6 @@ fn node_address_tags(
     Some(tags)
 }
 
-/// The features a way with `all_tags` (not empty) becomes, as the scan
-/// classifies it, without counting what it rejects again.
 pub(crate) fn way_features<'a>(
     object_id: i64,
     all_tags: &BTreeMap<String, String>,
@@ -258,8 +236,6 @@ pub(crate) fn way_features<'a>(
     ways
 }
 
-/// `refs` decodes the node list on first use; most tagged ways are not kept.
-/// Rejections go to `out` when given.
 fn scan_way<'a>(
     ways: &mut Vec<(WayFeature, Vec<i64>)>,
     mut out: Option<&mut Emitted>,
@@ -414,7 +390,6 @@ fn scan_relation(
         }
         return;
     }
-    // Rings assembled with the boundaries' (see `boundary::place_relations`).
     if is_area_relation(all_tags) && is_poi(all_tags, Drawn::Area) {
         if !members.is_empty() {
             let address = collect_addr_tags_from_map(all_tags);

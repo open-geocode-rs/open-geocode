@@ -625,9 +625,7 @@ struct BatchGeocodeArgs {
     join_lon_column: String,
 }
 
-/// Below this, sorters spill so often that the build drowns in tiny run files.
 const MIN_MEMORY_BUDGET_MB: u64 = 64;
-/// 1 TiB; keeps the conversion to bytes far from overflow.
 const MAX_MEMORY_BUDGET_MB: u64 = 1 << 20;
 
 #[tokio::main]
@@ -683,8 +681,6 @@ async fn main() -> Result<()> {
                 ..BuildOsmOptions::default()
             };
             let plan = plan_osm_build(&options)?;
-            // One pool serves every stage of the build, sized by the plan
-            // unless RAYON_NUM_THREADS sets it.
             if std::env::var_os("RAYON_NUM_THREADS").is_none() {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(plan.threads)
@@ -875,8 +871,6 @@ fn health(bind: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-/// What `--openaddresses`, `--openaddresses-zip` and `--addresses` add to a
-/// build, `None` for none of them.
 fn address_sources(
     pack: &Path,
     openaddresses: bool,
@@ -905,8 +899,6 @@ fn address_sources(
     })
 }
 
-/// The files `--addresses` names, each `[DATASET=]PATH`: a bare path is
-/// named by its file name.
 fn address_files_of(files: &[String]) -> Result<Vec<AddressFile>> {
     files
         .iter()
@@ -1091,9 +1083,6 @@ fn write_json(value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// A query fixture as one compact JSON object per case. Pretty-printing 500
-/// cases spans 4,500 lines; a line per case stays greppable and keeps a
-/// regenerated answer key to a readable diff.
 fn write_fixture_to_path(fixture: &BenchmarkFixture, output: &Path) -> Result<()> {
     create_output_dir(output)?;
     let body = fixture
@@ -1122,7 +1111,6 @@ fn write_json_to_path(value: &impl serde::Serialize, output: &PathBuf) -> Result
     Ok(())
 }
 
-/// Each token with its label, then the n-best labellings with their scores.
 fn parse_query(pack: &Path, query: &str) -> Result<()> {
     let tagger = LatticeTagger::open(pack)?;
     let parses = tagger.parse(query);
@@ -1174,7 +1162,6 @@ fn search_pack(pack: PathBuf, query: String, layer: Option<String>, limit: usize
     )?)?)
 }
 
-/// The `/reverse` answer for a point, as the Runtime gives it.
 fn reverse_pack(pack: PathBuf, lon: f64, lat: f64) -> Result<()> {
     let pack = Arc::new(Reader::open(pack)?);
     let geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
@@ -1263,8 +1250,6 @@ fn batch_geocode(args: BatchGeocodeArgs) -> Result<()> {
     }))
 }
 
-/// `--public-url`: an `http` or `https` URL with a host and nothing after
-/// its path.
 fn public_url(value: &str) -> std::result::Result<String, String> {
     let rest = value
         .strip_prefix("https://")
@@ -1330,8 +1315,6 @@ mod tests {
         assert_eq!(build_budget(None).expect("derived"), None);
     }
 
-    /// A collection archive with one Spokane address entry whose job states
-    /// CC BY-NC-SA, as OpenAddresses writes it.
     fn non_commercial_collection(path: &Path) {
         use std::io::Write;
         let mut zip = zip::ZipWriter::new(std::fs::File::create(path).expect("zip"));
@@ -1424,8 +1407,6 @@ mod tests {
         );
     }
 
-    /// Answers one request with `status`, as the server's /readyz would, and
-    /// returns the request line it got.
     fn readyz_stub(status: &'static str) -> (SocketAddr, std::thread::JoinHandle<String>) {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");

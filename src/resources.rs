@@ -1,40 +1,12 @@
-//! What this process can actually use: CPUs, memory and disk.
-//!
-//! Installed hardware is the wrong number. A process may be held to fewer
-//! CPUs by its affinity mask, a cgroup quota or a Windows Job object, and to
-//! less memory by a cgroup, a Job object, an rlimit or the commit limit,
-//! and memory in use by others is not free. [`Resources::probe`] reads the
-//! limits that bind:
-//!
-//! - CPUs: on Linux `available_parallelism`, which reads the affinity mask
-//!   and the cgroup CPU quota; on Windows the process affinity mask (across
-//!   processor groups) and a Job object's hard CPU rate cap, which the
-//!   standard library does not read.
-//! - Memory: on Linux `MemAvailable`, a cgroup v2 `memory.max` or v1
-//!   `memory.limit_in_bytes` less what the cgroup uses, and `RLIMIT_AS` and
-//!   `RLIMIT_DATA`; on Windows the available physical memory, the commit the
-//!   process can still charge (allocations fail when it runs out, however
-//!   much RAM looks free) and a Job object's memory limit.
-//!
-//! [`free_disk`] reads the free space of the volume a path is on. A long
-//! build probes again at a stage boundary, since by then it has used memory
-//! and page cache a fresh process would have.
-
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// The CPUs and memory this process can use, and what limited them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Resources {
     pub usable_cpus: usize,
-    /// The most memory the process could have: installed RAM, or less under
-    /// a cgroup, Job object or rlimit.
     pub total_memory_bytes: u64,
-    /// The memory the process can take now without paging or failing a
-    /// commit.
     pub available_memory_bytes: u64,
-    /// What bounds `usable_cpus` and `available_memory_bytes`.
     pub cpu_limit: String,
     pub memory_limit: String,
 }
@@ -46,10 +18,6 @@ impl Resources {
         resources.available_memory_bytes = resources
             .available_memory_bytes
             .min(resources.total_memory_bytes);
-        // Tests run many small builds side by side, and each would count the
-        // others' memory as taken: a build's plan then refused or warned
-        // depending on what its neighbours held at that instant. A test build
-        // sizes itself to the machine instead.
         #[cfg(test)]
         {
             resources.available_memory_bytes = resources.total_memory_bytes;
@@ -66,7 +34,6 @@ pub fn free_disk(path: &Path) -> Option<u64> {
     platform::free_disk(existing)
 }
 
-/// Whether `left` and `right` are on one volume, so their disk needs add up.
 pub fn same_volume(left: &Path, right: &Path) -> bool {
     let existing = |path: &Path| {
         let path = std::path::absolute(path).ok()?;
@@ -80,25 +47,18 @@ pub fn same_volume(left: &Path, right: &Path) -> bool {
     }
 }
 
-/// CPU time this process has used, user and kernel, over every thread.
-/// The build divides it by wall time and threads to tell a stage that kept
-/// its cores busy from one that waited.
 pub fn process_cpu_time() -> Option<std::time::Duration> {
     platform::process_cpu_time()
 }
 
-/// The CPU clock of one thread, readable from any thread: the build reads
-/// the thread that drives a stage, whose sink is often its serial path.
 #[derive(Debug)]
 pub struct ThreadClock(platform::ThreadClock);
 
 impl ThreadClock {
-    /// The clock of the calling thread, where it can be read.
     pub fn current() -> Option<Self> {
         platform::ThreadClock::current().map(Self)
     }
 
-    /// CPU time the thread has used, user and kernel.
     pub fn cpu_time(&self) -> Option<std::time::Duration> {
         self.0.cpu_time()
     }
@@ -118,15 +78,10 @@ pub fn opt_out_of_power_throttling() {
     platform::opt_out_of_power_throttling();
 }
 
-/// Run below the programs a person works in, so a build left running in
-/// the background takes only the CPU they leave idle. Their typing and
-/// browsing come first; the build still gets every idle core.
 pub fn yield_to_interactive_programs() {
     platform::yield_to_interactive_programs();
 }
 
-/// Run the calling thread below the process's other threads, so its work
-/// takes only the CPU they leave idle.
 pub fn lower_this_thread() {
     platform::lower_this_thread();
 }
@@ -195,9 +150,6 @@ mod platform {
         resources
     }
 
-    /// The CPUs of the process affinity mask, or of every processor group
-    /// when the process may run on all of them (Windows 11 lets a process
-    /// span groups), lowered by a Job object's hard CPU rate cap.
     fn cpus() -> (usize, String) {
         // SAFETY: plain queries of the current process.
         let all = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) } as usize;
@@ -237,7 +189,6 @@ mod platform {
         (cpus, limit)
     }
 
-    /// The memory limit of the Job object this process is in, if any.
     fn job_memory_limit() -> Option<u64> {
         // SAFETY: the limit information is plain integers, valid all zero.
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
@@ -265,7 +216,6 @@ mod platform {
         .min()
     }
 
-    /// Bytes this process has committed.
     fn private_bytes() -> u64 {
         // SAFETY: the counters are plain integers, valid all zero.
         let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
@@ -282,7 +232,6 @@ mod platform {
         }
     }
 
-    /// Kernel plus user time, from FILETIMEs in 100 ns ticks.
     fn busy(kernel: FILETIME, user: FILETIME) -> std::time::Duration {
         let ticks =
             |time: FILETIME| u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime);
@@ -298,7 +247,6 @@ mod platform {
         read.then(|| busy(*kernel, *user))
     }
 
-    /// A handle to a thread, opened to read its times.
     #[derive(Debug)]
     pub(super) struct ThreadClock(HANDLE);
 
@@ -363,7 +311,6 @@ mod platform {
     }
 
     pub(super) fn same_volume(left: &Path, right: &Path) -> bool {
-        // The drive or share each path starts with.
         let root = |path: &Path| {
             path.components()
                 .next()
@@ -415,7 +362,6 @@ mod platform {
     use super::Resources;
 
     pub(super) fn probe() -> Resources {
-        // On Linux this reads the affinity mask and the cgroup CPU quota.
         let usable_cpus = std::thread::available_parallelism().map_or(1, usize::from);
         let mut resources = Resources {
             usable_cpus,
@@ -473,10 +419,6 @@ mod platform {
         }
     }
 
-    /// The tightest cgroup memory limit over this process's cgroup and its
-    /// ancestors, and what is left under it: v2 `memory.max` less
-    /// `memory.current`, or v1 `memory.limit_in_bytes` less
-    /// `memory.usage_in_bytes`.
     #[cfg(target_os = "linux")]
     fn cgroup_memory() -> Option<(u64, u64)> {
         let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
@@ -540,7 +482,6 @@ mod platform {
         };
         let total = (pages.max(0) as u64).saturating_mul(page.max(0) as u64);
         resources.total_memory_bytes = total;
-        // No portable figure of the memory in use: take half.
         resources.available_memory_bytes = total / 2;
         resources.memory_limit = "half of installed memory".to_string();
     }
@@ -560,7 +501,6 @@ mod platform {
         Some(time(usage.ru_utime) + time(usage.ru_stime))
     }
 
-    /// A thread's CPU clock, which POSIX lets any thread read.
     #[derive(Debug)]
     pub(super) struct ThreadClock(libc::clockid_t);
 
@@ -670,9 +610,6 @@ mod tests {
         {
             let clock = ThreadClock::current().expect("thread clock");
             let before = clock.cpu_time().expect("thread time");
-            // Spin until the clock moves rather than for a fixed time: a
-            // thread clock ticks in scheduler quanta, and a loaded machine can
-            // leave a short spin with less CPU time than one quantum.
             let spin = std::time::Instant::now();
             let mut spun = before;
             while spun <= before && spin.elapsed() < std::time::Duration::from_secs(10) {

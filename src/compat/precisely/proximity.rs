@@ -1,5 +1,3 @@
-//! `/v1/proximity-search`, the nearest eligible addresses to a point.
-
 use std::collections::BTreeMap;
 
 use axum::{
@@ -73,7 +71,6 @@ struct Point {
     longitude: f64,
 }
 
-/// Metres in one of Precisely's distance units.
 fn metres_per(unit: &str) -> Option<f64> {
     Some(match unit.to_ascii_uppercase().as_str() {
         "METER" => 1.0,
@@ -84,11 +81,8 @@ fn metres_per(unit: &str) -> Option<f64> {
     })
 }
 
-/// The datasets a request may name: the sources of og's addresses.
 const DATASETS: [&str; 2] = ["osm", "openaddresses"];
 
-/// The unit a distance comes back in when the request names none. The
-/// documented answer measures kilometres.
 const DEFAULT_UNIT: &str = "KILOMETER";
 
 pub(super) async fn proximity_search(
@@ -106,8 +100,6 @@ pub(super) async fn proximity_search(
             "Dataset is not provided in the request (DIS-LI-1031)",
         ));
     };
-    // og holds no reference dataset of its own; the addresses it searches
-    // come from OSM or OpenAddresses, and only those two can be asked for.
     let dataset = dataset.to_ascii_lowercase();
     if !DATASETS.contains(&dataset.as_str()) {
         return Err(invalid(&format!(

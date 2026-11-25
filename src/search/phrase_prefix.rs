@@ -1,9 +1,3 @@
-//! A phrase whose last word is still being typed, matched and scored as
-//! tantivy's `PhrasePrefixQuery` does. Its scorer reads every completion at
-//! each document of the head, so "rue de la" on a planet costs millions of
-//! documents times 1,024 completions. This one keeps the completions in one
-//! queue by document and skips the head and the queue past each other.
-
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, binary_heap::PeekMut};
 
@@ -15,8 +9,6 @@ use tantivy::{
     schema::IndexRecordOption,
 };
 
-/// The words of `head` in a row, then a word that starts with `prefix`, one
-/// of the first `max_expansions` such words of each segment's dictionary.
 #[derive(Clone, Debug)]
 pub(super) struct PhrasePrefix {
     head: Vec<Term>,
@@ -54,7 +46,6 @@ impl Query for PhrasePrefix {
                 entry.name()
             )));
         }
-        // As tantivy scores it, so ranking stays as it was.
         let bm25 = match enable_scoring {
             EnableScoring::Enabled { searcher, .. } if self.head.len() > 1 => {
                 Some(Bm25Weight::for_terms(searcher, &self.head)?)
@@ -143,13 +134,9 @@ impl Weight for PhrasePrefixWeight {
 }
 
 struct PhrasePrefixScorer {
-    /// Each head word with how far its positions shift to where the
-    /// completion stands, rarest first so skipping starts on the shortest.
     head: Vec<(u32, SegmentPostings)>,
     suffixes: Vec<SegmentPostings>,
-    /// Completions past the current document, by document.
     queue: BinaryHeap<Reverse<(DocId, usize)>>,
-    /// Completions on the current document, out of the queue until it moves.
     here: Vec<usize>,
     doc: DocId,
     scoring: Option<(Bm25Weight, FieldNormReader)>,
@@ -213,7 +200,6 @@ impl PhrasePrefixScorer {
         }
     }
 
-    /// The first document at or after `target` holding every head word.
     fn seek_head(&mut self, mut target: DocId) -> DocId {
         'agree: loop {
             for (_, postings) in &mut self.head {
@@ -230,7 +216,6 @@ impl PhrasePrefixScorer {
         }
     }
 
-    /// The first document at or after `target` holding a completion.
     fn seek_suffixes(&mut self, target: DocId) -> DocId {
         for at in self.here.drain(..) {
             let doc = seek(&mut self.suffixes[at], target);
@@ -238,7 +223,6 @@ impl PhrasePrefixScorer {
                 self.queue.push(Reverse((doc, at)));
             }
         }
-        // A rare head strands most completions; past n / log n, rebuild.
         let len = self.queue.len();
         let mut sifts = len / (len.max(1).ilog2() as usize + 1);
         loop {
@@ -269,8 +253,6 @@ impl PhrasePrefixScorer {
         self.queue.peek().map_or(TERMINATED, |top| top.0.0)
     }
 
-    /// Whether the head words stand in a row on this document. Counts them
-    /// as tantivy's phrase scorer does, for BM25.
     fn head_phrase(&mut self) -> bool {
         let (first, rest) = self.head.split_first_mut().expect("head is never empty");
         first
@@ -284,7 +266,6 @@ impl PhrasePrefixScorer {
         !self.head_positions.is_empty()
     }
 
-    /// Whether a completion on this document follows the head phrase.
     fn completes(&mut self) -> bool {
         self.here.iter().any(|&at| {
             self.suffixes[at].positions(&mut self.positions);
@@ -302,7 +283,6 @@ fn seek(postings: &mut SegmentPostings, target: DocId) -> DocId {
     }
 }
 
-/// Keeps in `left` what `right` also holds. Both are sorted.
 fn retain_common(left: &mut Vec<u32>, right: &[u32]) {
     let mut at = 0;
     left.retain(|position| {
@@ -383,8 +363,6 @@ mod tests {
 
     const CAP: u32 = 1_024;
 
-    /// Two segments. The first holds 1,200 completions of "la" after a
-    /// common head, so the cap cuts it. The second holds a cut one again.
     static INDEX: LazyLock<(Searcher, Field)> = LazyLock::new(index);
 
     fn index() -> (Searcher, Field) {
@@ -451,7 +429,6 @@ mod tests {
     fn matches_and_scores_as_tantivy_phrase_prefix() {
         let (searcher, text) = &*INDEX;
         let text = *text;
-        // The 1,024 cap keeps la0000 to la1022 in the first segment.
         let cases: [(&[&str], usize); 6] = [
             (&["rue", "de", "la"], 1_028),
             (&["de", "la"], 1_029),
@@ -482,7 +459,6 @@ mod tests {
                 scored(searcher, &boosted(theirs.as_ref())),
                 "{words:?}"
             );
-            // Driven by seeks from an intersection, not by advances.
             let within = |query: &dyn Query| {
                 BooleanQuery::new(vec![(Occur::Must, rue()), (Occur::Must, query.box_clone())])
             };

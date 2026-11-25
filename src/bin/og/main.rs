@@ -1,10 +1,3 @@
-//! `og`: the interactive interface to open-geocode, and the commands it
-//! names for scripts. Run alone it opens the interface; `og build` and
-//! `og serve` do the same work without it.
-//!
-//! The interface draws in an inline viewport below the prompt, not the full
-//! screen: finished steps are printed above it and stay in terminal history.
-
 mod app;
 mod ask;
 mod batch;
@@ -53,9 +46,6 @@ use home::Home;
 use job::{BuildInput, BuildJob, BuildRequest};
 use regions::Region;
 
-/// mimalloc, counted, as the `open-geocode` binary has it: builds run on
-/// it, and the count lets a build's memory pool see the heap it does not
-/// track.
 #[global_allocator]
 static ALLOCATOR: CountingAlloc<mimalloc::MiMalloc> = CountingAlloc::new(mimalloc::MiMalloc);
 
@@ -214,7 +204,6 @@ fn serve_options(pack: PathBuf, bind: SocketAddr) -> ServeOptions {
     }
 }
 
-/// How `og build` was asked to build.
 #[derive(Clone, Copy)]
 struct Flags {
     memory_budget_bytes: Option<usize>,
@@ -226,9 +215,6 @@ struct Flags {
     tiger: bool,
 }
 
-/// `og build`: the build the interface runs, with one line per step. Ctrl-C
-/// stops it, keeping its last checkpoint for `--resume`; a second one quits
-/// at once.
 fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result<()> {
     let Flags {
         memory_budget_bytes,
@@ -245,9 +231,6 @@ fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result
         let Some(region) = tree.get(id) else {
             bail!("no region {id} in the catalog; ids look like canada/ontario");
         };
-        // An extract and the extract it is part of would index the same
-        // places twice, so a pair like `canada` and `canada/ontario`, or a
-        // region given twice, is refused rather than silently built.
         if let Some(other) = picked
             .iter()
             .find(|other| regions::overlaps(tree, other, region))
@@ -298,7 +281,6 @@ fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result
     let pack = request.pack.clone();
     let mut job = BuildJob::start(request, Arc::new(home));
     let interrupted = job.cancel_flag();
-    // The second handler quits only once the first has set the flag.
     signal_hook::flag::register_conditional_shutdown(
         signal_hook::consts::SIGINT,
         130,
@@ -356,9 +338,6 @@ fn interactive(home: Home) -> Result<()> {
         eprintln!("Run `og --help` for the commands that work in scripts.");
         return Ok(());
     }
-    // One window of fixed height, drawn below the prompt so finished steps
-    // stay in terminal history. A terminal too short for it gets the whole
-    // screen instead, as atuin does.
     let inline = terminal::size()?.1 > ui::HEIGHT;
     let viewport = if inline {
         Viewport::Inline(ui::HEIGHT)
@@ -367,13 +346,9 @@ fn interactive(home: Home) -> Result<()> {
     };
     let mut app = App::new(home);
     let mut terminal = ratatui::init_with_options(TerminalOptions { viewport });
-    // A terminal that supports it marks pasted text, so a pasted CSV arrives
-    // in one piece. The others send it as keys.
     let _ = execute!(io::stdout(), EnableBracketedPaste);
     let result = run(&mut terminal, &mut app, inline);
     let left = leave(&mut terminal, inline);
-    // Without scrollback, what the window would have pushed up is printed
-    // as plain lines once the screen is back.
     for line in &app.scrollback {
         let text: String = line
             .spans
@@ -391,16 +366,12 @@ fn interactive(home: Home) -> Result<()> {
     result.and(left)?;
     if let Some(pack) = app.serve.take() {
         let bind = app::SERVE_ADDRESS.parse().context("the serve address")?;
-        // The interface and its Pack are closed before the server opens it.
         drop(app);
         return serve_pack(pack, bind);
     }
     Ok(())
 }
 
-/// Gives the terminal back. The window is erased from its first row down, so
-/// the shell prompt returns where the window began and nothing is left to
-/// clear by hand.
 fn leave(terminal: &mut DefaultTerminal, inline: bool) -> io::Result<()> {
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     let erased = if inline {
@@ -433,8 +404,6 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, inline: bool) -> io::Resul
         }
         terminal.draw(|frame| ui::draw(frame, app))?;
         if event::poll(Duration::from_millis(40))? {
-            // Take everything waiting before drawing again: a paste sent as
-            // keys is thousands of events.
             loop {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
@@ -455,9 +424,6 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, inline: bool) -> io::Resul
     Ok(())
 }
 
-/// Erases the lines just above the window and opens the window again where
-/// they began, so a finished flow leaves nothing stacked above the next
-/// screen.
 fn erase_above(terminal: &mut DefaultTerminal, lines: usize) -> io::Result<()> {
     let top = terminal.get_frame().area().y;
     let from = top.saturating_sub(u16::try_from(lines).unwrap_or(u16::MAX));
@@ -475,7 +441,6 @@ fn erase_above(terminal: &mut DefaultTerminal, lines: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// Prints the lines waiting for terminal history above the window.
 fn print_scrollback(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     if app.scrollback.is_empty() {
         return Ok(());
@@ -544,7 +509,6 @@ mod tests {
         writer.finish().unwrap();
     }
 
-    /// The query shell's GeoJSON is the HTTP API's answer, value for value.
     #[test]
     fn the_shell_answers_what_the_api_answers() {
         let dir = TempDir::new("og-shell");
@@ -636,8 +600,6 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Quitting during a build leaves no unfinished Pack generation behind
-    /// but one a later build can resume.
     #[test]
     fn quitting_mid_build_cleans_up() {
         let dir = TempDir::new("og-quit");

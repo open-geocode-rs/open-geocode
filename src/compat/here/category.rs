@@ -1,10 +1,3 @@
-//! HERE's place categories beside og's.
-//!
-//! A HERE category id has three levels, `100`, `100-1000` and
-//! `100-1000-0009`. og knows a place's kind as its map tag (`amenity:cafe`).
-//! The table gives the kinds callers ask for most their HERE id, so a place
-//! states its category and Browse filters by one.
-
 use serde::Serialize;
 
 use super::Gs7Error;
@@ -13,7 +6,6 @@ use crate::categories;
 struct Category {
     id: &'static str,
     name: &'static str,
-    /// og's categories of the kind, as the catalog writes them.
     og: &'static [&'static str],
 }
 
@@ -185,10 +177,6 @@ const CATEGORIES: &[Category] = &[
     category("800-8100-0171", "Government Office", &["office government"]),
 ];
 
-/// The general category of a group, for a place of a key whose kind the
-/// table names no category for: a shop is consumer goods, an office a
-/// commercial service, a craft a consumer service, as HERE's category system
-/// groups them.
 const GROUPS: &[Category] = &[
     category("550-5520-0000", "Leisure", &["leisure"]),
     category("600-6900-0000", "Consumer Goods", &["shop"]),
@@ -202,7 +190,6 @@ const GROUPS: &[Category] = &[
     category("900-9300-0000", "Building", &["building"]),
 ];
 
-/// A category as a result item states it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct ItemCategory {
     pub(super) id: &'static str,
@@ -213,8 +200,6 @@ pub(super) struct ItemCategory {
 }
 
 impl ItemCategory {
-    /// An entry of a list whose first is the place's own, marked primary:
-    /// its categories, or its food types.
     pub(super) fn listed(entries: Vec<(&'static str, &'static str)>) -> Vec<Self> {
         entries
             .into_iter()
@@ -228,8 +213,6 @@ impl ItemCategory {
     }
 }
 
-/// The HERE categories of a place of og's `category` (`amenity:cafe`), its
-/// own kind marked primary. Empty when the table has none for it.
 pub(super) fn of_place(category: &str) -> Vec<ItemCategory> {
     let found = |table: &'static [Category]| {
         table
@@ -249,13 +232,6 @@ pub(super) fn of_place(category: &str) -> Vec<ItemCategory> {
     )
 }
 
-/// The categories a typed word begins a word of the name of, as HERE
-/// offers them as searches, each with its id, its name in `language` and
-/// where the typed word lies in that name, in characters. In English the
-/// name is HERE's, in another language og's catalog name of the kind, and
-/// a kind the catalog does not name in that language is offered in none. A
-/// word as short as `re` begins many names and means none of them, so a
-/// shorter one offers none.
 pub(super) fn begun_by(
     typed: &str,
     language: Option<&str>,
@@ -329,7 +305,6 @@ impl Listed {
     }
 }
 
-/// Browse's `categories` filter.
 #[derive(Debug, Default)]
 pub(super) struct Filter(Listed);
 
@@ -359,8 +334,6 @@ impl Filter {
         }
     }
 
-    /// og's categories that can hold a place the filter keeps. With no id to
-    /// keep they are every kind, and with ids the table has none of, none.
     pub(super) fn og_categories(&self) -> Vec<&'static str> {
         if self.0.included.is_empty() {
             return categories::keys();
@@ -378,8 +351,6 @@ impl Filter {
         found
     }
 
-    /// Whether a place of these categories is kept. An id to leave out wins
-    /// over one to keep.
     pub(super) fn admits(&self, of_place: &[ItemCategory]) -> bool {
         let any = |asked: &[String]| {
             asked

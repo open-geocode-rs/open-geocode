@@ -1,13 +1,3 @@
-//! OpenAddresses licences come from `catalog/licences.json`, generated from
-//! the pinned snapshot. A data set it does not list, or a file handed by
-//! path, is credited by name alone.
-//!
-//! A build judges each data set by the licence OpenAddresses states on the
-//! job whose output it reads ([`judge`]), not by the pinned snapshot, so terms
-//! a publisher changed since the pin decide. Rules read a standard licence's
-//! URL and a few phrases of free text; the catalog's `decisions` overrule
-//! them for texts read by hand, and only for the exact text read.
-
 use std::{collections::HashMap, sync::OnceLock};
 
 use regex::Regex;
@@ -17,13 +7,11 @@ use crate::{openaddresses::DATASET_PREFIX, record::OSM_DATASET};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Licence {
-    /// The URL of its terms when the source states no name.
     pub name: String,
     pub url: Option<String>,
     pub attribution: Option<String>,
 }
 
-// Every answer's areas and labels come from OSM, so it is always credited.
 pub fn osm() -> Licence {
     Licence {
         name: "ODbL 1.0".to_string(),
@@ -32,8 +20,6 @@ pub fn osm() -> Licence {
     }
 }
 
-// The zones are OpenStreetMap's boundaries joined into zones, under its
-// licence. Credited apart from it so an answer says where its zone is from.
 pub fn timezones() -> Licence {
     Licence {
         name: "ODbL 1.0".to_string(),
@@ -42,19 +28,13 @@ pub fn timezones() -> Licence {
     }
 }
 
-/// What an OpenAddresses data set's licence lets a Pack do with its rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Terms {
     /// Nothing in the licence forbids serving the rows, commercial use
     /// included. A data set that states no licence is one.
     Permitted,
-    /// Use for gain is forbidden: a Pack with these rows is for
-    /// non-commercial use only.
     NonCommercial,
-    /// Serving the rows in a Pack is forbidden for any use: all rights
-    /// reserved, no copies, no derivatives, or a condition a Pack cannot
-    /// carry with every copy.
     Restricted,
 }
 
@@ -68,8 +48,6 @@ impl Terms {
     }
 }
 
-/// A licence as OpenAddresses states it: its text and the URL of its terms,
-/// either or both missing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stated {
     pub text: Option<String>,
@@ -129,8 +107,6 @@ pub fn judge(source: &str, stated: &Stated) -> Terms {
     }
 }
 
-/// The licence the pinned snapshot records for data set `name` of `source`,
-/// for a job that states none: its source's, when the name is not listed.
 pub fn pinned(source: &str, name: &str) -> Stated {
     let rows = &catalog().datasets;
     let row = rows

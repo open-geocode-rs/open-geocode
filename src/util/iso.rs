@@ -1,9 +1,3 @@
-//! ISO 3166-1 country codes and common names used by the compatibility APIs.
-//!
-//! From the Debian `iso-codes` package (`iso_3166-1.json`), sorted by alpha-2
-//! for a binary search.
-
-/// `(alpha-2, alpha-3, numeric, name)`, sorted by alpha-2.
 const CODES: &[(&str, &str, &str, &str)] = &[
     ("AD", "AND", "020", "Andorra"),
     ("AE", "ARE", "784", "United Arab Emirates"),
@@ -273,17 +267,14 @@ fn row(alpha2: &str) -> Option<&'static (&'static str, &'static str, &'static st
         .map(|index| &CODES[index])
 }
 
-/// The three-letter code of a two-letter one, such as `NZL` for `NZ`.
 pub(crate) fn alpha3(alpha2: &str) -> Option<&'static str> {
     row(alpha2).map(|(_, alpha3, _, _)| *alpha3)
 }
 
-/// The numeric code of a two-letter one, such as `554` for `NZ`.
 pub(crate) fn numeric(alpha2: &str) -> Option<&'static str> {
     row(alpha2).map(|(_, _, numeric, _)| *numeric)
 }
 
-/// The two-letter code of a three-letter one, such as `NZ` for `NZL`.
 pub(crate) fn alpha2_of(alpha3: &str) -> Option<&'static str> {
     CODES
         .iter()
@@ -291,8 +282,6 @@ pub(crate) fn alpha2_of(alpha3: &str) -> Option<&'static str> {
         .map(|(alpha2, _, _, _)| *alpha2)
 }
 
-/// The two-letter code of a numeric one, such as `NZ` for `554`. Leading
-/// zeros are optional, so `36` and `036` are both Australia.
 pub(crate) fn alpha2_of_numeric(numeric: &str) -> Option<&'static str> {
     if numeric.is_empty() || !numeric.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -304,7 +293,6 @@ pub(crate) fn alpha2_of_numeric(numeric: &str) -> Option<&'static str> {
         .map(|(alpha2, _, _, _)| *alpha2)
 }
 
-/// The alpha-2 code of a common or short ISO country name.
 pub(crate) fn alpha2_of_name(name: &str) -> Option<&'static str> {
     let name = name.trim();
     CODES

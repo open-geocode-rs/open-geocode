@@ -1,21 +1,14 @@
-//! How libpostal's labels map onto og's eight. The table is the benchmark's
-//! definition of a correct label, so it lives here once and is documented in
-//! `docs/parse-eval.md` and `fixtures/parse/README.md`.
-
 use crate::parse::types::Label;
 
-/// The label set a raw row or a raw prediction is written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Scheme {
     /// libpostal's parser labels, in its training data and its parse output.
     Libpostal,
 }
 
-/// What a source label becomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mapped {
     Label(Label),
-    /// A part boundary: libpostal's `SEP` and `FSEP`.
     Separator,
 }
 

@@ -1,12 +1,3 @@
-//! The response contract checked against what the code produces (ADR 0022):
-//! real `/geocode`, `/places`, `/autocomplete` and `/reverse` answers, and a
-//! batch, from the router on a small Pack are the committed examples in
-//! `contract/responses/`, and the
-//! geocode batch audit columns are the committed
-//! `contract/batch-audit-columns.txt`. A change to the shape of an answer
-//! fails here until its examples are regenerated, with
-//! `OG_UPDATE_CONTRACT=1 cargo test contract`, and committed with it.
-
 use std::{path::Path, sync::LazyLock};
 
 use axum::{
@@ -32,11 +23,8 @@ use crate::{
     test_support::TempDir,
 };
 
-/// Set to write the live answers and columns over the committed files.
 const UPDATE: &str = "OG_UPDATE_CONTRACT";
 
-/// Check `text` against the committed file `contract/<file>`, or write it
-/// there when [`UPDATE`] is set.
 fn assert_committed(file: &str, text: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("contract")
@@ -57,15 +45,12 @@ fn assert_committed(file: &str, text: &str) {
     );
 }
 
-/// Check one answer against its committed example.
 fn assert_example(name: &str, body: &Value) {
     let mut text = serde_json::to_string_pretty(body).expect("answer serializes");
     text.push('\n');
     assert_committed(&format!("responses/{name}.json"), &text);
 }
 
-/// The committed contract is the one the code generates, and the one the
-/// server actually hands out at `/openapi.json`.
 #[tokio::test]
 async fn committed_openapi_is_the_served_contract() {
     let document =
@@ -120,11 +105,6 @@ fn the_contract_survives_a_release_version_bump() {
     );
 }
 
-/// Every `$ref` in the contract resolves, and every schema in it is reachable.
-///
-/// A schema that is only ever reached through a parameter is not collected
-/// automatically, so a dangling `$ref` is the failure this guards: the spec
-/// would still parse, and would still be wrong.
 #[test]
 fn every_schema_reference_resolves() {
     let document =
@@ -146,8 +126,6 @@ fn every_schema_reference_resolves() {
     assert!(unused.is_empty(), "schemas nothing points at: {unused:?}");
 }
 
-/// The contract never admits a null, because the API never sends one: an
-/// absent value is an absent key.
 #[test]
 fn the_contract_admits_no_nulls() {
     let document =
@@ -254,7 +232,6 @@ async fn responses_match_the_committed_examples() {
     let (status, malformed) = get_error(&router, "/places?ids=11").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(malformed["error_code"], "malformed_parameter");
-    // The default batch item limit caps `ids` too.
     let at_limit = ["osm:node:1"; 1000].join(",");
     get(&router, &format!("/places?ids={at_limit}")).await;
     let many = ["osm:node:1"; 1001].join(",");
@@ -287,8 +264,6 @@ async fn responses_match_the_committed_examples() {
     assert_eq!(properties["name"], "50 Queen Street");
     assert_eq!(properties["address"]["housenumber"], "50");
 
-    // An address the Pack lacks, in a town it holds, is answered with the
-    // town, and the answer says so; an answer that matches says nothing.
     let fallback = get(&router, "/geocode?q=99%20Nowhere%20Lane%2C%20Toronto").await;
     assert_example("geocode-fallback", &fallback);
     let properties = &fallback["features"][0]["properties"];
@@ -307,8 +282,6 @@ async fn responses_match_the_committed_examples() {
     ] {
         assert_example(name, &get(&router, uri).await);
     }
-    // A caller's location ranks ties and a box filters: the street the
-    // box holds answers, and one wholly outside it does not.
     let near = get(
         &router,
         "/geocode?q=King%20Street&focus=-79.0,43.0&bbox=-79.01,42.99,-78.99,43.01",
@@ -332,8 +305,6 @@ async fn responses_match_the_committed_examples() {
             .is_empty()
     );
 
-    // On the address: the address, then the areas it lies in, precise to
-    // broad.
     let on_address = get(&router, "/reverse?lon=-79.0&lat=43.0").await;
     assert_example("reverse-address", &on_address);
     assert_eq!(
@@ -396,7 +367,6 @@ async fn responses_match_the_committed_examples() {
     );
     assert_eq!(structured["features"][0]["properties"]["layer"], "address");
 
-    // Nothing fits: an empty collection, not an error and not a null.
     let unmatched = get(
         &router,
         "/geocode?address=10%20King%20Street&postcode=V6B%201A1",
@@ -410,8 +380,6 @@ async fn responses_match_the_committed_examples() {
             .is_empty()
     );
 
-    // Errors are part of the contract too: a client branches on `error_code`
-    // and shows `detail`, so both are committed like any answer.
     let (status, empty_query) = get_error(&router, "/geocode?q=").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_example("error-invalid-query", &empty_query);
@@ -431,22 +399,17 @@ async fn responses_match_the_committed_examples() {
     assert_example("error-malformed-parameter", &unknown_layer);
     assert_eq!(unknown_layer["error_code"], "malformed_parameter");
 
-    // A country code that is not two letters is a typo, and is rejected like
-    // an unknown layer rather than silently matching nothing.
     let (status, bad_country) = get_error(&router, "/geocode?q=king&country=Canada").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(bad_country["error_code"], "malformed_parameter");
     assert_eq!(bad_country["invalid_params"][0]["name"], "country");
 
-    // A well-formed country the Pack does not cover is not an error: it is
-    // an empty answer.
     let elsewhere = get(&router, "/geocode?q=king&country=FR").await;
     assert_eq!(
         elsewhere["features"].as_array().expect("features").len(),
         0,
         "a country the Pack does not hold answers with no features"
     );
-    // Places and suggestions are filtered alike, names and addresses both.
     for uri in [
         "/places?q=Queen%20Bakery",
         "/autocomplete?q=Queen%20Bak",
@@ -462,9 +425,6 @@ async fn responses_match_the_committed_examples() {
         assert_eq!(elsewhere["features"], json!([]), "{uri}");
     }
 
-    // The country the contract Pack is built from finds the same places the
-    // unfiltered query does, so the filter narrows without changing ranking.
-    // It states the country, which each answer then matches.
     let unfiltered = get(&router, "/geocode?q=king").await;
     let mut filtered = get(&router, "/geocode?q=king&country=CA").await;
     for feature in filtered["features"].as_array_mut().expect("features") {
@@ -476,7 +436,6 @@ async fn responses_match_the_committed_examples() {
     assert_eq!(unfiltered["features"], filtered["features"]);
 }
 
-/// One batch result, its answer kept as the bytes it was sent as.
 #[derive(serde::Deserialize)]
 struct RawResult {
     status: u16,
@@ -489,9 +448,6 @@ struct RawBatch {
     results: Vec<RawResult>,
 }
 
-/// Each batch result is the `GET` of its item, byte for byte: `response`
-/// is that `GET`'s answer and `error` its Problem. `QUERY` and `POST` answer
-/// a batch alike, byte for byte too.
 #[tokio::test]
 async fn batch_results_are_their_get_answers() {
     let jobs = TempDir::new("contract-batch");
@@ -590,9 +546,6 @@ async fn batch_results_are_their_get_answers() {
     batch_schemas_match_the_rendered_body(&example);
 }
 
-/// The batch schemas in the contract are mirrors, like `Problem`'s, so this
-/// holds them to a body the server rendered: every member it sends is one
-/// the contract describes.
 fn batch_schemas_match_the_rendered_body(batch: &Value) {
     let document =
         crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
@@ -624,8 +577,6 @@ fn batch_schemas_match_the_rendered_body(batch: &Value) {
     assert_eq!(documented("ForwardResult"), documented("ReverseResult"));
 }
 
-/// The query string a `GET` of this batch item carries: the shared
-/// parameters, overridden by the item's own, each value as its text.
 fn get_query(shared: &str, item: &Value) -> String {
     let own = item
         .as_object()
@@ -645,8 +596,6 @@ fn get_query(shared: &str, item: &Value) -> String {
     serde_urlencoded::to_string(pairs).expect("query string")
 }
 
-/// Send a request with a fixed request id, so a Problem's bytes do not
-/// differ by it, and return the status and body.
 async fn send_raw(
     router: &Router,
     method: &str,
@@ -676,8 +625,6 @@ async fn send_raw(
     (status, body.to_vec())
 }
 
-/// A request that is expected to fail, returning its status and problem body.
-/// The request id is fixed so the committed example is stable.
 async fn get_error(router: &Router, uri: &str) -> (StatusCode, Value) {
     let response = router
         .clone()
@@ -720,8 +667,6 @@ async fn get(router: &Router, uri: &str) -> Value {
     serde_json::from_slice(&body).expect("response body is JSON")
 }
 
-/// Canada > Ontario > Toronto, an address, a POI with an address, a street
-/// and an interpolation range in Toronto.
 fn write_pack(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
     let mut writer = Writer::create(dir).expect("writer");
@@ -747,9 +692,6 @@ fn write_pack(dir: &Path) {
     let country = place(&mut writer, PlaceLayer::Country, "Canada", 1);
     let region = place(&mut writer, PlaceLayer::Region, "Ontario", 2);
     let locality = place(&mut writer, PlaceLayer::Locality, "Toronto", 3);
-    // The country record's ISO code, as a build derives it from the boundary.
-    // Without it no record carries a country and the `country` filter, which
-    // matches on the code, would find nothing.
     writer.set_country_codes(
         [(
             country,
@@ -773,8 +715,6 @@ fn write_pack(dir: &Path) {
             [-796_392_727, 435_796_082, -791_132_193, 438_554_425],
         ),
     ]);
-    // Toronto lies wholly in one zone, as a build given timezone boundaries
-    // finds. Ontario and Canada reach into several, so they name none.
     writer.set_timezones(vec!["America/Toronto".to_string()], vec![(locality, 0)]);
     let context = Some(RecordContext {
         admin_context: AdminContextTuple::from_tiers([
@@ -893,16 +833,12 @@ fn write_pack(dir: &Path) {
         )
         .expect("interpolation");
     writer.finish().expect("finish");
-    // Calibrated, so the examples show what a calibrated Pack answers. The
-    // weights are made up: the fit has its own tests.
     let pack = crate::pack::Reader::open(dir).expect("pack");
     Model::new(CONTRACT_WEIGHTS, Default::default())
         .save(&pack)
         .expect("confidence model");
 }
 
-/// A plausible model: an answer is likelier right on a strict pass, with
-/// its number, in its postcode and well clear of the next.
 const CONTRACT_WEIGHTS: [f64; FEATURES] = [
     1.5, -1.0, -1.5, -0.8, -1.5, -1.0, -0.7, -2.0, -1.5, 0.8, -2.5, -0.2, 0.5, -2.0, -0.3, 1.0,
     -1.5, 0.3, -0.3, -1.0, -0.6, 1.2, -1.5,
@@ -914,8 +850,6 @@ fn line(from_lon: f64, from_lat: f64, to_lon: f64, to_lat: f64) -> Geometry {
     })
 }
 
-/// Geneva in Switzerland, each area with its names in other languages, and
-/// an address in Geneva.
 fn write_geneva_pack(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
     let mut writer = Writer::create(dir).expect("writer");
@@ -1024,9 +958,6 @@ fn write_geneva_pack(dir: &Path) {
     writer.finish().expect("finish");
 }
 
-/// `lang` names results and their areas. The first language gives `name`,
-/// with the local name standing in where there is none, and each other one
-/// gives `translations`.
 #[tokio::test]
 async fn lang_names_results_and_areas_in_the_languages_asked() {
     let dir = TempDir::new("geneva");
@@ -1055,7 +986,6 @@ async fn lang_names_results_and_areas_in_the_languages_asked() {
         json!({"de": "Schweiz"})
     );
 
-    // A language with no name falls back to the local one, and adds nothing.
     let romansh = get(&router, "/places?ids=osm:relation:1685488&lang=rm,ja").await;
     let city = &romansh["features"][0]["properties"];
     assert_eq!(city["name"], "Genève");
@@ -1065,8 +995,6 @@ async fn lang_names_results_and_areas_in_the_languages_asked() {
         "Schweiz/Suisse/Svizzera/Svizra"
     );
 
-    // A region or script with no name of its own reads its base language,
-    // and a repeat counts once.
     let swiss = get(&router, "/places?ids=osm:relation:1685488&lang=de-CH,DE-ch").await;
     let city = &swiss["features"][0]["properties"];
     assert_eq!(city["name"], "Genf");

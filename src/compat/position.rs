@@ -1,14 +1,8 @@
-//! A query that is a position: decimal degrees (`59.89076,30.35442`) or
-//! degrees, minutes and seconds with their hemispheres
-//! (`59 53 30 N 30 21 11 E`, `59°53'30"N 30°21'11"E`).
-
-/// The position a query writes, as `[lon, lat]`, latitude first as written.
 pub(crate) fn parse(query: &str) -> Option<[f64; 2]> {
     let query = query.trim();
     decimal(query).or_else(|| sexagesimal(query))
 }
 
-/// `lat,lon` or `lat lon` in decimal degrees.
 fn decimal(query: &str) -> Option<[f64; 2]> {
     let parts = query
         .split(|c: char| c == ',' || c.is_whitespace())
@@ -17,8 +11,6 @@ fn decimal(query: &str) -> Option<[f64; 2]> {
     let [lat, lon] = parts[..] else {
         return None;
     };
-    // A bare whole number is a house number or a postcode more often than
-    // a degree.
     if !lat.contains('.') || !lon.contains('.') {
         return None;
     }
@@ -26,8 +18,6 @@ fn decimal(query: &str) -> Option<[f64; 2]> {
     valid(lat, lon)
 }
 
-/// Degrees, then optional minutes and seconds, then the hemisphere letter,
-/// for the latitude and then the longitude.
 fn sexagesimal(query: &str) -> Option<[f64; 2]> {
     let spaced = query
         .chars()

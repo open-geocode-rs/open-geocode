@@ -1,8 +1,3 @@
-//! Questions for the open Pack, answered on a thread of their own so a slow
-//! answer never holds up a key press. Only the newest question counts: one
-//! asked while another waits takes its place, a long one stops once a newer
-//! one is asked, and the answer to an older one is never taken.
-
 use std::{
     collections::HashMap,
     sync::{
@@ -18,15 +13,9 @@ use crate::{
 };
 
 pub(crate) enum Question {
-    /// What search answers for a query, and how the parser reads it.
     Search(String),
-    Reverse {
-        lat: f64,
-        lon: f64,
-    },
-    /// Every address of pasted text, as a batch run answers it.
+    Reverse { lat: f64, lon: f64 },
     Pasted(String),
-    /// What a batch run answers for each of these addresses.
     Addresses(Vec<String>),
 }
 
@@ -38,13 +27,11 @@ pub(crate) enum Reply {
     Reverse(Result<Answer, String>),
     Pasted {
         rows: Vec<PastedRow>,
-        /// How the rows were read from the text.
         note: String,
     },
     Addresses(Vec<Option<Hit>>),
 }
 
-/// One pasted address and the answer for it.
 pub(crate) struct PastedRow {
     pub input: String,
     pub answer: Option<Arc<Answer>>,
@@ -58,17 +45,13 @@ impl PastedRow {
 
 pub(crate) struct Asker {
     shared: Arc<Shared>,
-    /// The id of the newest question.
     asked: u64,
 }
 
 struct Shared {
     waiting: Mutex<Option<(u64, Question)>>,
     wake: Condvar,
-    /// The id of the newest question: one being answered stops once it is
-    /// no longer this.
     newest: AtomicU64,
-    /// The id of the newest question answered or given up.
     settled: AtomicU64,
     answered: Mutex<Option<(u64, Reply)>>,
     closed: AtomicBool,
@@ -98,7 +81,6 @@ impl Asker {
         self.shared.wake.notify_one();
     }
 
-    /// Drops the questions asked so far: their answers are not taken.
     pub(crate) fn forget(&mut self) {
         self.asked += 1;
         self.shared.newest.store(self.asked, Ordering::Relaxed);
@@ -106,7 +88,6 @@ impl Asker {
         *self.shared.waiting.lock().expect("question lock") = None;
     }
 
-    /// The answer to the newest question, once it is there.
     pub(crate) fn take(&mut self) -> Option<Reply> {
         match self.shared.answered.lock().expect("answer lock").take() {
             Some((id, reply)) if id == self.asked => Some(reply),
@@ -114,7 +95,6 @@ impl Asker {
         }
     }
 
-    /// Whether the newest question is still being answered.
     pub(crate) fn busy(&self) -> bool {
         self.shared.settled.load(Ordering::Relaxed) < self.asked
     }
@@ -130,9 +110,6 @@ impl Drop for Asker {
     }
 }
 
-/// Answers questions until the asker is dropped. Answers to pasted rows are
-/// kept for as long as the Pack is open, so text pasted again, or with a
-/// row more, is answered at once.
 fn answer(engine: &Engine, shared: &Shared) {
     let mut known: HashMap<String, Option<Arc<Answer>>> = HashMap::new();
     loop {
@@ -161,8 +138,6 @@ fn answer(engine: &Engine, shared: &Shared) {
             )),
             Question::Pasted(text) => {
                 let (addresses, note) = batch::pasted_addresses(&text);
-                // A last line without its line break may still be typed:
-                // it is answered, but not kept.
                 let open = (!text.ends_with('\n')).then(|| addresses.len().saturating_sub(1));
                 let mut rows = Vec::with_capacity(addresses.len());
                 for (index, input) in addresses.into_iter().enumerate() {

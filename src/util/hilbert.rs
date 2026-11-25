@@ -1,21 +1,9 @@
-//! Hilbert curve ordering for WGS84 points.
-//!
-//! Records are stored in Hilbert order so neighbours on the map are neighbours
-//! in the Pack: a reverse lookup or a batch of nearby addresses touches a few
-//! adjacent pages instead of pages scattered across the file, and delta-encoded
-//! coordinates stay small. Hilbert beats Morton order here because it has no
-//! long jumps at quadrant boundaries.
-
-/// Hilbert index of a point given as 1e-7 degree fixed-point coordinates.
 pub(crate) fn hilbert_key(lon_e7: i32, lat_e7: i32) -> u64 {
-    // Shift both axes to unsigned and stretch latitude so the grid is square:
-    // lon spans 3.6e9 units and lat spans 1.8e9 units before stretching.
     let x = (i64::from(lon_e7) + 1_800_000_000).clamp(0, u32::MAX as i64) as u64;
     let y = ((i64::from(lat_e7) + 900_000_000) * 2).clamp(0, u32::MAX as i64) as u64;
     hilbert_index(x, y, 32)
 }
 
-/// Distance along a Hilbert curve covering a `2^bits x 2^bits` grid.
 fn hilbert_index(mut x: u64, mut y: u64, bits: u32) -> u64 {
     let n = 1u64 << bits;
     let mut index = 0u64;

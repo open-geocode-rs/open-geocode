@@ -59,21 +59,15 @@ use crate::{
     util::{fold::search_key, hilbert::hilbert_key},
 };
 
-/// Seconds a refused single lookup is told to wait: lookups take
-/// milliseconds, so a slot frees within it.
 const LOOKUP_RETRY_AFTER_SECONDS: u32 = 1;
 
-/// Kubernetes' default grace period, and actix-web's default shutdown
-/// timeout.
 pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub pack: PathBuf,
-    /// Static demo files to serve; without them only the API is served.
     pub demo: Option<PathBuf>,
     pub bind: SocketAddr,
-    /// The basemap PMTiles archive the demo shows, when there is one.
     pub basemap: Option<PathBuf>,
     /// Where job results are kept: one directory per port under the
     /// system's temporary directory when not given.
@@ -96,11 +90,9 @@ pub(crate) struct AppState {
     pack: Arc<Reader>,
     searcher: Arc<TextSearcher>,
     places: Arc<TextSearcher>,
-    /// `None` for a Pack built before the catalogue.
     catalogue: Option<Arc<Catalogue>>,
     reverse_geocoder: Arc<PackReverseGeocoder>,
     ready: Arc<AtomicBool>,
-    /// Cancelled once the server starts to stop.
     stopping: CancellationToken,
     error_log: ErrorLog,
     batch_pool: Arc<ThreadPool>,
@@ -108,36 +100,23 @@ pub(crate) struct AppState {
     here_upload_slot: Arc<Semaphore>,
     jobs: Arc<JobStore>,
     limits: Limits,
-    /// One permit per single lookup running; one without a permit is refused.
     lookup_slots: Arc<Semaphore>,
-    /// `/openapi.json` for this server's limits, built once.
     spec: Arc<str>,
-    /// See [`ServeOptions::hook_hosts`].
     hook_hosts: Arc<[String]>,
-    /// See [`ServeOptions::public_url`], with no trailing `/`.
     public_url: Option<Arc<str>>,
 }
 
 impl AppState {
-    /// Open the Pack at `path`, keeping `/jobs` files in `jobs`, under
-    /// `limits`.
     pub(crate) fn open(path: &Path, jobs: &Path, limits: Limits) -> Result<Self> {
         let pack = Arc::new(Reader::open(path)?);
         let resources = Resources::probe();
-        // Every query looks things up all over the Pack: read it in now
-        // when it fits, so the first queries do not each wait on faults.
         pack.container()
             .advise_random_reads(resources.available_memory_bytes);
-        // Tables built once per process take up to a second on a slow
-        // build. Built on first use, they eat the first lookup's deadline.
         crate::categories::load();
         crate::parse::lattice::postcode::Table::global();
         let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
         let reverse_geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
         let catalogue = Catalogue::open(pack.container())?;
-        // Every CPU, at low priority: batches and jobs take all the CPU
-        // single lookups leave idle, and a single lookup never waits for a
-        // core.
         let batch_pool = ThreadPoolBuilder::new()
             .num_threads(resources.usable_cpus)
             .thread_name(|index| format!("batch-{index}"))
@@ -154,8 +133,6 @@ impl AppState {
             stopping: CancellationToken::new(),
             error_log: ErrorLog::default(),
             batch_pool: Arc::new(batch_pool),
-            // Batches and jobs share the pool's cores, so running more of them
-            // at once than there are cores only slows each one down.
             batch_slots: Arc::new(Semaphore::new(resources.usable_cpus)),
             here_upload_slot: Arc::new(Semaphore::new(1)),
             jobs: Arc::new(JobStore::open(jobs.to_path_buf(), limits.job_retention())?),
@@ -171,8 +148,6 @@ impl AppState {
         })
     }
 
-    /// The same state, calling back only `hosts` (see
-    /// [`ServeOptions::hook_hosts`]).
     pub(crate) fn with_hook_hosts(mut self, hosts: Vec<String>) -> Self {
         self.hook_hosts = hosts
             .into_iter()
@@ -182,17 +157,11 @@ impl AppState {
         self
     }
 
-    /// The same state, handing back URLs under `url` (see
-    /// [`ServeOptions::public_url`]).
     pub(crate) fn with_public_url(mut self, url: Option<String>) -> Self {
         self.public_url = url.map(|url| url.trim_end_matches('/').into());
         self
     }
 
-    /// Where a client reaches this server, the start of every absolute URL
-    /// it hands back: the operator's public URL, else the `Host` the client
-    /// connected with. A forwarded header is never read, since any client
-    /// can send one.
     pub(crate) fn origin(&self, headers: &axum::http::HeaderMap) -> String {
         match &self.public_url {
             Some(url) => url.to_string(),
@@ -206,8 +175,6 @@ impl AppState {
         }
     }
 
-    /// Whether a job may call `host` on `port`: the operator allows that
-    /// host on any port, or on that one.
     pub(crate) fn may_call(&self, host: &str, port: Option<u16>) -> bool {
         let host = host.to_ascii_lowercase();
         let with_port = port.map(|port| format!("{host}:{port}"));
@@ -232,12 +199,10 @@ impl AppState {
         &self.spec
     }
 
-    /// Where batch items and job rows run.
     pub(crate) fn batch_pool(&self) -> &ThreadPool {
         &self.batch_pool
     }
 
-    /// One permit per batch or job running; one without a permit is refused.
     pub(crate) fn batch_slots(&self) -> &Arc<Semaphore> {
         &self.batch_slots
     }
@@ -258,57 +223,35 @@ impl AppState {
         &self.pack
     }
 
-    /// True once the Pack is loaded and the Runtime can answer API traffic
-    /// (ADR 0017 Decision 28).
     pub(crate) fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
 }
 
-/// `/places`: places by name in `q`, or by id in `ids`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct PlacesParams {
     q: Param,
-    /// Comma-separated stable ids, such as `osm:node:123`.
     ids: Param,
     #[serde(default)]
     limit: usize,
     country: Param,
     focus: Param,
     bbox: Param,
-    /// See [`parse_lang`].
     lang: Param,
 }
 
-/// `/autocomplete`: unlike `/places`, an empty `q` answers no suggestions
-/// rather than an error, as a user who cleared the box expects.
 #[derive(Debug, Deserialize)]
 pub(crate) struct AutocompleteParams {
     q: Param,
     #[serde(default)]
     limit: usize,
-    /// Comma-separated ISO 3166-1 alpha-2 codes; see [`parse_countries`].
     country: Param,
-    /// Left as a string here and parsed by [`parse_layer`], so an unknown
-    /// layer is a 400 naming the valid ones rather than a serde rejection
-    /// reading `unknown variant`.
     layer: Param,
-    /// `lon,lat`; see [`bounds::parse_focus`].
     focus: Param,
-    /// `min_lon,min_lat,max_lon,max_lat`; see [`bounds::parse_bbox`].
     bbox: Param,
-    /// See [`parse_lang`].
     lang: Param,
 }
 
-/// Resolve the `layer` filter, rejecting a layer that does not exist.
-///
-/// An unknown layer is a 400 listing the valid ones, not a filter that
-/// matches nothing: a typo would look exactly like "no results here", and a
-/// client could not tell the two apart.
-///
-/// An empty value means "no filter", which is what a form that always sends
-/// the key produces.
 fn parse_layer(layer: &Param) -> Result<Option<Layer>, Problem> {
     let value = match layer {
         Param::Missing | Param::Empty => return Ok(None),
@@ -325,20 +268,6 @@ fn parse_layer(layer: &Param) -> Result<Option<Layer>, Problem> {
     })
 }
 
-/// Resolve the `country` filter: a comma-separated list of ISO 3166-1
-/// alpha-2 codes, upper-cased, naming the countries to answer from.
-///
-/// A Pack built from one extract covers one country and needs none. One built
-/// from several covers them all, and this narrows a search to part of it: a
-/// filter on one index, not a route to one of many.
-///
-/// A code that is not two letters is rejected, like an unknown `layer`: a
-/// typo that silently matched nothing would look exactly like "no results
-/// here". A country the Pack does not cover is *not* rejected, because it is
-/// a legitimate empty answer.
-///
-/// An empty value means "no filter", which is what a form that always sends
-/// the key produces.
 fn parse_countries(country: &Param) -> Result<Vec<String>, Problem> {
     let value = match country {
         Param::Missing | Param::Empty => return Ok(Vec::new()),
@@ -364,15 +293,10 @@ fn parse_countries(country: &Param) -> Result<Vec<String>, Problem> {
     Ok(codes)
 }
 
-/// `/geocode`: an address as free text in `q`, or one whose parts the
-/// caller already has apart.
 #[derive(Debug, Deserialize)]
 pub(crate) struct GeocodeParams {
     q: Param,
-    /// `lon,lat`; see [`bounds::parse_focus`].
     focus: Param,
-    /// `min_lon,min_lat,max_lon,max_lat`; see
-    /// [`bounds::parse_bbox`].
     bbox: Param,
     address: Param,
     locality: Param,
@@ -381,9 +305,7 @@ pub(crate) struct GeocodeParams {
     #[serde(default)]
     limit: usize,
     layer: Param,
-    /// Comma-separated ISO 3166-1 alpha-2 codes; see [`parse_countries`].
     country: Param,
-    /// See [`parse_lang`].
     lang: Param,
 }
 
@@ -391,30 +313,19 @@ pub(crate) struct GeocodeParams {
 pub(crate) struct ReverseParams {
     lon: f64,
     lat: f64,
-    /// See [`parse_layer`].
     layer: Param,
-    /// How many results of `layer` to answer, nearest first. 0, the
-    /// default, is 1, and above 1 needs a `layer`.
     #[serde(default)]
     limit: usize,
-    /// How far to look for the nearest house, street or place, in metres.
     radius: Option<f64>,
-    /// See [`parse_lang`].
     lang: Param,
 }
 
-/// `/reverse`'s request, checked: the point and layer, and how many results
-/// of the layer to answer.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReverseRequest {
     options: GeocodeOptions,
     limit: usize,
 }
 
-/// Resolve `lang`, the comma-separated language codes to name results in,
-/// such as `fr,de`. A malformed code is a 400 naming it, like an unknown `layer`,
-/// and so is asking for more than [`api::MAX_LANGUAGES`] distinct languages.
-/// An empty value means local names, as no `lang` does.
 fn parse_lang(lang: &Param) -> Result<api::Languages, Problem> {
     let value = match lang {
         Param::Missing | Param::Empty => return Ok(api::Languages::default()),
@@ -436,7 +347,6 @@ fn parse_lang(lang: &Param) -> Result<api::Languages, Problem> {
     })
 }
 
-/// A lookup's checked request and the languages its answer is named in.
 #[derive(Debug, Clone)]
 pub(crate) struct Named<R> {
     pub(crate) request: R,
@@ -454,7 +364,6 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     serve_on(listener, options).await
 }
 
-/// [`serve`] on a listener the caller already bound, in place of `options.bind`.
 pub async fn serve_on(listener: TcpListener, options: ServeOptions) -> Result<()> {
     let address = listener.local_addr()?;
     let jobs_dir = options
@@ -481,7 +390,6 @@ pub async fn serve_on(listener: TcpListener, options: ServeOptions) -> Result<()
     .await
 }
 
-/// Split from [`serve`] so a test can stop it without a signal.
 async fn run(
     listener: TcpListener,
     app: Router,
@@ -499,13 +407,10 @@ async fn run(
         () = stop => {}
     }
     eprintln!("Shutting down, for at most {} s", budget.as_secs());
-    // Jobs first: a job's upload is a request as long as the job, so requests
-    // drain only once jobs stop.
     state.jobs().cancel_running();
     stopping.cancel();
     let stopped = tokio::time::timeout(budget, async {
         let served = (&mut server).await;
-        // A job can outlive its request (`Prefer: respond-async`).
         state.jobs().stopped().await;
         served
     })
@@ -518,18 +423,8 @@ async fn run(
     Ok(())
 }
 
-/// Assemble the public-demo router with its boundary policy: method-restricted
-/// routes (ADR 0017 Decision 27), Problem Details 404/405 fallbacks
-/// (Decisions 27, 37), and request-id propagation (Decision 30). The basemap is
-/// served raw with no guard — in the deployed topology PMTiles is served from
-/// Cloudflare R2, not the Runtime (Decisions 6/35a, amended 2026-06-03).
-///
-/// Split out from [`serve`] so it can be exercised without binding a socket.
 pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option<&Path>) -> Router {
-    // Read-only routes: GET only (Decision 27), and QUERY or POST for a batch
-    // on the lookup routes. axum would otherwise route HEAD to the GET
-    // handler automatically, so both register an explicit HEAD responder that
-    // returns 405. Other methods fall through to a 405.
+    // axum routes HEAD to a GET handler unless HEAD is registered, so every route registers a HEAD that answers 405.
     let max_body = state.limits().max_batch_body_bytes();
     let mut app: Router<AppState> = Router::new()
         .route("/places", batchable(places, places_batch, max_body))
@@ -560,16 +455,6 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         .route("/version", get_only(version::version))
         .merge(compat::router());
 
-    // The basemap PMTiles lives with the other data artifacts (not in the demo
-    // dir), so serve it explicitly. ServeFile honors HTTP range requests, which
-    // is what the PMTiles client uses. Skip it if the file is absent so a fresh
-    // clone without a basemap still serves the API and demo.
-    //
-    // This is served raw and is a local-dev convenience only. In the public
-    // demo the basemap is served from Cloudflare R2, not the Runtime (ADR 0017
-    // Decisions 6/7/8, amended 2026-06-03); R2's free egress makes PMTiles
-    // abuse protection a non-issue. The bare binary hands back the file with
-    // native range support and no policy.
     match basemap {
         Some(basemap) if basemap.exists() => {
             app = app.route_service("/basemap.pmtiles", ServeFile::new(basemap));
@@ -582,12 +467,6 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         None => {}
     }
 
-    // ServeDir keeps local-dev static serving (Decision 10) but its built-in 404
-    // is replaced with a Problem Details 404 so unknown paths don't fall through
-    // to a static-file response (Decision 37). `method_not_allowed_fallback`
-    // turns method mismatches into a Problem 405 instead of an empty body. The
-    // request-id layer is outermost so it also wraps both fallbacks, which puts
-    // the id in every Problem and logs every 500 in one place.
     let error_log = state.error_log.clone();
     let app = app.method_not_allowed_fallback(method::method_not_allowed);
     let app = match demo {
@@ -600,8 +479,6 @@ pub(crate) fn build_router(state: AppState, demo: Option<&Path>, basemap: Option
         error_log,
         request_id::propagate,
     ))
-    // gzip or zstd by Accept-Encoding. The default predicate leaves bodies
-    // under 32 bytes, ranges and already-encoded bodies alone.
     .layer(CompressionLayer::new())
     .with_state(state)
 }
@@ -639,13 +516,10 @@ where
                 }
             },
         )
-        // After the fallback, so the limit covers QUERY as well as POST.
         .layer(DefaultBodyLimit::max(max_body))
         .layer(middleware::map_response(batch::advertise))
 }
 
-/// A route that takes one method. HEAD is refused too, rather than routed to
-/// a GET handler, and every other method is a 405 naming the one it takes.
 fn only<H, T>(filter: MethodFilter, allow: &'static str, handler: H) -> MethodRouter<AppState>
 where
     H: Handler<T, AppState>,
@@ -661,9 +535,6 @@ async fn batch_method_not_allowed() -> Problem {
     Problem::method_not_allowed(batch::METHODS)
 }
 
-/// Run geocoder work, GeoJSON included, on the blocking pool. Its errors and
-/// a panic both become Problems here, with their cause kept for the log, so a
-/// handler only needs `?`.
 async fn blocking<T, F>(work: F) -> Result<T, Problem>
 where
     T: Send + 'static,
@@ -672,10 +543,6 @@ where
     task::spawn_blocking(work).await?.map_err(Problem::from)
 }
 
-/// Run one lookup under the server's limits: refused with 503 `busy` while
-/// as many run as the server allows, and stopped at its next check past the
-/// lookup timeout, or once this future is dropped, as axum drops it when the
-/// client disconnects.
 async fn lookup<T, F>(state: &AppState, work: F) -> Result<T, Problem>
 where
     T: Send + 'static,
@@ -687,8 +554,6 @@ where
     let cancel = Arc::new(AtomicBool::new(false));
     let _cancel = CancelOnDrop(Arc::clone(&cancel));
     let stop = Stop::new(state.limits.lookup_timeout(), cancel);
-    // The work holds the slot, not this future: a lookup whose client left
-    // holds it until it stops.
     blocking(move || {
         let _permit = permit;
         stop::within(stop, work)
@@ -847,9 +712,6 @@ pub(crate) async fn places_batch(State(state): State<AppState>, request: Request
     batch::run(state, PLACES, request).await
 }
 
-/// `/places` as a batch item, in `QUERY /places`. Not a `/jobs` endpoint: a
-/// job is a file of addresses or points too long for one request, and one
-/// batch already holds a saved-place list, ids and names alike.
 pub(crate) const PLACES: Lookup<PlacesParams, Named<PlacesRequest>, ForwardCollection, String> =
     Lookup {
         route: "/places",
@@ -872,12 +734,10 @@ pub(crate) enum PlacesRequest {
     Text(TextSearchOptions),
     Ids {
         catalogue: Arc<Catalogue>,
-        /// In the order asked, without the ids no record can have.
         ids: Vec<(ObjectType, i64)>,
     },
 }
 
-/// `/places`' parameters, checked.
 fn places_request(state: &AppState, params: PlacesParams) -> Result<PlacesRequest, Problem> {
     let q = match (params.q, params.ids) {
         (Param::Missing, Param::Missing) => {
@@ -910,9 +770,6 @@ fn places_request(state: &AppState, params: PlacesParams) -> Result<PlacesReques
     .map(PlacesRequest::Text)
 }
 
-/// Names that read alike sit together, as `/geocode`'s text queries do. An
-/// id's block is known only once the catalogue is read, so id lookups take no
-/// place and run first.
 fn places_place(request: &PlacesRequest) -> String {
     match request {
         PlacesRequest::Text(options) => options.query.to_lowercase(),
@@ -955,8 +812,6 @@ fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardColl
                     named.push(hit);
                 }
             }
-            // A query that only names a kind of place means the nearest
-            // ones, as autocomplete reads it.
             let as_typed = TextAutocompleteOptions {
                 query: options.query.clone(),
                 limit: options.limit,
@@ -974,7 +829,6 @@ fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardColl
                 true => named,
                 false => nearest_of_category(state, &as_typed, limit, named)?,
             };
-            // A search's results carry no highlights, a suggestion's do.
             for hit in &mut hits {
                 hit.highlights = Default::default();
             }
@@ -1007,16 +861,11 @@ fn no_ids() -> Problem {
         .with_invalid_params(vec![InvalidParam::new("ids", "empty")])
 }
 
-/// `ids` as the catalogue reads them, at most `max` of them: the server's
-/// batch item limit, so one setting caps the lookups one request makes
-/// whether they come as items or as ids.
 fn place_ids(ids: &str, max: usize) -> Result<Vec<(ObjectType, i64)>, Problem> {
     let ids = ids
         .split(',')
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        // One past the limit is enough to refuse the list, so a list of a
-        // million ids costs no more than one just over it.
         .take(max.saturating_add(1))
         .collect::<Vec<_>>();
     if ids.is_empty() {
@@ -1043,7 +892,6 @@ fn place_ids(ids: &str, max: usize) -> Result<Vec<(ObjectType, i64)>, Problem> {
 }
 
 struct TextParams {
-    /// As sent, holding at least one word.
     q: String,
     limit: usize,
     country: Param,
@@ -1159,9 +1007,6 @@ pub(crate) const AUTOCOMPLETE: batch::Lookup<
 };
 
 fn autocomplete_request(params: &AutocompleteParams) -> Result<AutocompleteRequest, Problem> {
-    // Nothing typed yet is no suggestions, not an error, so only the length is
-    // bounded here; the searcher answers an empty or very short query with
-    // none, and caps the result count itself.
     let query = match &params.q {
         Param::Missing | Param::Empty => String::new(),
         Param::Value(q) => bounds::validate_query_length(q)?,
@@ -1231,28 +1076,17 @@ fn autocomplete_answer(state: &AppState, named: AutocompleteRequest) -> Result<F
     Ok(collection)
 }
 
-/// A search for places by their kind. No route of og's own answers one.
-/// `/compat` answers a vendor's category search from it.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CategoryParams {
     #[serde(default)]
     limit: usize,
-    /// See [`parse_countries`].
     country: Param,
-    /// The point to search around, as `lon,lat`.
     focus: Param,
-    /// How many metres from `focus` a place may lie. [`BIAS_RADIUS_M`] when
-    /// not given.
     radius: Option<f64>,
     bbox: Param,
-    /// See [`parse_lang`].
     lang: Param,
 }
 
-/// The places of `categories`, each written as the catalog writes it
-/// (`amenity pharmacy`, or a bare key). With `focus` they are the ones
-/// around it, nearest first. Without one they are the best known of the
-/// Pack, or of `bbox` and `country`.
 pub(crate) async fn of_categories(
     State(state): State<AppState>,
     categories: Vec<&'static str>,
@@ -1292,10 +1126,6 @@ pub(crate) async fn of_categories(
     Ok(Json(collection))
 }
 
-/// A query that only names a kind of place ("pharmacy", "apotheek") means
-/// the nearest ones, whatever their names. A place near the caller named as
-/// typed ("Subway") still answers, so a brand that is also a category word
-/// keeps its meaning. What else matched fills the rest.
 fn nearest_of_category(
     state: &AppState,
     options: &TextAutocompleteOptions,
@@ -1329,7 +1159,6 @@ fn nearest_of_category(
                 .is_some_and(|point| haversine_m(lon, lat, point.lon, point.lat) <= BIAS_RADIUS_M)
         })
     };
-    // A name nearby as typed ("subway"), or being typed ("bank of amer"), wins.
     let named_near = named
         .first()
         .is_some_and(|hit| near(hit) && search_key(&hit.record.name) == typed)
@@ -1340,7 +1169,6 @@ fn nearest_of_category(
     if named_near {
         return Ok(named);
     }
-    // A place in the words outranks where the map is.
     let focus = match &request.place {
         None => options.focus,
         Some(words) => place_named(state, options, words, through_typo)?,
@@ -1418,9 +1246,6 @@ fn prefer_poi_names(
     Ok((qualified, true))
 }
 
-/// The POIs of `categories`, as many as `limit`. With a focus and its radius
-/// in metres they are the ones inside it, nearest first. Without one they are
-/// the best known of the Pack.
 fn pois_of_categories(
     state: &AppState,
     categories: &[&str],
@@ -1429,12 +1254,10 @@ fn pois_of_categories(
     countries: &[String],
     bbox: Option<BoundingBox>,
 ) -> Result<Vec<TextSearchHit>> {
-    // Past the categories' own count, reading them from the index costs less.
     let count = state.places.category_count(categories)?;
     if count == 0 {
         return Ok(Vec::new());
     }
-    // The walk knows no country, so a country filter reads the index.
     let walked = match focus {
         Some((point, radius_m)) if countries.is_empty() => state.reverse_geocoder.nearest_pois(
             point,
@@ -1462,20 +1285,16 @@ fn pois_of_categories(
     }
 }
 
-/// The point of the place `words` name, a town, a street or a POI.
 fn place_named(
     state: &AppState,
     options: &TextAutocompleteOptions,
     words: &str,
     towns_only: bool,
 ) -> Result<Option<[f64; 2]>> {
-    // A town nearby, then one known abroad ("new york"), then a POI nearby
-    // ("pike place" is the market here, not a street in Auckland).
     let towns = state.searcher.place_point(words, options.focus, false)?;
     if let Some(point) = towns.near.or(towns.known_abroad) {
         return Ok(Some(point));
     }
-    // Through a typo of the kind, the rest is more often a name being typed.
     if towns_only {
         return Ok(None);
     }
@@ -1483,10 +1302,6 @@ fn place_named(
     Ok(pois.near.or(towns.known).or(pois.known))
 }
 
-// For callers holding street, town and postcode in separate fields: joined
-// into one string, the parser would have to split them apart again, and a
-// town in the string could outrank the street. `geocode batch` runs this
-// same lookup per row.
 /// Geocode an address
 ///
 /// Geocodes an address to coordinates, given as free text in `q` or as
@@ -1658,7 +1473,6 @@ pub(crate) async fn geocode_batch(State(state): State<AppState>, request: Reques
     batch::run(state, GEOCODE, request).await
 }
 
-/// `/geocode` as a batch item, in `QUERY /geocode` and in `/jobs`.
 pub(crate) const GEOCODE: Lookup<
     GeocodeParams,
     Named<GeocodeRequest>,
@@ -1690,10 +1504,7 @@ pub(crate) enum GeocodeRequest {
     },
 }
 
-/// `/geocode`'s parameters, checked.
 fn geocode_request(_: &AppState, params: GeocodeParams) -> Result<GeocodeRequest, Problem> {
-    // A field sent empty is still sent: `q=&address=10 King Street` names two
-    // ways of giving the address, and which one the caller meant is a guess.
     let fields = [
         &params.address,
         &params.locality,
@@ -1752,20 +1563,14 @@ fn geocode_fields(params: &GeocodeParams) -> Result<AddressGeocodeOptions, Probl
     })
 }
 
-/// `locality`, `region` or `postcode`, which narrow an address search rather
-/// than drive it.
 fn context_field(field: &Param) -> Result<Option<String>, Problem> {
     match field {
         Param::Missing => Ok(None),
-        // A form that always sends every field sends the ones left blank
-        // empty; a blank locality narrows nothing, unlike a blank `address`.
         Param::Empty => Ok(None),
         Param::Value(value) => bounds::validate_query_length(value).map(Some),
     }
 }
 
-/// Addresses in one postcode and town read the same part of the Pack, so a
-/// batch looks them up together, as `geocode batch` does its rows.
 fn geocode_place(request: &GeocodeRequest) -> [String; 3] {
     let field = |value: &Option<String>| value.as_deref().unwrap_or_default().to_lowercase();
     match request {
@@ -1917,7 +1722,6 @@ pub(crate) async fn reverse_batch(State(state): State<AppState>, request: Reques
     batch::run(state, REVERSE, request).await
 }
 
-/// `/reverse` as a batch item, in `QUERY /reverse` and in `/jobs`.
 pub(crate) const REVERSE: Lookup<ReverseParams, Named<ReverseRequest>, ReverseCollection, u64> =
     Lookup {
         route: "/reverse",
@@ -1935,7 +1739,6 @@ pub(crate) const REVERSE: Lookup<ReverseParams, Named<ReverseRequest>, ReverseCo
         },
     };
 
-/// `/reverse`'s parameters, checked.
 fn reverse_request(_: &AppState, params: ReverseParams) -> Result<ReverseRequest, Problem> {
     let ReverseParams {
         lon,
@@ -1974,8 +1777,6 @@ fn reverse_request(_: &AppState, params: ReverseParams) -> Result<ReverseRequest
     })
 }
 
-/// The Pack stores records in Hilbert order, so points close on this curve
-/// read neighbouring pages.
 fn reverse_place(options: &GeocodeOptions) -> u64 {
     hilbert_key(
         (options.lon * 1e7).round() as i32,
@@ -2427,8 +2228,6 @@ pub(crate) mod router_tests {
         );
     }
 
-    /// The house 67 m from the point is past the default reach and inside
-    /// an asked radius; a radius og cannot search is refused.
     #[tokio::test]
     async fn reverse_looks_as_far_as_its_radius() {
         let jobs = TempDir::new("reverse-radius");
@@ -2462,10 +2261,6 @@ pub(crate) mod router_tests {
 
     #[tokio::test]
     async fn basemap_is_served_raw_with_range_support() {
-        // The runtime serves the basemap raw: range requests work natively and
-        // there is deliberately no full-file fetch guard here (that is a
-        // deployment-layer concern, ADR 0017 Decision 35a). The bare binary hands
-        // back exactly what was asked for.
         let jobs = TempDir::new("basemap");
         let missing = TempDir::new("basemap-missing");
         let demo = missing.join("demo");
@@ -2479,7 +2274,6 @@ pub(crate) mod router_tests {
             Some(&basemap),
         );
 
-        // A bounded range is honored as a 206 with exactly the requested bytes.
         let mut req = request("GET", "/basemap.pmtiles");
         req.headers_mut().insert(
             header::RANGE,
@@ -2489,7 +2283,6 @@ pub(crate) mod router_tests {
         assert_eq!(reply.status, StatusCode::PARTIAL_CONTENT);
         assert_eq!(reply.body.len(), 512_000);
 
-        // A Range-less GET returns the whole file (200) — raw, unguarded.
         let reply = send(router.clone(), request("GET", "/basemap.pmtiles")).await;
         assert_eq!(reply.status, StatusCode::OK);
         assert_eq!(reply.body.len(), 600_000);
@@ -2498,8 +2291,6 @@ pub(crate) mod router_tests {
         assert_eq!(reply.status, StatusCode::OK);
     }
 
-    /// A router whose routes fail on purpose, behind the same request-id layer
-    /// as the real one, logging into `log`.
     fn failing_router(log: &ErrorLog) -> Router {
         Router::new()
             .route(
@@ -2550,8 +2341,6 @@ pub(crate) mod router_tests {
         assert!(body.get("detail").is_none());
         assert!(!body.to_string().contains("section offset"));
 
-        // The log has one line naming the request, route and cause, and not
-        // the query, which is personal data.
         let lines = log_lines(&log);
         assert_eq!(lines.len(), 1);
         let line = &lines[0];
@@ -2711,7 +2500,6 @@ pub(crate) mod router_tests {
             .collect()
     }
 
-    /// A cafe stating its contact and hours at -79.0, and a bare one at -79.1.
     fn write_poi_cafes(writer: &mut Writer) {
         use crate::record::{Contact, PoiDetails, PoiRecord};
         let cafe = |id: i64, name: &str, lon: f64, details| PoiRecord {
@@ -2744,8 +2532,6 @@ pub(crate) mod router_tests {
         }
     }
 
-    /// A record's contact and hours are its own: every route that answers
-    /// with it gives them alike, and a POI stating none has no such field.
     #[tokio::test]
     async fn a_poi_carries_its_contact_and_hours_on_every_route() {
         let dir = TempDir::new("poi-details");
@@ -2830,8 +2616,6 @@ pub(crate) mod router_tests {
         assert_eq!(details(&lines[1]["response"]), bare);
     }
 
-    /// A town drawn as an area, a street, a hall drawn as a building, a cafe
-    /// mapped as a node and a house, in that order.
     fn write_shaped(writer: &mut Writer) -> crate::pack::RecordId {
         use crate::record::{PlaceLayer, PlaceRecord, PoiDetails, PoiRecord, StreetRecord};
         let poi = |id: i64, object_type, name: &str, lon: f64, details| PoiRecord {
@@ -2921,8 +2705,6 @@ pub(crate) mod router_tests {
         ids[0]
     }
 
-    /// The box around a record is its own. Every route that answers with
-    /// the record gives it, and a record that is only a point has none.
     #[tokio::test]
     async fn a_result_larger_than_a_point_carries_its_bbox_on_every_route() {
         let dir = TempDir::new("bbox");
@@ -3038,9 +2820,6 @@ pub(crate) mod router_tests {
         assert_eq!(rows[1]["geocode_bbox"], "");
     }
 
-    /// A region and a town in it, each wholly in a zone, an area in none,
-    /// a house in the town, a house whose own point says its zone, and a
-    /// cafe in no zone.
     fn write_zoned(writer: &mut Writer) -> Vec<(crate::pack::RecordId, u16)> {
         use crate::context::{AdminContextTuple, RecordContext};
         use crate::record::{PlaceLayer, PlaceRecord, PoiRecord, Record};
@@ -3091,8 +2870,6 @@ pub(crate) mod router_tests {
         writer
             .write(&area(PlaceLayer::Locality, "Borderton", 309, -79.4), None)
             .expect("an area in two zones");
-        // The town's zone is read before the region's, as the most specific
-        // area of the chain says it.
         writer
             .write(
                 &house(301, "Maple Street", -79.0),
@@ -3139,9 +2916,6 @@ pub(crate) mod router_tests {
         vec![(region, 1), (town, 0)]
     }
 
-    /// A record's timezone is its own. Every route that answers with the
-    /// record gives it and credits the boundaries it is read from, and a
-    /// record in no zone has no such field and no such credit.
     #[tokio::test]
     async fn a_result_carries_its_timezone_on_every_route() {
         let dir = TempDir::new("timezone");
@@ -3266,7 +3040,6 @@ pub(crate) mod router_tests {
         assert_eq!(rows[0]["geocode_timezone"], "America/Toronto");
         assert_eq!(rows[1]["geocode_timezone"], "");
 
-        // A Pack built without timezone boundaries names no zone.
         let jobs = TempDir::new("no-timezone");
         let router = build_router(king_state(&jobs, Limits::DEFAULT), None, None);
         for uri in [
@@ -3279,8 +3052,6 @@ pub(crate) mod router_tests {
         }
     }
 
-    /// A vendor writes a result's zone with its offset when it answers,
-    /// HERE when `show=tz` asks and Google when the field mask does.
     #[tokio::test]
     async fn a_vendor_writes_the_zone_and_its_offset_now() {
         let dir = TempDir::new("timezone-vendors");
@@ -3332,8 +3103,6 @@ pub(crate) mod router_tests {
         );
     }
 
-    /// A house and a hall with entrances mapped, and a house and a cafe
-    /// with none.
     fn write_entered(writer: &mut Writer) {
         use crate::record::{Entrance, PoiDetails, PoiRecord, Record};
         let entrance = |lon: i32, lat: i32, kind: &str| Entrance {
@@ -3408,9 +3177,6 @@ pub(crate) mod router_tests {
         }
     }
 
-    /// The entrances mapped for a record are its own. Every route that
-    /// answers with the record gives them, and a record with none has no
-    /// such field.
     #[tokio::test]
     async fn a_result_carries_its_access_points_on_every_route() {
         let dir = TempDir::new("access");
@@ -3522,11 +3288,6 @@ pub(crate) mod router_tests {
         assert_eq!(rows[1]["geocode_access"], "");
     }
 
-    /// Houses whose source states their town or country in another language
-    /// than their areas' local names: Vienna in Wien, Munich in München,
-    /// Moscow in Москва, and `AT` for Austria. Each area has names in English,
-    /// French, German and Russian. A last house states a town no area of its
-    /// context names.
     pub(crate) fn write_stated_names_pack(dir: &Path) {
         let _ = std::fs::remove_dir_all(dir);
         let mut writer = Writer::create(dir).expect("writer");
@@ -3560,8 +3321,6 @@ pub(crate) mod router_tests {
         let munich = area(PlaceLayer::Locality, "München", 4);
         let russia = area(PlaceLayer::Country, "Россия", 5);
         let moscow = area(PlaceLayer::Locality, "Москва", 6);
-        // A country OSM names in its four languages at once, and a district
-        // named in French, Gundis in German.
         let switzerland = area(PlaceLayer::Country, "Schweiz/Suisse/Svizzera/Svizra", 7);
         let conthey = area(PlaceLayer::District, "Conthey", 8);
         let code = |code: &str| CountryCode::parse(code).expect("code");
@@ -3745,10 +3504,6 @@ pub(crate) mod router_tests {
         }
     }
 
-    /// A town or country the source states in another language is written as
-    /// the area it names, in the language asked or else its local name, so
-    /// no answer names one place in two languages. The street stays as the
-    /// source writes it, and a town naming no area of the context stays too.
     #[tokio::test]
     async fn a_stated_place_is_named_as_its_area_in_every_language() {
         let dir = TempDir::new("stated-names");
@@ -3948,9 +3703,6 @@ pub(crate) mod router_tests {
         }
     }
 
-    /// Toronto in Ontario in Canada and Berlin in Germany, with houses and
-    /// a cafe that state a street, a hall that states none, and a house in
-    /// no country.
     fn write_lined(writer: &mut Writer, areas: &Canada) {
         use crate::record::{PlaceLayer, PoiRecord, Record};
         let stated = |number: &str, street: &str| AddressComponents {
@@ -4048,10 +3800,6 @@ pub(crate) mod router_tests {
         }
     }
 
-    /// A result's postal lines are laid out by its country's template from
-    /// what the record states and the areas it lies in. Every route that
-    /// answers with an address or a POI with a street gives them, and any
-    /// other result has no such field.
     #[tokio::test]
     async fn a_result_carries_its_address_lines_on_every_route() {
         let dir = TempDir::new("address-lines");
@@ -4126,7 +3874,6 @@ pub(crate) mod router_tests {
             assert_eq!(reply.status, StatusCode::OK, "{uri}");
             assert_eq!(&lined(&reply.json()), expected, "{uri}");
         }
-        // The areas a reverse answer lists after its address have no lines.
         let reply = send(
             router.clone(),
             request("GET", "/reverse?lon=-79.0&lat=51.0"),
@@ -4225,8 +3972,6 @@ pub(crate) mod router_tests {
         );
     }
 
-    /// One house and a café in a town, its region and its country, each an
-    /// area search knows by name.
     fn write_matched(writer: &mut Writer, areas: &Canada) {
         use crate::record::{PlaceLayer, PoiRecord};
         let context = within(&[
@@ -4290,7 +4035,6 @@ pub(crate) mod router_tests {
     }
 
     fn write_reverse_houses(writer: &mut Writer) {
-        // Three houses about 8 m apart along one street.
         for (id, number, lon) in [
             (801, "10", -79.0),
             (802, "12", -79.0001),
@@ -4389,8 +4133,6 @@ pub(crate) mod router_tests {
             }),
             source: SourceProvenance::osm(ObjectType::Way, id),
         };
-        // A street of many short stretches beside the point, and another a
-        // little further.
         let near = (0..8)
             .map(|step| [-79.0 + f64::from(step) * 0.00002, 59.00005])
             .collect();
@@ -4518,13 +4260,11 @@ pub(crate) mod router_tests {
                 &town_by_fields,
             ),
             ("/geocode?q=Toronto", &town),
-            // A street with a word the query leaves out is another street.
             ("/geocode?q=12%20Queen%20Street", &queen_in_part),
             (
                 "/geocode?q=10%20King%20Street%20West&country=CA",
                 &house(&[("country", "matched")]),
             ),
-            // A place is sought by name, a suggestion by what is typed.
             ("/places?q=Lantern%20Cafe,%20Toronto", &cafe),
             ("/places?ids=osm:node:605", &cafe),
             ("/autocomplete?q=10%20King%20St", &without("osm:node:601")),
@@ -4624,7 +4364,6 @@ pub(crate) mod router_tests {
                     Some(serde_json::json!([range(0, 7)])),
                 ),
             ),
-            // Found as a place of the kind typed, and marked all the same.
             (
                 "/autocomplete?q=cafe&focus=-79.4,53.0",
                 (
@@ -4637,8 +4376,6 @@ pub(crate) mod router_tests {
                 "/places?q=Lantern%20Cafe",
                 (serde_json::json!("Lantern Cafe, Toronto"), None),
             ),
-            // A search for a kind of place, as autocomplete reads it, finds
-            // the nearest place of that kind whatever its name.
             (
                 "/places?q=coffeehouse&focus=-79.4,53.0",
                 (serde_json::json!("Lantern Cafe, Toronto"), None),
@@ -4654,8 +4391,6 @@ pub(crate) mod router_tests {
         }
     }
 
-    /// A CSV comes back as it went, each row with `geocode batch`'s columns
-    /// holding its `GET` answer, and the job can be read again by its id.
     #[tokio::test]
     async fn jobs_stream_a_csv_back_with_each_rows_answer() {
         let jobs = TempDir::new("jobs-csv");
@@ -4707,7 +4442,6 @@ pub(crate) mod router_tests {
         assert_eq!(rows[1]["geocode_status"], "error");
         assert!(rows[1]["geocode_reason"].starts_with("invalid_query"));
         assert_eq!(rows[2]["geocode_status"], "unresolved");
-        // The repeat of row a is answered from it, alike.
         assert_eq!(rows[3]["geocode_lon"], rows[0]["geocode_lon"]);
 
         let status = send(router.clone(), request("GET", &location)).await.json();
@@ -4726,8 +4460,6 @@ pub(crate) mod router_tests {
         assert_eq!(again.body, reply.body);
     }
 
-    /// JSONL rows are batch items, answered as their `GET` is, each tagged
-    /// with its place in the upload.
     #[tokio::test]
     async fn jobs_answer_jsonl_rows_as_their_get() {
         let jobs = TempDir::new("jobs-jsonl");
@@ -4763,8 +4495,6 @@ pub(crate) mod router_tests {
         assert_eq!(lines[2]["error"]["error_code"], "malformed_body");
     }
 
-    /// `Prefer: respond-async` is answered once the upload is in, and the
-    /// results are read from the job.
     #[tokio::test]
     async fn jobs_answer_at_once_when_asked() {
         let jobs = TempDir::new("jobs-async");
@@ -4798,7 +4528,6 @@ pub(crate) mod router_tests {
         assert_eq!(gone.status, StatusCode::NOT_FOUND);
     }
 
-    /// What `/jobs` cannot read is refused before it starts.
     #[tokio::test]
     async fn jobs_refuse_what_they_cannot_read() {
         let jobs = TempDir::new("jobs-refused");
@@ -4863,8 +4592,6 @@ pub(crate) mod router_tests {
         }
     }
 
-    /// A finished job is still served after a restart, and one that was
-    /// running when the server stopped is failed, not left running forever.
     #[tokio::test]
     async fn jobs_outlive_a_restart() {
         let jobs = TempDir::new("jobs-restart");
@@ -4909,8 +4636,6 @@ pub(crate) mod router_tests {
         assert!(interrupted["error"].as_str().unwrap().contains("restarted"));
     }
 
-    /// Each item is answered as its own `GET` would be, a bad item fails
-    /// alone, ids are echoed and the query string scopes every item.
     #[tokio::test]
     async fn batch_answers_each_item_alone() {
         let jobs = TempDir::new("batch-items");
@@ -4956,8 +4681,6 @@ pub(crate) mod router_tests {
             "a Pack never calibrated rates no answer"
         );
 
-        // Fails as `GET` fails, with the batch's request id, and the batch
-        // goes on.
         assert_eq!(results[1]["id"], "row-2");
         assert_eq!(results[1]["status"], 400);
         assert_eq!(results[1]["error"]["error_code"], "invalid_query");
@@ -4971,7 +4694,6 @@ pub(crate) mod router_tests {
         assert_eq!(results[2]["status"], 200);
         assert_eq!(results[2]["response"]["features"], serde_json::json!([]));
 
-        // An id that is not a string is the item's error, and is not echoed.
         assert!(results[3].get("id").is_none());
         assert_eq!(results[3]["status"], 400);
         assert_eq!(results[3]["error"]["invalid_params"][0]["name"], "id");
@@ -4979,7 +4701,6 @@ pub(crate) mod router_tests {
         assert_eq!(results[4]["error"]["error_code"], "limit_too_large");
         assert_eq!(results[5]["error"]["invalid_params"][0]["name"], "address");
 
-        // A null is an absent field, so the shared postcode still applies.
         assert_eq!(results[6]["status"], 200);
         assert_eq!(
             results[6]["response"]["features"]
@@ -4995,8 +4716,6 @@ pub(crate) mod router_tests {
         );
     }
 
-    /// JSON keeps the last of two equal keys, but `GET` refuses a repeated
-    /// parameter, so the item is refused the same way.
     #[tokio::test]
     async fn batch_item_with_a_repeated_field_fails_as_get_does() {
         let jobs = TempDir::new("batch-repeated");
@@ -5023,8 +4742,6 @@ pub(crate) mod router_tests {
         assert_eq!(result["error"]["error_code"], get.json()["error_code"]);
     }
 
-    /// With every slot taken a batch is refused at once, told when to retry,
-    /// and single lookups still answer.
     #[tokio::test]
     async fn batch_is_refused_when_every_slot_is_taken() {
         let jobs = TempDir::new("batch-busy");
@@ -5083,7 +4800,6 @@ pub(crate) mod router_tests {
         let reply = send(router.clone(), batch_request("POST", "/geocode", full)).await;
         assert_eq!(reply.status, StatusCode::OK);
 
-        // Turned away on its declared length, before a byte is read.
         let mut declared = batch_request("POST", "/geocode", "[]");
         declared.headers_mut().insert(
             header::CONTENT_LENGTH,
@@ -5093,7 +4809,6 @@ pub(crate) mod router_tests {
         assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(error(&reply).as_deref(), Some("body_too_large"));
 
-        // And on what arrives, when no length is declared.
         let oversized = " ".repeat(limits.max_batch_body_bytes() + 1);
         for method in ["POST", "QUERY"] {
             let request = batch_request(method, "/geocode", oversized.clone());
@@ -5133,9 +4848,6 @@ pub(crate) mod router_tests {
         );
     }
 
-    /// QUERY reaches the batch, every answer of a batchable route says how
-    /// to batch, and the methods it does not take are a 405 that lists the
-    /// ones it does.
     #[tokio::test]
     async fn batchable_routes_take_query_and_post() {
         let jobs = TempDir::new("batch-methods");
@@ -5169,7 +4881,6 @@ pub(crate) mod router_tests {
                 Some("application/json")
             );
         }
-        // A Problem keeps the route's headers when the id is written in.
         let reply = send(router.clone(), request("GET", "/geocode?address=")).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert_eq!(
@@ -5193,7 +4904,6 @@ pub(crate) mod router_tests {
                 );
             }
         }
-        // A route without a batch still takes GET only.
         let reply = send(router.clone(), request("QUERY", "/autocomplete")).await;
         assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(header_value(&reply, "allow"), Some("GET"));
@@ -5210,8 +4920,6 @@ pub(crate) mod router_tests {
         api::forward_collection(&state.pack, query, Vec::new())
     }
 
-    /// A panic fails its item with a bare 500, logged with the item's place,
-    /// and the items around it are answered.
     #[tokio::test]
     async fn batch_item_panic_fails_only_that_item() {
         let jobs = TempDir::new("batch-panic");
@@ -5277,8 +4985,6 @@ pub(crate) mod router_tests {
         );
     }
 
-    /// `country` is parsed like `layer`: a value that cannot be a code is a
-    /// 400 rather than a filter that silently matches nothing.
     #[test]
     fn parses_the_country_filter() {
         let parse = |value: Option<&str>| {
@@ -5286,14 +4992,10 @@ pub(crate) mod router_tests {
             parse_countries(&param).map_err(|_| ())
         };
 
-        // No filter: absent, empty, or whitespace, as a form that always
-        // sends the key produces.
         assert_eq!(parse(None), Ok(Vec::new()));
         assert_eq!(parse(Some("")), Ok(Vec::new()));
         assert_eq!(parse(Some("  ")), Ok(Vec::new()));
 
-        // Upper-cased, trimmed, comma-separated, and de-duplicated so a
-        // repeated code does not repeat a clause.
         assert_eq!(parse(Some("nz")), Ok(vec!["NZ".to_string()]));
         assert_eq!(
             parse(Some(" nz , AU ")),
@@ -5307,9 +5009,6 @@ pub(crate) mod router_tests {
         }
     }
 
-    /// A lookup past the lookup timeout stops at its next check and answers
-    /// 503 `timeout`, with no `Retry-After`: the same lookup takes as long
-    /// the next time.
     #[tokio::test]
     async fn a_lookup_past_its_timeout_stops_with_a_503() {
         let jobs = TempDir::new("lookup-timeout");
@@ -5339,8 +5038,6 @@ pub(crate) mod router_tests {
         assert!(header_value(&reply, "retry-after").is_none());
     }
 
-    /// With every lookup slot taken a single lookup is refused at once with
-    /// 503 `busy` and a `Retry-After`, and answers again once a slot frees.
     #[tokio::test]
     async fn a_lookup_is_refused_while_every_lookup_slot_is_taken() {
         let jobs = TempDir::new("lookup-busy");
@@ -5380,8 +5077,6 @@ pub(crate) mod router_tests {
         api::forward_collection(&state.pack, query, Vec::new())
     }
 
-    /// An item past the lookup timeout fails alone with 503 `timeout`, and
-    /// the items around it are answered.
     #[tokio::test]
     async fn a_batch_item_past_its_timeout_fails_alone() {
         let jobs = TempDir::new("batch-timeout");
@@ -5419,8 +5114,6 @@ pub(crate) mod router_tests {
         assert_eq!(body["summary"]["failed"], 1);
     }
 
-    /// A job reads at most the server's row cap, then fails naming it, with
-    /// the rows it read answered.
     #[tokio::test]
     async fn a_job_stops_reading_at_the_row_cap() {
         let jobs = TempDir::new("jobs-row-cap");
@@ -5443,8 +5136,6 @@ pub(crate) mod router_tests {
         );
     }
 
-    /// An upload declared over the server's upload limit is refused before
-    /// a byte of it is read.
     #[tokio::test]
     async fn a_job_upload_over_the_limit_is_refused() {
         let jobs = TempDir::new("jobs-upload-cap");
@@ -5461,12 +5152,9 @@ pub(crate) mod router_tests {
         assert_eq!(reply.json()["error_code"], "body_too_large");
     }
 
-    /// While the results kept fill the job store, a new job is refused with
-    /// 503 `busy`, and the kept ones are still served.
     #[tokio::test]
     async fn a_full_job_store_refuses_new_jobs() {
         let jobs = TempDir::new("jobs-store-full");
-        // Sparse: the store counts the length, and the disk holds none of it.
         std::fs::File::create(jobs.join("kept.results"))
             .expect("results")
             .set_len(1 << 30)
@@ -5501,8 +5189,6 @@ pub(crate) mod router_tests {
         assert_eq!(kept.status, StatusCode::OK);
     }
 
-    /// `/openapi.json` states the batch item cap this server was started
-    /// with.
     #[tokio::test]
     async fn the_served_spec_states_the_servers_limits() {
         let jobs = TempDir::new("spec-limits");
@@ -5539,8 +5225,6 @@ pub(crate) mod router_tests {
         Ok((status, body.to_string()))
     }
 
-    /// `/slow` answers after a while and `/hang` never does; `started` is
-    /// told when either is entered.
     fn drain_app(state: AppState, started: Arc<tokio::sync::Notify>) -> Router {
         use axum::routing::get;
         let on_slow = Arc::clone(&started);
@@ -5648,7 +5332,6 @@ pub(crate) mod router_tests {
             Duration::from_secs(30),
         ));
 
-        // Past the 64 KiB the reader sniffs before it answers, then held open.
         let (upload, location) = task::spawn_blocking(move || {
             use std::io::{Read, Write};
             let rows = format!("street\n{}", "10 King Street\n".repeat(6000));
@@ -5679,8 +5362,6 @@ pub(crate) mod router_tests {
         .await
         .expect("upload");
         let status = || async { send(router.clone(), request("GET", &location)).await.json() };
-        // The reader answers whole windows of 256 rows and then waits for the
-        // rest of the next one, so 23 windows in it is parked on the upload.
         let answered = 23 * 256;
         let mut running = status().await;
         for _ in 0..1000 {
@@ -5719,7 +5400,6 @@ pub(crate) mod router_tests {
         drop(upload);
     }
 
-    /// How a text parameter is sent in one cell of the matrix below.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum Sent {
         Missing,
@@ -5729,7 +5409,6 @@ pub(crate) mod router_tests {
 
     type Sents = BTreeMap<&'static str, Sent>;
 
-    /// What one combination of sent parameters must give.
     #[derive(Debug, PartialEq)]
     enum Expect {
         Answer,
@@ -5748,26 +5427,17 @@ pub(crate) mod router_tests {
         detail: "q must not be empty",
     };
 
-    /// One endpoint's text parameters and the rules they answer by.
     struct Rules {
         route: &'static str,
-        /// Every field of the endpoint's params struct, as serde reads it.
         fields: &'static [&'static str],
-        /// The parameters that are not text, and the values they keep.
         fixed: &'static [(&'static str, &'static str)],
-        /// A valid value for every text parameter.
         filled: &'static [(&'static str, &'static str)],
         outcome_classes: &'static [&'static [&'static str]],
-        /// Where it answers, these sent empty answer as if not sent.
         empty_is_missing: &'static [&'static str],
-        /// Takes a `QUERY` batch, whose items each answer as their `GET`.
         batchable: bool,
         expect: fn(&Sents) -> Expect,
     }
 
-    /// The names of a params struct's fields, as serde's derive lists them to
-    /// a deserializer, so a parameter added to the struct joins the matrix
-    /// without being named in it.
     fn field_names<P: serde::de::DeserializeOwned>() -> &'static [&'static str] {
         use serde::de::{Error as _, Visitor, value::Error};
 
@@ -5909,9 +5579,6 @@ pub(crate) mod router_tests {
         ]
     }
 
-    /// Every text parameter of every endpoint missing, empty and filled,
-    /// against the rules: empty, missing and a value are three states, and
-    /// each endpoint says what each means.
     #[tokio::test]
     async fn every_text_parameter_missing_empty_or_filled_answers_by_the_rules() {
         let jobs = TempDir::new("param-matrix");
@@ -6037,8 +5704,6 @@ pub(crate) mod router_tests {
                 match (rules.expect)(&sent) {
                     Expect::Answer => {
                         assert_eq!(reply.status, StatusCode::OK, "{uri}: {body}");
-                        // Cells run with fewer parameters sent first, so this
-                        // one's twin without its empty ones has answered.
                         let mut without_empty = sent.clone();
                         for (name, state) in &mut without_empty {
                             if *state == Sent::Empty && rules.empty_is_missing.contains(name) {
@@ -6064,8 +5729,6 @@ pub(crate) mod router_tests {
         }
     }
 
-    /// `ids` holds at most the server's batch item limit, in `GET` and in
-    /// each batch item alike.
     #[tokio::test]
     async fn ids_past_the_limit_are_refused_however_many() {
         let jobs = TempDir::new("param-ids");
@@ -6105,8 +5768,6 @@ pub(crate) mod router_tests {
             results[1]["error"]["invalid_params"][0]["reason"],
             "at most 7 ids"
         );
-        // Past what a URI holds, so through the parser itself: a malformed id
-        // past the limit is never read.
         let huge = format!("{}not-an-id", "osm:node:1,".repeat(1_000_000));
         let refused = place_ids(&huge, 7).unwrap_err();
         assert_eq!(refused.error_code().as_str(), "limit_too_large");
@@ -6164,7 +5825,6 @@ pub(crate) mod router_tests {
             plain.body
         );
 
-        // Too small to be worth the frame.
         let tiny = send(
             router,
             with_headers("GET", "/healthz", &[("accept-encoding", "gzip")]),
@@ -6173,8 +5833,6 @@ pub(crate) mod router_tests {
         assert!(tiny.headers.get(header::CONTENT_ENCODING).is_none());
     }
 
-    /// Compression must not hold a job's rows back until the upload ends, nor
-    /// panic on the end of the results stream.
     #[tokio::test]
     async fn compressed_jobs_still_stream_while_uploading() {
         use futures_util::{StreamExt, stream};
@@ -6198,8 +5856,6 @@ pub(crate) mod router_tests {
                 .header(header::ACCEPT_ENCODING, encoding)
                 .body(body)
                 .unwrap();
-            // Two windows of rows, so the first is answered while the upload
-            // is still open.
             let rows = 2 * 256;
             upload
                 .send("{\"lon\": -79.0, \"lat\": 43.0}\n".repeat(rows))

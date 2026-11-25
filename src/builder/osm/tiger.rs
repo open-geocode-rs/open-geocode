@@ -174,7 +174,6 @@ pub(super) fn counties_for_pack(path: &Path, cache: &Path) -> Result<BTreeSet<St
         shape_reader(bytes, NAME, MAX_COUNTY_ENTRY_BYTES, MAX_COUNTY_ENTRY_BYTES)
     })?;
     let mut counties = BTreeSet::new();
-    // Census county equivalents need no matching OSM administrative record.
     for row in source.iter_shapes_and_records_as::<shapefile::Polygon, dbase::Record>() {
         let (shape, row) = row.map_err(|error| bad(error.to_string()))?;
         let code = dbf_text(&row, "GEOID")

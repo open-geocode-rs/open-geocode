@@ -1,20 +1,3 @@
-//! Enclosing areas: every area of the Pack a record lies in, with the OSM tags
-//! that say what kind of area each is.
-//!
-//! A record's context keeps one area per tier, so a `place=city` contour and an
-//! `admin_level=8` district that claim the locality tier show only the winner.
-//! The lists belong to context tuples, which [`crate::context`] interns by
-//! chain and list together.
-//!
-//! ```text
-//! context/enclosing  tuple_count, then per context tuple, by tuple id:
-//!                      len, then len x record_id; smallest area first, a
-//!                      derived country last
-//!                    area_count, then per area with a tag, by ascending
-//!                    record_id: record_id, admin_level, boundary, place
-//!                    every number a varint, every tag an optional string
-//! ```
-
 use std::collections::BTreeMap;
 
 use serde::Serialize;
@@ -30,8 +13,6 @@ use crate::{
 pub(crate) const SECTION: &str = "context/enclosing";
 const VERSION: u32 = 1;
 
-/// The `admin_level`, `boundary` and `place` tags of an area, as OSM writes
-/// them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AreaTags {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,16 +74,11 @@ pub(crate) fn write(
 #[derive(Debug, Clone)]
 pub(crate) struct Reader {
     bytes: Bytes,
-    /// Byte offset of each tuple's list; lists vary in length.
     lists: Vec<usize>,
-    /// Record id and byte offset of the tags of each tagged area, by record id.
     tags: Vec<(RecordId, usize)>,
 }
 
 impl Reader {
-    /// `None` for a Pack built before the section existed. Everything that
-    /// can be wrong with it is refused here, so a lookup indexes nothing
-    /// unchecked.
     pub(crate) fn open(container: &Container, tuples: u64, records: u64) -> Result<Option<Self>> {
         if !container.sections().contains_key(SECTION) {
             return Ok(None);
@@ -111,8 +87,6 @@ impl Reader {
         let corrupt = |detail: String| Error::Inconsistent(format!("{SECTION} {detail}"));
         let mut input: &[u8] = &bytes;
         let offset = |input: &[u8]| bytes.len() - input.len();
-        // Every entry takes a byte at least, so a count past the bytes left
-        // is refused before anything is allocated.
         let counted = |input: &mut &[u8], what: &str| -> Result<usize> {
             let count = get_u64(input)?;
             usize::try_from(count)
@@ -202,7 +176,6 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
 
-    /// A Pack file holding what `add` puts in it, opened as a Pack opens it.
     fn open(
         add: impl FnOnce(&mut Writer) -> Result<()>,
         tuples: u64,
@@ -242,7 +215,6 @@ mod tests {
 
     #[test]
     fn a_damaged_section_is_refused_with_what_is_wrong() {
-        // Two lists, (1, 2) and (3), then area 3 with admin_level "8".
         let good = [2, 2, 1, 2, 1, 3, 1, 3, 1, 1, b'8', 0, 0];
         let padded = [&good[..], &[0]].concat();
         let cases: [(&[u8], [u64; 2], &str); 5] = [

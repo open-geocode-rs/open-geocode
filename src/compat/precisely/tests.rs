@@ -1,5 +1,3 @@
-//! `/compat/precisely` driven through og's router on a small Pack.
-
 use std::{collections::BTreeSet, path::Path, sync::LazyLock};
 
 use axum::{
@@ -57,10 +55,6 @@ impl Fixture {
     }
 }
 
-/// Canada > Ontario > Toronto, with every area tier a Precisely address has
-/// a slot for, and an address, a bakery and a numbered range in it.
-/// The vendor id og issues for an address of the fixture: its og id, its
-/// layer and its label, since the catalogue holds no address.
 fn address_vendor_id(og_id: &str) -> String {
     let label = match og_id {
         "osm:node:10" => "100 King Street West, Unit 5, ON, M5X 1A9",
@@ -211,7 +205,6 @@ fn write_pack(dir: &Path) {
         )
         .expect("postcode");
     writer.finish().expect("finish");
-    // Calibrated, so answers carry the confidence `score` is made from.
     let pack = crate::pack::Reader::open(dir).expect("pack");
     Model::new([0.1; FEATURES], Default::default())
         .save(&pack)
@@ -272,15 +265,12 @@ fn errors(status: &str, message: &str) -> Value {
     json!({"errors": [{"status": status, "errorMessage": message}]})
 }
 
-/// og's own answer for the same lookup.
 async fn native(router: &Router, path: &str) -> Value {
     let reply = get(router, path).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     reply.json()
 }
 
-/// The Precisely route a result came back through, which decides where its
-/// distance goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
     Geocode,
@@ -289,8 +279,6 @@ enum Route {
     Autocomplete,
 }
 
-/// The og values a Precisely result carries. Each one og gave is named in
-/// `seen`, so a test can tell that every slot was reached.
 fn assert_carries(
     route: Route,
     feature: &Value,
@@ -325,8 +313,6 @@ fn assert_carries(
         result["location"]["explanation"]["additionalMetadata"]["SOURCE"],
         properties["source"]["dataset"]
     );
-    // With no address asked there is nothing to score, and Precisely
-    // writes 0.
     match (route, properties["confidence"].as_f64()) {
         (Route::Reverse | Route::Lookup, _) => assert_eq!(result["score"], 0, "{result}"),
         (_, Some(confidence)) => {
@@ -345,7 +331,6 @@ fn assert_carries(
     let judged = &properties["match"];
     slot("match", judged);
     let description = &result["explanation"]["addressMatch"]["description"];
-    // Lookup keys establish postal parts that a point does not.
     if matches!(route, Route::Reverse | Route::Lookup) {
         let address = &result["address"];
         let held = |held: bool| if held { "EXACT" } else { "NONE" };
@@ -387,8 +372,6 @@ fn assert_carries(
             )
         }
     };
-    // An autocomplete asked with no origin measures from nowhere, and
-    // Precisely writes 0.
     let distance = match (route, distance) {
         (Route::Autocomplete, Value::Null) => &json!(0.0),
         _ => distance,
@@ -442,8 +425,6 @@ fn assert_carries(
     for (og, precisely) in pairs {
         assert_eq!(og, precisely, "{feature} as {result}");
     }
-    // The region's own code is its short name; the region the record states
-    // stands in when og knows no code.
     let short = region["code"]
         .as_str()
         .and_then(|code| code.split_once('-'))
@@ -453,8 +434,6 @@ fn assert_carries(
         carried["admin1"]["shortName"], short,
         "{feature} as {result}"
     );
-    // The country's code, which a region's ISO 3166-2 code starts with when
-    // og names no country.
     let code = country["code"]
         .as_str()
         .or_else(|| {
@@ -475,8 +454,6 @@ fn assert_carries(
     );
 }
 
-/// The address result, `exact` the parts og matched, every other part
-/// Precisely lists `NONE`, in Precisely's order.
 fn address_result(score: &Value, exact: &[&str]) -> Value {
     let description = [
         "placeName",
@@ -495,7 +472,6 @@ fn address_result(score: &Value, exact: &[&str]) -> Value {
     ]
     .iter()
     .map(|label| {
-        // The street is asked whole, so its type and direction agree too.
         let street_part =
             matches!(*label, "streetType" | "streetDirectional") && exact.contains(&"street");
         let kind = if exact.contains(label) || street_part {
@@ -549,17 +525,11 @@ fn address_result(score: &Value, exact: &[&str]) -> Value {
     })
 }
 
-/// A result to a request whose `clientLocale` is `en_US`, which restates
-/// the language.
 fn in_english(mut result: Value) -> Value {
     result["customFields"]["LANGUAGE"] = json!("en");
     result
 }
 
-/// The custom fields that restate the King Street West address's parts,
-/// with `fields` besides. Outside the US og writes the street's type as
-/// the address writes it, and its one name for a town as each of the
-/// town's names.
 fn restated(mut fields: Value) -> Value {
     let parts = json!({
         "ADDRLINE_SHORT": "100 King Street West, Unit 5",
@@ -578,8 +548,6 @@ fn restated(mut fields: Value) -> Value {
     fields
 }
 
-/// The street's type and direction are judged apart from its name. Each
-/// agrees, neither stating one included, or not.
 #[tokio::test]
 async fn geocode_judges_a_streets_type_and_direction_apart() {
     let fixture = Fixture::new("street-parts");
@@ -716,7 +684,6 @@ async fn every_og_value_lands_in_its_precisely_slot() {
     for (feature, result) in features.iter().zip(results.as_array().expect("results")) {
         assert_carries(Route::Geocode, feature, result, &mut seen);
     }
-    // A range with no number asked is placed on its street, not at a house.
     assert_eq!(
         [
             &results[0]["location"]["explanation"]["type"],
@@ -738,14 +705,10 @@ async fn every_og_value_lands_in_its_precisely_slot() {
     .await;
     let results = reply.json()["responses"][0]["results"].clone();
     let results = results.as_array().expect("results");
-    // The house is a few metres off the asked point, so a distance lost or
-    // zeroed shows.
     assert!(
         features[0]["properties"]["distance_m"].as_f64() > Some(1.0),
         "{og}"
     );
-    // The fixture's areas below the region name no country, so the asked
-    // country keeps the house, the region and the country.
     assert_eq!(results.len(), 3, "{og}");
     for result in results {
         let key = result["customFields"]["PB_KEY"].as_str().expect("PB_KEY");
@@ -809,7 +772,6 @@ async fn a_poi_says_what_it_is_and_where() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::OK);
-    // The typed name marks the place's name whole, and no other part.
     let typed = [
         "placeName",
         "addressNumber",
@@ -855,8 +817,6 @@ async fn a_poi_says_what_it_is_and_where() {
             },
             "addressLines": ["120 King Street West", "Toronto, ON M5X 1A9", "Canada"],
             "explanation": {"addressMatch": {"type": "POI", "description": typed}},
-            // A place has no number of its own to start a range, and with
-            // no `originXY` the distance is negative zero.
             "customFields": {
                 "PB_KEY": encode_parts("osm:way:11", Some(Layer::Poi), ""),
                 "FORMATTED_STRING": "Queen Bakery, 120 King Street West, Toronto, ON, M5X 1A9",
@@ -1025,7 +985,6 @@ async fn reverse_geocode_answers_each_point() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::PARTIAL_CONTENT);
-    // Reverse can confirm a street segment without confirming a house number or postcode.
     let mut expected = address_result(&json!(0), &[]);
     let exact = [
         "admin1",
@@ -1043,8 +1002,6 @@ async fn reverse_geocode_answers_each_point() {
         .map(|label| json!({"label": label, "matchType": if exact.contains(label) { "EXACT" } else { "NONE" }}))
         .collect::<Vec<_>>()
     );
-    // No address was asked, and the point is the one asked, so the answer
-    // names no kind of match and restates no geohash.
     let fields = expected["customFields"].as_object_mut().expect("an object");
     fields.remove("MATCH_TYPE");
     fields.remove("GEOHASH");
@@ -1061,8 +1018,6 @@ async fn reverse_geocode_answers_each_point() {
             {"addressId": "d", "status": "ZERO_RESULTS", "results": []},
         ]})
     );
-    // Past the search radius is no house or street. An area holds the
-    // point, so it is within any radius.
     let near = post(
         &router,
         "/v1/reverse-geocode",
@@ -1079,8 +1034,6 @@ async fn reverse_geocode_answers_each_point() {
         .collect::<Vec<_>>();
     assert_eq!(kinds, [json!("ADMIN")], "{near}");
 
-    // The house 55 m off is found within the documented 150 m, past og's
-    // own default reach, and not within Precisely's default 5 m.
     let far = |preferences: Value| {
         let router = router.clone();
         async move {
@@ -1125,7 +1078,6 @@ async fn lookup_finds_a_record_by_the_pb_key_og_issued() {
         &mut BTreeSet::new(),
     );
 
-    // The key of an address, which the catalogue does not hold, finds it.
     let reply = post(
         &router,
         "/v1/lookup",
@@ -1240,7 +1192,6 @@ async fn an_unknown_path_or_method_is_not_found() {
     }
 }
 
-/// Upload a CSV the way Precisely's flow does, returning its file id.
 async fn upload(router: &Router, csv: &str) -> String {
     let reply = post(router, "/v2/files/upload-url", &json!({"fileName": "test"})).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
@@ -1320,8 +1271,6 @@ async fn a_bulk_job_runs_on_og_jobs_and_downloads_as_precisely_csv() {
     .await;
     let body = reply.json();
     let file_id = body["fileId"].as_str().expect("fileId");
-    // A forwarded host is a header any client can send, so the URL takes
-    // the host the client connected with.
     assert_eq!(
         body,
         json!({
@@ -1367,8 +1316,6 @@ async fn a_bulk_job_runs_on_og_jobs_and_downloads_as_precisely_csv() {
         status_url,
         format!("http://localhost/compat/precisely/v2/bulk/jobs/{job_id}")
     );
-    // Precisely writes a job id as a hyphenated UUID; og's own is the same
-    // UUID without hyphens.
     let og_id = uuid::Uuid::try_parse(&job_id)
         .expect("a UUID")
         .simple()
@@ -1785,8 +1732,6 @@ fn a_country_is_read_as_any_iso_code() {
     }
 }
 
-/// The standardized result verify gives for 100 King Street West, with
-/// the score og's confidence makes.
 fn verified_result(score: &Value, stated: &[&str], codes: [&str; 2]) -> Value {
     let description =
         address_result(score, stated)["explanation"]["addressMatch"]["description"].clone();
@@ -1810,7 +1755,6 @@ fn verified_result(score: &Value, stated: &[&str], codes: [&str; 2]) -> Value {
         },
         "addressLines": ["Unit 5", "100 King Street West", "Toronto, ON M5X 1A9", "Canada"],
         "explanation": {"addressMatch": {"type": "ADDRESS", "description": description}},
-        // Verify places nothing, so it restates no geohash.
         "customFields": restated(json!({
             "PB_KEY": address_vendor_id("osm:node:10"),
             "MATCH_TYPE": "ADDRESS",
@@ -1866,7 +1810,6 @@ async fn verify_answers_the_matched_address_standardized_without_a_point() {
         ]})
     );
 
-    // The code verify gives reads back through explain-addresscode.
     let explained = post(
         &router,
         "/v1/explain-addresscode",
@@ -1983,7 +1926,6 @@ async fn explain_answers_each_code_it_cannot_read() {
         )
     );
 
-    // A code type og issues none of is answered, item by item.
     let reply =
         explain(json!({"codeType": "ForwardResultCode", "codes": [{"code": "S8HPNTSCZA"}]})).await;
     assert_eq!(reply.status, StatusCode::PARTIAL_CONTENT);
@@ -2135,7 +2077,6 @@ async fn postal_city_completes_a_postcode_with_its_town() {
         "location": {"feature": {"type": "Feature", "properties": {"crsName": "epsg:4326"},
             "geometry": {"type": "Point", "coordinates": [-79.3815, 43.6492]}}},
     });
-    // With no type named, text with a digit is a postcode.
     for address in [
         json!({"type": "POSTAL", "postAddress": "M5X", "country": "CAN"}),
         json!({"postAddress": "m5x 1", "country": "CA"}),
@@ -2309,7 +2250,6 @@ async fn express_autocomplete_v2_filters_and_biases_by_city_and_postcode() {
     }
 }
 
-/// Files asked for within one second list in the order they were asked for.
 #[tokio::test]
 async fn files_list_in_the_order_they_were_uploaded() {
     let fixture = Fixture::new("file-order");
@@ -2327,7 +2267,6 @@ async fn files_list_in_the_order_they_were_uploaded() {
     assert_eq!(listed, ids);
 }
 
-/// How a result found by a query describes the parts og judged.
 fn assert_judged(
     route: Route,
     feature: &Value,
@@ -2335,7 +2274,6 @@ fn assert_judged(
     judged: &Value,
     description: &Value,
 ) {
-    // Autocomplete judges no part; it says which the typed text marked.
     if judged.is_null() && route != Route::Autocomplete {
         assert_eq!(description, &Value::Null, "{feature} as {result}");
     }

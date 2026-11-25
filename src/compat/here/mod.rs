@@ -1,13 +1,3 @@
-//! `/compat/here`, HERE Geocoding and Search v7 and Batch v7.
-//!
-//! HERE serves each endpoint from a host of its own
-//! (`geocode.search.hereapi.com/v1/geocode`,
-//! `batch.search.hereapi.com/v7/batch/jobs`). og serves them all under this
-//! one prefix by path, so a client points every service's base URL here.
-//!
-//! A batch job runs as og `/jobs` jobs, one per start, each listed at
-//! `/jobs/{id}` as any other.
-
 mod batch;
 pub(crate) use batch::sweep;
 mod category;
@@ -122,7 +112,6 @@ impl<S: Send + Sync> FromRequestParts<S> for Rid {
     }
 }
 
-/// A Geocoding and Search error, as HERE's `ErrorResponse` and its status.
 #[derive(Debug)]
 pub(super) struct Gs7Error {
     status: StatusCode,
@@ -143,8 +132,6 @@ impl Gs7Error {
         }
     }
 
-    /// HERE's 400 for a parameter, its name in the title and the value sent
-    /// in the cause, as HERE's own validation errors read.
     fn illegal(param: &str, value: &str, action: impl Into<String>) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
@@ -164,8 +151,6 @@ impl Gs7Error {
         self
     }
 
-    /// og's refusal in HERE's shape. og names its own parameters; the title
-    /// names the HERE parameter that became it.
     fn of(problem: Problem) -> Self {
         let param = problem
             .invalid_params()
@@ -181,8 +166,6 @@ impl Gs7Error {
         error
     }
 
-    /// The parts of og's Problem that HERE's body has room for, so a
-    /// Problem read back from a job's results maps as a live one does.
     fn of_parts(
         status: u16,
         og_param: Option<&str>,
@@ -227,8 +210,6 @@ impl Gs7Error {
         body
     }
 
-    /// The body as text, its fields in the order HERE writes them, for a
-    /// batch error line, which quotes it.
     fn body_text(&self, request_id: &str) -> String {
         #[derive(serde::Serialize)]
         #[serde(rename_all = "camelCase")]
@@ -265,7 +246,6 @@ impl Gs7Error {
     }
 }
 
-/// The HERE parameter an og one was translated from.
 fn here_param(og: &str) -> &str {
     match og {
         "q" => "q",
@@ -278,7 +258,6 @@ fn here_param(og: &str) -> &str {
     }
 }
 
-/// A route's answer, or its HERE error.
 fn respond<T: serde::Serialize>(request_id: &str, answer: Result<T, Gs7Error>) -> Response {
     match answer {
         Ok(answer) => axum::Json(answer).into_response(),
@@ -332,7 +311,6 @@ impl Params {
             .map(|(_, value)| value.as_str())
     }
 
-    /// `limit`, checked against HERE's own bounds for the endpoint.
     fn limit(&self, default: usize, max: usize) -> Result<usize, Gs7Error> {
         self.int("limit", 1, max)
             .map(|limit| limit.unwrap_or(default))
@@ -357,7 +335,6 @@ impl Params {
             })
     }
 
-    /// `types`, each value one the endpoint lists.
     fn types(&self, allowed: &[&str]) -> Result<Option<Vec<String>>, Gs7Error> {
         let Some(value) = self.get("types") else {
             return Ok(None);
@@ -391,7 +368,6 @@ const GEOCODE_SHOW: [&str; 6] = [
 ];
 const REVGEOCODE_SHOW: [&str; 4] = ["countryInfo", "postalCodeDetails", "streetInfo", "tz"];
 
-/// `show`, each value one the endpoint lists, as HERE refuses any other.
 fn check_show(value: Option<&str>, listed: &[&str]) -> Result<(), Gs7Error> {
     let Some(value) = value else {
         return Ok(());
@@ -416,7 +392,6 @@ fn supported(unknown: &str, allowed: &[&str]) -> String {
     format!("Unsupported value: '{unknown}'. Supported values: {allowed}")
 }
 
-/// A point, which HERE writes as `{latitude},{longitude}`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct LatLng {
     lat: f64,
@@ -435,26 +410,18 @@ impl LatLng {
         Ok(Self { lat, lng })
     }
 
-    /// og's `focus` form, `lon,lat`.
     fn og_point(self) -> String {
         format!("{},{}", self.lng, self.lat)
     }
 }
 
-/// The area `in` names.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Area {
-    /// ISO 3166-1 alpha-2 codes, as og's `country` takes them.
     Countries(Vec<&'static str>),
-    Circle {
-        center: LatLng,
-        radius_m: f64,
-    },
-    /// `west,south,east,north`, which is og's `bbox` order too.
+    Circle { center: LatLng, radius_m: f64 },
     Bbox([f64; 4]),
 }
 
-/// The members of HERE's `XEA` group, the European Union.
 const EU: [&str; 27] = [
     "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT", "LV",
     "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE",
@@ -532,7 +499,6 @@ impl Area {
     }
 }
 
-/// The `Content-Type` a body was sent as, without its parameters.
 fn media_type(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get(header::CONTENT_TYPE)?

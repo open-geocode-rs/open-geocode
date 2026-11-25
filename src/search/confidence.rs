@@ -1,24 +1,3 @@
-//! A calibrated confidence for each forward answer: how often an answer like
-//! it is the address its query asks for.
-//!
-//! A `score` orders the answers of one response and says nothing across
-//! responses. `confidence` is a probability: of the answers given 0.8, about
-//! eight in ten are right. It is read off [`Features`], what search knows of
-//! an answer when it gives it, by a logistic model per country that
-//! `geocode calibrate` fits to perturbed held-out addresses (see
-//! [`crate::calibration`]). A Pack without a fitted model gives no
-//! confidence at all rather than a made-up one.
-//!
-//! The model is a sidecar file beside the Pack file, not a Pack section. A
-//! published Pack is immutable and mapped by the servers reading it, and a
-//! planet Pack is too large to copy for a few hundred bytes; the model is fit
-//! after the build, from data the build never sees, and may be refit at
-//! will. The file names the Pack it was fit to by [`Container::fingerprint`],
-//! and a Pack refuses a model fit to another: a rebuilt Pack ranks
-//! differently, so its answers need their own fit.
-//!
-//! [`Container::fingerprint`]: crate::container::Container::fingerprint
-
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -34,37 +13,21 @@ use crate::{
     search::Pass,
 };
 
-/// The format of the sidecar file.
 pub const MODEL_VERSION: u32 = 1;
 
-/// What the sidecar of a Pack file `pack.ogp` is called: `pack.confidence.json`.
 const SIDECAR_EXTENSION: &str = "confidence.json";
 
-/// How strongly the pooled model is held toward no effect, per feature: a
-/// ridge, so a feature the data never varies, or one that separates the
-/// examples perfectly, keeps a finite weight. The bias is left free.
 const POOLED_RIDGE: f64 = 1.0;
 
-/// How strongly a country's model is held toward the pooled one, per
-/// feature. A country's weights move off the pooled ones only as far as its
-/// own examples outweigh this: at an even chance an example adds a quarter
-/// to the curvature, so a few dozen examples are needed to move a weight,
-/// and a country of a handful keeps the pooled model.
 const COUNTRY_PRIOR: f64 = 10.0;
 
-/// Newton steps at most, and the step below which a fit has converged.
 const MAX_NEWTON_STEPS: usize = 100;
 const CONVERGED_STEP: f64 = 1e-10;
 
-/// Words left out of the answer counted at most: past a few, more say
-/// little more.
 const MAX_DROPPED_WORDS: u8 = 4;
 
-/// How many inputs the model reads: [`FEATURE_NAMES`], the first the bias.
 pub const FEATURES: usize = 23;
 
-/// The model's inputs by name, as the sidecar lists them, so a model fit to
-/// another set of features is refused instead of misread.
 pub const FEATURE_NAMES: [&str; FEATURES] = [
     "bias",
     "pass_street",
@@ -91,56 +54,37 @@ pub const FEATURE_NAMES: [&str; FEATURES] = [
     "lower_rank",
 ];
 
-/// How an answer relates to a part of the query (see the glossary's
-/// agreement).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Agreement {
-    /// The query states no such part.
     #[default]
     Unstated,
     Agrees,
     Contradicts,
-    /// The query states it, and nothing says either way: the Pack does not
-    /// know the area, or knows nothing of where the answer is.
     Unknown,
 }
 
-/// What search knows of one answer when it gives it, the inputs of the
-/// model.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Features {
     /// The country the answer lies in, whose model rates it; `None` rates it
     /// with the pooled model.
     pub country: Option<CountryCode>,
-    /// The pass that found it.
     pub pass: Pass,
-    /// The typo tier it was found in: the edits a word may be from its
-    /// record's.
     pub edits: u8,
-    /// Whether it suggests a completion of a query still being typed.
     pub prefix: bool,
     pub accuracy: Option<Accuracy>,
     pub postcode: Agreement,
-    /// The stated localities.
     pub area: Agreement,
-    /// Whether the answer states the house number the query asks for, `None`
-    /// when it asks for none.
     pub number: Option<bool>,
-    /// The same of the unit.
     pub unit: Option<bool>,
-    /// See [`crate::record::AddressRecord::disputed`].
     pub disputed: bool,
-    /// The words of what the query seeks that the answer's label lacks.
     pub dropped_words: u8,
     /// How far its score stands above the next answer's, as a share of its
     /// own: 1 when no answer follows.
     pub margin: f32,
-    /// Whether another answer ranks above it.
     pub lower_rank: bool,
 }
 
 impl Features {
-    /// The model's inputs, in [`FEATURE_NAMES`] order.
     pub fn inputs(&self) -> [f64; FEATURES] {
         let flag = |value: bool| f64::from(u8::from(value));
         let agreement = |agreement: Agreement| {
@@ -183,7 +127,6 @@ impl Features {
     }
 }
 
-/// One answer of a calibration run, and whether it was right.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Example {
     pub features: Features,
@@ -192,19 +135,15 @@ pub struct Example {
 
 type Weights = [f64; FEATURES];
 
-/// Logistic weights over [`Features::inputs`]: one set pooled over every
-/// country, and one per country that had examples, shrunk toward it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     pooled: Weights,
     countries: BTreeMap<CountryCode, Weights>,
 }
 
-/// The sidecar file as written.
 #[derive(Debug, Serialize, Deserialize)]
 struct Stored {
     version: u32,
-    /// [`crate::container::Container::fingerprint`] of the Pack, in hex.
     pack: String,
     features: Vec<String>,
     pooled: Vec<f64>,
@@ -225,10 +164,6 @@ impl Model {
         sigmoid(dot(weights, &features.inputs())) as f32
     }
 
-    /// Fit the pooled model to every example, then each country's to its
-    /// own, held toward the pooled one by [`COUNTRY_PRIOR`]. A country with
-    /// few examples so stays near the pooled model, and one with many
-    /// follows its own.
     pub fn fit(examples: &[Example]) -> Self {
         let mut free = [POOLED_RIDGE; FEATURES];
         free[0] = 0.0;
@@ -250,12 +185,10 @@ impl Model {
         Self { pooled, countries }
     }
 
-    /// The countries with a model of their own.
     pub fn countries(&self) -> impl Iterator<Item = CountryCode> + '_ {
         self.countries.keys().copied()
     }
 
-    /// Where the model of the Pack file `pack_file` is kept.
     pub fn path(pack_file: &Path) -> PathBuf {
         pack_file.with_extension(SIDECAR_EXTENSION)
     }
@@ -356,11 +289,6 @@ fn sigmoid(value: f64) -> f64 {
     1.0 / (1.0 + (-value).exp())
 }
 
-/// Logistic regression by Newton's method, each weight held toward its
-/// `prior` with strength `strength`: the maximum of the log likelihood less
-/// `strength * (weight - prior)^2 / 2`, summed over the weights. With every
-/// strength positive but the bias's the problem is strictly concave, so the
-/// steps converge from the prior.
 fn fit_logistic<'a>(
     examples: &(impl Iterator<Item = &'a Example> + Clone),
     prior: &Weights,
@@ -372,8 +300,6 @@ fn fit_logistic<'a>(
         let mut hessian = [[0.0; FEATURES]; FEATURES];
         for (index, strength) in strength.iter().enumerate() {
             gradient[index] = strength * (weights[index] - prior[index]);
-            // Keeps the system solvable when no example moves a weight and
-            // nothing holds it.
             hessian[index][index] = strength + 1e-9;
         }
         for example in examples.clone() {
@@ -401,9 +327,6 @@ fn fit_logistic<'a>(
     weights
 }
 
-/// `x` with `matrix * x = vector`, by Gaussian elimination with partial
-/// pivoting. The matrix is a Hessian made positive definite above, so no
-/// pivot is zero.
 fn solve(mut matrix: [[f64; FEATURES]; FEATURES], mut vector: Weights) -> Weights {
     for column in 0..FEATURES {
         let pivot = (column..FEATURES)
@@ -442,7 +365,6 @@ fn solve(mut matrix: [[f64; FEATURES]; FEATURES], mut vector: Weights) -> Weight
 mod tests {
     use super::*;
 
-    /// SplitMix64, so the synthetic examples are the same on every run.
     struct Draws(u64);
 
     impl Draws {
@@ -455,8 +377,6 @@ mod tests {
         }
     }
 
-    /// Answers that are right more often the wider their margin and less
-    /// often after a typo, by a known logistic law.
     fn synthetic(count: usize, country: Option<CountryCode>, seed: u64) -> Vec<Example> {
         let mut draws = Draws(seed);
         (0..count)
@@ -520,7 +440,6 @@ mod tests {
         let ca = CountryCode::parse("CA");
         let nz = CountryCode::parse("NZ");
         let mut examples = synthetic(3_000, ca, 1);
-        // Five New Zealand answers, all right whatever their margin.
         examples.extend((0..5).map(|index| Example {
             features: Features {
                 country: nz,

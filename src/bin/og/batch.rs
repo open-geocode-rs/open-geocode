@@ -1,12 +1,3 @@
-//! The batch geocoding flow: a file of addresses is read, the columns that
-//! make up the address are picked, and the file is geocoded by the engine's
-//! batch run, the same `open-geocode geocode batch` does, into a new file
-//! beside it. Text pasted into the batch tab is read the same way.
-//!
-//! A row's address is its picked cells joined in file order into one line,
-//! which the engine's parser reads like any query: there is no telling it
-//! which cell is the street or the postcode.
-
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fs,
@@ -30,13 +21,9 @@ use open_geocode::{
 
 use crate::engine::{Hit, name_of};
 
-/// Rows of the file shown, and geocoded, before the run starts.
 pub(crate) const PREVIEW_ROWS: usize = 3;
-/// Rows the running screen lists, newest first.
 const LATEST_ROWS: usize = 8;
 
-/// Words of a header that name part of an address, in the languages
-/// address files come in, and the codes of common registers.
 const ADDRESS_WORDS: &[&str] = &[
     "address",
     "addr",
@@ -111,8 +98,6 @@ const ADDRESS_WORDS: &[&str] = &[
     "q",
 ];
 
-/// Words of a header that name something else, which wins over the above:
-/// identifiers, coordinates, dates and flags.
 const OTHER_WORDS: &[&str] = &[
     "id",
     "uuid",
@@ -145,7 +130,6 @@ const OTHER_WORDS: &[&str] = &[
     "url",
 ];
 
-/// The words of a header: `ADR_NUMBER` is `adr` and `number`.
 fn words(header: &str) -> Vec<String> {
     header
         .to_lowercase()
@@ -155,8 +139,6 @@ fn words(header: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether a header names part of an address. A municipality's or
-/// commune's name counts; its number does not.
 fn names_address(header: &str) -> bool {
     let words = words(header);
     let has = |list: &[&str]| words.iter().any(|word| list.contains(&word.as_str()));
@@ -177,9 +159,6 @@ fn is_number(cell: &str) -> bool {
     !cell.is_empty() && cell.parse::<f64>().is_ok()
 }
 
-/// Whether a first row names columns instead of holding data: some column
-/// is a number in the second row but not in the first, or a cell of the
-/// first row names part of an address.
 fn looks_like_header(first: &[String], second: Option<&Vec<String>>) -> bool {
     let typed = second.is_some_and(|second| {
         first
@@ -190,9 +169,6 @@ fn looks_like_header(first: &[String], second: Option<&Vec<String>>) -> bool {
     typed || first.iter().any(|cell| names_address(cell))
 }
 
-/// The columns that make up the address, for columns named `headers`: those
-/// whose name says so, or all of them when no name does, as in a file
-/// without a header row.
 fn address_columns(headers: &[String]) -> Vec<bool> {
     let used: Vec<bool> = headers.iter().map(|header| names_address(header)).collect();
     if used.contains(&true) {
@@ -202,8 +178,6 @@ fn address_columns(headers: &[String]) -> Vec<bool> {
     }
 }
 
-/// The address of a row: the cells of the `used` columns with their
-/// whitespace collapsed, in file order, joined as the run joins them.
 fn address(used: &[bool], row: &[String]) -> String {
     used.iter()
         .zip(row)
@@ -214,9 +188,6 @@ fn address(used: &[bool], row: &[String]) -> String {
         .join(", ")
 }
 
-/// Reads pasted text as a file would be read: a first row that names its
-/// columns picks the address columns, and every other row is one address.
-/// Returns the addresses and a short note on how they were read.
 pub(crate) fn pasted_addresses(text: &str) -> (Vec<String>, String) {
     let records: Vec<Vec<String>> = csv::ReaderBuilder::new()
         .has_headers(false)
@@ -265,20 +236,13 @@ pub(crate) struct BatchFile {
     pub bytes: u64,
     pub headers: Vec<String>,
     pub header_found: bool,
-    /// Rows of data, the header row not counted, as far as the count got.
     rows: Arc<AtomicU64>,
-    /// Whether the count reached the end of the file.
     counted: Arc<AtomicBool>,
-    /// Set to stop the count when the file is let go of.
     stop: Arc<AtomicBool>,
-    /// The first rows of data.
     sample: Vec<Vec<String>>,
 }
 
 impl BatchFile {
-    /// Reads a delimited file's header and first rows, and starts counting
-    /// its rows in the background. None when the path is no file with at
-    /// least one row.
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
         let meta = path.metadata().ok()?;
         if !meta.is_file() {
@@ -348,17 +312,14 @@ impl BatchFile {
         })
     }
 
-    /// Rows of data counted so far.
     pub(crate) fn rows(&self) -> u64 {
         self.rows.load(Ordering::Relaxed)
     }
 
-    /// Whether [`Self::rows`] is the whole file.
     pub(crate) fn counted(&self) -> bool {
         self.counted.load(Ordering::Relaxed)
     }
 
-    /// The first rows, each with one cell per header.
     pub(crate) fn sample(&self) -> Vec<Vec<String>> {
         self.sample
             .iter()
@@ -370,15 +331,12 @@ impl BatchFile {
             .collect()
     }
 
-    /// The file name without its extension.
     pub(crate) fn stem(&self) -> &str {
         self.name
             .rsplit_once('.')
             .map_or(&self.name, |(stem, _)| stem)
     }
 
-    /// Where a run writes: `<stem>.geocoded.csv` beside the file, numbered
-    /// when that name is taken, so nothing is written over.
     fn output_path(&self) -> PathBuf {
         let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
         let mut path = dir.join(format!("{}.geocoded.csv", self.stem()));
@@ -391,31 +349,23 @@ impl BatchFile {
     }
 }
 
-/// The count stops with the file: a path typed over is not read to its end.
 impl Drop for BatchFile {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
     }
 }
 
-/// One row of the running screen.
 pub(crate) struct Latest {
     pub query: String,
     pub hit: Option<(String, f64, f64)>,
     pub millis: f64,
 }
 
-/// Sub-buckets per power of two of [`Latencies`]: each bucket is at most
-/// an eighth wider than its lower bound.
 const SUB_BUCKETS: u32 = 8;
-/// Bits of the slowest time [`Latencies`] tells apart, in microseconds:
-/// longer ones count as this long, about 19 hours.
 const LATENCY_BITS: u32 = 36;
 const LATENCY_BUCKETS: usize =
     (SUB_BUCKETS + (LATENCY_BITS - SUB_BUCKETS.ilog2()) * SUB_BUCKETS) as usize;
 
-/// How long rows took, in buckets of fixed bounds: memory that does not
-/// grow with the rows, and quantiles to within an eighth.
 pub(crate) struct Latencies {
     buckets: [AtomicU64; LATENCY_BUCKETS],
     slowest_micros: AtomicU64,
@@ -431,8 +381,6 @@ impl Default for Latencies {
 }
 
 impl Latencies {
-    /// The bucket of a time: one per microsecond below [`SUB_BUCKETS`],
-    /// then [`SUB_BUCKETS`] for each power of two.
     fn bucket(micros: u64) -> usize {
         let micros = micros.min((1 << LATENCY_BITS) - 1);
         if micros < u64::from(SUB_BUCKETS) {
@@ -444,7 +392,6 @@ impl Latencies {
         (SUB_BUCKETS + shift * SUB_BUCKETS) as usize + within as usize
     }
 
-    /// The smallest time in a bucket.
     fn lower(bucket: usize) -> u64 {
         let bucket = bucket as u64;
         let sub = u64::from(SUB_BUCKETS);
@@ -461,8 +408,6 @@ impl Latencies {
         self.slowest_micros.fetch_max(micros, Ordering::Relaxed);
     }
 
-    /// The time below which a share `q` of the rows took, in milliseconds:
-    /// the middle of its bucket.
     pub(crate) fn quantile(&self, q: f64) -> f64 {
         let counts: Vec<u64> = self
             .buckets
@@ -490,7 +435,6 @@ impl Latencies {
     }
 }
 
-/// What a run has done so far, shared with its thread.
 #[derive(Default)]
 pub(crate) struct RunStats {
     done: AtomicU64,
@@ -503,8 +447,6 @@ pub(crate) struct RunStats {
 impl Observer for RunStats {
     fn row(&self, row: &Row) {
         let millis = row.elapsed.as_secs_f64() * 1_000.0;
-        // A row is done before it is matched, so `matched` read before
-        // `done` is never more.
         self.done.fetch_add(1, Ordering::SeqCst);
         if let Some(feature) = row.feature {
             self.matched.fetch_add(1, Ordering::SeqCst);
@@ -533,7 +475,6 @@ impl Observer for RunStats {
 }
 
 impl RunStats {
-    /// Rows done and rows matched so far.
     pub(crate) fn counts(&self) -> (u64, u64) {
         let matched = self.matched.load(Ordering::SeqCst);
         let done = self.done.load(Ordering::SeqCst);
@@ -541,11 +482,9 @@ impl RunStats {
     }
 }
 
-/// What a finished run found.
 pub(crate) struct Summary {
     pub rows: u64,
     pub matched: u64,
-    /// Matches by accuracy, the most precise first.
     pub by_accuracy: Vec<(String, u64)>,
     pub p50: f64,
     pub p95: f64,
@@ -554,7 +493,6 @@ pub(crate) struct Summary {
     pub seconds: f64,
     pub output: PathBuf,
     pub output_bytes: u64,
-    /// The output's first rows, header first.
     pub output_head: Vec<Vec<String>>,
 }
 
@@ -575,7 +513,6 @@ impl Run {
         self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
-    /// The run's outcome, once it is finished.
     pub(crate) fn take(&mut self) -> Option<Result<()>> {
         if !self.is_finished() {
             return None;
@@ -589,8 +526,6 @@ impl Run {
     }
 }
 
-/// A run let go of is stopped, and waited for, so its temporary output
-/// file is removed before og exits.
 impl Drop for Run {
     fn drop(&mut self) {
         self.cancel();
@@ -602,13 +537,9 @@ impl Drop for Run {
 
 pub(crate) struct BatchSession {
     pub file: BatchFile,
-    /// Which columns make up the address.
     pub used: Vec<bool>,
-    /// The column the setup cursor is on.
     pub column: usize,
-    /// What a run would answer for the sample rows, by the columns picked.
     pub previews: HashMap<Vec<bool>, Vec<Option<Hit>>>,
-    /// Where the run writes, as it would be named now.
     pub output: PathBuf,
     pub run: Option<Run>,
     pub summary: Option<Summary>,
@@ -629,7 +560,6 @@ impl BatchSession {
         }
     }
 
-    /// The address searched for a row.
     pub(crate) fn query(&self, row: &[String]) -> String {
         address(&self.used, row)
     }
@@ -638,7 +568,6 @@ impl BatchSession {
         self.used.contains(&true)
     }
 
-    /// Starts geocoding the whole file.
     pub(crate) fn start(&mut self, pack: &Path) {
         self.output = self.file.output_path();
         let output = self.output.clone();
@@ -649,7 +578,6 @@ impl BatchSession {
             input: self.file.path.clone(),
             output: output.clone(),
             header_row: self.file.header_found,
-            // By place: two columns may share a name, or have none.
             address_field_groups: vec![
                 self.used
                     .iter()
@@ -674,7 +602,6 @@ impl BatchSession {
         });
     }
 
-    /// Totals for the done screen, from the finished run and its output.
     pub(crate) fn summarize(&mut self) {
         let Some(run) = &self.run else {
             return;

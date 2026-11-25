@@ -1,20 +1,9 @@
-//! A text parameter of a query string, as the client sent it.
-
 use serde::{Deserialize, Deserializer};
 
-/// Not sent, sent empty, or sent with a value.
-///
-/// A form that always sends every key sends `locality=` for a field left
-/// blank, so empty and missing are different answers to "did the caller give
-/// this?". They are told apart once, here, and every handler matches all
-/// three, saying what each means for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Param {
     Missing,
-    /// Sent with nothing but whitespace. [`super::bounds::validate_query`]
-    /// collapses whitespace, so a blank value reads as no words at all.
     Empty,
-    /// Sent with at least one non-whitespace character, kept as sent.
     Value(String),
 }
 

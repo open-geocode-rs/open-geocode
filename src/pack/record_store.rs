@@ -1,93 +1,3 @@
-//! Compact record store.
-//!
-//! Records are written in their final order (the builder sorts them along a
-//! Hilbert curve) and packed into blocks of [`BLOCK_RECORDS`]. A block starts
-//! with an absolute base coordinate; every record in it stores its display
-//! point as a small zigzag delta from that base, then its fields as varints and
-//! string-table ids, then any line geometry as a delta chain. Finding record
-//! `N` means jumping to block `N / 64` through the block index, then to the
-//! record through the block's table of body starts, or on from its run's anchor.
-//! (Continued addresses, below, store their point from the record before them.)
-//!
-//! ```text
-//! records/index    record_count u64, then (block_count + 1) u64 block offsets
-//! records/blocks   blocks: base_lon i32 | base_lat i32 | start width u8 (2 or 4)
-//!                  | flags u8 | continued u64 | centroids u64, ways u64, relations
-//!                  u64, disputed u64, each when its flag is set | the start (u16
-//!                  or u32) of each body that is not continued | bodies
-//! records/datasets count varint, then each imported dataset's name and a
-//!                  presence byte, then its licence: name, URL and whom it
-//!                  credits, the last two each behind a presence byte
-//! records/strings  segment_count u64 | per segment: first record u64, first string u64
-//!                  | string_count u64 | string_count x u64 end offset | UTF-8 bytes
-//!
-//! body  tag u8        layer (4 bits) | centroid (1) | line geometry (1) | source kind (2)
-//!       dlon, dlat    zigzag varints from the block base
-//!       context       varint, 0 = none, else (tuple_id + 1) << 1 | ambiguous
-//!       source        zigzag OSM object id, the address count of a postcode, or
-//!                     the zigzag row of an imported address followed by its
-//!                     dataset's index in `records/datasets`
-//!       fields        per layer, strings as varint ids local to the record's segment;
-//!                     a street's, place's or POI's alternate names follow its name
-//!                     (a street's locality after them, behind a presence byte,
-//!                     then its road class as one byte, then its other ways
-//!                     as a varint count and varint deltas, each from the way
-//!                     before it, the street's own way first)
-//!                     (and category or place type) as a varint count and ids, and
-//!                     an address's areas follow its other fields the same way,
-//!                     then its street's postcodes; a POI's or a place's
-//!                     prominence follows its names as one byte, its importance
-//!                     as one byte and its Wikidata item as a varint (0 = none), a POI's
-//!                     aliases (a varint count, then each OSM object's
-//!                     number << 2 | kind), its brand's string id + 1 (0 = none) and the brand's
-//!                     Wikidata item, then a presence byte and the string ids of
-//!                     those of its phone, website, email and opening hours
-//!                     it states, then, when the byte's fifth bit is set, its
-//!                     extent's west, south, east and north as zigzag varints
-//!                     from its point, then, when its sixth bit is set, its
-//!                     entrances, then its address after a presence byte;
-//!                     an address whose presence byte has its eighth bit set
-//!                     ends with its entrances; entrances are a varint count,
-//!                     then each one's longitude and latitude as zigzag
-//!                     varints from the record's point and its kind's string
-//!                     id; a postcode's country follows its code as
-//!                     a varint, 0 = none, else its two letters as a u16
-//!       geometry      lines only: varint part count, then per part a varint
-//!                     point count and zigzag deltas, chained across parts
-//!
-//! continued address (its bit set in `continued`; no tag, its precision and
-//! source kind are in the block's bitmaps)
-//!
-//! An address another source placed elsewhere (see
-//! [`AddressRecord::disputed`]) has its bit set in `disputed`, continued or
-//! not: a bit per slot costs nothing in the many blocks with none.
-//!       dlon, dlat    zigzag varints from the record before it
-//!       source        zigzag OSM object id delta from the record before it
-//!       number        varint: value << 2 | unit (1) | text (1); a plain number's
-//!                     value is its zigzag delta from the last plain number of
-//!                     the run, a text number's its string id
-//!       unit          string id, when flagged
-//! ```
-//!
-//! The builder writes the addresses of one street as a run, ordered by house
-//! number. An address that states the same street, place, areas, locality,
-//! region, postcode, country, street postcodes, building and admin context as
-//! the address before it in its block is written as a continuation of that run:
-//! only its number, unit, point and id, each as a small delta. The run's
-//! first address in the block, its
-//! anchor, holds every shared field, so any record decodes from its own block.
-//! A continued address has no start of its own: it is read on from its
-//! anchor, as its number and point are deltas along the run anyway.
-//!
-//! Strings are interned per segment: the build keeps one segment's dictionary
-//! in memory, not every distinct string of the input. A segment ends after
-//! [`SEGMENT_RECORDS`] records or once its dictionary uses its share of the
-//! build budget, whichever comes first, and only ever between blocks, so a
-//! continuation reads its anchor's strings from the same segment. Records are
-//! in Hilbert order, so a segment covers one area and most of its strings are
-//! its own; only widely shared ones (countries, regions) repeat across
-//! segments.
-
 use std::{
     fs::File,
     io::{BufWriter, Write},
@@ -138,18 +48,13 @@ pub struct CatalogueId {
     pub record_id: RecordId,
     pub object_type: ObjectType,
     pub object_id: i64,
-    /// A place sharing the id with a street wins.
     pub street: bool,
 }
 
 pub const BLOCK_RECORDS: u64 = 64;
 const LABEL: &str = "pack-records";
-/// Approximate bytes a dictionary entry costs beyond its text: the boxed
-/// key, the id and the hash table slot.
 const DICTIONARY_ENTRY_OVERHEAD: usize = 48;
-/// Records per string segment.
 pub const SEGMENT_RECORDS: u64 = 1 << 20;
-/// Share of the build budget the string dictionary may use.
 const DICTIONARY_BUDGET_FRACTION: usize = 8;
 const COORDINATE_SCALE: f64 = 10_000_000.0;
 const BLOCK_HEADER_BYTES: usize = 18;
@@ -162,33 +67,19 @@ const TAG_LAYER_MASK: u8 = 0x0f;
 const TAG_CENTROID: u8 = 0x10;
 const TAG_LINE: u8 = 0x20;
 const TAG_SOURCE_SHIFT: u8 = 6;
-/// Bit of a POI's details byte, past its four strings. When set, its
-/// extent follows them, each side as a zigzag varint from the record's
-/// point.
 const POI_EXTENT: u8 = 1 << 4;
-/// Bit of a POI's details byte. When set, its entrances follow its extent.
 const POI_ACCESS: u8 = 1 << 5;
-/// Bit of a POI's details byte. When set, the kinds of food it serves
-/// follow its entrances.
 const POI_CUISINE: u8 = 1 << 6;
 const POI_FAX: u8 = 1 << 7;
-/// Bit of an address's presence byte, past its seven strings. When set, a
-/// details byte follows its street's postcodes, saying which of its
-/// building's name and its entrances follow it, in that order.
 const ADDRESS_DETAILS: u8 = 1 << 7;
-/// Bit of an address's details byte: it has entrances.
 const DETAIL_ACCESS: u8 = 1;
-/// Bit of an address's details byte: its source draws it as a building.
 const DETAIL_BUILDING: u8 = 2;
-/// Bit of an address's details byte: its building's name follows.
 const DETAIL_BUILDING_NAME: u8 = 4;
 const DETAIL_BLOCK_NUMBER: u8 = 8;
 const NUMBER_TEXT: u64 = 1;
 const NUMBER_UNIT: u64 = 2;
 const NUMBER_SHIFT: u32 = 2;
 
-/// What a record's source value is. `Other` is a postcode's address count,
-/// or an address's row in an imported dataset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceKind {
     Node = 0,
@@ -197,7 +88,6 @@ enum SourceKind {
     Other = 3,
 }
 
-/// Admin context reference stored in a record body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextRef {
     pub tuple_id: u32,
@@ -208,14 +98,10 @@ pub struct ContextRef {
 pub struct Summary {
     pub id: String,
     pub layer: String,
-    /// The thing itself: a POI's, place's or street's name, an address's
-    /// house number and street, a postcode.
     pub name: String,
     pub label: String,
-    /// The address parts the record states.
     #[serde(skip_serializing_if = "Address::is_empty")]
     pub address: Address,
-    /// A POI's category, for example `amenity:cafe`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,26 +112,16 @@ pub struct Summary {
     pub contact: Option<Contact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opening_hours: Option<String>,
-    /// The kinds of food a POI serves, as its `cuisine` tag lists them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cuisine: Vec<String>,
-    /// The box around a record larger than a point, as [`bbox`] writes it.
-    /// It holds a street's line, or the outline a POI is drawn with. An
-    /// area's is the Pack's to add, which holds it beside the record.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bbox: Option<[f64; 4]>,
-    /// The IANA name of the timezone the record lies in, which the Pack
-    /// adds, as it holds the zones beside the records.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
-    /// For an address that states no postcode, the one postcode the other
-    /// addresses of its street state, when they agree on one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub street_postcode: Option<String>,
-    /// The entrances the record's source maps, as points to route to.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub access: Vec<AccessPoint>,
-    /// The building an address's source draws it as.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub building: Option<Building>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -265,12 +141,10 @@ pub struct Point {
 pub enum PointPrecision {
     Point,
     Centroid,
-    /// A house number placed along an interpolation range.
     Estimated,
     RepresentativePoint,
 }
 
-/// Source data the result comes from.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct Source {
     pub dataset: String,
@@ -294,15 +168,12 @@ pub struct ContextRecord {
     pub point: Option<Point>,
 }
 
-/// Global string ids `first..end` belong to one segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StringSegment {
     first: u64,
     end: u64,
 }
 
-/// The fixed part of a record: enough for spatial filtering without touching
-/// strings or geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     pub layer: Layer,
@@ -310,14 +181,11 @@ pub struct Header {
     pub lon_e7: i32,
     pub lat_e7: i32,
     pub context: Option<ContextRef>,
-    /// See [`AddressRecord::disputed`].
     pub disputed: bool,
     centroid: bool,
     line: bool,
     source_kind: SourceKind,
     source_value: u64,
-    /// The imported dataset an address comes from, by its index in the
-    /// store's dataset table.
     dataset: Option<u32>,
 }
 
@@ -349,7 +217,6 @@ impl Header {
         }
     }
 
-    /// The object the record comes from: an OSM object, or an imported row.
     pub(crate) fn object(&self) -> Result<(ObjectType, i64)> {
         let object_type = match (self.source_kind, self.dataset) {
             (SourceKind::Node, _) => ObjectType::Node,
@@ -365,7 +232,6 @@ impl Header {
         Ok((object_type, unzigzag(self.source_value)))
     }
 
-    /// The dataset the record comes from, by name.
     fn dataset<'a>(&self, datasets: &'a [String]) -> Result<&'a str> {
         match self.dataset {
             None => Ok(OSM_DATASET),
@@ -376,8 +242,6 @@ impl Header {
         }
     }
 
-    /// The id search and inspect show: "osm:node:1",
-    /// "openaddresses:nz/countrywide:row:7".
     fn record_id(&self, datasets: &[String]) -> Result<String> {
         let (object_type, object_id) = self.object()?;
         Ok(crate::labels::record_id(
@@ -416,8 +280,6 @@ impl Header {
     }
 }
 
-/// The record store as a checkpoint names it: its files, by name in the
-/// scratch directory and length, and the counts its sections start with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriterState {
     blocks: (String, u64),
@@ -436,14 +298,10 @@ pub struct WriterState {
 pub struct Writer {
     blocks: BufWriter<ScratchFile>,
     blocks_len: u64,
-    /// Start of every block, streamed to scratch.
     block_offsets: BufWriter<ScratchFile>,
-    /// Bodies of the open block, where each one that is not continued
-    /// starts, and its slots so far.
     block: Vec<u8>,
     block_starts: Vec<u32>,
     block_slots: usize,
-    /// Bitmaps of the open block: see [`Block`].
     continued: u64,
     centroids: u64,
     ways: u64,
@@ -453,19 +311,12 @@ pub struct Writer {
     record_count: u64,
     strings: StringTable,
     body: Vec<u8>,
-    /// The address run the next address may continue, within the open block.
     run: AddressRun,
-    /// The imported datasets addresses come from, in order of first use.
     datasets: Vec<String>,
 }
 
-/// The last address written in the open block, and the anchor of its run.
-/// One is kept for the whole store and refilled as each run starts, so its
-/// strings reuse their buffers instead of being cloned anew.
 #[derive(Debug, Default)]
 struct AddressRun {
-    /// Whether an address of the open block started it: off before the
-    /// block's first address and after a record of another layer.
     open: bool,
     street: Option<String>,
     place: Option<String>,
@@ -477,12 +328,10 @@ struct AddressRun {
     block_number_len: Option<std::num::NonZeroU16>,
     street_postcodes: Vec<String>,
     building: Option<Building>,
-    /// The imported dataset of the run, `None` for OSM addresses.
     dataset: Option<String>,
     context: Option<ContextRef>,
     point: (i32, i32),
     object_id: i64,
-    /// The last plain number of the run, 0 before the first.
     number: u32,
 }
 
@@ -502,11 +351,9 @@ impl AddressRun {
             && self.block_number_len == address.block_number_len
             && self.street_postcodes == record.street_postcodes
             && self.building == record.building
-            // A continuation holds a number, a unit, a point and an id alone.
             && record.access.is_empty()
     }
 
-    /// Start a run at `record`.
     fn start(&mut self, record: &AddressRecord, context: Option<ContextRef>, point: (i32, i32)) {
         let address = &record.address;
         self.open = true;
@@ -535,13 +382,10 @@ impl AddressRun {
     }
 }
 
-/// The imported dataset an address comes from, `None` for OSM.
 fn imported_dataset(record: &AddressRecord) -> Option<&str> {
     (record.source.object_type == ObjectType::Row).then_some(record.source.dataset.as_str())
 }
 
-/// A house number written as digits alone, without a leading zero, so that it
-/// reads back exactly from its value.
 fn plain_number(number: &str) -> Option<u32> {
     let canonical = !number.is_empty()
         && number.bytes().all(|byte| byte.is_ascii_digit())
@@ -549,21 +393,12 @@ fn plain_number(number: &str) -> Option<u32> {
     canonical.then(|| number.parse().ok()).flatten()
 }
 
-/// Strings of the current segment. Bytes and end offsets stream to scratch
-/// files; only the current segment's dictionary is held in memory.
 #[derive(Debug)]
 struct StringTable {
-    /// FxHash, not SipHash: every string of every record is looked up here,
-    /// on the one thread that writes records in order, and the strings come
-    /// from the build's own input file.
     ids: FxHashMap<Box<str>, u32>,
-    /// The dictionary's memory, held against the build budget. It cannot
-    /// spill, but it is bounded by one segment and released at the next.
     memory: Reservation,
-    /// Dictionary bytes after which the next block starts a new segment.
     memory_share: usize,
     segment_records: u64,
-    /// First record and first string of every segment.
     segments: Vec<(u64, u64)>,
     count: u64,
     bytes_len: u64,
@@ -572,7 +407,6 @@ struct StringTable {
 }
 
 impl StringTable {
-    /// Segment-local id of `value`.
     fn id(&mut self, value: &str) -> Result<u32> {
         if let Some(&id) = self.ids.get(value) {
             return Ok(id);
@@ -674,7 +508,6 @@ impl Writer {
         })
     }
 
-    /// The scratch files the store streams to.
     pub fn files(&self) -> Vec<PathBuf> {
         [
             &self.blocks,
@@ -687,7 +520,6 @@ impl Writer {
         .collect()
     }
 
-    /// The store a checkpoint left, ready to be copied into the Pack.
     pub fn restore(
         scratch: &Arc<Scratch>,
         budget: &Arc<Budget>,
@@ -732,12 +564,10 @@ impl Writer {
 
     #[cfg(test)]
     fn with_segment_records(mut self, segment_records: u64) -> Self {
-        // Applies from the next segment; the writer has not started one yet.
         self.strings.segment_records = segment_records;
         self
     }
 
-    /// Strings in the current segment's in-memory dictionary.
     pub fn resident_strings(&self) -> usize {
         self.strings.ids.len()
     }
@@ -1005,7 +835,6 @@ impl Writer {
         Ok(())
     }
 
-    /// The index of an imported dataset in the store's table.
     fn dataset_id(&mut self, dataset: &str) -> Result<u32> {
         let index = match self.datasets.iter().position(|known| known == dataset) {
             Some(index) => index,
@@ -1050,7 +879,6 @@ impl Writer {
         Ok(())
     }
 
-    /// Writes the address, and says where its presence byte is.
     fn put_address(&mut self, out: &mut Vec<u8>, address: &AddressComponents) -> Result<usize> {
         put_u64(out, u64::from(self.strings.id(&address.number)?));
         let present_at = out.len();
@@ -1085,7 +913,6 @@ impl Writer {
         Ok(())
     }
 
-    /// A list of strings: its length, then each one's id.
     fn put_strings(&mut self, out: &mut Vec<u8>, values: &[String]) -> Result<()> {
         put_u64(out, values.len() as u64);
         for value in values {
@@ -1155,7 +982,6 @@ impl Writer {
         Ok(())
     }
 
-    /// Copy the store into the Pack.
     pub fn finish(mut self, pack: &mut container::Writer) -> Result<()> {
         self.flush_block()?;
         self.blocks.flush()?;
@@ -1213,10 +1039,8 @@ pub struct Reader {
     strings: Bytes,
     segment_count: u64,
     string_count: u64,
-    /// Byte offsets within `strings` of the end-offset table and the text.
     ends_start: usize,
     text_start: usize,
-    /// Names of the imported datasets, by the index records store.
     datasets: Arc<Vec<String>>,
     licences: Arc<Vec<Option<Licence>>>,
 }
@@ -1434,8 +1258,6 @@ impl Reader {
         self.licences.get(index).cloned().flatten()
     }
 
-    /// Id, name, label, address, layer, point and source. Decodes no
-    /// geometry but a street's line, for the box around it.
     pub fn summary(&self, id: RecordId) -> Result<Summary> {
         let entry = self.body(id)?;
         let (header, mut fields) = (entry.header, entry.fields);
@@ -1559,8 +1381,6 @@ impl Reader {
         })
     }
 
-    /// The postcode an address, POI, interpolation or postcode record states,
-    /// without decoding its geometry.
     pub fn postcode(&self, id: RecordId) -> Result<Option<String>> {
         let entry = self.body(id)?;
         let (header, mut fields) = (entry.header, entry.fields);
@@ -1583,8 +1403,6 @@ impl Reader {
         })
     }
 
-    /// A POI's or a place's prominence; none for the other layers. Reads no
-    /// geometry.
     pub fn prominence(&self, id: RecordId) -> Result<Option<Prominence>> {
         let entry = self.body(id)?;
         let (header, mut fields) = (entry.header, entry.fields);
@@ -1597,8 +1415,6 @@ impl Reader {
         }
     }
 
-    /// A POI's or a place's Wikidata item; none for the other layers or
-    /// when it has none. Reads no geometry.
     pub fn wikidata(&self, id: RecordId) -> Result<Option<u32>> {
         let entry = self.body(id)?;
         let (header, mut fields) = (entry.header, entry.fields);
@@ -1612,7 +1428,6 @@ impl Reader {
         }
     }
 
-    /// A place's prominence, reading its fields up to it.
     fn place_prominence(&self, strings: StringSegment, fields: &mut &[u8]) -> Result<Prominence> {
         get_u32(fields)?;
         get_u32(fields)?;
@@ -1620,8 +1435,6 @@ impl Reader {
         Ok(Prominence::from_byte(get_u8(fields)?, get_u8(fields)?))
     }
 
-    /// A POI's category (`amenity:pharmacy`); none for the other layers.
-    /// Reads no geometry, so a nearest walk can test thousands.
     pub fn poi_category_is(&self, id: RecordId, accept: impl Fn(&str) -> bool) -> Result<bool> {
         let entry = self.body(id)?;
         let (header, mut fields) = (entry.header, entry.fields);
@@ -1632,7 +1445,6 @@ impl Reader {
         Ok(accept(self.string_field(header.strings, &mut fields)?))
     }
 
-    /// A place's `place_type`; none for the other layers. Reads no geometry.
     pub fn place_type(&self, id: RecordId) -> Result<Option<String>> {
         let entry = self.body(id)?;
         let (header, mut fields) = (entry.header, entry.fields);
@@ -1645,9 +1457,6 @@ impl Reader {
         ))
     }
 
-    /// The postcodes a record is in by its own data: the one it states, else
-    /// for an address the ones its street's addresses state. Empty when
-    /// neither says.
     pub fn postcodes(&self, id: RecordId) -> Result<Vec<String>> {
         let entry = self.body(id)?;
         if entry.header.layer != Layer::Address {
@@ -1661,8 +1470,6 @@ impl Reader {
         }
     }
 
-    /// Every name of a street, place or POI, its `name` first; empty for the
-    /// other layers. Reads no geometry.
     pub fn names(&self, id: RecordId) -> Result<Vec<String>> {
         let entry = self.body(id)?;
         let (header, mut fields) = (entry.header, entry.fields);
@@ -1686,7 +1493,6 @@ impl Reader {
         Ok(std::iter::once(name.to_string()).chain(alt_names).collect())
     }
 
-    /// Context (place or postcode) record view, `None` for other layers.
     pub fn context_record(&self, id: RecordId) -> Result<Option<ContextRecord>> {
         let header = self.header(id)?;
         if !header.layer.is_context() {
@@ -1831,8 +1637,6 @@ impl Reader {
         })
     }
 
-    /// Decodes POIs and streets only up to their aliases or ways: building
-    /// the catalogue reads every block.
     pub fn block_ids(&self, block: u64) -> Result<Vec<CatalogueId>> {
         let found = self.block(block)?;
         let strings = self.segment(found.first);
@@ -1900,7 +1704,6 @@ impl Reader {
         ))
     }
 
-    /// Layer and display point only: the hot path of spatial queries.
     pub fn point(&self, id: RecordId) -> Result<(Layer, f64, f64)> {
         let (block, slot) = self.locate(id)?;
         let (layer, (lon, lat)) = if block.is_continued(slot) {
@@ -1923,8 +1726,6 @@ impl Reader {
         Ok((layer, dequantize(lon), dequantize(lat)))
     }
 
-    /// Every record of a block with its layer, display point and whether it
-    /// has line geometry, read front to back: what a spatial query scans.
     pub fn block_points(
         &self,
         block: u64,
@@ -1932,8 +1733,6 @@ impl Reader {
     ) -> Result<()> {
         let block = self.block(block)?;
         let mut previous = block.base;
-        // Where the next continued address starts: after the address before
-        // it, anchor or continued.
         let mut cursor: &[u8] = &[];
         for slot in 0..block.count {
             let (layer, point, line) = if block.is_continued(slot) {
@@ -1954,9 +1753,6 @@ impl Reader {
         Ok(())
     }
 
-    /// The house number and unit of every address among records
-    /// `first..first + count`, read front to back through each block rather
-    /// than one record at a time. Other records are passed over.
     pub fn address_numbers(
         &self,
         first: RecordId,
@@ -1970,8 +1766,6 @@ impl Reader {
             let (block, start) = self.locate(id)?;
             let strings = self.segment(id);
             let stop = (end - block.first).min(block.count as u64) as usize;
-            // A continued address's number is a delta along its run, so the
-            // run is read from its anchor.
             let begin = if block.is_continued(start) {
                 block.anchor(start)?
             } else {
@@ -2068,7 +1862,6 @@ impl Reader {
                 disputed,
                 centroid: block.centroids & 1 << slot != 0,
                 line: false,
-                // A run is all OSM or all of one imported dataset.
                 source_kind: match anchor_header.dataset {
                     Some(_) => SourceKind::Other,
                     None => block.source_kind(slot),
@@ -2087,7 +1880,6 @@ impl Reader {
 
     fn string_list(&self, strings: StringSegment, fields: &mut &[u8]) -> Result<Vec<String>> {
         let count = get_u64(fields)?;
-        // Every id takes at least a byte, so a corrupt count allocates nothing.
         if count > fields.len() as u64 {
             return Err(Error::Decode("string list is truncated"));
         }
@@ -2111,9 +1903,6 @@ impl Reader {
         Ok(values)
     }
 
-    /// An address record's components: its anchor's, with its own number and
-    /// unit when it continues a run. Also whether entrances follow the
-    /// postcodes of the street in the body read.
     fn entry_address(
         &self,
         entry: &Entry<'_>,
@@ -2134,14 +1923,6 @@ impl Reader {
         Ok((address, flagged))
     }
 
-    /// The entrances of an address whose body flags them, read after its
-    /// street's postcodes. An address that continues a run has none, as
-    /// the body read is its anchor's, whose entrances are the anchor's
-    /// alone.
-    /// The building of an address whose body flags details, and its
-    /// entrances. An address that continues a run shares its anchor's
-    /// building, as a run holds addresses of one, and has no entrances, as
-    /// the body read is its anchor's, whose entrances are the anchor's alone.
     fn entry_details(
         &self,
         entry: &Entry<'_>,
@@ -2163,8 +1944,6 @@ impl Reader {
         Ok((building, access))
     }
 
-    /// An address's details byte and its building's name, and whether its
-    /// entrances follow.
     fn details_field(
         &self,
         strings: StringSegment,
@@ -2191,7 +1970,6 @@ impl Reader {
 
     fn access_field(&self, header: &Header, fields: &mut &[u8]) -> Result<Vec<Entrance>> {
         let count = get_u64(fields)?;
-        // Each takes at least three bytes, so a corrupt count allocates nothing.
         if count > fields.len() as u64 {
             return Err(Error::Decode("entrances are truncated"));
         }
@@ -2216,7 +1994,6 @@ impl Reader {
         Ok(self.address_fields(strings, fields)?.0)
     }
 
-    /// The address, and whether its presence byte flags entrances.
     fn address_fields(
         &self,
         strings: StringSegment,
@@ -2434,7 +2211,6 @@ impl Reader {
     }
 }
 
-/// What a POI's body holds before its geometry.
 struct PoiFields<'a> {
     name: &'a str,
     category: &'a str,
@@ -2447,21 +2223,16 @@ struct PoiFields<'a> {
     address: Option<AddressComponents>,
 }
 
-/// One block of the store, as [`Reader::block`] finds it.
 struct Block<'a> {
     first: RecordId,
     base: (i32, i32),
     width: usize,
     count: usize,
-    /// Bit `n` set: slot `n` continues the address run before it.
     continued: u64,
-    /// Of continued slots: a centroid point, a way, a relation.
     centroids: u64,
     ways: u64,
     relations: u64,
-    /// Of every slot: a disputed address.
     disputed: u64,
-    /// Where each slot that is not continued starts in `bodies`.
     starts: &'a [u8],
     bodies: &'a [u8],
 }
@@ -2471,8 +2242,6 @@ impl<'a> Block<'a> {
         slot < self.count && self.continued & 1 << slot != 0
     }
 
-    /// The bytes of a record that is not continued, to the end of the block:
-    /// every field reader stops where its record does.
     fn plain_body(&self, slot: usize) -> Result<&'a [u8]> {
         let rank = slot - (self.continued & low_slots(slot)).count_ones() as usize;
         let at = rank * self.width;
@@ -2484,7 +2253,6 @@ impl<'a> Block<'a> {
             .ok_or(Error::Decode("record body is out of range"))
     }
 
-    /// The slot of the anchor of the continued address at `slot`.
     fn anchor(&self, slot: usize) -> Result<usize> {
         let plain = !self.continued & low_slots(slot);
         if plain == 0 {
@@ -2507,7 +2275,6 @@ impl<'a> Block<'a> {
     }
 }
 
-/// Bits of the slots below `slot`.
 fn low_slots(slot: usize) -> u64 {
     if slot >= 64 {
         u64::MAX
@@ -2516,7 +2283,6 @@ fn low_slots(slot: usize) -> u64 {
     }
 }
 
-/// The fields of a continued address, read from its body.
 struct ContinuedFields {
     d_lon: i64,
     d_lat: i64,
@@ -2533,7 +2299,6 @@ impl ContinuedFields {
         ))
     }
 
-    /// Its number, `plain` being the last plain number of its run.
     fn number(&self, plain: u32) -> Result<ContinuedNumber> {
         let value = self.code >> NUMBER_SHIFT;
         Ok(if self.code & NUMBER_TEXT != 0 {
@@ -2566,8 +2331,6 @@ fn read_continuation(cursor: &mut &[u8]) -> Result<ContinuedFields> {
     })
 }
 
-/// The string id of an address's unit, `fields` starting after its number:
-/// the optional fields are street, place and unit, in that order.
 fn unit_id(fields: &mut &[u8]) -> Result<Option<u32>> {
     let present = get_u8(fields)?;
     for bit in 0..2 {
@@ -2580,8 +2343,6 @@ fn unit_id(fields: &mut &[u8]) -> Result<Option<u32>> {
         .transpose()
 }
 
-/// The bytes after an address body that is not continued: where the first
-/// address continuing it starts.
 fn block_number_len(fields: &mut &[u8]) -> Result<Option<std::num::NonZeroU16>> {
     Ok(std::num::NonZeroU16::new(
         u16::try_from(get_u64(fields)?)
@@ -2591,7 +2352,6 @@ fn block_number_len(fields: &mut &[u8]) -> Result<Option<std::num::NonZeroU16>> 
 
 fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
     let tag = get_u8(&mut body)?;
-    // The point, context, source, an imported row's dataset, and the number.
     let imported = source_kind_of(tag) == SourceKind::Other;
     for _ in 0..5 + usize::from(imported) {
         get_u64(&mut body)?;
@@ -2600,7 +2360,6 @@ fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
     for _ in 0..(present & !ADDRESS_DETAILS).count_ones() {
         get_u64(&mut body)?;
     }
-    // Its areas, then its street's postcodes.
     for _ in 0..2 {
         let strings = get_u64(&mut body)?;
         if strings > body.len() as u64 {
@@ -2626,7 +2385,6 @@ fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
         if entrances > body.len() as u64 {
             return Err(Error::Decode("entrances are truncated"));
         }
-        // A longitude, a latitude and a kind each.
         for _ in 0..entrances * 3 {
             get_u64(&mut body)?;
         }
@@ -2634,7 +2392,6 @@ fn skip_address_body(mut body: &[u8]) -> Result<&[u8]> {
     Ok(body)
 }
 
-/// A postcode record's country, 0 when unknown.
 const ALIAS_KIND_BITS: u32 = 2;
 
 pub(crate) fn put_aliases(out: &mut Vec<u8>, aliases: &[(ObjectType, i64)]) -> Result<()> {
@@ -2678,8 +2435,6 @@ pub(crate) fn aliases_field(fields: &mut &[u8]) -> Result<Vec<(ObjectType, i64)>
         .collect()
 }
 
-// Deltas: a road's ways are mapped together, so their ids lie close and a
-// delta takes a byte or two.
 pub(crate) fn put_other_ways(out: &mut Vec<u8>, own: i64, ways: &[i64]) -> Result<()> {
     put_u64(out, ways.len() as u64);
     let mut before = own;
@@ -2740,9 +2495,6 @@ fn country_field(fields: &mut &[u8]) -> Result<Option<CountryCode>> {
     }
 }
 
-/// A record's header, the bytes of the fields it shares with its run's anchor
-/// (its own when it is not continued), and what a continued address states
-/// itself.
 struct Entry<'a> {
     header: Header,
     fields: &'a [u8],
@@ -2757,7 +2509,6 @@ struct Continued {
 #[derive(Clone, Copy)]
 enum ContinuedNumber {
     Plain(u32),
-    /// A string id local to the record's segment.
     Text(u32),
 }
 
@@ -2777,7 +2528,6 @@ fn source_kind_of(tag: u8) -> SourceKind {
     }
 }
 
-/// The display point of a record that is not continued.
 fn plain_point(base: (i32, i32), mut body: &[u8]) -> Result<(i32, i32)> {
     get_u8(&mut body)?;
     Ok((
@@ -2843,10 +2593,8 @@ fn layer_code(layer: Layer) -> u8 {
         .expect("every layer has a code") as u8
 }
 
-/// Quantized vertices of a line, one list per part.
 type LineVertices = Vec<Vec<(i32, i32)>>;
 
-/// The vertices of a line geometry, `None` for points.
 fn line_coordinates(geometry: &Geometry) -> Result<Option<LineVertices>> {
     if let GeometryValue::Point { .. } = &geometry.value {
         return Ok(None);
@@ -2898,7 +2646,6 @@ pub(crate) fn dequantize(value: i32) -> f64 {
     value as f64 / COORDINATE_SCALE
 }
 
-/// An extent as an answer gives it, in degrees.
 pub(crate) fn bbox(extent: Extent) -> [f64; 4] {
     extent.map(dequantize)
 }
@@ -2908,9 +2655,6 @@ fn add_delta(base: i32, delta: i64) -> Result<i32> {
         .map_err(|_| Error::Decode("coordinate delta is out of range"))
 }
 
-/// The one postcode `postcodes` agree on, as the first writes it. None
-/// when they are none or name more than one, written in any case or
-/// spacing.
 fn agreed_postcode(postcodes: &[String]) -> Option<String> {
     let first = postcodes.first()?;
     let key = crate::text_index::compact_postcode(first)?;
@@ -3159,7 +2903,6 @@ mod tests {
                 4,
                 vec![vec![[-79.2, 43.1], [-79.19, 43.12], [-79.21, 43.11]]],
             ),
-            // Two ways of one street, one each side of the antimeridian.
             street(
                 5,
                 vec![
@@ -3231,8 +2974,6 @@ mod tests {
         ];
         let reader = write_store(&records, &[]);
         let agreed = |id: u64| reader.summary(id).expect("summary").street_postcode;
-        // Written in any spacing, one postcode is agreed on, whether or not
-        // the address maps its entrances.
         assert_eq!(agreed(0).as_deref(), Some("M5V 1A1"));
         assert_eq!(agreed(1).as_deref(), Some("M5V 1A1"));
         assert_eq!(agreed(2), None, "the street's addresses disagree");
@@ -3330,8 +3071,6 @@ mod tests {
                 source: SourceProvenance::osm(ObjectType::Way, id),
             })
         };
-        // On one street, 4 starts a run, 6 states entrances so it starts its
-        // own, and 8 and 10 continue from 6 without taking its entrances.
         let records = [
             house(1, "4", Vec::new()),
             house(2, "6", doors.clone()),
@@ -3614,7 +3353,6 @@ mod tests {
         let budget = Budget::new(1 << 20);
         let mut writer = Writer::create(&scratch, &budget).expect("writer");
         let base = sample_records().remove(0);
-        // Every record brings a new street name: the worst case.
         for index in 0..5_000 {
             let mut record = base.clone();
             if let Record::Address(address) = &mut record {
@@ -3622,8 +3360,6 @@ mod tests {
             }
             writer.write(&record, None).expect("write");
         }
-        // Segments end only between blocks, so the rest of the block lands after
-        // the share is reached.
         let share = budget.limit() / DICTIONARY_BUDGET_FRACTION;
         let slack = BLOCK_RECORDS as usize * (64 + DICTIONARY_ENTRY_OVERHEAD);
         assert!(
@@ -3690,12 +3426,9 @@ mod tests {
                 );
                 address.disputed = index % 7 == 3;
                 if index == 70 {
-                    // A different postcode breaks the run; the next continues
-                    // the new one.
                     address.address.postcode = Some("M5V 9Z9".into());
                 }
             }
-            // A street between addresses ends their run.
             if index == 20 {
                 records.push(street.clone());
                 contexts.push(None);

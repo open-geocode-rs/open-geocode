@@ -1,14 +1,3 @@
-//! Point-in-area tests for areas of any size, read from a scratch file.
-//!
-//! The boundaries of a planet hold several times the memory a build is
-//! given, so no shape stays on the heap. Each built area is written to one
-//! scratch file as a block: its rings as OSM's 1e-7 fixed-point coordinates,
-//! and its edges filed into horizontal bands of equal height. A test reads
-//! the band its latitude falls in and casts a ray east from the point across
-//! that band's edges only, so an island drawn from a coastline of a million
-//! vertices costs a few dozen edge tests. The file is mapped, so the shapes
-//! take page cache the system reclaims as it needs, not heap.
-
 use std::{
     fs::File,
     io::{BufWriter, Write},
@@ -27,27 +16,17 @@ use crate::{
 
 use super::locations::degrees;
 
-/// Edges a band holds on average when its edges are spread evenly.
 const EDGES_PER_BAND: usize = 16;
-/// Band entries a shape may hold per edge: an edge spanning several bands
-/// is filed in each, and a shape whose long edges would fill more halves its
-/// bands until they fit.
 const ENTRIES_PER_EDGE: usize = 4;
-/// Bytes of a block's header: four counts and the band span.
 const HEADER_BYTES: usize = 32;
-/// Scratch label of the boundaries' shape file.
 pub(crate) const SHAPES_LABEL: &str = "boundary-shapes";
 
-/// Where an area's block lies in the shape file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ShapeRef {
     pub offset: u64,
     pub bytes: u64,
 }
 
-/// Write the block of `geometry`: its rings, exterior first, and their edges
-/// by band. Rings are read by the even-odd rule, so holes and separate parts
-/// need no bookkeeping.
 pub(crate) fn encode_shape(geometry: &MultiPolygon<f64>, out: &mut Vec<u8>) {
     let rings = geometry
         .iter()
@@ -62,9 +41,6 @@ pub(crate) fn encode_shape(geometry: &MultiPolygon<f64>, out: &mut Vec<u8>) {
     encode_rings(&coords, &ring_ends, out);
 }
 
-/// [`encode_shape`] for rings already in fixed point. `coords` holds every
-/// ring's vertices, its first repeated as its last, and `ring_ends` where
-/// each ring stops.
 pub(crate) fn encode_rings(coords: &[[i32; 2]], ring_ends: &[u32], out: &mut Vec<u8>) {
     let (lat_lo, lat_hi) = coords
         .iter()
@@ -141,17 +117,12 @@ pub(crate) fn encode_rings(coords: &[[i32; 2]], ring_ends: &[u32], out: &mut Vec
     }
 }
 
-/// A coordinate in the PBF's fixed point. The node store hands out exactly
-/// these, so a vertex reads back with the bits it was given.
 pub(crate) fn fixed(value: f64) -> i32 {
     (value * 1e7)
         .round()
         .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
-/// The band of `bands` over `lo..=hi` that `lat` falls in. Monotonic in
-/// `lat`, so an edge filed from its lowest to its highest band is found from
-/// every latitude it spans.
 fn band_of(lat: f64, lo: f64, hi: f64, bands: usize) -> usize {
     if hi.partial_cmp(&lo) != Some(std::cmp::Ordering::Greater) {
         return 0;
@@ -164,7 +135,6 @@ fn band_of(lat: f64, lo: f64, hi: f64, bands: usize) -> usize {
     }
 }
 
-/// Whether the area of `block` covers the point, its boundary included.
 pub(crate) fn covers(block: &[u8], lon: f64, lat: f64) -> bool {
     let u32_at = |at: usize| u32::from_le_bytes(block[at..at + 4].try_into().expect("4 bytes"));
     let i32_at = |at: usize| i32::from_le_bytes(block[at..at + 4].try_into().expect("4 bytes"));
@@ -215,7 +185,6 @@ pub(crate) fn covers(block: &[u8], lon: f64, lat: f64) -> bool {
     inside
 }
 
-/// The box around the area of `block`: west, south, east, north.
 pub(crate) fn extent(block: &[u8]) -> [f64; 4] {
     let u32_at = |at: usize| u32::from_le_bytes(block[at..at + 4].try_into().expect("4 bytes"));
     let f64_at = |at: usize| f64::from_le_bytes(block[at..at + 8].try_into().expect("8 bytes"));
@@ -234,7 +203,6 @@ pub(crate) fn extent(block: &[u8]) -> [f64; 4] {
     [west, f64_at(16), east, f64_at(24)]
 }
 
-/// A shape block's parts, found once for a test that reads many of them.
 #[derive(Clone, Copy)]
 struct Block<'a> {
     bytes: &'a [u8],
@@ -281,7 +249,6 @@ impl<'a> Block<'a> {
         self.fixed_vertex(index).map(degrees)
     }
 
-    /// The vertices of each ring, as the range of their indexes.
     fn rings(&self) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
         let mut start = 0;
         (0..self.rings).map(move |ring| {
@@ -292,8 +259,6 @@ impl<'a> Block<'a> {
         })
     }
 
-    /// The edges that reach a latitude of `lo..=hi`, each as its first
-    /// vertex. One that spans several of the bands comes more than once.
     fn edges_between(&self, lo: f64, hi: f64) -> impl Iterator<Item = usize> + '_ {
         let bands = if hi < self.lat_lo || lo > self.lat_hi {
             0..0
@@ -307,8 +272,6 @@ impl<'a> Block<'a> {
     }
 }
 
-/// The narrowest box around the area of `block`, which crosses the
-/// antimeridian when the area does. None for a block of no ring.
 pub(crate) fn narrowest_extent(block: &[u8]) -> Option<Extent> {
     let block = Block::of(block);
     narrowest_box(
@@ -318,8 +281,6 @@ pub(crate) fn narrowest_extent(block: &[u8]) -> Option<Extent> {
     )
 }
 
-/// The box around each ring of `block`, in ring order, as its west, south,
-/// east and north. A ring of no vertex has none.
 pub(crate) fn ring_extents(block: &[u8]) -> Vec<Option<[f64; 4]>> {
     let block = Block::of(block);
     block
@@ -331,9 +292,6 @@ pub(crate) fn ring_extents(block: &[u8]) -> Vec<Option<[f64; 4]>> {
         .collect()
 }
 
-/// A point inside the area of `block` and off its outline. It is the
-/// middle of the widest stretch the area covers along one latitude. None
-/// for an area of no height.
 pub(crate) fn interior_point(block: &[u8]) -> Option<[f64; 2]> {
     let block = Block::of(block);
     let lat = block
@@ -359,9 +317,6 @@ pub(crate) fn interior_point(block: &[u8]) -> Option<[f64; 2]> {
         .map(|[west, east]| [(west + east) / 2.0, lat])
 }
 
-/// Whether the outline of `area` stays in `shape`. A stretch of it within
-/// `tolerance` degrees of the outline of `shape` is not out of it. Two
-/// sources draw one border a little apart, and that is no crossing of it.
 pub(crate) fn outline_within(area: &[u8], shape: &[u8], tolerance: f64) -> bool {
     let (area, shape) = (Block::of(area), Block::of(shape));
     let mut edges = Vec::new();
@@ -383,8 +338,6 @@ pub(crate) fn outline_within(area: &[u8], shape: &[u8], tolerance: f64) -> bool 
                 crossing(from, to, shape.vertex(edge), shape.vertex(edge + 1))
             }));
             cuts.sort_unstable_by(f64::total_cmp);
-            // Between two crossings the edge is on one side, and its middle
-            // says which.
             for piece in cuts.windows(2) {
                 let [lon, lat] = along(from, to, (piece[0] + piece[1]) / 2.0);
                 if piece[0] < piece[1]
@@ -406,7 +359,6 @@ pub(crate) fn outline_within(area: &[u8], shape: &[u8], tolerance: f64) -> bool 
     true
 }
 
-/// Whether the point is within `tolerance` degrees of the outline of `block`.
 pub(crate) fn near_outline(block: &[u8], [lon, lat]: [f64; 2], tolerance: f64) -> bool {
     let block = Block::of(block);
     block
@@ -423,7 +375,6 @@ pub(crate) fn near_outline(block: &[u8], [lon, lat]: [f64; 2], tolerance: f64) -
         })
 }
 
-/// The vertices of ring `ring` of `block`.
 pub(crate) fn ring_vertices(block: &[u8], ring: usize) -> impl Iterator<Item = [f64; 2]> + '_ {
     let block = Block::of(block);
     block
@@ -453,9 +404,6 @@ fn minus(left: [f64; 2], right: [f64; 2]) -> [f64; 2] {
     [left[0] - right[0], left[1] - right[1]]
 }
 
-/// How far along `from..to`, strictly between its ends, it crosses the edge
-/// `start..end`. None for edges that run alongside. Those meet over a
-/// stretch, which [`hugs`] judges.
 fn crossing(from: [f64; 2], to: [f64; 2], start: [f64; 2], end: [f64; 2]) -> Option<f64> {
     let (line, edge) = (minus(to, from), minus(end, start));
     let turn = cross(line, edge);
@@ -467,8 +415,6 @@ fn crossing(from: [f64; 2], to: [f64; 2], start: [f64; 2], end: [f64; 2]) -> Opt
     (at > 0.0 && at < 1.0 && (0.0..=1.0).contains(&on_edge)).then_some(at)
 }
 
-/// Whether every point of `start..end` is within `tolerance` of one of
-/// `edges` of `shape`. `spans` is scratch.
 fn hugs(
     start: [f64; 2],
     end: [f64; 2],
@@ -498,9 +444,6 @@ fn hugs(
     reach >= 1.0
 }
 
-/// The stretch of `start..end`, as fractions of it, within `tolerance` of
-/// the edge `from..to`. That neighbourhood is the edge's band and a disc
-/// around each of its ends. It is convex, so it is one stretch.
 fn capsule_span(
     start: [f64; 2],
     end: [f64; 2],
@@ -520,7 +463,6 @@ fn capsule_span(
             return (c <= 0.0).then_some((0.0, 1.0));
         }
         let root = (b * b - 4.0 * a * c).sqrt();
-        // NaN when the line misses the disc, which no comparison passes.
         let (low, high) = ((-b - root) / (2.0 * a), (-b + root) / (2.0 * a));
         (low <= 1.0 && high >= 0.0).then_some((low.max(0.0), high.min(1.0)))
     };
@@ -533,7 +475,6 @@ fn capsule_span(
         let unit = [edge[0] / length, edge[1] / length];
         let offset = minus(start, from);
         let (mut low, mut high) = (0.0_f64, 1.0_f64);
-        // Along the edge within its ends, and across it within the tolerance.
         for (at, step, least, most) in [
             (dot(offset, unit), dot(line, unit), 0.0, length),
             (
@@ -561,14 +502,12 @@ fn capsule_span(
         .reduce(|held, span| (held.0.min(span.0), held.1.max(span.1)))
 }
 
-/// The shape file as it is written, one block after another.
 pub(crate) struct ShapeWriter {
     file: BufWriter<ScratchFile>,
     bytes: u64,
 }
 
 impl ShapeWriter {
-    /// A shape file of scratch label `label`.
     pub(crate) fn create(scratch: &Arc<Scratch>, label: &str) -> Result<Self> {
         let path = scratch.new_file(label);
         let name = path
@@ -581,7 +520,6 @@ impl ShapeWriter {
         })
     }
 
-    /// Append a block [`encode_shape`] wrote.
     pub(crate) fn write(&mut self, block: &[u8]) -> Result<ShapeRef> {
         self.file.write_all(block)?;
         let shape = ShapeRef {
@@ -592,7 +530,6 @@ impl ShapeWriter {
         Ok(shape)
     }
 
-    /// Close the file and map it to test points against its shapes.
     pub(crate) fn finish(self) -> Result<Shapes> {
         let file = self
             .file
@@ -602,7 +539,6 @@ impl ShapeWriter {
     }
 }
 
-/// The shape file, mapped. Removed once dropped.
 #[derive(Debug)]
 pub(crate) struct Shapes {
     /// Taken before the file is removed: Windows cannot remove a mapped file.
@@ -633,26 +569,21 @@ impl Shapes {
         Ok(Self { map, file })
     }
 
-    /// The block of a shape. None for one past the file's end, which is a
-    /// checkpoint gone wrong that the restore refuses before any test.
     pub(crate) fn block(&self, shape: ShapeRef) -> Option<&[u8]> {
         let bytes = self.map.as_deref()?;
         let start = usize::try_from(shape.offset).ok()?;
         bytes.get(start..start.checked_add(usize::try_from(shape.bytes).ok()?)?)
     }
 
-    /// Whether the shape covers the point, its boundary included.
     pub(crate) fn covers(&self, shape: ShapeRef, lon: f64, lat: f64) -> bool {
         self.block(shape)
             .is_some_and(|block| covers(block, lon, lat))
     }
 
-    /// Bytes the file holds.
     pub(crate) fn bytes(&self) -> u64 {
         self.file.bytes()
     }
 
-    /// The file as a checkpoint names it: its name and length.
     pub(crate) fn state(&self) -> (String, u64) {
         (self.file.name(), self.file.bytes())
     }
@@ -661,12 +592,10 @@ impl Shapes {
         self.file.path()
     }
 
-    /// The file a checkpoint named.
     pub(crate) fn restore(scratch: &Arc<Scratch>, (name, bytes): &(String, u64)) -> Result<Self> {
         Self::map(ScratchFile::reopen(scratch, SHAPES_LABEL, name, *bytes)?)
     }
 
-    /// Whether every one of `shapes` lies inside the file.
     pub(crate) fn holds(&self, shapes: impl IntoIterator<Item = ShapeRef>) -> bool {
         let len = self.file.bytes();
         shapes.into_iter().all(|shape| {
@@ -691,7 +620,6 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
 
-    /// A ring of `points` vertices around a jagged circle.
     fn jagged(center: (f64, f64), radius: f64, points: usize) -> LineString<f64> {
         let mut ring = (0..points)
             .map(|index| {
@@ -769,8 +697,6 @@ mod tests {
             )])),
             Some([74_090_279, 437_247_599, 74_398_704, 437_519_311])
         );
-        // Drawn as OSM draws an area over the antimeridian, one ring each
-        // side that meet at 180 and -180.
         assert_eq!(
             narrowest_extent(&block(vec![
                 square(177.0, -19.0, 180.0, -16.0),
@@ -814,14 +740,12 @@ mod tests {
             "apart"
         );
         assert!(!within(&rectangle(20.0, 2.0, 22.0, 4.0), &square), "beside");
-        // One border drawn by two sources, a little apart.
         assert!(within(&rectangle(-0.000_000_5, 2.0, 3.0, 4.0), &square));
         assert!(!within(&rectangle(-0.000_002, 2.0, 3.0, 4.0), &square));
         assert!(within(
             &rectangle(-0.000_000_5, -0.000_000_4, 10.000_000_3, 10.000_000_6),
             &square
         ));
-        // The other source has a vertex where this one has none.
         let split = shape(&[&[
             (0.0, 0.0),
             (10.0, 0.0),
@@ -830,7 +754,6 @@ mod tests {
             (0.0, 5.0),
         ]]);
         assert!(within(&rectangle(-0.000_000_5, 2.0, 3.0, 8.0), &split));
-        // Every vertex inside, yet an edge runs over a notch of the shape.
         let notched = shape(&[&[
             (0.0, 0.0),
             (10.0, 0.0),
@@ -847,8 +770,6 @@ mod tests {
         }
         assert!(!within(&over, &notched));
         assert!(within(&rectangle(1.0, 6.0, 3.0, 8.0), &notched));
-        // An outline around a hole of the shape stays in the shape, and
-        // one through the hole does not.
         let holed = shape(&[
             &[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
             &[(4.0, 4.0), (6.0, 4.0), (6.0, 6.0), (4.0, 6.0)],
@@ -885,7 +806,6 @@ mod tests {
         ]]);
         assert!(!covers(&c, 6.0, 5.0));
         assert_eq!(interior_point(&c), Some([5.0, 1.0]));
-        // Of two parts, the wider one at the latitude tried holds the point.
         let parts = shape(&[
             &[(0.0, 0.0), (1.0, 0.0), (1.0, 4.0), (0.0, 4.0)],
             &[(5.0, 0.0), (9.0, 0.0), (9.0, 4.0), (5.0, 4.0)],
@@ -905,8 +825,6 @@ mod tests {
 
     #[test]
     fn a_long_edge_is_found_from_every_band_it_spans() {
-        // A tall thin sliver: one long edge on each side, many short ones
-        // along the bottom, so the long edges span every band.
         let mut ring = vec![(0.0, 0.0)];
         ring.extend((1..=400).map(|step| (f64::from(step) * 0.0025, 0.0)));
         ring.extend([(1.0, 50.0), (0.0, 50.0), (0.0, 0.0)]);

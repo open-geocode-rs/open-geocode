@@ -1,15 +1,3 @@
-//! Coordinate-scored geocoding benchmark.
-//!
-//! Separate from [`crate::bench`] on purpose: that harness checks whether a
-//! named object came back by `osm_type`/`osm_id`, an equality test. This one
-//! scores how far the returned point is from an authoritative coordinate, an
-//! ordering test. Sharing one fixture would leave the scoring rule implicit in
-//! which fields a case happened to populate.
-//!
-//! The distance buckets and the geohash precisions are read from the fixture's
-//! own metadata and are never derived from the run, so a later build cannot
-//! retune the scale it is measured against.
-
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
@@ -37,8 +25,6 @@ struct GeocodeFixture {
     cases: Vec<GeocodeCase>,
 }
 
-/// Frozen scoring contract. Defaults match the committed fixtures so an older
-/// fixture without a `meta` block still scores on the same scale.
 #[derive(Debug, Clone, Deserialize)]
 struct FixtureMeta {
     #[serde(default)]
@@ -73,7 +59,6 @@ fn default_buckets() -> BTreeMap<String, f64> {
 
 #[derive(Debug, Clone, Deserialize)]
 struct GeocodeCase {
-    /// Case identifier, carried into the worst-case list for triage.
     #[serde(default)]
     name: Option<String>,
     #[serde(rename = "q", alias = "query")]
@@ -82,9 +67,6 @@ struct GeocodeCase {
     form: Option<String>,
     #[serde(default)]
     cohort: Option<String>,
-    /// Whether the expected street exists in the Pack at all. Cases that are
-    /// not covered are counted apart so an OSM coverage gap is never read as a
-    /// ranking failure.
     #[serde(default = "covered_by_default")]
     covered: bool,
     expect_lat: f64,
@@ -106,24 +88,18 @@ pub struct GeocodeBenchmarkReport {
     pub datum: Option<String>,
     pub buckets_m: BTreeMap<String, f64>,
     pub cases: usize,
-    /// Keyed `<cohort>/<form>/<coverage>`, plus `all` roll-ups.
     pub groups: BTreeMap<String, GroupReport>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct GroupReport {
     pub cases: usize,
-    /// `hit@1`: bucket of the first result's distance.
     pub hit1: BTreeMap<String, usize>,
-    /// `hit@5`: bucket of the *best* distance among the first five results, so
-    /// a block of neighbouring houses cannot satisfy it by accident.
     pub hit5: BTreeMap<String, usize>,
-    /// Geohash-prefix agreement, an absolute grid that cannot be retuned.
     pub gh6_hit1: usize,
     pub gh4_hit1: usize,
     pub median_distance_m: Option<f64>,
     pub p90_distance_m: Option<f64>,
-    /// Up to five of the worst `hit@1` outcomes, for triage.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub worst: Vec<WorstCase>,
 }
@@ -291,8 +267,6 @@ fn percentile(sorted: &[f64], q: f64) -> Option<f64> {
         .map(|v| (v * 100.0).round() / 100.0)
 }
 
-/// `None` distance means the query returned nothing, which is a coverage
-/// outcome and is kept apart from a wrong answer.
 fn bucket_of(distance: Option<f64>, buckets: &BTreeMap<String, f64>) -> String {
     let Some(d) = distance else {
         return "none".to_string();

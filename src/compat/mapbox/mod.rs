@@ -1,12 +1,3 @@
-//! `/compat/mapbox`: Mapbox Geocoding v6 and Search Box v1.
-//!
-//! Geocoding v6 answers `/search/geocode/v6/{forward,reverse,batch}` from
-//! og's `/geocode`, `/places?ids` and `/reverse`. Search Box v1 answers
-//! `/search/searchbox/v1/{suggest,retrieve,forward,reverse}` from
-//! `/autocomplete`, `/places`, `/geocode` and `/reverse`, and
-//! `/search/searchbox/v1/category/{id}` and `/list/category` from og's
-//! places by kind.
-
 mod category;
 mod geocoding;
 mod hours;
@@ -138,8 +129,6 @@ impl Api {
         error(status, message)
     }
 
-    /// og's Problem as Mapbox's error. Mapbox documents no message for most
-    /// of og's checks, so og's own detail is the message.
     fn failed(self, problem: Problem) -> VendorError {
         let detail = problem.detail().unwrap_or_default().to_string();
         let vendor = match problem.status() {
@@ -159,7 +148,6 @@ impl Api {
     }
 }
 
-/// A request's query parameters, or a batch query's keys, as text.
 #[derive(Debug, Default)]
 struct Params(Vec<(String, String)>);
 
@@ -207,8 +195,6 @@ impl Params {
         Ok(Some(format!("{lon},{lat}")))
     }
 
-    /// A reverse request's `longitude` and `latitude` as og's `lon` and
-    /// `lat`, checked in the words Mapbox uses for its other coordinates.
     fn point(&self, api: Api) -> Result<(String, String), VendorError> {
         let coordinate = |name: &str, label: &str, bound: f64| {
             self.get(name)
@@ -227,7 +213,6 @@ impl Params {
         ))
     }
 
-    /// `bbox` as og's, checked in Mapbox's words.
     fn bbox(&self, api: Api) -> Result<Option<String>, VendorError> {
         let Some(value) = self.get("bbox") else {
             return Ok(None);
@@ -274,7 +259,6 @@ impl Params {
     }
 }
 
-/// The `types` a request asks for, as Mapbox `feature_type`s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Types(Vec<&'static str>);
 
@@ -315,9 +299,6 @@ impl Types {
         Ok(Self(types))
     }
 
-    /// og's `layer` for these types, only when they are one type og has a
-    /// layer for. Several types are filtered from og's answer instead, by
-    /// [`Types::admits`], as og takes one layer at a time.
     fn og_layer(&self) -> Option<&'static str> {
         match self.0.as_slice() {
             [single] => match *single {
@@ -336,10 +317,6 @@ impl Types {
         }
     }
 
-    /// og's `layer` for a reverse lookup of these types. og's reverse
-    /// answers the address or street at the point with the areas holding
-    /// it, and filters only those two, so an area type is kept from its
-    /// whole answer by [`Types::admits`].
     fn reverse_layer(&self) -> Option<&'static str> {
         self.og_layer()
             .filter(|layer| matches!(*layer, "address" | "street" | "poi"))
@@ -350,24 +327,16 @@ impl Types {
     }
 }
 
-/// Keeps the features `types` asks for, so a type og has no layer for, or
-/// one of several, is never answered with a feature of another type.
 fn admitted(types: Option<&Types>, common: &Common) -> bool {
     types.is_none_or(|types| types.admits(feature_type(common)))
 }
 
-/// og's layer as Mapbox's `feature_type`.
 fn feature_type(common: &Common) -> &'static str {
     match common.layer {
         Layer::Address => "address",
-        // og's interpolation layer holds an estimated address, with its
-        // number, and the range it was estimated on, a stretch of street.
         Layer::Interpolation if is_address(common) => "address",
         Layer::Interpolation | Layer::Street => "street",
         Layer::Postcode => "postcode",
-        // og's locality is the city, town or village, Mapbox's `place`. og's
-        // `place` layer is a named area outside the admin tiers, such as an
-        // island or a hamlet, which Mapbox also files as a `place`.
         Layer::Locality | Layer::Place => "place",
         Layer::Neighbourhood => "neighborhood",
         Layer::District => "district",
@@ -406,8 +375,6 @@ fn accuracy(api: Api, common: &Common) -> Option<&'static str> {
     }
 }
 
-/// The code of the country a reverse point lies in: of the country its
-/// results lie in, or of the country og answers as one of them.
 fn point_country(collection: &ReverseCollection) -> Option<&str> {
     collection.features.iter().find_map(|feature| {
         let common = &feature.properties.common;
@@ -420,8 +387,6 @@ fn point_country(collection: &ReverseCollection) -> Option<&str> {
     })
 }
 
-/// Keeps a reverse answer only when its point lies in one of `countries`,
-/// any when there are none. A point og places in no country is in none.
 fn keep_countries(collection: &mut ReverseCollection, countries: &[String]) {
     let kept = countries.is_empty()
         || point_country(collection)
@@ -431,8 +396,6 @@ fn keep_countries(collection: &mut ReverseCollection, countries: &[String]) {
     }
 }
 
-/// `country`, comma-separated ISO 3166 alpha-2 codes, as upper case. A
-/// value that is no code is Mapbox's unknown stack.
 fn countries(api: Api, params: &Params) -> Result<Vec<String>, crate::compat::VendorError> {
     params.get("country").map_or(Ok(Vec::new()), |value| {
         value
@@ -450,8 +413,6 @@ fn countries(api: Api, params: &Params) -> Result<Vec<String>, crate::compat::Ve
     })
 }
 
-/// og's credits as one line. They name the data the answer comes from,
-/// never Mapbox's.
 fn attribution(credits: &[Attribution]) -> String {
     credits
         .iter()
@@ -474,7 +435,6 @@ fn attribution(credits: &[Attribution]) -> String {
         .join("; ")
 }
 
-/// A Mapbox `coordinates` object.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct Coordinates {
     longitude: f64,
@@ -485,8 +445,6 @@ struct Coordinates {
     routable_points: Vec<RoutablePoint>,
 }
 
-/// A point to route to: an entrance OpenStreetMap maps on the outline the
-/// address or POI is drawn with.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct RoutablePoint {
     name: &'static str,
@@ -494,16 +452,11 @@ struct RoutablePoint {
     latitude: f64,
 }
 
-/// One og result as the translators read it: its properties and point, and
-/// what the lookup that found it measured.
 #[derive(Debug, Clone, Copy)]
 struct Found<'a> {
     common: &'a Common,
     coordinates: [f64; 2],
-    /// How the query's parts matched, on a forward geocode's address
-    /// reading.
     matched: Option<&'a QueryMatch>,
-    /// Metres from the forward focus, Mapbox's `proximity`.
     distance_m: Option<f64>,
 }
 
@@ -530,7 +483,6 @@ impl<'a> Found<'a> {
     }
 }
 
-/// Comma-separated finite numbers, `None` when any part is not one.
 fn numbers(value: &str) -> Option<Vec<f64>> {
     value
         .split(',')
@@ -554,7 +506,6 @@ fn bbox(common: &Common) -> Option<[f64; 4]> {
     })
 }
 
-/// GeoJSON point geometry.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct Geometry {
     #[serde(rename = "type")]
@@ -571,12 +522,8 @@ impl Geometry {
     }
 }
 
-/// One context layer, before it is written with Geocoding's `mapbox_id` or
-/// Search Box's `id`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Area {
-    /// The encoded og id. Absent on a layer filled from an address part
-    /// the source states, which names no record.
     id: Option<String>,
     name: String,
     address_number: Option<String>,
@@ -585,7 +532,6 @@ struct Area {
     country_code_alpha_3: Option<&'static str>,
     region_code: Option<String>,
     region_code_full: Option<String>,
-    /// The area's Wikidata item, `Q30`.
     wikidata_id: Option<String>,
 }
 
@@ -598,9 +544,6 @@ impl Area {
         }
     }
 
-    /// An area og found the result in. A country's code is its own two
-    /// letters; any other area's is its subdivision code, written on the
-    /// region only.
     fn of(area: &crate::api::ContextArea) -> Self {
         Self {
             wikidata_id: area.wikidata.map(|item| format!("Q{item}")),
@@ -609,13 +552,10 @@ impl Area {
         .with_country_code(area.code.as_deref())
     }
 
-    /// The region og found the result in, with its code (`ON` of `CA-ON`)
-    /// and its full code.
     fn region(area: &crate::api::ContextArea) -> Self {
         Self::of(area).with_region_code(area.code.as_deref())
     }
 
-    /// The area with `code`'s country codes, when it is a country's.
     fn with_country_code(mut self, code: Option<&str>) -> Self {
         if let Some(code) = code.filter(|code| !code.contains('-')) {
             self.country_code_alpha_3 = iso::alpha3(code);
@@ -624,7 +564,6 @@ impl Area {
         self
     }
 
-    /// The area with `code`'s region codes, when it is a subdivision's.
     fn with_region_code(mut self, code: Option<&str>) -> Self {
         if let Some((_, own)) = code.and_then(|code| code.split_once('-')) {
             self.region_code = Some(own.to_string());
@@ -634,7 +573,6 @@ impl Area {
     }
 }
 
-/// The fields every layer may carry besides its id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct LayerFields {
     name: String,
@@ -653,8 +591,6 @@ struct LayerFields {
 }
 
 impl Area {
-    /// The id, and the fields each product writes beside it under its own
-    /// key.
     fn split(self) -> (Option<String>, LayerFields) {
         (
             self.id,
@@ -671,8 +607,6 @@ impl Area {
     }
 }
 
-/// A Mapbox `context`, most specific layer first. `L` is the layer as each
-/// product writes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct Context<L> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -718,7 +652,6 @@ impl<L> Default for Context<L> {
 }
 
 impl Context<Area> {
-    /// [`Context::map`], with each layer's key.
     fn map_named<L>(self, layer: impl Fn(&str, Area) -> L) -> Context<L> {
         let layer = &layer;
         let named = |key: &'static str| move |area| layer(key, area);
@@ -737,8 +670,6 @@ impl Context<Area> {
         }
     }
 
-    /// The layers that name a record. A layer filled from an address part
-    /// the source states names none, so it has no id to give.
     fn recorded(self) -> Self {
         let kept = |layer: Option<Area>| layer.filter(|area| area.id.is_some());
         Self {
@@ -773,13 +704,11 @@ impl Context<Area> {
     }
 }
 
-/// One og result, read into the parts Mapbox's two products share.
 #[derive(Debug, Clone, PartialEq)]
 struct Translated {
     mapbox_id: String,
     feature_type: &'static str,
     name: String,
-    /// House number and street, as Search Box's `address`.
     address: Option<String>,
     full_address: Option<String>,
     place_formatted: Option<String>,
@@ -848,7 +777,6 @@ impl Translated {
     }
 }
 
-/// House number then street, as og's own address names are written.
 fn address_line(number: Option<&str>, street: Option<&str>) -> Option<String> {
     let line = [number, street]
         .into_iter()
@@ -939,8 +867,6 @@ fn context(common: &Common, mapbox_id: &str, is_address: bool) -> Context<Area> 
             street_name: parts.street.clone(),
             ..own()
         });
-        // An address that states a unit is the flat, so it is the unit's
-        // record too.
         context.secondary_address = parts
             .unit
             .as_deref()
@@ -961,8 +887,6 @@ fn context(common: &Common, mapbox_id: &str, is_address: bool) -> Context<Area> 
         context.street = stated(&parts.street);
         return context;
     }
-    // An area's context is what holds it. og reads an area's context at its
-    // point, which also lies in areas smaller than the area itself.
     let below = match common.layer {
         Layer::Locality | Layer::Place => 2,
         Layer::District => 3,
@@ -990,8 +914,6 @@ fn context(common: &Common, mapbox_id: &str, is_address: bool) -> Context<Area> 
         Layer::Country => &mut context.country,
         Layer::Address | Layer::Poi => return context,
     };
-    // An area is its own layer, with the code og gives it. A country og
-    // derives from its code names it in its id instead.
     let code = common
         .code
         .as_deref()
@@ -1004,8 +926,6 @@ fn context(common: &Common, mapbox_id: &str, is_address: bool) -> Context<Area> 
     context
 }
 
-/// The Maki icon for og's POI category, for the categories one icon plainly
-/// names. Others get none rather than a guess.
 fn maki(category: &str) -> Option<&'static str> {
     Some(match category {
         "amenity:cafe" => "cafe",

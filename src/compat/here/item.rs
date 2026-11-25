@@ -1,5 +1,3 @@
-//! og features as HERE result items.
-
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -17,9 +15,6 @@ use super::{
     hours::{self, OpeningHours},
 };
 
-/// What HERE reads of an og feature. A live answer converts from og's own
-/// types; a batch job's results come back from disk as og's JSON, and that
-/// boundary reads the same fields (pinned equal by a test).
 #[derive(Debug, PartialEq, Deserialize)]
 pub(super) struct Feature {
     geometry: Geometry,
@@ -44,7 +39,6 @@ struct Properties {
     context: Context,
     confidence: Option<f32>,
     distance_m: Option<f64>,
-    /// A place's kind, as og's map tag (`amenity:cafe`).
     category: Option<String>,
     bbox: Option<[f64; 4]>,
     #[serde(rename = "match")]
@@ -53,22 +47,16 @@ struct Properties {
     highlights: Vec<Highlight>,
     #[serde(default)]
     access: Vec<Access>,
-    /// An area's own ISO code (`US`, `US-RI`).
     code: Option<String>,
     contact: Option<Contact>,
-    /// OpenStreetMap's `opening_hours`, as written.
     opening_hours: Option<String>,
-    /// The address as the lines of a postal address, in its country's form.
     #[serde(default)]
     address_lines: Vec<String>,
-    /// The IANA zone the result lies in.
     timezone: Option<String>,
-    /// The kinds of food a place serves, as its `cuisine` tag lists them.
     #[serde(default)]
     cuisine: Vec<String>,
 }
 
-/// A way in og maps for the result.
 #[derive(Debug, PartialEq, Deserialize)]
 struct Access {
     lon: f64,
@@ -117,8 +105,6 @@ impl Area {
     }
 }
 
-/// The parts of a forward or a reverse answer HERE reads that `Common`
-/// does not hold.
 struct Extra {
     confidence: Option<f32>,
     distance_m: Option<f64>,
@@ -127,8 +113,6 @@ struct Extra {
 }
 
 impl Feature {
-    /// How far the result lies from a reverse geocode's point, none for an
-    /// area holding the point.
     pub(super) fn distance_m(&self) -> f64 {
         self.properties.distance_m.unwrap_or(0.0)
     }
@@ -160,15 +144,11 @@ impl Feature {
                     block,
                     subblock,
                     unit: address.unit.clone(),
-                    // A US street in the postal abbreviation, as its label
-                    // writes it.
                     street: match compat::country_code(context) {
                         Some("US") => compat::us_street(address).or_else(|| address.street.clone()),
                         _ => address.street.clone(),
                     },
                     areas: address.areas.clone(),
-                    // A stated town as a vendor writes it, in the
-                    // locality's spelling.
                     locality: address
                         .locality
                         .as_ref()
@@ -242,8 +222,6 @@ impl From<&ReverseFeature> for Feature {
     }
 }
 
-/// A HERE result item. Every field og has no value for is left out, as HERE
-/// leaves out what it lacks.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Item {
@@ -256,44 +234,36 @@ pub(super) struct Item {
     pub(super) locality_type: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) administrative_area_type: Option<&'static str>,
-    /// A query item's search, a `/discover` URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) href: Option<String>,
     #[serde(skip_serializing_if = "ItemAddress::is_empty")]
     pub(super) address: ItemAddress,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) position: Option<Position>,
-    /// The entrances og maps for the result, HERE's points to route to.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) access: Vec<Position>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) distance: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) map_view: Option<MapView>,
-    /// The HERE categories of a place whose kind has one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) categories: Vec<ItemCategory>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) food_types: Vec<ItemCategory>,
-    /// How to reach a place, which only place answers carry.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) contacts: Vec<ContactInformation>,
-    /// When a place is open, which only place answers carry.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) opening_hours: Vec<OpeningHours>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) highlights: Option<Highlights>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) scoring: Option<Scoring>,
-    /// How og read the query, part by part, when `show=parsing` asks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) parsing: Option<Parsing>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) time_zone: Option<ItemTimeZone>,
 }
 
-/// HERE's `timeZone`, the IANA zone and its offset from UTC when the
-/// request is answered.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ItemTimeZone {
@@ -301,7 +271,6 @@ pub(super) struct ItemTimeZone {
     pub(super) utc_offset: String,
 }
 
-/// A place's contacts by kind, each value as its source writes it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(super) struct ContactInformation {
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -396,7 +365,6 @@ pub(super) struct Position {
     pub(super) lng: f64,
 }
 
-/// The box a result covers, from og's `bbox`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub(super) struct MapView {
     pub(super) west: f64,
@@ -405,12 +373,9 @@ pub(super) struct MapView {
     pub(super) north: f64,
 }
 
-/// Where the typed text lies in the title and the address label, in
-/// characters, end exclusive.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(super) struct Highlights {
     title: Vec<Highlight>,
-    /// A query item has a title and no address, so it marks none.
     #[serde(skip_serializing_if = "Option::is_none")]
     address: Option<LabelHighlights>,
 }
@@ -418,13 +383,10 @@ pub(super) struct Highlights {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct LabelHighlights {
     label: Vec<Highlight>,
-    /// Each address field's marks, where the typed text marks it.
     #[serde(flatten)]
     fields: std::collections::BTreeMap<&'static str, Vec<Highlight>>,
 }
 
-/// The marks of `label` that fall in `value`, where `label` writes it,
-/// counted from the start of `value`.
 fn field_marks(label: &str, marks: &[Highlight], value: &str) -> Vec<Highlight> {
     let Some(byte) = label.find(value) else {
         return Vec::new();
@@ -441,12 +403,8 @@ fn field_marks(label: &str, marks: &[Highlight], value: &str) -> Vec<Highlight> 
         .collect()
 }
 
-/// HERE's `parsing`: each part of the query og read, by HERE's name of it,
-/// with where it stands in the query.
 pub(super) type Parsing = std::collections::BTreeMap<&'static str, Vec<ParsedTerm>>;
 
-/// A part of the query: its text, where it starts and ends in characters,
-/// and the `qq` field it came from when it came from one.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(super) struct ParsedTerm {
     pub(super) start: usize,
@@ -464,8 +422,6 @@ pub(super) struct Scoring {
     field_score: FieldScore,
 }
 
-/// og's `match`, part by part, as HERE scores a field. HERE sends a field
-/// only when it matched the query, so an unmatched part is left out.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FieldScore {
@@ -495,9 +451,6 @@ impl FieldScore {
     }
 }
 
-/// A part's share of a full match. `partial` is og's word for a value
-/// accepted as the same though it differs (a typo, a range estimate, the
-/// postal town), so it counts half.
 const fn part_score(part: PartMatch) -> f64 {
     match part {
         PartMatch::Matched => 1.0,
@@ -506,11 +459,6 @@ const fn part_score(part: PartMatch) -> f64 {
     }
 }
 
-/// HERE's scoring of an og answer, from what og judged. `queryScore` is
-/// the mean share of the parts the query states, each by [`part_score`],
-/// which is 1 when every stated part matched. A result og judged on no part,
-/// found by its name, takes og's calibrated confidence when the Pack has
-/// one. With neither, og judged nothing, and no score is sent.
 fn scoring(properties: &Properties) -> Option<Scoring> {
     let matched = properties.matched.unwrap_or_default();
     let parts = [
@@ -552,8 +500,6 @@ fn scoring(properties: &Properties) -> Option<Scoring> {
     })
 }
 
-/// HERE's kind of result for an og layer, as `resultType`, then
-/// `localityType` or `administrativeAreaType`.
 fn kind(layer: Layer) -> (&'static str, Option<&'static str>, Option<&'static str>) {
     match layer {
         Layer::Address | Layer::Interpolation => ("houseNumber", None, None),
@@ -561,32 +507,22 @@ fn kind(layer: Layer) -> (&'static str, Option<&'static str>, Option<&'static st
         Layer::Poi => ("place", None, None),
         Layer::Postcode => ("postalCodePoint", None, None),
         Layer::Locality => ("locality", Some("city"), None),
-        // og's neighbourhood is a part of a town, which is HERE's district.
         Layer::Neighbourhood => ("locality", Some("district"), None),
-        // og's district is the tier between region and town, a county.
         Layer::District => ("administrativeArea", None, Some("county")),
         Layer::Region => ("administrativeArea", None, Some("state")),
         Layer::Country => ("administrativeArea", None, Some("country")),
-        // A named area outside the admin tiers, usually an island. HERE has
-        // no type of locality for one.
         Layer::Place => ("locality", None, None),
     }
 }
 
-/// The HERE item for an og feature, with `position` set, `distance` from
-/// og's own `distance_m` (a reverse answer's), `mapView` from og's `bbox`
-/// and `scoring` from og's `match`.
 pub(super) fn item(feature: &Feature) -> Item {
     let properties = &feature.properties;
     let (mut result_type, locality_type, administrative_area_type) = kind(properties.layer);
-    // An interpolation range found by its street alone, with no number
-    // asked, is a street to HERE.
     if properties.layer == Layer::Interpolation && properties.address.housenumber.is_none() {
         result_type = "street";
     }
     let house_number_type = match (result_type, properties.accuracy) {
         ("houseNumber", Accuracy::Interpolated) => Some("interpolated"),
-        // The address's own point or building is a point address.
         ("houseNumber", Accuracy::Rooftop | Accuracy::Centroid) => Some("PA"),
         _ => None,
     };
@@ -609,7 +545,6 @@ pub(super) fn item(feature: &Feature) -> Item {
                 lng: point.lon,
             })
             .collect(),
-        // HERE counts whole meters.
         distance: properties
             .distance_m
             .map(|distance| distance.round() as i64),
@@ -637,8 +572,6 @@ pub(super) fn item(feature: &Feature) -> Item {
     }
 }
 
-/// A place is titled by its name, a house or street by its postal label,
-/// anything else by og's label.
 fn title(properties: &Properties) -> String {
     match properties.layer {
         Layer::Poi => properties.name.clone(),
@@ -646,10 +579,6 @@ fn title(properties: &Properties) -> String {
     }
 }
 
-/// HERE's label: for a house or street its postal address lines in its
-/// country's form, joined (`Heinestraße 42, 1020 Wien, Austria`), else
-/// og's label. The town is the one [`compat::town`] names, and a US street
-/// is abbreviated as the postal service writes it, as HERE writes both.
 fn label(properties: &Properties) -> String {
     postal_label(properties).unwrap_or_else(|| properties.label.clone())
 }
@@ -665,8 +594,6 @@ fn postal_label(properties: &Properties) -> Option<String> {
     }
     let address = &properties.address;
     let mut lines = lines.clone();
-    // HERE writes the house's own line first; a country whose post puts
-    // the unit on a line above it still gets the house line first.
     if let Some(street) = address.street.as_deref()
         && let Some(at) = lines[1..].iter().position(|line| line.contains(street))
     {
@@ -676,9 +603,6 @@ fn postal_label(properties: &Properties) -> Option<String> {
     Some(lines.join(", "))
 }
 
-/// og's highlights mark og's label. Each marked text is found again in
-/// HERE's label, which may write the parts in another order, and the title
-/// keeps the marks that lie in it when the label starts with it.
 fn highlights(properties: &Properties) -> Highlights {
     let label = label(properties);
     let marks = moved(&properties.label, &properties.highlights, &label);
@@ -706,9 +630,6 @@ fn highlights(properties: &Properties) -> Highlights {
     }
 }
 
-/// `marks` on `from`, placed on `to` where the text each marks is found,
-/// in order and without overlap, ignoring case. A mark whose text `to` does
-/// not hold is dropped.
 fn moved(from: &str, marks: &[Highlight], to: &str) -> Vec<Highlight> {
     if from == to {
         return marks.to_vec();
@@ -752,17 +673,11 @@ fn moved(from: &str, marks: &[Highlight], to: &str) -> Vec<Highlight> {
     placed
 }
 
-/// The areas the feature lies in first. HERE's tiers are admin areas, and
-/// og's context is the admin hierarchy. What the record states fills a tier
-/// og has no area for. An area feature fills its own tier with its name, so
-/// a town is its own city. Street, number, unit and postcode are the
-/// record's.
 fn address(properties: &Properties) -> ItemAddress {
     let stated = &properties.address;
     let context = &properties.context;
     let area = |area: &Option<Area>| area.as_ref().map(|area| area.name.clone());
     let own = |layer: Layer| (properties.layer == layer).then(|| properties.name.clone());
-    // An area's own code names it where no context area does.
     let own_code = |layer: Layer| {
         properties
             .code
@@ -777,10 +692,6 @@ fn address(properties: &Properties) -> ItemAddress {
         // OSM's `addr:country` is the two-letter code by convention.
         .or(stated.country.as_deref())
         .and_then(|code| iso::alpha3(&code.to_ascii_uppercase()));
-    // HERE's district is the first tier below the town and its subdistrict
-    // the one below that. og's sublocality and neighbourhood are those two
-    // tiers when both are there, and a lone neighbourhood is the district,
-    // as a neighbourhood found as itself is.
     let (district, subdistrict) = match (area(&context.sublocality), area(&context.neighbourhood)) {
         (Some(sublocality), neighbourhood) => (Some(sublocality), neighbourhood),
         (None, Some(neighbourhood)) => (Some(neighbourhood), None),
@@ -826,8 +737,6 @@ fn address(properties: &Properties) -> ItemAddress {
 }
 
 impl Item {
-    /// The crow-flies distance from the search center to the result, in
-    /// whole meters, as HERE counts it.
     pub(super) fn distance_from(mut self, center: Option<LatLng>) -> Self {
         if let (Some(center), Some(position)) = (center, self.position) {
             let meters = haversine_m(center.lng, center.lat, position.lng, position.lat);
@@ -862,16 +771,11 @@ impl Item {
         self
     }
 
-    /// Only `/geocode` scores its items.
     pub(super) fn without_scoring(mut self) -> Self {
         self.scoring = None;
         self
     }
 
-    /// Where the typed text lies, which only suggestions carry.
-    /// A query item, a search HERE offers to run: `categoryQuery` or
-    /// `chainQuery`, with its title, the `/discover` URL that runs it and
-    /// where the typed text lies in its title.
     pub(super) fn query(
         result_type: &'static str,
         title: String,
@@ -935,10 +839,6 @@ impl Item {
         self
     }
 
-    /// An autocomplete suggestion's title, its parts from the country down
-    /// as HERE's autocomplete writes it: `Deutschland, 60486, Frankfurt am
-    /// Main, Pariser Straße 2`. A street spans postcodes, so it names none.
-    /// The typed text's marks follow their text into it.
     pub(super) fn titled_country_first(mut self, feature: &Feature) -> Self {
         let properties = &feature.properties;
         let address = &self.address;
@@ -975,8 +875,6 @@ impl Item {
         self
     }
 
-    /// The zone the result lies in and its offset now, when `show=tz` asks
-    /// for it.
     pub(super) fn with_time_zone(mut self, feature: &Feature, shown: bool) -> Self {
         self.time_zone = feature
             .properties
@@ -993,8 +891,6 @@ impl Item {
         self
     }
 
-    /// A place's contacts and opening hours, which only the answers that
-    /// carry place details have: discover, browse, lookup and autosuggest.
     pub(super) fn with_details(mut self, feature: &Feature) -> Self {
         let properties = &feature.properties;
         self.contacts = properties
@@ -1015,7 +911,6 @@ impl Item {
         self
     }
 
-    /// An `/autocomplete` suggestion has no point, no way in and no box.
     pub(super) fn without_position(mut self) -> Self {
         self.position = None;
         self.access = Vec::new();
@@ -1023,7 +918,6 @@ impl Item {
         self
     }
 
-    /// Whether a `types` value admits the item, by HERE's definitions.
     pub(super) fn is_of(&self, kind: &str) -> bool {
         let result_type = self.result_type;
         match kind {

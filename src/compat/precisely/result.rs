@@ -1,9 +1,3 @@
-//! og's feature as a Precisely `Result`.
-//!
-//! A real-time lookup hands og's typed feature over as it is. A job's results
-//! come back from disk as og wrote them, and are parsed there into the same
-//! [`Feature`], so both fill the same Precisely slots.
-
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -29,7 +23,6 @@ pub(super) enum Product {
     Verify,
 }
 
-/// og's feature, the fields a Precisely result carries.
 #[derive(Debug, Deserialize)]
 pub(super) struct Feature {
     geometry: Geometry,
@@ -58,8 +51,6 @@ struct Properties {
     accuracy: Accuracy,
     name: String,
     label: String,
-    /// The ISO code of an area result itself, which its `context` does not
-    /// name.
     code: Option<String>,
     #[serde(default)]
     address: Address,
@@ -74,10 +65,7 @@ struct Properties {
     distance_m: Option<f64>,
     #[serde(default)]
     highlights: Vec<Highlight>,
-    /// The building the address's source draws it as.
     building: Option<crate::record::Building>,
-    /// The kind of entrance the result's own point is, when it is one of
-    /// its entrances (`main`).
     door: Option<String>,
 }
 
@@ -96,7 +84,6 @@ struct Address {
     street_parts: Option<StreetParts>,
 }
 
-/// og's `street_parts`, the street as its prefix, name, type and suffix.
 #[derive(Debug, Deserialize)]
 struct StreetParts {
     prefix: Option<String>,
@@ -124,7 +111,6 @@ struct Area {
     census_code: Option<String>,
 }
 
-/// An area the result lies in or is: its name and ISO code.
 #[derive(Debug, Clone, Copy)]
 struct AreaRef<'a> {
     name: &'a str,
@@ -146,7 +132,6 @@ struct Source {
 }
 
 impl Feature {
-    /// The parts both a forward and a reverse feature have.
     fn of(common: &api::Common, coordinates: [f64; 2]) -> Self {
         let address = &common.address;
         let context = &common.context;
@@ -255,7 +240,6 @@ impl Candidate {
     }
 }
 
-/// Precisely's `Result`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Candidate {
@@ -358,7 +342,6 @@ pub(super) struct SimpleFeature {
 }
 
 impl SimpleFeature {
-    /// A point in og's coordinates.
     pub(super) fn point(coordinates: [f64; 2]) -> Self {
         Self {
             kind: "Feature",
@@ -392,7 +375,6 @@ pub(super) struct AddressMatch {
     pub(super) description: Vec<MatchDescription>,
 }
 
-/// How one address part matched, `MatchDescription`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct MatchDescription {
@@ -402,29 +384,20 @@ pub(super) struct MatchDescription {
     pub(super) matched_substring: Option<String>,
 }
 
-/// og's coordinates are WGS 84 longitude and latitude.
 const CRS_NAME: &str = "epsg:4326";
 
-/// The compatibility field carrying the og reference for lookup.
 pub(super) const ID_FIELD: &str = "PB_KEY";
-/// The custom field naming the result's point as a geohash.
 const GEOHASH: &str = "GEOHASH";
-/// Characters of the geohash, which names the point to centimetres.
 const GEOHASH_CHARS: usize = 12;
-/// The custom field naming what kind of thing matched the address asked.
 const MATCH_TYPE: &str = "MATCH_TYPE";
 
-/// Which autocomplete a prediction answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Autocomplete {
-    /// `/v1/autocomplete`.
     V1,
-    /// `/v2/express-autocomplete`.
     Express,
 }
 
 impl Feature {
-    /// The label, as an autocomplete `prediction` shows it.
     pub(super) fn label(&self) -> &str {
         &self.properties.label
     }
@@ -433,13 +406,10 @@ impl Feature {
         &self.properties.name
     }
 
-    /// `[longitude, latitude]`.
     pub(super) const fn coordinates(&self) -> [f64; 2] {
         self.geometry.coordinates
     }
 
-    /// The result itself as an area of `layer`, when it is one. An area's
-    /// `context` holds only the areas around it.
     fn own(&self, layer: Layer) -> Option<AreaRef<'_>> {
         let properties = &self.properties;
         (properties.layer == layer).then(|| AreaRef {
@@ -448,7 +418,6 @@ impl Feature {
         })
     }
 
-    /// The region the result lies in, or is.
     fn region(&self) -> Option<AreaRef<'_>> {
         self.properties
             .context
@@ -458,7 +427,6 @@ impl Feature {
             .or_else(|| self.own(Layer::Region))
     }
 
-    /// The country the result lies in, or is.
     fn country(&self) -> Option<AreaRef<'_>> {
         self.properties
             .context
@@ -468,9 +436,6 @@ impl Feature {
             .or_else(|| self.own(Layer::Country))
     }
 
-    /// The ISO 3166-1 alpha-2 code of the country it lies in or is. A
-    /// region's ISO 3166-2 code starts with it, so a region that names no
-    /// country still gives it.
     pub(super) fn country_code(&self) -> Option<&str> {
         self.country().and_then(|country| country.code).or_else(|| {
             self.region()
@@ -547,12 +512,8 @@ impl Feature {
         }
     }
 
-    /// A reverse geocode candidate. It carries how far the result is from
-    /// the asked point in the custom fields Precisely writes it to. An area
-    /// holds the point, so it has none.
     pub(super) fn reverse_candidate(&self) -> Candidate {
         let mut candidate = self.unasked_candidate(FoundBy::Point);
-        // The point is the one asked, so the answer restates no geohash.
         candidate.custom_fields.remove(GEOHASH);
         if let Some(distance_m) = self.properties.distance_m {
             candidate
@@ -586,7 +547,6 @@ impl Feature {
     pub(super) fn unasked_candidate(&self, found_by: FoundBy) -> Candidate {
         let mut candidate = self.candidate(Product::Geocode);
         candidate.score = Some(0);
-        // No address was asked, so no kind of match is named.
         candidate.custom_fields.remove(MATCH_TYPE);
         candidate.explanation.address_match.description = judged_unasked(
             &candidate.address,
@@ -596,13 +556,10 @@ impl Feature {
         candidate
     }
 
-    /// Metres from the point a reverse geocode, or an autocomplete with
-    /// `originXY`, measured from.
     pub(super) const fn distance_m(&self) -> Option<f64> {
         self.properties.distance_m
     }
 
-    /// A geocode, verify, lookup or reverse candidate, in the postal form.
     pub(super) fn candidate(&self, product: Product) -> Candidate {
         self.build(product, Style::Postal).0
     }
@@ -699,7 +656,6 @@ impl Feature {
             Some((zip, extension)) => (Some(zip.to_string()), Some(extension.to_string())),
             None => (address.postcode.clone(), None),
         };
-        // Address fields often use a region abbreviation; the containing area holds the full name.
         let region = self.region();
         let region_code = region
             .and_then(|region| region.code?.split_once('-'))
@@ -725,10 +681,7 @@ impl Feature {
             iso_numeric_code: code.as_deref().and_then(iso::numeric),
             iso_alpha2_code: code,
         });
-        // An area result is its own area of its layer: a town fills `city`
-        // with its own name, as a region fills `admin1`.
         let own = |of: &str| (layer == of).then(|| properties.name.clone());
-        // `areas` runs outermost first, a suburb before a neighbourhood.
         let neighborhood = area(&context.neighbourhood)
             .or_else(|| address.areas.last().cloned())
             .or_else(|| own("neighbourhood"));
@@ -737,11 +690,8 @@ impl Feature {
         let street = address
             .street
             .clone()
-            // OSM `addr:place` numbers the house on a place, not a street.
             .or_else(|| address.place.clone())
             .or_else(|| (layer == "street").then(|| properties.name.clone()));
-        // og's name is the street line only for these layers; a POI's is
-        // its own name.
         let (street_line, location_line) = if is_street_line {
             let (street_line, location_line) =
                 split_label(&properties.label, &properties.name, address.unit.as_deref());
@@ -775,8 +725,6 @@ impl Feature {
                 formatted_location_address: location_line,
                 address_number: address.housenumber.clone(),
                 street,
-                // The unit's type apart from its value: `STE` and `300` of
-                // `STE 300`.
                 unit: match (&address.unit, &kind) {
                     (Some(unit), Some(kind)) => unit
                         .strip_prefix(kind.as_str())
@@ -892,7 +840,6 @@ impl Feature {
         let holds = Holds::of(&candidate.address);
         candidate.explanation.address_match.description = describe(judged);
         if product == Product::Verify {
-            // Verify standardizes an address and does not place it.
             candidate.location = None;
             candidate.custom_fields.remove(GEOHASH);
             if let Some(code) = MatchCode::derive(judged, holds, candidate.score) {
@@ -907,8 +854,6 @@ impl Feature {
         (candidate, us)
     }
 
-    /// The street's own name and its type, the postal form's for a US
-    /// address, og's parts for any other.
     fn street_name_and_type(&self, us: Option<&UsAddress>) -> Option<(String, Option<String>)> {
         if let Some(us) = us {
             return Some((us.street(Style::Postal), us.street_type(Style::Postal)));
@@ -994,9 +939,6 @@ impl Feature {
         }))
     }
 
-    /// How the typed text matched each part, from the parts of the label
-    /// it marked. Precisely names what matched in capitals. Empty when og
-    /// marked nothing.
     fn typed(&self, address: &ResponseAddress) -> Vec<MatchDescription> {
         let label = self.properties.label.chars().collect::<Vec<_>>();
         let marked = self
@@ -1054,7 +996,6 @@ impl Feature {
 }
 
 impl UsAddress {
-    /// Writes the address into a candidate in `style`.
     fn write(&self, candidate: &mut Candidate, style: Style) {
         let address = &mut candidate.address;
         let street_line = self.street_line(style);
@@ -1095,7 +1036,6 @@ impl AdminField {
         })
     }
 
-    /// A name Precisely writes as both the long and the short name.
     fn both(name: String) -> Self {
         Self {
             short_name: Some(name.clone()),
@@ -1123,7 +1063,6 @@ const LABELS: [&str; 13] = [
 ];
 
 impl Holds {
-    /// What a result's address holds, for the parts og can fill.
     fn of(address: &ResponseAddress) -> Self {
         Self {
             housenumber: address.address_number.is_some(),
@@ -1139,26 +1078,12 @@ impl Holds {
     }
 }
 
-/// How each part matched, as Precisely's `MatchDescription` names it, for
-/// every part it lists. A part og did not judge, or the query left out, is
-/// `NONE`. og judges the street whole, not its type and direction apart.
-/// Empty when og judged no part, as of a record looked up by its key.
-/// How a record was found when no address was asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FoundBy {
-    /// Reverse geocoding, by the street segment the point lies on.
     Point,
-    /// Lookup, by the whole record its key names.
     Key,
 }
 
-/// Each part judged with no address asked. Found by a point, the record is
-/// the street segment the point lies on, so the street (its name, type and
-/// direction as one), the city and the state are `EXACT` where the record
-/// holds them, and the house number, postcode and unit, which a point does
-/// not fix, are `NONE`. Found by its key, the postal parts of the record
-/// are read with it and are `EXACT` too where it holds a postcode. A part
-/// the record lacks is `NONE`.
 fn judged_unasked(
     address: &ResponseAddress,
     street: bool,
@@ -1219,19 +1144,12 @@ fn describe(judged: QueryMatch) -> Vec<MatchDescription> {
         .collect()
 }
 
-/// The keys a reverse geocode result's distance from the asked point is
-/// under.
 pub(super) const REVERSE_DISTANCE: &str = "REVERSE_GEOCODE_DISTANCE";
 pub(super) const REVERSE_DISTANCE_UNIT: &str = "REVERSE_GEOCODE_DISTANCE_UNIT";
 
-/// The keys a verify result's Global Match Codes are under.
 pub(super) const SIMPLE_MATCH_CODE: &str = "SIMPLE_MATCH_CODE";
 pub(super) const EXTENDED_MATCH_CODE: &str = "EXTENDED_MATCH_CODE";
 
-/// og's label as Precisely's two lines. The street line, with the unit
-/// when the label writes it next, and the rest. The label starts with the
-/// name, then follows the country's template; a label that does not start
-/// so has no location line og can tell apart.
 fn split_label(label: &str, name: &str, unit: Option<&str>) -> (String, Option<String>) {
     let Some(rest) = label
         .strip_prefix(name)
@@ -1251,12 +1169,9 @@ fn split_label(label: &str, name: &str, unit: Option<&str>) -> (String, Option<S
     }
 }
 
-/// Precisely's `LocationType` for what og's point stands for. A named
-/// `place` (an island, a hamlet) has no counterpart, so it has none.
 fn location_type(layer: &str, accuracy: &str) -> Option<&'static str> {
     Some(match (layer, accuracy) {
         ("address" | "interpolation", "interpolated") => "ADDRESS_INTERPOLATED",
-        // With no house to place, the point is on its street.
         ("address" | "interpolation" | "street", "street") | ("street", _) => "STREET_CENTER",
         ("address", _) => "ADDRESS_POINT",
         ("interpolation", _) => "ADDRESS_INTERPOLATED",
@@ -1271,11 +1186,6 @@ fn location_type(layer: &str, accuracy: &str) -> Option<&'static str> {
     })
 }
 
-/// Precisely's `LocationDescription`, what an address's point stands on. A
-/// point that is one of the address's own entrances is a door, the front
-/// one for OSM's main entrance and the back one for its service entrance.
-/// Any other point of an address its source draws as a building is the
-/// building.
 fn location_description(properties: &Properties) -> Option<&'static str> {
     if properties.layer != Layer::Address {
         return None;
@@ -1289,8 +1199,6 @@ fn location_description(properties: &Properties) -> Option<&'static str> {
     }
 }
 
-/// Precisely's `MatchType`, what kind of thing matched. An area, og's
-/// fallback when the address is not found among them, is `ADMIN`.
 fn match_type(layer: &str, accuracy: &str) -> &'static str {
     match (layer, accuracy) {
         ("address" | "interpolation", "street") | ("street", _) => "STREET",
@@ -1300,8 +1208,6 @@ fn match_type(layer: &str, accuracy: &str) -> &'static str {
     }
 }
 
-/// The columns of a bulk geocode output row, in order. Precisely names the
-/// fields but documents no order, so this is og's.
 const COLUMNS: [&str; 30] = [
     "addressId",
     "status",
@@ -1335,12 +1241,9 @@ const COLUMNS: [&str; 30] = [
     "customFields",
 ];
 
-/// Columns bulk verify output leaves out, since a verified address has no
-/// point.
 const UNPLACED: [&str; 2] = ["latitude", "longitude"];
 
 impl Product {
-    /// The columns of the product's bulk output row, in order.
     pub(super) fn columns(self) -> Vec<&'static str> {
         COLUMNS
             .into_iter()
@@ -1350,8 +1253,6 @@ impl Product {
 }
 
 impl Candidate {
-    /// The candidate's cells from `score` on, as [`Product::columns`] lists
-    /// them.
     pub(super) fn cells(&self, product: Product) -> Vec<String> {
         let address = &self.address;
         let text = |value: &Option<String>| value.clone().unwrap_or_default();
@@ -1432,8 +1333,6 @@ impl Candidate {
             self.explanation.address_match.kind.to_string(),
             custom_fields,
         ];
-        // `COLUMNS` opens with the id, status and message, which the caller
-        // writes.
         COLUMNS[3..]
             .iter()
             .zip(cells)
@@ -1472,8 +1371,6 @@ mod tests {
         assert_eq!(county.get("city"), None);
     }
 
-    /// og's answer for 350 Jordan Avenue as the Lycoming County source
-    /// writes it, `district` standing in for the town.
     fn jordan() -> Feature {
         serde_json::from_value(serde_json::json!({
             "geometry": {"coordinates": [-76.9251736, 41.2480338]},
@@ -1572,8 +1469,6 @@ mod tests {
         );
     }
 
-    /// Each part is judged where it stands, a unit designator the asked
-    /// street ends in left out.
     #[test]
     fn a_streets_parts_are_judged_where_they_stand() {
         let judged = |asked: &str| {
@@ -1604,12 +1499,8 @@ mod tests {
         assert_eq!(judged("jordan rd"), (Some("NONE"), Some("EXACT")));
         assert_eq!(judged("jordan"), (Some("NONE"), Some("EXACT")));
         assert_eq!(judged("n jordan ave"), (Some("EXACT"), Some("NONE")));
-        // A word that only may be a type elsewhere in the street is none:
-        // `St` of Saint before the name, a direction that is the name.
         assert_eq!(judged("St Jordan Rd"), (Some("NONE"), Some("EXACT")));
         assert_eq!(judged("North Ave"), (Some("EXACT"), Some("EXACT")));
-        // Asked `St Botolph Ave` of `SAINT BOTOLPH ST`, the type differs,
-        // though the asked `St` of Saint spells the record's type.
         let mut botolph = jordan();
         botolph.properties.address.street = Some("SAINT BOTOLPH ST".to_string());
         botolph.properties.address.street_parts = Some(StreetParts {
@@ -1638,8 +1529,6 @@ mod tests {
         assert_eq!(kind, Some("NONE"));
     }
 
-    /// A postal answer restates its parts in the postal form, as the
-    /// documented answers for `1700 DISTRICT AVE STE 300` do.
     #[test]
     fn a_us_answer_restates_its_parts_in_the_postal_form() {
         let fields = jordan()
@@ -1674,9 +1563,6 @@ mod tests {
         assert!(!verified.contains_key(GEOHASH) && verified.contains_key(MATCH_TYPE));
     }
 
-    /// Each autocomplete restates what its documented predictions do, the
-    /// first the address on one line and the number and street matched,
-    /// express its formatted address and the unit.
     #[test]
     fn a_prediction_restates_what_its_autocomplete_does() {
         let fields = |feature: &Feature, version| {
@@ -1768,7 +1654,6 @@ mod tests {
             ),
             ("100 King Street West, Unit 5".to_string(), None)
         );
-        // A unit the label does not write next stays out of the street line.
         assert_eq!(
             split(
                 "100 King Street West, Toronto 5",
@@ -1835,7 +1720,6 @@ mod tests {
     }
 }
 
-/// Words a unit starts with that say what kind of unit it is.
 const UNIT_TYPES: [&str; 18] = [
     "apartment",
     "apt",
@@ -1857,13 +1741,9 @@ const UNIT_TYPES: [&str; 18] = [
     "#",
 ];
 
-/// `unit`'s designator as written, such as `Apt` of `Apt 4`, for
-/// Precisely's `unitType`. `None` when the unit starts with none, or is
-/// only one.
 fn unit_type(unit: &str) -> Option<String> {
     let mut words = unit.split_whitespace();
     let first = words.next()?;
-    // A designator with nothing after it is the whole unit, not its type.
     words.next()?;
     let key = first.trim_end_matches('.').to_lowercase();
     UNIT_TYPES

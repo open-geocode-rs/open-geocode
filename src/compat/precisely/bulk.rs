@@ -1,14 +1,3 @@
-//! Bulk Geo Addressing v2 on og's `/jobs`.
-//!
-//! Precisely's flow, on og's own URLs. An upload URL that points back at og,
-//! a `PUT` of the CSV to it, a submit that starts an og job, polling, and a
-//! download. The uploaded file and the job's bookkeeping live in the job
-//! store's directory and expire with its jobs.
-//!
-//! The CSV streams into the job as one JSONL item a row, so each row carries
-//! its own country and id; the job's JSONL results stream back out as
-//! Precisely's output CSV. Neither file is ever held in memory whole.
-
 use std::{
     collections::{BTreeMap, HashSet},
     fs::{self, File},
@@ -44,34 +33,27 @@ use crate::{
     runtime::AppState,
 };
 
-/// Bytes handed on at a time, to a job's upload or a download.
 const CHUNK_BYTES: usize = 64 << 10;
 
 const INVALID_FILE: &str = "Invalid File Id (DIS-LI-1052)";
 const INVALID_JOB: &str = "Invalid Job Id (DIS-LI-1051)";
 const INVALID_CLIENT_INPUT: &str = "Request is not valid (DIS-LI-1018)";
 
-/// An upload, as its record on disk keeps it.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredFile {
     file_id: String,
     file_name: String,
-    /// Unix nanoseconds, so files asked for within one second list in the
-    /// order they were.
     created_ns: u64,
 }
 
-/// A job started here, og's job and the upload it read.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredJob {
     job_id: String,
     file_id: String,
     file_name: String,
-    /// Unix milliseconds.
     submitted_at: u64,
-    /// Absent on a job stored before bulk verify, which was a geocode.
     #[serde(default)]
     product: Product,
 }
@@ -82,8 +64,6 @@ pub(super) fn now() -> Duration {
         .unwrap_or_default()
 }
 
-/// Inside og's job directory, so uploads and jobs expire together and one
-/// setting moves both.
 fn root(state: &AppState) -> PathBuf {
     state.jobs().dir().join("precisely")
 }
@@ -96,22 +76,18 @@ fn jobs_dir(state: &AppState) -> PathBuf {
     root(state).join("jobs")
 }
 
-/// A file id as og issued it. Being a UUID also makes it safe as a file
-/// name.
 fn file_id(raw: &str) -> Option<String> {
     uuid::Uuid::try_parse(raw.trim())
         .ok()
         .map(|id| id.hyphenated().to_string())
 }
 
-/// og's job ids are UUIDs written without hyphens.
 fn job_id(raw: &str) -> Option<String> {
     uuid::Uuid::try_parse(raw.trim())
         .ok()
         .map(|id| id.simple().to_string())
 }
 
-/// og's job id as Precisely writes a job id, a hyphenated UUID.
 fn vendor_job_id(job_id: &str) -> String {
     uuid::Uuid::try_parse(job_id)
         .map_or_else(|_| job_id.to_string(), |id| id.hyphenated().to_string())
@@ -121,8 +97,6 @@ fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
-/// Written aside and renamed into place, so a reader never sees half a
-/// record.
 fn write_record<T: Serialize>(path: &Path, record: &T) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -143,7 +117,6 @@ fn internal(cause: io::Error) -> VendorError {
     .caused_by(crate::http::problem::Problem::internal(cause.into()))
 }
 
-/// The upload `id` names, unless it expired.
 fn stored_file(state: &AppState, id: &str) -> Option<StoredFile> {
     let id = file_id(id)?;
     let file = read_record::<StoredFile>(&files_dir(state).join(format!("{id}.json")))?;
@@ -155,7 +128,6 @@ fn content_path(state: &AppState, id: &str) -> PathBuf {
     files_dir(state).join(format!("{id}.csv"))
 }
 
-/// The job `id` names, if this module started it and og still keeps it.
 fn stored_job(state: &AppState, id: &str) -> Option<(StoredJob, jobs::JobStatus)> {
     let id = job_id(id)?;
     let path = jobs_dir(state).join(format!("{id}.json"));
@@ -169,13 +141,9 @@ fn stored_job(state: &AppState, id: &str) -> Option<(StoredJob, jobs::JobStatus)
     }
 }
 
-/// Delete uploads past the job store's retention, and the records of jobs
-/// og no longer keeps.
 pub(crate) fn sweep(state: &AppState) {
     let retention = state.limits().job_retention().as_secs();
     let now = now().as_secs();
-    // Every file is named for its id first. The record, its content, and a
-    // write in progress or cut off by a crash all go with the record.
     let id_of = |path: &Path| {
         path.file_name()
             .and_then(|name| name.to_str())
@@ -220,7 +188,6 @@ pub(super) struct UploadUrl {
     message: &'static str,
 }
 
-/// Longest file name kept. It is a label, never a path.
 const MAX_FILE_NAME_CHARS: usize = 255;
 
 pub(super) async fn upload_url(
@@ -252,7 +219,6 @@ pub(super) async fn upload_url(
     }))
 }
 
-/// A write in progress, removed unless it is renamed into place.
 #[derive(Debug)]
 struct Partial(PathBuf);
 
@@ -262,7 +228,6 @@ impl Drop for Partial {
     }
 }
 
-/// The upload URL's `PUT`, the file's bytes written as they arrive.
 pub(super) async fn put_content(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
@@ -348,8 +313,6 @@ pub(super) async fn put_content(
     Ok(StatusCode::OK)
 }
 
-/// Bytes the uploads take, so they cannot fill the disk og's job store is
-/// capped on.
 fn stored_bytes(dir: &Path) -> u64 {
     fs::read_dir(dir).map_or(0, |entries| {
         entries
@@ -372,8 +335,6 @@ struct InputFile {
     file_name: String,
 }
 
-/// Uploaded files, oldest first. One whose upload URL was never used is
-/// not one yet.
 pub(super) async fn list_files(State(state): State<AppState>) -> Json<InputFiles> {
     let dir = files_dir(&state);
     let mut files = fs::read_dir(&dir)
@@ -415,7 +376,6 @@ pub(super) async fn delete_file(
 ) -> Result<Json<Deleted>, VendorError> {
     let file = stored_file(&state, &id)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_REQUEST", INVALID_FILE))?;
-    // A job reading the file keeps its open handle.
     if let Err(error) = fs::remove_file(content_path(&state, &file.file_id))
         && error.kind() != io::ErrorKind::NotFound
     {
@@ -491,8 +451,6 @@ fn check_emails(emails: Option<&[Option<String>]>) -> Result<(), VendorError> {
     Ok(())
 }
 
-/// The columns a row is read from. The three Precisely requires, and the
-/// address parts its utility maps a file's own columns to.
 #[derive(Debug, Clone, Copy)]
 struct Columns {
     address_id: usize,
@@ -505,7 +463,6 @@ struct Columns {
 
 const BYTE_ORDER_MARK: &[u8] = "\u{feff}".as_bytes();
 
-/// Read the header row, leaving `reader` at the first row.
 fn read_header(reader: &mut csv::Reader<File>) -> Result<Columns, VendorError> {
     let missing = || {
         error(
@@ -551,8 +508,6 @@ fn read_header(reader: &mut csv::Reader<File>) -> Result<Columns, VendorError> {
     })
 }
 
-/// Feed the upload's rows to the job as JSONL, a chunk at a time. Stops
-/// when the job stops reading, as a cancelled one does.
 fn translate(
     mut reader: csv::Reader<File>,
     columns: &Columns,
@@ -612,7 +567,6 @@ fn translate(
     }
 }
 
-/// `/v2/bulk-geocode`.
 pub(super) async fn geocode(
     State(state): State<AppState>,
     request: Request,
@@ -620,8 +574,6 @@ pub(super) async fn geocode(
     submit(state, request, Product::Geocode).await
 }
 
-/// `/v2/bulk-verify`. The same job as a geocode, written out as verify
-/// output.
 pub(super) async fn verify(
     State(state): State<AppState>,
     request: Request,
@@ -689,8 +641,6 @@ async fn submit(
         .and_then(|location| location.strip_prefix("/jobs/"))
         .map(str::to_string)
         .ok_or_else(|| internal(io::Error::other("the job has no Location")))?;
-    // Not streamed, since the client polls and the job runs on without a
-    // reader.
     drop(started);
     let stored = StoredJob {
         job_id: job_id.clone(),
@@ -712,8 +662,6 @@ async fn submit(
         .into_response())
 }
 
-/// og's job state as Precisely names it. og starts a job at once, so none
-/// is ever `SCHEDULED`.
 fn status_name(status: Status) -> &'static str {
     match status {
         Status::Running => "RUNNING",
@@ -756,8 +704,6 @@ pub(super) struct Cancelled {
     message: &'static str,
 }
 
-/// Precisely cancels a job only while it waits to start. og's never wait,
-/// so a running one is cancelled; the rows it answered are kept.
 pub(super) async fn cancel_job(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
@@ -785,7 +731,6 @@ pub(super) struct QueuedJobs {
     jobs: Vec<QueuedJob>,
 }
 
-/// `QueuedJobView`. Its `emailId` is omitted, since og has no users.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueuedJob {
@@ -796,8 +741,6 @@ struct QueuedJob {
     submitted_at: String,
 }
 
-/// Jobs still to finish, newest first. `status` picks `scheduled`,
-/// `running` or `all` of them.
 pub(super) async fn list_jobs(
     State(state): State<AppState>,
     RawQuery(query): RawQuery,
@@ -851,7 +794,6 @@ pub(super) async fn list_jobs(
     }))
 }
 
-/// Unix milliseconds as `2025-11-03T09:39:17.128Z`.
 pub(super) fn iso8601(millis: u64) -> String {
     let seconds = millis / 1000;
     let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX);
@@ -866,8 +808,6 @@ pub(super) fn iso8601(millis: u64) -> String {
     )
 }
 
-/// A line of og's JSONL results. The row's place, its id, and its answer
-/// or its Problem.
 #[derive(Debug, Deserialize)]
 struct ResultLine {
     row: usize,
@@ -894,8 +834,6 @@ struct RowParam {
     name: String,
 }
 
-/// The output rows of one input row. One a candidate, or one saying why
-/// there is none.
 fn output_rows(line: ResultLine, product: Product) -> io::Result<Vec<u8>> {
     let mut writer = WriterBuilder::new().from_writer(Vec::new());
     let id = line.id.unwrap_or_default();
@@ -932,15 +870,11 @@ fn output_rows(line: ResultLine, product: Product) -> io::Result<Vec<u8>> {
     writer.into_inner().map_err(|error| error.into_error())
 }
 
-/// Write the job's results as Precisely's output, in input order, a chunk
-/// at a time.
 fn convert(results: &Path, product: Product, chunks: &mpsc::Sender<Result<Bytes, io::Error>>) {
     let run = || -> io::Result<()> {
         let mut header = WriterBuilder::new().from_writer(Vec::new());
         header.write_record(product.columns())?;
         let mut buffer = header.into_inner().map_err(|error| error.into_error())?;
-        // og writes rows as they finish; the order is restored here, as og
-        // restores it for its own CSV.
         let mut pending = BTreeMap::new();
         let mut next_row = 0;
         for line in BufReader::new(File::open(results)?).lines() {
@@ -969,7 +903,6 @@ fn convert(results: &Path, product: Product, chunks: &mpsc::Sender<Result<Bytes,
     }
 }
 
-/// The `downloadUrl`, a completed job's output CSV.
 pub(super) async fn output(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,

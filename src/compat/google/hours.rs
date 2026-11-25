@@ -1,14 +1,7 @@
-//! A place's opening hours as Google's `OpeningHours`.
-//!
-//! [`Week`] reads OpenStreetMap's value. A value it does not read gives no
-//! hours, so the slot stays empty.
-
 use serde::Serialize;
 
 use crate::compat::hours::{DAY_MINUTES, Week, Weekday};
 
-/// Google's `OpeningHours`, as weekly periods only. `weekdayDescriptions` is
-/// text Google writes in the language asked, which og does not render.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct OpeningHours {
     pub(super) periods: Vec<Period>,
@@ -23,7 +16,6 @@ pub(super) struct Period {
     pub(super) close: Option<Point>,
 }
 
-/// `day` counts from 0 for Sunday.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub(super) struct Point {
     pub(super) day: u8,
@@ -32,7 +24,6 @@ pub(super) struct Point {
 }
 
 impl Point {
-    /// `minutes` past the start of `day`, carried into the day after.
     fn at(day: Weekday, minutes: u16) -> Self {
         let day = if minutes >= DAY_MINUTES {
             day.next()
@@ -48,7 +39,6 @@ impl Point {
     }
 }
 
-/// `value` as weekly periods, `None` when [`Week`] does not read it.
 pub(super) fn parse(value: &str, zone: Option<&str>) -> Option<OpeningHours> {
     let week = Week::parse(value)?;
     let open_now = week.open_at(zone, jiff::Timestamp::now());
@@ -80,7 +70,6 @@ pub(super) fn parse(value: &str, zone: Option<&str>) -> Option<OpeningHours> {
 mod tests {
     use super::*;
 
-    /// Day, hour and minute.
     type At = (u8, u8, u8);
 
     fn periods(value: &str) -> Option<Vec<(At, Option<At>)>> {
@@ -136,7 +125,6 @@ mod tests {
                     .collect()
             )
         );
-        // A later rule overrides an earlier one for its days.
         assert_eq!(
             periods("Mo-We 09:00-17:00; Tu off"),
             Some(vec![

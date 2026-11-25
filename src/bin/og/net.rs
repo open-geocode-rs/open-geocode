@@ -1,6 +1,3 @@
-//! Talking to the servers extracts come from: their size and date, the
-//! extract itself, and the checksum it is published with.
-
 use std::{
     fmt::Write as _,
     fs::{self, File, OpenOptions},
@@ -24,19 +21,14 @@ use ureq::{Agent, ResponseExt, http::Response};
 use crate::format;
 
 const CHUNK_BYTES: usize = 1 << 20;
-/// How long a download may receive nothing before it is given up as stalled.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long the index body may take to arrive once its headers are in.
 const INDEX_BODY_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_millis(500)
 } else {
     Duration::from_secs(60)
 };
-/// How often a download waiting for data looks at its cancel flag.
 const POLL: Duration = Duration::from_millis(200);
-/// Geofabrik's list of every extract it serves and where each one is now.
 pub(crate) const GEOFABRIK_INDEX: &str = "https://download.geofabrik.de/index-v1-nogeom.json";
-/// How many times a request is repeated after a timeout or a 5xx answer.
 const RETRIES: u32 = 3;
 
 fn agent() -> &'static Agent {
@@ -55,7 +47,6 @@ fn agent() -> &'static Agent {
     })
 }
 
-/// The wait before retry number `attempt` (from 0), doubling each time.
 fn backoff(attempt: u32) -> Duration {
     let first = if cfg!(test) {
         Duration::from_millis(1)
@@ -65,8 +56,6 @@ fn backoff(attempt: u32) -> Duration {
     first * 2u32.pow(attempt)
 }
 
-/// A timeout or a server error may pass. A 404 or any other answer will not,
-/// so it is never repeated.
 fn is_transient(error: &ureq::Error) -> bool {
     match error {
         ureq::Error::Timeout(_) => true,
@@ -75,8 +64,6 @@ fn is_transient(error: &ureq::Error) -> bool {
     }
 }
 
-/// Runs `request` and repeats it, with a growing wait, while it fails with a
-/// timeout or a 5xx answer.
 fn retrying<T>(mut request: impl FnMut() -> Result<T, ureq::Error>) -> Result<T, ureq::Error> {
     let mut attempt = 0;
     loop {
@@ -90,7 +77,6 @@ fn retrying<T>(mut request: impl FnMut() -> Result<T, ureq::Error>) -> Result<T,
     }
 }
 
-/// A file on a server, as its headers describe it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Remote {
     pub bytes: Option<u64>,
@@ -155,7 +141,6 @@ struct Urls {
 
 impl Index {
     pub(crate) fn fetch(url: &str) -> Result<Self> {
-        // Only the index gets a body limit, extract downloads keep their idle timeout.
         retrying(|| {
             agent()
                 .get(url)
@@ -170,7 +155,6 @@ impl Index {
         .with_context(|| format!("failed to read {url}"))
     }
 
-    /// The download link of the extract the index calls `id`.
     pub(crate) fn link(&self, id: &str) -> Result<&str> {
         self.features
             .iter()
@@ -180,8 +164,6 @@ impl Index {
     }
 }
 
-/// An extract where its server keeps it now, and the MD5 sum published
-/// beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Published {
     pub url: String,
@@ -214,23 +196,18 @@ pub(crate) fn published(url: &str) -> Result<Published> {
     Ok(Published { url, md5 })
 }
 
-/// The file a download is written to until it is complete and checked.
 pub(crate) fn partial_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".part");
     path.with_file_name(name)
 }
 
-/// Beside a partial file: the ETag, or else the Last-Modified date, of the
-/// response it was written from. A download continues the partial file only
-/// while the server still has that version of the file.
 fn version_path(partial: &Path) -> PathBuf {
     let mut name = partial.file_name().unwrap_or_default().to_os_string();
     name.push(".version");
     partial.with_file_name(name)
 }
 
-/// Moves a complete, checked download into place.
 pub(crate) fn complete(partial: &Path, path: &Path) -> Result<()> {
     fs::rename(partial, path)
         .with_context(|| format!("failed to move {} into place", path.display()))?;
@@ -238,16 +215,11 @@ pub(crate) fn complete(partial: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Removes a partial file there is no use continuing from.
 pub(crate) fn discard(partial: &Path) {
     let _ = fs::remove_file(partial);
     let _ = fs::remove_file(version_path(partial));
 }
 
-/// Downloads the published file to the partial file of `path`, continuing
-/// an earlier download that stopped while the server still has the same
-/// version of the file, and starting over when it does not. `progress` is told the
-/// bytes on disk so far and the whole size, when the server says it.
 pub(crate) fn download(
     published: &Published,
     path: &Path,
@@ -268,7 +240,6 @@ pub(crate) fn download(
     let resume = version.filter(|_| have > 0).map(|version| (have, version));
     match fetch(url, &partial, resume.as_ref(), cancel, &mut progress)? {
         Fetched::Done => Ok(partial),
-        // The partial file is no part of what the server has now.
         Fetched::Stale => {
             discard(&partial);
             match fetch(url, &partial, None, cancel, &mut progress)? {
@@ -281,12 +252,9 @@ pub(crate) fn download(
 
 enum Fetched {
     Done,
-    /// The partial file cannot be continued.
     Stale,
 }
 
-/// One request for `url`: the bytes after `resume`'s when given, else all
-/// of it.
 fn fetch(
     url: &str,
     partial: &Path,
@@ -361,8 +329,6 @@ fn fetch(
         .with_context(|| format!("failed to create {}", partial.display()))?;
     let mut done = start;
     progress(done, total);
-    // The body is read on a thread of its own, so a server that stops
-    // sending is noticed, and a cancel is seen, while a read waits.
     let (sender, chunks) = mpsc::sync_channel::<io::Result<Vec<u8>>>(4);
     let mut body = response.into_body().into_reader();
     thread::spawn(move || {
@@ -420,7 +386,6 @@ fn fetch(
     Ok(Fetched::Done)
 }
 
-/// Checks a file against an MD5 sum. `progress` is told the bytes read.
 pub(crate) fn check_md5(
     path: &Path,
     expected: &str,
@@ -473,22 +438,16 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
 
-    /// What a route answers: a body, a redirect to a path or a full URL, or an
-    /// error status.
     #[derive(Clone)]
     enum Answer {
         Body(Vec<u8>),
         Redirect(String),
-        /// An error status with no body.
         Status(u16),
-        /// Each answer once, in order, and the last one from then on.
         Sequence(Vec<Answer>),
-        /// A 200 whose headers promise more body than is ever sent, then silence.
         Stall(Vec<u8>),
     }
 
     impl Answer {
-        /// The answer for this request. A sequence moves on to its next one.
         fn next(&mut self) -> Answer {
             match self {
                 Answer::Sequence(answers) if answers.len() > 1 => answers.remove(0),
@@ -498,8 +457,6 @@ mod tests {
         }
     }
 
-    /// A local HTTP server whose routes a test can change while it runs.
-    /// Unknown paths answer 404.
     struct Server {
         base: String,
         routes: Arc<Mutex<Vec<(String, Answer)>>>,
@@ -580,7 +537,6 @@ mod tests {
             }
         }
 
-        /// How many requests the path has had.
         fn requests(&self, path: &str) -> usize {
             let asked = self.asked.lock().unwrap();
             asked
@@ -662,8 +618,6 @@ mod tests {
         );
     }
 
-    /// Geofabrik's biggest extracts: `-latest` redirects to a mirror, and only
-    /// the mirror has the `.md5`.
     #[test]
     fn the_sum_is_read_from_the_mirror_latest_redirects_to() {
         let (origin, mirror) = (Server::start(), Server::start());
@@ -712,8 +666,6 @@ mod tests {
         );
     }
 
-    /// `-latest` moves on to a new snapshot after its sum was read: the
-    /// download still fetches the snapshot the sum is of.
     #[test]
     fn a_snapshot_published_after_the_sum_is_read_does_not_reach_the_download() {
         let server = Server::start();
@@ -751,8 +703,6 @@ mod tests {
 
     const INDEX: &str = include_str!("fixtures/geofabrik-index.json");
 
-    /// A fake Geofabrik. Its index lists Monaco, which `/europe/monaco-latest.osm.pbf`
-    /// redirects to a dated file, and its sum is served beside that file.
     fn geofabrik(monaco: &[u8]) -> Server {
         let server = Server::start();
         server.route(
@@ -774,8 +724,6 @@ mod tests {
         server
     }
 
-    /// What `og build` does for a region: the index's link, the sum, the
-    /// download and the check. The file's bytes, or why it failed.
     fn build_download(server: &Server, id: &str) -> Result<Vec<u8>> {
         let index = Index::fetch(&server.url("/index-v1-nogeom.json"))?;
         let published = published(index.link(id)?)?;

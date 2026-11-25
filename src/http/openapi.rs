@@ -1,33 +1,3 @@
-//! The published API contract: an OpenAPI 3.1 description of every route,
-//! generated from the types that serve them and served at `/openapi.json`.
-//!
-//! Generating it from the Rust types rather than writing it by hand is what
-//! keeps it true: a field cannot change shape without the spec changing with
-//! it, and `contract_tests` fails when the committed
-//! `contract/openapi.json` and the code disagree.
-//!
-//! Five things are adjusted after generation, in [`transform`]:
-//!
-//! 1. `Option<T>` renders as a nullable union, `["string", "null"]`, but this
-//!    API never emits a null: an absent value is an absent key
-//!    (`skip_serializing_if`). The nulls are dropped so the spec says what
-//!    the API does.
-//! 2. Every route answers a method it does not take with a 405, from the
-//!    router's fallbacks rather than from a handler, so there is no
-//!    attribute to carry it.
-//! 3. Every single lookup may answer a 503, from the runner all lookups
-//!    share.
-//! 4. Every response gains the `X-Request-Id` header it actually returns,
-//!    and a batchable route's the `Allow` and `Accept-Query` it returns.
-//! 5. A batch body gains its `maxItems`, from the server's limits.
-//!
-//! OpenAPI 3.1 has no `query` operation, so a batch is documented on its
-//! `post`, whose description says `QUERY` takes the same body.
-//!
-//! Bounds in the parameter attributes below are written as literals, because
-//! the attribute macro cannot read a constant. `bounds_match_the_constants`
-//! keeps them honest.
-
 use axum::{
     extract::State,
     http::{HeaderValue, header},
@@ -49,11 +19,8 @@ use crate::{
     runtime::AppState,
 };
 
-/// The media type every error is served as (RFC 9457).
 pub(crate) const PROBLEM_JSON: &str = "application/problem+json";
 
-/// The response header every answer carries, echoing or minting the id the
-/// logs are indexed by.
 const REQUEST_ID_HEADER: &str = "X-Request-Id";
 
 #[derive(OpenApi)]
@@ -138,9 +105,6 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
 )]
 pub(crate) struct ApiDoc;
 
-// Schema-only mirror of [`crate::http::problem::Problem`], whose fields are
-// private so only its constructors build one.
-// `problem_schema_matches_the_rendered_body` holds the two together.
 /// Error response, an RFC 9457 problem document.
 #[derive(utoipa::ToSchema)]
 #[schema(as = Problem, title = "Problem")]
@@ -167,7 +131,6 @@ pub(crate) struct Problem {
     pub invalid_params: Option<Vec<InvalidParam>>,
 }
 
-// Mirrors [`crate::http::problem::ErrorCode`] for the schema.
 /// Stable error code.
 #[derive(utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -211,7 +174,6 @@ pub(crate) enum ErrorCode {
     PackOutdated,
 }
 
-// Mirrors [`crate::http::problem::InvalidParam`] for the schema.
 /// A rejected parameter.
 #[derive(utoipa::ToSchema)]
 #[allow(dead_code)]
@@ -371,8 +333,6 @@ pub(crate) struct BatchSummary {
     pub failed: usize,
 }
 
-// With the default limits, the same bytes as the committed
-// `contract/openapi.json`, which the contract tests hold to the code.
 /// Get the OpenAPI document
 ///
 /// Returns the OpenAPI 3.1 document describing this server's API.
@@ -394,9 +354,6 @@ pub(crate) async fn openapi_json(State(state): State<AppState>) -> Response {
     response
 }
 
-/// The spec as a canonical JSON string, with the bounds `limits` sets:
-/// `/openapi.json` serves it for the server's own, and
-/// `contract/openapi.json` is it for [`Limits::DEFAULT`].
 pub(crate) fn document(limits: &Limits) -> serde_json::Result<String> {
     let mut value = serde_json::to_value(ApiDoc::openapi())?;
     transform(&mut value, limits);
@@ -405,7 +362,6 @@ pub(crate) fn document(limits: &Limits) -> serde_json::Result<String> {
     Ok(text)
 }
 
-/// Adjust the generated spec to describe what the API actually does.
 fn transform(value: &mut Value, limits: &Limits) {
     drop_nulls(value);
     add_boundary_responses(value);
@@ -414,8 +370,6 @@ fn transform(value: &mut Value, limits: &Limits) {
     bound_batch_bodies(value, limits);
 }
 
-/// Give every batch body its item cap, which a `request_body` attribute has
-/// no way to say.
 fn bound_batch_bodies(value: &mut Value, limits: &Limits) {
     let Some(paths) = value.get_mut("paths").and_then(Value::as_object_mut) else {
         return;
@@ -431,9 +385,6 @@ fn bound_batch_bodies(value: &mut Value, limits: &Limits) {
     }
 }
 
-/// Document the 503 every single lookup may answer: refused while the server
-/// runs as many as it allows, or stopped past the lookup timeout. Both come
-/// from the shared lookup runner, not from one handler, so it is added here.
 fn add_lookup_refusals(value: &mut Value) {
     let Some(paths) = value.get_mut("paths").and_then(Value::as_object_mut) else {
         return;
@@ -468,17 +419,6 @@ fn add_lookup_refusals(value: &mut Value) {
     }
 }
 
-/// Document the 405 every route answers a method it does not take with.
-///
-/// It comes from the router's own fallbacks rather than from a handler, so
-/// there is no handler attribute to carry it and it has to be added here.
-/// Every route takes GET, and a route with a batch QUERY and POST too. HEAD
-/// is never taken: the router answers it 405 rather than letting axum route
-/// it to the GET handler.
-///
-/// The 404 is deliberately not added per operation: it belongs to paths that
-/// are not in this document at all, so hanging it off the paths that are
-/// would say the wrong thing.
 fn add_boundary_responses(value: &mut Value) {
     let Some(paths) = value.get_mut("paths").and_then(Value::as_object_mut) else {
         return;
@@ -500,7 +440,6 @@ fn add_boundary_responses(value: &mut Value) {
     }
 }
 
-/// A lookup route with a batch: `GET` for one, `POST` for many.
 fn is_batchable(operations: &Map<String, Value>) -> bool {
     operations.contains_key("get") && operations.contains_key("post")
 }
@@ -543,15 +482,6 @@ fn method_not_allowed_response(operations: &Map<String, Value>) -> Value {
     })
 }
 
-/// Drop `null` from everywhere the generator admitted one for an `Option<T>`.
-///
-/// Every optional field here is `skip_serializing_if`, so it is either a
-/// value or an absent key, never an explicit null. Leaving the nulls in would
-/// tell a client to expect a value this API never sends.
-///
-/// An `Option<T>` arrives in one of two shapes, so both are handled: a type
-/// union, `"type": ["string", "null"]`, for a plain field, and a
-/// `oneOf: [{$ref}, {"type": "null"}]` for one whose `T` is a named schema.
 fn drop_nulls(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -565,9 +495,6 @@ fn drop_nulls(value: &mut Value) {
 
             if let Some(Value::Array(variants)) = map.get_mut("oneOf") {
                 variants.retain(|variant| !is_null_schema(variant));
-                // A `oneOf` of one is just that one: inline it, so the field
-                // reads as the thing it is rather than a choice with no
-                // alternative.
                 if variants.len() == 1
                     && let Some(Value::Object(only)) = variants.pop()
                 {
@@ -591,15 +518,12 @@ fn drop_nulls(value: &mut Value) {
     }
 }
 
-/// Is this schema just `{"type": "null"}`?
 fn is_null_schema(value: &Value) -> bool {
     value
         .as_object()
         .is_some_and(|map| map.len() == 1 && map.get("type") == Some(&Value::String("null".into())))
 }
 
-/// Document the `X-Request-Id` every response carries, and the `Allow` and
-/// `Accept-Query` every response of a batchable route carries.
 fn add_response_headers(value: &mut Value) {
     let Some(paths) = value.get_mut("paths").and_then(Value::as_object_mut) else {
         return;
@@ -681,9 +605,6 @@ mod tests {
             .clone()
     }
 
-    /// The bounds in the `#[utoipa::path]` attributes are literals, because
-    /// the macro cannot read a constant. This is what stops them drifting
-    /// away from the constants the handlers actually enforce.
     #[test]
     fn bounds_match_the_constants() {
         let spec: Value =
@@ -705,8 +626,6 @@ mod tests {
             Value::from(MAX_AUTOCOMPLETE_LIMIT),
         );
 
-        // Compared as numbers: an integral bound serializes without its
-        // fractional part, so `-180.0` is written `-180`.
         let degrees = |parameter: &Value, bound: &str| {
             parameter["schema"][bound]
                 .as_f64()
@@ -720,10 +639,6 @@ mod tests {
         assert_eq!(degrees(&lat, "maximum"), 90.0);
     }
 
-    /// [`Problem`] here describes the body, and `problem::Problem` renders
-    /// it. They are separate types, so this holds their field names together:
-    /// a member renamed on one side without the other would publish a
-    /// contract the server does not honour.
     #[test]
     fn problem_schema_matches_the_rendered_body() {
         let rendered = serde_json::to_value(
@@ -756,15 +671,12 @@ mod tests {
             undocumented.is_empty(),
             "the server sends members the contract does not describe: {undocumented:?}"
         );
-        // `detail` is absent from this particular problem but documented, so
-        // only check that everything documented could be sent.
         assert!(
             documented.contains("detail"),
             "the contract should still document `detail`"
         );
     }
 
-    /// Every error the server can construct is a value the contract lists.
     #[test]
     fn every_error_code_is_in_the_contract() {
         let spec: Value =

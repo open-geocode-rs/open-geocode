@@ -1,26 +1,13 @@
-//! Whether two street names on nearby records name one road. The sources a
-//! Pack mixes spell one road differently: one's "Roosevelt Boulevard" is
-//! another's "E ROOSEVELT BLVD", and "Pražská třída" is "Pražská tř.". A
-//! search reads roads this way when it pairs house-number neighbours and
-//! joins the pieces of a street answer; a Pack build can read them alike.
-
 use crate::{
     parse::lattice,
     text_index::{direction_word, is_street_type},
     util::fold::search_key,
 };
 
-/// How far apart two pieces of one road may lie and still join: farther
-/// than the gaps between the address points along most roads, nearer than
-/// two roads of one name in one town usually are.
 pub(crate) const ROAD_LINK_M: f64 = 1_000.0;
 
-/// The fewest letters of a type glued onto a name that split it off: the
-/// tables list one-letter endings that end many names.
 const MIN_GLUED_TYPE: usize = 3;
 
-/// A street name read for comparing with another: its words, and its
-/// direction apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoadName {
     words: Vec<String>,
@@ -42,8 +29,6 @@ pub(crate) fn direction_of(word: &str) -> Option<&'static str> {
     direction_word(word).or_else(|| DIRECTIONS.iter().find(|full| **full == word).copied())
 }
 
-/// The parts of a street name as written: "W Main St N" is the prefix "W",
-/// the name "Main", the type "St" and the suffix "N".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct StreetParts<'a> {
     pub(crate) prefix: Option<&'a str>,
@@ -53,15 +38,9 @@ pub(crate) struct StreetParts<'a> {
 }
 
 impl<'a> StreetParts<'a> {
-    /// `street` split into its parts, `None` when it has no type or
-    /// direction to split off. A word is split off only while a word that
-    /// names the street is left: "North Street" is the name "North" and the
-    /// type "Street", never a direction and a type alone.
     pub(crate) fn of(street: &'a str) -> Option<Self> {
         let words = street.split_whitespace().collect::<Vec<_>>();
         let key = |word: &str| search_key(word).unwrap_or_default();
-        // A type is written in full or short, and a short form may stand
-        // for more than one word ("st" for street and saint).
         let is_type = |word: &str| {
             let key = key(word);
             is_street_type(&key)
@@ -90,8 +69,6 @@ impl<'a> StreetParts<'a> {
 }
 
 impl RoadName {
-    /// `name` read as a road, `None` when it has no words. A type glued
-    /// onto the name is a word of its own ("hauptstr" is "haupt str").
     pub(crate) fn of(name: &str) -> Option<Self> {
         let mut words = Vec::new();
         for word in search_key(name)?.split_whitespace() {
@@ -103,8 +80,6 @@ impl RoadName {
                 _ => words.push(word.to_string()),
             }
         }
-        // A direction leads or ends the name; it is kept apart only when a
-        // word that names the road is left ("North Street" stays a name).
         let names = |words: &[String]| {
             words
                 .iter()
@@ -129,9 +104,6 @@ impl RoadName {
         (!words.is_empty()).then_some(Self { words, direction })
     }
 
-    /// Whether `self` and `other` name one road: word for word alike, an
-    /// abbreviation alike with its full form; a direction only one states
-    /// does not tell them apart, two different ones do.
     pub(crate) fn same_road(&self, other: &Self) -> bool {
         if let (Some(mine), Some(theirs)) = (self.direction, other.direction)
             && mine != theirs
@@ -157,8 +129,6 @@ fn same_word(mine: &str, theirs: &str) -> bool {
         || mine_full.iter().any(|form| theirs_full.contains(form))
 }
 
-/// Whether the street names `left` and `right` name one road (see
-/// [`RoadName::same_road`]).
 pub(crate) fn same_road(left: &str, right: &str) -> bool {
     match (RoadName::of(left), RoadName::of(right)) {
         (Some(left), Some(right)) => left.same_road(&right),
@@ -166,9 +136,6 @@ pub(crate) fn same_road(left: &str, right: &str) -> bool {
     }
 }
 
-/// Whether records named `left` at `left_at` and `right` at `right_at`
-/// (longitude, latitude) lie on one road: one road by name, at most
-/// `within_m` apart.
 pub(crate) fn same_road_near(
     left: &str,
     left_at: [f64; 2],
@@ -179,8 +146,6 @@ pub(crate) fn same_road_near(
     planar_m(left_at, right_at) <= within_m && same_road(left, right)
 }
 
-/// The distance in metres between two near points, on a plane at their
-/// latitude: close enough at a road's scale and cheap enough for many.
 pub(crate) fn planar_m(left: [f64; 2], right: [f64; 2]) -> f64 {
     let latitude = ((left[1] + right[1]) / 2.0).to_radians();
     let east = (left[0] - right[0]) * latitude.cos();
@@ -188,9 +153,6 @@ pub(crate) fn planar_m(left: [f64; 2], right: [f64; 2]) -> f64 {
     (east * east + north * north).sqrt() * 111_195.0
 }
 
-/// The pieces of `pieces` (each a name and its points) that join into one
-/// road: one by name, each within [`ROAD_LINK_M`] of another of its road.
-/// Every piece is in one group; a group lists its pieces in their order.
 pub(crate) fn road_groups(pieces: &[(Option<RoadName>, Vec<[f64; 2]>)]) -> Vec<Vec<usize>> {
     let mut group = (0..pieces.len()).collect::<Vec<_>>();
     fn root(group: &mut [usize], mut at: usize) -> usize {
@@ -236,9 +198,6 @@ pub(crate) fn road_groups(pieces: &[(Option<RoadName>, Vec<[f64; 2]>)]) -> Vec<V
     groups
 }
 
-/// The middle of a road's `points`: the one half way along the road, by
-/// order along the longer side of their box, so it lies on the road.
-/// `None` for none.
 pub(crate) fn road_middle(points: &[[f64; 2]]) -> Option<[f64; 2]> {
     let first = points.first()?;
     let (mut west, mut south, mut east, mut north) = (first[0], first[1], first[0], first[1]);

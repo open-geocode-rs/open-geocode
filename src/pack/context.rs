@@ -1,29 +1,3 @@
-//! Boundary-derived admin context.
-//!
-//! A record's context is the chain of areas it lies in, outermost first. The
-//! chain is variable length because a country's hierarchy is: Germany maps
-//! nine admin levels, Monaco two. A fixed tuple of named slots has to choose
-//! which of a country's levels to keep, and the ones it drops are gone from
-//! every address in that country for the life of the Pack. A chain never
-//! chooses, so the build keeps every boundary and the lossy step moves to the
-//! response, where it is recomputed per request and costs nothing permanent.
-//!
-//! Most records share their chain with many neighbours, so chains are
-//! interned. A record body stores only the chain id ([`ContextRef`]); this
-//! module stores the chain table. Each tuple also carries the list of every
-//! area the record lies in (see [`crate::enclosing`]), so two records with
-//! one chain and different lists have two tuple ids.
-//!
-//! ```text
-//! context/tuples  chain_count u64, then per chain:
-//!                   len u8, zone u16, then len x (record_id u32, tiers u16)
-//!                 tiers is a bit per PlaceLayer discriminant, so one area
-//!                 can be two things at once; chains sorted by outermost.
-//!                 zone is 0 for none, else one more than the index of a
-//!                 timezone in the Pack's zone names (see
-//!                 [`RecordContext::zone`])
-//! ```
-
 use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{Error, Result};
@@ -39,28 +13,14 @@ use crate::{
 };
 
 pub const SECTION_TUPLES: &str = "context/tuples";
-/// 4 gives each chain a timezone; 3 gave each entry a set of tiers; 2 gave
-/// it one; 1 held a fixed six-slot tuple.
 pub const CONTEXT_VERSION: u32 = 4;
 pub const CONTEXT_FLAG_AMBIGUOUS_ADMIN: u16 = 1;
 pub(crate) const CONTEXT_FLAG_OUTER_ONLY: u16 = 2;
 
 const ENTRY_BYTES: usize = 6;
-/// Bytes of a chain's length and zone, which come before its entries.
 const CHAIN_HEADER_BYTES: usize = 3;
-/// Bounds one chain so a corrupt length cannot drive a huge allocation. No
-/// country maps anywhere near this many tiers.
 const MAX_CHAIN: usize = 32;
 
-/// The tiers one area is, as a bit per [`PlaceLayer`].
-///
-/// An area is usually one tier, but some are two at once and no ranking can
-/// choose between them without losing something true: Berlin is a city and a
-/// German state, Tokyo a city and a prefecture, Singapore a city and a
-/// country, Washington DC a city and a top-level region. With one tier per
-/// area a query for a city named Berlin and a query for the states of
-/// Germany cannot both be answered -- whichever tier is stored, the other
-/// fact is gone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TierSet(u16);
 
@@ -81,14 +41,12 @@ impl TierSet {
         self.0 == 0
     }
 
-    /// The tiers, outermost first.
     pub fn iter(self) -> impl Iterator<Item = PlaceLayer> {
         PlaceLayer::ALL
             .into_iter()
             .filter(move |tier| self.contains(*tier))
     }
 
-    /// The outermost tier, which is where the area sorts in a chain.
     pub fn outermost(self) -> Option<PlaceLayer> {
         self.iter().next()
     }
@@ -115,7 +73,6 @@ impl FromIterator<PlaceLayer> for TierSet {
     }
 }
 
-/// One area a record lies in, and everything that area is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AdminEntry {
     pub record_id: RecordId,
@@ -123,19 +80,16 @@ pub struct AdminEntry {
 }
 
 impl AdminEntry {
-    /// Where the area sorts in the chain: its outermost tier.
     fn rank(&self) -> Option<PlaceLayer> {
         self.tiers.outermost()
     }
 }
 
-/// The areas a record lies in, outermost first, one per tier.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AdminContextTuple {
     entries: Vec<AdminEntry>,
 }
 
-/// Admin context of one record plus assignment flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecordContext {
     pub admin_context: AdminContextTuple,
@@ -150,8 +104,6 @@ pub struct RecordContext {
 }
 
 impl RecordContext {
-    /// A boundary's chain is available to lookup, but does not vote in the
-    /// parser's dictionaries as if it were an address in its parent.
     pub fn is_area_list(&self) -> bool {
         self.flags & CONTEXT_FLAG_OUTER_ONLY != 0
             || (self.admin_context.is_empty() && !self.enclosing.is_empty())
@@ -163,7 +115,6 @@ impl AdminContextTuple {
         self.entries.is_empty()
     }
 
-    /// The chain, outermost first.
     pub fn entries(&self) -> &[AdminEntry] {
         &self.entries
     }
@@ -181,8 +132,6 @@ impl AdminContextTuple {
             self.sort();
             return;
         }
-        // An area already holding the tier is replaced, so a caller walking
-        // boundaries outermost-in keeps the innermost of a tier.
         match self
             .entries
             .iter_mut()
@@ -236,7 +185,6 @@ impl AdminContextTuple {
             .map(|entry| entry.record_id)
     }
 
-    /// Most specific first, place before the admin tiers.
     pub fn parent_record_ids(&self) -> impl Iterator<Item = RecordId> + '_ {
         self.entries.iter().rev().map(|entry| entry.record_id)
     }
@@ -257,7 +205,6 @@ impl AdminContextTuple {
         }
     }
 
-    /// Keeps only the areas `keep` says to.
     pub fn retain(&mut self, keep: impl FnMut(&AdminEntry) -> bool) {
         self.entries.retain(keep);
     }
@@ -331,7 +278,6 @@ impl FromIterator<AdminEntry> for AdminContextTuple {
 #[derive(Debug, Default)]
 pub struct TupleWriter {
     tuples: Vec<(AdminContextTuple, Option<u16>)>,
-    /// By tuple id, parallel to `tuples`.
     lists: Vec<Vec<RecordId>>,
     ids: HashMap<(AdminContextTuple, Vec<RecordId>, Option<u16>), u32>,
     area_tags: BTreeMap<RecordId, AreaTags>,
@@ -395,7 +341,6 @@ impl TupleWriter {
         self.tuples.len() as u64
     }
 
-    /// Write the table, and hand back its tuples.
     pub fn finish(self, pack: &mut Writer) -> Result<Vec<AdminContextTuple>> {
         let mut bytes =
             Vec::with_capacity(8 + self.tuples.len() * (CHAIN_HEADER_BYTES + 4 * ENTRY_BYTES));
@@ -417,8 +362,6 @@ impl TupleWriter {
 #[derive(Debug, Clone)]
 pub struct Reader {
     tuples: Bytes,
-    /// Byte offset of each chain. Chains vary in length, so there is no
-    /// stride to multiply; the offsets are walked once at open.
     offsets: Vec<u32>,
 }
 
@@ -494,9 +437,6 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
 
-    /// The bits are the on-disk encoding, so every tier has to survive the
-    /// round trip and a bit no tier claims has to be refused rather than
-    /// read as some other tier.
     #[test]
     fn every_tier_round_trips_through_its_bit() {
         for tier in PlaceLayer::ALL {
@@ -520,9 +460,6 @@ mod tests {
         assert_eq!(TierSet::from_bits(u16::MAX), None);
     }
 
-    /// One area that is two tiers is found by either, and sorts at its
-    /// outermost. Berlin is a city and a German state; before an entry
-    /// carried a set, storing one of those erased the other.
     #[test]
     fn an_area_can_be_two_tiers_at_once() {
         let chain = AdminContextTuple::from_tiers([

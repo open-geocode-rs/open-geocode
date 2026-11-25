@@ -1,25 +1,3 @@
-//! The old comma-based query parser, which the search used before the
-//! lattice parser, as a [`Tagger`], so the parse benchmark can show it as a
-//! floor beside the gold rows and the baselines.
-//!
-//! The plan holds words by role but not their positions, so the positions
-//! are recovered here by retracing its steps on each comma-separated part
-//! with the parser's own predicates, and then checked against the plan: a
-//! query whose retrace disagrees with the plan gets every token
-//! [`Label::Other`] rather than a guess. The roles map as:
-//!
-//! - the house number to `house_number`;
-//! - the required words of the subject part to `street`, whether they name a
-//!   street or what is sought ("tim hortons");
-//! - unit text, and words with digits after the street type ("fl36"), to
-//!   `unit`;
-//! - a context part with a digit to `postcode` from its first word with a
-//!   digit on, and `region` before that ("on m5c 2a1"); any other context
-//!   part to `locality`.
-//!
-//! The parser needs commas to tell a place from what is sought: without them
-//! every word but the house number and unit text is `street`.
-
 use crate::{
     parse::types::{Label, Tagged, Tagger},
     text_index::{
@@ -29,7 +7,6 @@ use crate::{
     util::fold::search_key,
 };
 
-/// The old comma-based query parser as a tagger.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LegacyTagger;
 
@@ -49,16 +26,12 @@ impl Tagger for LegacyTagger {
     }
 }
 
-/// One label per normalized token of the query, or `None` when the parser
-/// finds nothing to search or the retrace disagrees with its plan.
 fn legacy_labels(query: &str) -> Option<Vec<Label>> {
     let normalized_parts = query
         .split(',')
         .filter_map(search_key)
         .map(|part| part.split(' ').count())
         .collect::<Vec<_>>();
-    // The variant the search tries first: normalized, abbreviations expanded
-    // and fractional house numbers joined ("993_5"), word for word otherwise.
     let variant = expand_query(query)?;
     let plan = QueryPlan::parse(&variant)?;
     let parts = variant
@@ -101,8 +74,6 @@ fn legacy_labels(query: &str) -> Option<Vec<Label>> {
             }
             part_labels
         };
-        // A joined fraction ("993_5") is one word of the variant and one
-        // normalized token per number.
         let mut covered = 0;
         for (word, label) in words.iter().zip(part_labels) {
             let count = word.matches('_').count() + 1;
@@ -116,9 +87,6 @@ fn legacy_labels(query: &str) -> Option<Vec<Label>> {
     (context.next().is_none()).then_some(labels)
 }
 
-/// Which words of a part are unit text, as [`split_unit_words`] reads it: a
-/// unit designator and the value with a digit after it ("unit 602"). Checked
-/// against that function, so the two cannot drift apart.
 fn unit_positions(words: &[&str]) -> Option<Vec<bool>> {
     let mut unit = vec![false; words.len()];
     let mut index = 0;
@@ -147,9 +115,6 @@ fn unit_positions(words: &[&str]) -> Option<Vec<bool>> {
     (pick(false) == identifying && pick(true) == unit_words).then_some(unit)
 }
 
-/// Roles of the subject part's identifying words: the house number, the
-/// street, and words with digits after the street type, as
-/// [`QueryPlan::parse`] splits them. `None` when they disagree with the plan.
 fn subject_roles(plan: &QueryPlan, words: &[String]) -> Option<Vec<Label>> {
     let mut roles = Vec::with_capacity(words.len());
     let mut rest = words;
@@ -180,9 +145,6 @@ fn subject_roles(plan: &QueryPlan, words: &[String]) -> Option<Vec<Label>> {
     (street == plan.required).then_some(roles)
 }
 
-/// Roles of a context part's words: a part with a digit is a postcode from
-/// its first word with a digit on, the words before it a region ("on m5c
-/// 2a1"); any other part is a locality.
 fn context_roles(words: &[String]) -> Vec<Label> {
     if !is_postcode_part(words) {
         return vec![Label::Locality; words.len()];
@@ -202,22 +164,14 @@ fn context_roles(words: &[String]) -> Vec<Label> {
         .collect()
 }
 
-/// The old comma-based query parser, kept here only to be scored: a query's
-/// words by role. The first comma-separated part with words other than unit
-/// text names what is sought, and its words are required. The parts after it
-/// ("Toronto", "M6G 1B8") place it.
 #[derive(Debug, Default, PartialEq)]
 struct QueryPlan {
-    /// Whether the leading required word reads as a house number ("670",
-    /// "221b", "993_5") and other required words follow.
     house_number: bool,
     required: Vec<String>,
-    /// The identifying words of each part after the subject, in order.
     context: Vec<Vec<String>>,
 }
 
 impl QueryPlan {
-    /// Plan a normalized query whose parts are separated by commas.
     fn parse(query: &str) -> Option<Self> {
         let parts = query
             .split(',')
@@ -243,9 +197,6 @@ impl QueryPlan {
             plan.house_number = true;
             plan.required.remove(0);
         }
-        // The street name ends at its type or direction ("Wellington Street
-        // West"), unless the type leads it ("Highway 7"); words with digits
-        // after that are a unit or floor ("FL36", "G120", a trailing "2").
         if let Some(end) = plan
             .required
             .iter()
@@ -266,9 +217,6 @@ impl QueryPlan {
     }
 }
 
-/// Digits with at most one letter after them: "670", "221b", but not "1st".
-/// A fraction joined by [`join_fractional_house_number`] reads as one
-/// ("993_5").
 fn is_house_number(word: &str) -> bool {
     let digits = word.trim_end_matches(|character: char| character.is_alphabetic());
     word[digits.len()..].chars().count() <= 1
@@ -278,7 +226,6 @@ fn is_house_number(word: &str) -> bool {
         && base_house_number(word).is_some()
 }
 
-/// Whether an expanded word is a direction.
 fn is_direction(word: &str) -> bool {
     matches!(
         word,
@@ -286,17 +233,11 @@ fn is_direction(word: &str) -> bool {
     )
 }
 
-/// A context part with a digit names a postcode ("M6G 1B8", "SW1A", "10115"),
-/// not a locality.
 fn is_postcode_part(part: &[String]) -> bool {
     part.iter()
         .any(|word| word.chars().any(|character| character.is_ascii_digit()))
 }
 
-/// A comma-separated part that is a unit designator and its value, though the
-/// value has no digit ("unit b", "suite b"). The short designators "ste",
-/// "fl" and "rm" also abbreviate place names (Sainte, Florida), so only they
-/// need a digit to be read as a unit.
 fn is_unit_part<T: AsRef<str>>(words: &[T]) -> bool {
     let [designator, value] = words else {
         return false;
@@ -306,8 +247,6 @@ fn is_unit_part<T: AsRef<str>>(words: &[T]) -> bool {
         && (is_unit_value_token(value.as_ref()) || !matches!(designator, "ste" | "fl" | "rm"))
 }
 
-/// Words that identify a place, and unit text: a unit designator followed by
-/// a value with a digit ("unit 602", "suite 4b").
 fn split_unit_words(words: &[&str]) -> (Vec<String>, Vec<String>) {
     let mut identifying = Vec::new();
     let mut unit = Vec::new();
@@ -328,9 +267,6 @@ fn split_unit_words(words: &[&str]) -> (Vec<String>, Vec<String>) {
     (identifying, unit)
 }
 
-/// The query as the old search spelt it first: normalized, abbreviations
-/// expanded and fractional house numbers joined, keeping its comma-separated
-/// parts. `None` when no part has words.
 fn expand_query(query: &str) -> Option<String> {
     let parts = query
         .split(',')
@@ -346,10 +282,6 @@ fn expand_query(query: &str) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-/// A part that starts with a house number with a fraction ("993.5 Bloor",
-/// "1384 1/2 Queen"), split into the number as one word, its parts joined by
-/// "_" ("993_5"), and the rest of the part. Normalizing would split the
-/// number into two.
 fn join_fractional_house_number(part: &str) -> (Option<String>, &str) {
     let trimmed = part.trim_start();
     let digits = |text: &str| {
@@ -445,8 +377,6 @@ mod tests {
 
     #[test]
     fn tokens_are_the_normalized_query_whatever_the_expansion() {
-        // "St" expands to "street" and "W" to "west" for the search, but the
-        // tagger labels the query's own tokens.
         let tagged = tags("79 Wellington St. W FL36, Toronto");
         assert_eq!(
             tagged
@@ -498,8 +428,6 @@ mod tests {
 
     #[test]
     fn without_commas_everything_but_number_and_unit_is_street() {
-        // A word with a digit after the street type reads as a unit, even a
-        // postcode.
         assert_eq!(
             labels("30 w 26th st new york ny 10010"),
             vec![

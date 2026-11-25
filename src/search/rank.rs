@@ -1,18 +1,3 @@
-//! A learned order for the hits of a query's pool: LambdaMART (Burges,
-//! 2010), gradient boosted regression trees fit to the lambda gradients of
-//! NDCG, over what search knows of each hit (see [`inputs`]).
-//!
-//! Without it the pool is ordered by hand: fewer typos, then the stricter
-//! pass, then the parser's score of the reading (see
-//! `search::Evidence`). Those rules each hold; how they trade off against
-//! one another, and against the many signals they leave out, only answers
-//! can say. `geocode calibrate` writes queries from the Pack's own
-//! addresses, so it knows the right answer of each, and fits the trees to
-//! rank it first.
-//!
-//! The model is a sidecar beside the Pack file, as the confidence model is,
-//! and names the Pack it was fit to: a rebuilt Pack ranks differently.
-
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -27,31 +12,17 @@ use crate::{
 
 pub const RANKER_VERSION: u32 = 1;
 const SIDECAR_EXTENSION: &str = "ranker.json";
-/// Trees in the ensemble.
 const TREES: usize = 300;
-/// Splits from the root to a leaf at most.
 const DEPTH: usize = 5;
-/// What each tree's leaves are scaled by: smaller steps generalise better.
 const LEARNING_RATE: f64 = 0.1;
-/// Hits a leaf holds at least, so no leaf fits a few queries' noise.
 const MIN_LEAF: usize = 32;
-/// Thresholds a feature is split at, at most: the boundaries of this many
-/// equal shares of its values.
 const BINS: usize = 64;
-/// Inputs a joint decoding that found no labelling stands at: below any a
-/// labelling scores.
 const UNEXPLAINED: f32 = -64.0;
 
-/// What search knows of a hit besides its [`crate::confidence::Features`]:
-/// how its search ranked it, how its record reads the query, and what the
-/// pool around it says. Inputs of the [`Ranker`] only.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Signals {
-    /// It answers the house number itself (stated or on a range), not only
-    /// its street.
     pub house_level: bool,
     pub stated: bool,
-    /// How much of the stated postcode it shares, by `QueryPostcode::rank`.
     pub postcode_agreement: u8,
     pub name_words: u8,
     pub place_rank: u8,
@@ -63,22 +34,14 @@ pub struct Signals {
     pub focus_band: u8,
     pub precision: u8,
     pub poi: bool,
-    /// A POI ranked below the addresses and streets the query's words name.
     pub demoted: bool,
-    /// Where its search ranked it.
     pub window_rank: u16,
-    /// The reading that found it, 0 the parser's best.
     pub reading: u8,
-    /// Its reading's score less the best reading's.
     pub parse_gap: f32,
-    /// How well the parser reads the query as the record reads it, less its
-    /// best reading (see `TextSearcher::explain`); `None` when not decoded.
     pub explained: Option<f32>,
     pub confirmed: bool,
     pub contradicted: bool,
-    /// Its text score as a share of the best in the pool.
     pub text_share: f32,
-    /// The ranker's score of it, once ranked.
     pub ranked: f32,
 }
 
@@ -128,7 +91,6 @@ pub const INPUT_NAMES: [&str; INPUTS] = [
     "text_share",
 ];
 
-/// The ranker's inputs of a hit, in [`INPUT_NAMES`] order.
 pub fn inputs(hit: &TextSearchHit) -> [f32; INPUTS] {
     let flag = |value: bool| f32::from(u8::from(value));
     let features = &hit.features;
@@ -181,13 +143,10 @@ pub fn inputs(hit: &TextSearchHit) -> [f32; INPUTS] {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Node {
-    /// The input split on; `None` at a leaf.
     input: Option<u16>,
-    /// Inputs at most this go left.
     threshold: f32,
     left: u32,
     right: u32,
-    /// What a leaf adds to the score.
     value: f32,
 }
 
@@ -212,8 +171,6 @@ impl Tree {
     }
 }
 
-/// One query of a training run: each hit of its pool, and whether it is
-/// the answer sought.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub hits: Vec<([f32; INPUTS], bool)>,
@@ -224,11 +181,9 @@ pub struct Ranker {
     trees: Vec<Tree>,
 }
 
-/// The sidecar file as written.
 #[derive(Debug, Serialize, Deserialize)]
 struct Stored {
     version: u32,
-    /// [`crate::container::Container::fingerprint`] of the Pack, in hex.
     pack: String,
     inputs: Vec<String>,
     trees: Vec<Tree>,
@@ -243,9 +198,6 @@ impl Ranker {
         self.trees.iter().map(|tree| tree.score(inputs)).sum()
     }
 
-    /// Fit the trees to rank each query's answers first. Queries with no
-    /// answer, or nothing but answers, have nothing to order and teach
-    /// nothing.
     pub fn fit(queries: &[Query]) -> Self {
         let queries = queries
             .iter()
@@ -272,7 +224,6 @@ impl Ranker {
         Self { trees }
     }
 
-    /// Where the ranker of the Pack file `pack_file` is kept.
     pub fn path(pack_file: &Path) -> PathBuf {
         pack_file.with_extension(SIDECAR_EXTENSION)
     }
@@ -313,8 +264,6 @@ impl Ranker {
         }))
     }
 
-    /// Write the ranker beside `pack`'s file, replacing any before it
-    /// whole, as [`crate::confidence::Model::save`] does.
     pub fn save(&self, pack: &pack::Reader) -> Result<PathBuf> {
         let path = Self::path(pack.path());
         let stored = Stored {
@@ -344,8 +293,6 @@ fn fingerprint(pack: &pack::Reader) -> String {
     format!("{:016x}", pack.container().fingerprint())
 }
 
-/// Each input's split thresholds: the distinct boundaries of [`BINS`] equal
-/// shares of its values.
 fn thresholds(rows: &[[f32; INPUTS]]) -> Vec<Vec<f32>> {
     (0..INPUTS)
         .map(|input| {
@@ -364,10 +311,6 @@ fn thresholds(rows: &[[f32; INPUTS]]) -> Vec<Vec<f32>> {
         .collect()
 }
 
-/// The lambda gradient of each row and its second derivative: for every
-/// pair of an answer and another hit of one query, how much swapping them
-/// would change the query's NDCG, scaled by how likely the current scores
-/// order them wrongly. Binary relevance: an answer gains 1 at its rank.
 fn lambdas(queries: &[&Query], scores: &[f64]) -> (Vec<f64>, Vec<f64>) {
     let mut lambdas = vec![0.0; scores.len()];
     let mut weights = vec![0.0; scores.len()];
@@ -400,8 +343,6 @@ fn lambdas(queries: &[&Query], scores: &[f64]) -> (Vec<f64>, Vec<f64>) {
     (lambdas, weights)
 }
 
-/// A regression tree of at most [`DEPTH`] levels fit to `lambdas` by least
-/// squares, each leaf a Newton step: its rows' lambdas over their weights.
 fn grow(rows: &[[f32; INPUTS]], lambdas: &[f64], weights: &[f64], thresholds: &[Vec<f32>]) -> Tree {
     let mut tree = Tree { nodes: Vec::new() };
     let all = (0..rows.len()).collect::<Vec<_>>();
@@ -435,8 +376,6 @@ fn split(
     if depth >= DEPTH || members.len() < 2 * MIN_LEAF {
         return at;
     }
-    // Least squares: the split that most raises the sum over both sides of
-    // (sum of lambdas)^2 / count.
     let base = sum * sum / members.len() as f64;
     let mut best = None::<(f64, usize, f32)>;
     for (input, cuts) in thresholds.iter().enumerate() {

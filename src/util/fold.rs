@@ -1,18 +1,3 @@
-//! The keys names and queries are matched by.
-//!
-//! A search key is what retrieval and the parser's dictionaries match on:
-//! NFKC (fullwidth "１" is "1", "ﬁ" is "fi"), lower case, and Latin letters
-//! written in ASCII by CLDR's Latin-ASCII transform ("łódź" is "lodz",
-//! "straße" is "strasse", "ørsted" is "orsted"), so a query typed without a
-//! letter's accent, stroke or ligature finds the name. Decomposing and
-//! dropping marks alone would leave `ł`, `ø`, `ß`, `æ`, `đ` and `ı` as they
-//! are: they carry no mark. An exact key keeps the accents (NFC, lower case),
-//! so a query that spells a name exactly can rank it above a namesake
-//! spelled plainer ("Taupō" over "Taupo").
-//!
-//! Both keys cut words in [`split`], the one place text becomes words: index
-//! text, queries and dictionary keys alike.
-
 use std::{collections::HashMap, sync::OnceLock};
 
 use icu_normalizer::ComposingNormalizerBorrowed;
@@ -28,11 +13,9 @@ use unicode_script::{Script, UnicodeScript};
 /// "hawaiʻi" is dropped, not cut into a gap.
 const LATIN_ASCII: &str = include_str!("../parse/lattice/data/latin_ascii.tsv");
 
-/// What [`split`] cuts text into, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Piece<'a> {
     Word(&'a str),
-    /// A character between words, normalized as the words are.
     Gap(char),
 }
 
@@ -42,45 +25,30 @@ enum Key {
     Exact,
 }
 
-/// `value` as retrieval and the parser match it: its words, NFKC, lower case
-/// and Latin-ASCII folded, joined by single spaces. `None` when it has no
-/// word.
 pub(crate) fn search_key(value: &str) -> Option<String> {
     join(value, Key::Search)
 }
 
-/// `value` as written, to tell exact spellings apart among the records a
-/// search key found: its words, NFC and lower case, joined by single spaces.
-/// `None` when it has no word.
 pub(crate) fn exact_key(value: &str) -> Option<String> {
     join(value, Key::Exact)
 }
 
-/// The pieces of `value` whose words joined by single spaces are its
-/// [`search_key`].
 pub(crate) fn search_pieces(value: &str, piece: impl FnMut(Piece<'_>)) {
     split(value, Key::Search, piece);
 }
 
-/// A word of a text as its [`search_key`] writes it, and where in the text
-/// it was cut from. Offsets count characters of the text, not bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Span {
     pub(crate) key: String,
     pub(crate) start: usize,
-    /// Per character of `key`, where the characters of the text it was
-    /// folded from end. One of the text may fold to several ("ß" is "ss").
     ends: Vec<usize>,
 }
 
 impl Span {
-    /// Where the word ends in the text, exclusive.
     pub(crate) fn end(&self) -> usize {
         self.end_of(self.ends.len())
     }
 
-    /// Where the first `chars` characters of `key` end in the text, a
-    /// character of the text half taken counted whole.
     pub(crate) fn end_of(&self, chars: usize) -> usize {
         match chars.min(self.ends.len()).checked_sub(1) {
             Some(last) => self.ends[last],
@@ -89,18 +57,10 @@ impl Span {
     }
 }
 
-/// The words of `value` as [`search_key`] writes them, each with where it
-/// lies in `value`.
-///
-/// Folded a letter and its marks at a time, so each character of a key
-/// knows the characters it came from. Conjoining jamo compose only across
-/// letters, so a word written with them keeps them apart here and has no
-/// key a query can equal.
 pub(crate) fn search_spans(value: &str) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut open = None::<Span>;
     let mut close = |open: &mut Option<Span>| {
-        // A run of replacement characters alone spells nothing (see `flush`).
         spans.extend(open.take().filter(|span| {
             span.key
                 .chars()
@@ -138,7 +98,6 @@ pub(crate) fn search_spans(value: &str) -> Vec<Span> {
                 false => close(&mut open),
             }
         } else if first == char::REPLACEMENT_CHARACTER {
-            // Stays in its word, as `split_unicode` keeps it.
             add(&mut open, first.encode_utf8(&mut [0; 4]));
         } else {
             split(&value[from..to], Key::Search, |piece| match piece {
@@ -164,10 +123,6 @@ fn join(value: &str, key: Key) -> Option<String> {
     (!joined.is_empty()).then_some(joined)
 }
 
-/// Words are runs of letters and digits, and a mark continues the word
-/// before it. Composed first, so a decomposed "wa\u{304}naka" is one word,
-/// and a mark with no precomposed letter ("m\u{303}", a virama) still does not
-/// cut its word in two.
 fn split(value: &str, key: Key, piece: impl FnMut(Piece<'_>)) {
     if value.is_ascii() {
         split_ascii(value, piece);
@@ -176,9 +131,6 @@ fn split(value: &str, key: Key, piece: impl FnMut(Piece<'_>)) {
     }
 }
 
-/// [`split_unicode`] for ASCII text, which is most of what a build folds:
-/// ASCII is its own NFKC and NFC, has no marks, and needs no Latin-ASCII
-/// fold, so both keys come to its lower-case alphanumeric runs.
 fn split_ascii(value: &str, mut piece: impl FnMut(Piece<'_>)) {
     let lower = value.to_ascii_lowercase();
     let mut start = 0;
@@ -210,8 +162,6 @@ fn split_unicode(value: &str, key: Key, mut piece: impl FnMut(Piece<'_>)) {
         .collect::<String>();
     let lower = ComposingNormalizerBorrowed::new_nfc().normalize(&lower);
     let mut word = String::new();
-    // Whether the letter a mark would follow is Latin: Latin-ASCII drops the
-    // accents of a Latin letter, and only those.
     let mut latin = false;
     for character in lower.chars() {
         if !word.is_empty() && is_mark(character) {
@@ -220,9 +170,6 @@ fn split_unicode(value: &str, key: Key, mut piece: impl FnMut(Piece<'_>)) {
             }
             continue;
         }
-        // A replacement character stands for a letter a wrong encoding lost
-        // ("Ch\u{fffd}teauneuf" of "Châteauneuf"), so it stays in its word, one
-        // edit from the letter it replaced, for a typo tier to reach.
         if character == char::REPLACEMENT_CHARACTER {
             word.push(character);
             latin = true;
@@ -247,8 +194,6 @@ fn split_unicode(value: &str, key: Key, mut piece: impl FnMut(Piece<'_>)) {
     flush(&mut word, &mut piece);
 }
 
-/// End the word being cut, if there is one. A run of replacement characters
-/// alone spells nothing, so it is a gap.
 fn flush(word: &mut String, piece: &mut impl FnMut(Piece<'_>)) {
     if word
         .chars()
@@ -263,8 +208,6 @@ fn flush(word: &mut String, piece: &mut impl FnMut(Piece<'_>)) {
     word.clear();
 }
 
-/// How many characters of `word` a wrong encoding replaced: each is one
-/// edit from the letter it stood for.
 pub(crate) fn replaced_characters(word: &str) -> usize {
     word.chars()
         .filter(|character| *character == char::REPLACEMENT_CHARACTER)
@@ -275,8 +218,6 @@ fn is_mark(character: char) -> bool {
     GeneralCategoryGroup::Mark.contains(CodePointMapData::<GeneralCategory>::new().get(character))
 }
 
-/// The ASCII a lower-case Latin letter is written with, when it is not ASCII
-/// already.
 fn latin_ascii(character: char) -> Option<&'static str> {
     static TABLE: OnceLock<HashMap<char, &'static str>> = OnceLock::new();
     TABLE
@@ -387,14 +328,10 @@ mod tests {
                 word("elysee", 12, 18),
             ]
         );
-        // "É" is two bytes and "ß" folds to two letters. Neither moves a
-        // character offset.
         assert_eq!(
             cut("Été, Straße 5"),
             [word("ete", 0, 3), word("strasse", 5, 11), word("5", 12, 13)]
         );
-        // A decomposed letter is two characters of the text and one of the
-        // key.
         assert_eq!(cut("wa\u{304}naka"), [word("wanaka", 0, 7)]);
         let strasse = &search_spans("Straße 5")[0];
         assert_eq!(

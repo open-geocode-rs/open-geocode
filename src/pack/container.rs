@@ -1,19 +1,3 @@
-//! Single-file Pack container.
-//!
-//! A Pack is one file: a short header, named sections, and a table of contents
-//! at the end. Each section carries its own format version so one part of the
-//! Pack can evolve without touching the others. One file is one thing to
-//! upload, copy or swap, and readers memory-map it once and hand out borrowed
-//! slices per section. Every section carries an XXH3 checksum, so a copy
-//! damaged in transit is caught by [`Container::verify`] before it is served.
-//!
-//! ```text
-//! header   magic "OGPACK01" | container version u32 | reserved u32
-//! sections each starts on a 64-byte boundary
-//! toc      varint count, then per section: name, version, offset, length, xxh3
-//! trailer  toc offset u64 | toc length u64 | magic "OGPACKTC"
-//! ```
-
 use std::{
     collections::BTreeMap,
     fmt,
@@ -51,8 +35,6 @@ pub struct SectionInfo {
     pub checksum: u64,
 }
 
-/// How far a Pack file was written: the end of its last section, and the
-/// sections before it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     pub offset: u64,
@@ -190,7 +172,6 @@ impl Writer {
         })
     }
 
-    /// Start a section. Bytes written until [`Self::end`] belong to it.
     pub fn begin(&mut self, name: &str, version: u32) -> Result<()> {
         if self.open.is_some() {
             return Err(Error::Inconsistent(format!(
@@ -252,7 +233,6 @@ impl Writer {
         self.end()
     }
 
-    /// Write the table of contents and sync the file. Returns the Pack size.
     pub fn finish(mut self) -> Result<u64> {
         if self.open.is_some() {
             return Err(Error::Inconsistent(
@@ -300,7 +280,6 @@ impl Write for Writer {
     }
 }
 
-/// Read-only view of a Pack file.
 #[derive(Clone)]
 pub struct Container {
     bytes: SharedMmap,
@@ -338,7 +317,6 @@ impl Container {
         })
     }
 
-    /// Size of the Pack file in bytes.
     pub fn file_size(&self) -> u64 {
         self.bytes.len() as u64
     }
@@ -439,7 +417,6 @@ impl Container {
     }
 
     fn bytes_of(&self, info: &SectionInfo) -> Bytes {
-        // Bounds were validated when the table of contents was parsed.
         Bytes::new(self.bytes.clone())
             .slice(info.offset as usize..(info.offset + info.len) as usize)
     }
@@ -641,7 +618,6 @@ mod tests {
         let mut bytes = std::fs::read(&path).expect("read");
         bytes[offset + 2000] ^= 1;
         std::fs::write(&path, &bytes).expect("corrupt");
-        // Structure is intact, so the file still opens; the checksum catches it.
         let container = Container::open(&path).expect("open");
         let error = container.verify().unwrap_err().to_string();
         assert!(error.contains("alpha"), "{error}");

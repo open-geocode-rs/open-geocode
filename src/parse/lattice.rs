@@ -1,25 +1,3 @@
-//! The lattice address parser.
-//!
-//! A query is split into the tokens the text index uses, and each token into
-//! the units the lattice is built on (see [`Units`]): a token is one unit,
-//! except that every character of a script written without spaces (Han,
-//! kana, Thai) is a unit of its own, so "東京都千代田区" reads the same with
-//! spaces between its names, without them, or with a space after every
-//! character. Every span of one to [`MAX_SPAN_TOKENS`] units, or of up to
-//! [`MAX_UNSPACED_SPAN`] units written without spaces, is looked up in the
-//! Pack's own dictionaries of
-//! street, locality, region and country names (see [`dictionary`]), exactly
-//! and then within a small edit distance, and matched against per-country
-//! postcode patterns (see [`postcode`]). Each span with evidence, and every
-//! single token, becomes an edge of a lattice that may carry any label. A
-//! linear model scores each edge from its features and each pair of
-//! consecutive labels from a per-country transition table, and a semi-Markov
-//! Viterbi pass returns the best labellings (see [`decode`]).
-//!
-//! Nothing in the parser is written per country: the vocabulary lives in the
-//! Pack, the postcode patterns and address templates are vendored data, and
-//! the weights are learned from the Pack's own records (see [`train`]).
-
 mod abbreviations;
 mod decode;
 pub mod dictionary;
@@ -49,43 +27,20 @@ use crate::{
     util::fold::{Piece, search_key, search_pieces},
 };
 
-/// The longest span looked up as one name.
 pub const MAX_SPAN_TOKENS: usize = 5;
-/// The longest span of units written without spaces between them looked up
-/// as one name: a name of a script without spaces is one unit per character
-/// ("千代田区" is four, "南アルプス市" six).
 pub const MAX_UNSPACED_SPAN: usize = 10;
-/// How many labellings [`LatticeTagger::parse`] returns at most.
 pub const N_BEST: usize = 3;
-/// The most words a country name a query ends in is read in: "United States
-/// of America".
 const MAX_COUNTRY_TOKENS: usize = 4;
-/// How many labellings are decoded per country before those that cannot be
-/// one address are dropped (see [`LatticeTagger::is_one_address`]).
 const CONSTRAINED_PATHS: usize = 8;
-/// How many candidate countries are decoded besides the global fallback.
 const MAX_CANDIDATE_COUNTRIES: usize = 3;
-/// Spans shorter than this many characters are only looked up exactly: one
-/// edit turns most two- and three-letter words into many others.
 const MIN_FUZZY_CHARS: usize = 4;
-/// Spans at least this long may be two edits from a name...
 const TWO_EDIT_CHARS: usize = 8;
-/// ...up to this long. A longer span may be one edit from a name: the
-/// automaton of two edits grows with the key, and costs hundreds of
-/// microseconds to build for a key of twenty characters.
 const MAX_TWO_EDIT_CHARS: usize = 16;
-/// Spans longer than this are only looked up exactly.
 const MAX_FUZZY_CHARS: usize = 32;
-/// A one-token span shorter than this is only looked up exactly in the POI
-/// names: they are many, and a short word is one edit from many venues.
 const MIN_FUZZY_POI_CHARS: usize = 6;
-/// Characters that end one field of a query and start the next.
 const FIELD_BREAKS: [char; 4] = [',', ';', '\n', '|'];
-/// Characters that join two words into one written unit: the parts of a
-/// number ("993.5", "1/2") or a unit and its house number ("306-1333").
 pub const JOINERS: [char; 3] = ['.', '/', '-'];
 
-/// A two-letter ISO 3166-1 country code, upper case.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CountryCode([u8; 2]);
 
@@ -125,24 +80,14 @@ impl fmt::Display for CountryCode {
     }
 }
 
-/// A query split into the words [`search_key`] produces, with where
-/// punctuation that separates fields (a comma, a semicolon, a line break)
-/// stood between them, and which words punctuation joins to the word before
-/// ("993.5", "1/2", "306-1333"). Commas are a feature of the parse, never its
-/// rule.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tokens {
     pub words: Vec<String>,
-    /// `breaks[index]` is whether a field break precedes word `index`.
     pub breaks: Vec<bool>,
-    /// `joiners[index]` is the one character of [`JOINERS`] that joins word
-    /// `index` to the word before it, with no space around it.
     pub joiners: Vec<Option<char>>,
 }
 
 impl Tokens {
-    /// Split raw query text. Joined by single spaces the words are exactly
-    /// [`search_key`] of the text.
     pub fn new(text: &str) -> Self {
         let mut tokens = Self::default();
         let mut pending_break = false;
@@ -166,7 +111,6 @@ impl Tokens {
         tokens
     }
 
-    /// Words already normalized, with no breaks or joiners between them.
     pub fn from_words<S: AsRef<str>>(words: &[S]) -> Self {
         Self {
             words: words.iter().map(|word| word.as_ref().to_string()).collect(),
@@ -175,7 +119,6 @@ impl Tokens {
         }
     }
 
-    /// The first `end` words, with their breaks and joiners.
     pub(crate) fn prefix(&self, end: usize) -> Self {
         Self {
             words: self.words[..end].to_vec(),
@@ -200,8 +143,6 @@ impl Tokens {
     }
 }
 
-/// The scripts written without spaces between words: a space between two of
-/// their characters marks no word boundary.
 const UNSPACED_SCRIPTS: [Script; 7] = [
     Script::Han,
     Script::Hiragana,
@@ -212,13 +153,7 @@ const UNSPACED_SCRIPTS: [Script; 7] = [
     Script::Myanmar,
 ];
 
-/// Whether `character` belongs to a script written without spaces between
-/// words ([`UNSPACED_SCRIPTS`]), by its Unicode Script_Extensions property:
-/// the prolonged sound mark "ー" and the iteration mark "々" are, as kana and
-/// Han are, and a character of every script (a digit) is not.
 pub fn is_unspaced(character: char) -> bool {
-    // No ASCII character is in an unspaced script, and the script table is a
-    // binary search.
     if character.is_ascii() {
         return false;
     }
@@ -247,8 +182,6 @@ fn is_neutral(word: &str) -> bool {
 /// `NOTICE`), vendored.
 pub(super) const NUMERALS: &str = include_str!("lattice/data/numerals.tsv");
 
-/// The value of a numeral character that Unicode does not class as a
-/// number: an ideograph of [`NUMERALS`].
 pub fn numeral_value(character: char) -> Option<u32> {
     static TABLE: OnceLock<HashMap<char, u32>> = OnceLock::new();
     TABLE
@@ -267,17 +200,10 @@ pub fn numeral_value(character: char) -> Option<u32> {
         .copied()
 }
 
-/// Whether `character` is a numeral of any script: a Unicode number (`Nd`,
-/// `Nl`, `No`, so fullwidth and other scripts' digits) or a numeral
-/// ideograph of [`NUMERALS`].
 pub fn is_numeral(character: char) -> bool {
     character.is_numeric() || numeral_value(character).is_some()
 }
 
-/// Per word of `text` as [`Tokens::new`] splits it, whether the number sign
-/// `#` stands right before it, spaces aside, after some other word. Written
-/// so ("District Ave #300") it numbers a flat or a suite, never the house,
-/// though [`search_key`] drops the sign and leaves a bare number.
 fn after_number_sign(text: &str) -> Vec<bool> {
     let mut signed = Vec::new();
     let mut sign = false;
@@ -292,9 +218,6 @@ fn after_number_sign(text: &str) -> Vec<bool> {
     signed
 }
 
-/// `key` with each run of numerals written as `#`, the form numbered areas
-/// of one kind share ("#丁目" of "5丁目" and "四丁目", "sector #"), or
-/// `None` when it has no numeral or nothing but numerals.
 pub fn mask_numerals(key: &str) -> Option<String> {
     let mut masked = String::with_capacity(key.len());
     let mut numbered = false;
@@ -311,15 +234,8 @@ pub fn mask_numerals(key: &str) -> Option<String> {
     (numbered && masked.chars().any(char::is_alphabetic)).then_some(masked)
 }
 
-/// The key a name is stored under in the parser's dictionaries: its
-/// normalized words as [`Units`], glued as a query's are, so a name written
-/// with spaces between characters of a script without spaces
-/// ("とうきょう たからづかげきじょう") is found by the units of a query that
-/// writes it.
 pub fn dictionary_key(name: &str) -> Option<String> {
     let normalized = search_key(name)?;
-    // ASCII has no unspaced script, so no unit is glued and the key is the
-    // words as they are.
     if normalized.is_ascii() {
         return Some(normalized);
     }
@@ -328,24 +244,10 @@ pub fn dictionary_key(name: &str) -> Option<String> {
     Some(units.key(0, units.len()))
 }
 
-/// The units a lattice is built on: the tokens of a [`Tokens`], except that
-/// a token holding characters of a script written without spaces is split
-/// into one unit per such character and one per run of other characters
-/// ("丸の内2" is "丸", "の", "内", "2"). Units written with no space between
-/// them, or with only a space between a character of such a script and
-/// another or a digit (see [`is_neutral`]), are *glued*: they join without a
-/// space in a dictionary key, so "東京都千代田区", "東京都 千代田区" and
-/// "東 京 都 千 代 田 区" are the same units with the same keys, and so are
-/// "5番2号" and "5 番 2 号".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Units {
-    /// The units as words, with the field breaks and joiners of the tokens
-    /// they start.
     pub tokens: Tokens,
-    /// The token each unit is part of.
     pub token_of: Vec<usize>,
-    /// `glued[index]` is whether unit `index` joins the unit before it
-    /// without a space.
     pub glued: Vec<bool>,
 }
 
@@ -382,10 +284,6 @@ impl Units {
         units
     }
 
-    /// Add a unit of token `index` of `tokens`, `first` when it starts it.
-    /// The first unit of a token is glued to the unit before it when only a
-    /// space stands between them and one side is a character of a script
-    /// without spaces and the other is too or is [`is_neutral`].
     fn push(&mut self, tokens: &Tokens, index: usize, text: String, first: bool) {
         let glued = if first {
             let spaced = !tokens.breaks[index] && tokens.joiners[index].is_none();
@@ -417,8 +315,6 @@ impl Units {
         self.tokens.is_empty()
     }
 
-    /// The units of `start..end` as one dictionary key: glued units joined
-    /// directly, others by a space.
     fn key(&self, start: usize, end: usize) -> String {
         let mut key = String::new();
         for index in start..end {
@@ -430,7 +326,6 @@ impl Units {
         key
     }
 
-    /// The maximal runs of two or more glued units, as `start..end`.
     fn runs(&self) -> Vec<(usize, usize)> {
         let mut runs = Vec::new();
         let mut start = 0;
@@ -445,25 +340,19 @@ impl Units {
         runs
     }
 
-    /// Whether every unit of `start..end` after the first is glued to the
-    /// one before it.
     fn unspaced(&self, start: usize, end: usize) -> bool {
         self.glued[start + 1..end].iter().all(|glued| *glued)
     }
 
-    /// The units of the tokens `start..end`.
     fn of_tokens(&self, start: usize, end: usize) -> (usize, usize) {
         let first = |token: usize| self.token_of.partition_point(|of| *of < token);
         (first(start), first(end))
     }
 
-    /// One label per unit from one label per token.
     pub fn expand(&self, labels: &[Label]) -> Vec<Label> {
         self.token_of.iter().map(|token| labels[*token]).collect()
     }
 
-    /// One label per token from one label per unit: the label of most of
-    /// the token's characters, the first of them on a tie.
     pub fn collapse(&self, labels: &[Label]) -> Vec<Label> {
         let mut out: Vec<Label> = Vec::new();
         let mut counts = [0usize; Label::ALL.len()];
@@ -490,18 +379,10 @@ impl Units {
         out
     }
 
-    /// The units as written words with their labels, from the labelled
-    /// segments of a path. Units not glued together are words of their own,
-    /// as tokens are. The glued units of a segment are one word, a name the
-    /// dictionaries know ("千代田区"), and so are glued one-unit segments
-    /// with one label, a name read a character at a time ("丸", "の", "内"
-    /// is "丸の内"), so a search looks up the names the text index holds.
     pub fn pieces(&self, segments: &[(usize, usize, Label)]) -> Vec<Tagged> {
         self.corrected_pieces(segments, &[]).0
     }
 
-    /// [`Self::pieces`], each with the word of the name it is a typo of
-    /// when that word differs from it (see [`Self::unit_corrections`]).
     fn corrected_pieces(
         &self,
         segments: &[(usize, usize, Label)],
@@ -535,11 +416,6 @@ impl Units {
         (pieces, corrected)
     }
 
-    /// The word of the name each unit is a typo of, from a lattice's
-    /// `corrections`: of a span whose every unit `segments` label as its
-    /// name reads, so a name read a word at a time ("lamton", "quay" as two
-    /// street segments) is still corrected. A span that is a segment comes
-    /// first, then the longest.
     fn unit_corrections(
         &self,
         segments: &[(usize, usize, Label)],
@@ -575,10 +451,6 @@ impl Units {
         by_unit
     }
 
-    /// The word of `name` each unit of `start..end` is a typo of, `None`
-    /// where it is the unit as the text index expands it. `None` when the
-    /// span's words do not pair one to one with the name's, or it has a
-    /// glued unit: fuzzy lookup skips scripts without spaces.
     fn correction(&self, start: usize, end: usize, name: &str) -> Option<Vec<Option<String>>> {
         if self.glued[start..end].iter().any(|glued| *glued) {
             return None;
@@ -596,7 +468,6 @@ impl Units {
     }
 }
 
-/// The characters between two words, while they may be one joiner.
 #[derive(Debug, Clone, Copy)]
 enum Gap {
     None,
@@ -613,28 +484,16 @@ impl Gap {
     }
 }
 
-/// One labelling of a query, best first in [`LatticeTagger::parse`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedQuery {
-    /// One label per token of the query, as [`Tokens::new`] splits it.
     pub tokens: Vec<Tagged>,
-    /// The query as written words with their labels (see
-    /// [`Units::pieces`]): its tokens, except that a token of a script
-    /// written without spaces is split where its label changes, and glued
-    /// characters with one label are one word.
     pub pieces: Vec<Tagged>,
-    /// One per piece: the word of the name the parser read a misspelt
-    /// piece as ("lambton" of "lamton"), `None` for a piece read as written.
-    /// [`Tagged`] stays the written word, as the parse contract has it.
     pub corrections: Vec<Option<String>>,
-    /// The country whose transition table and postcode pattern scored it,
-    /// `None` for the global fallback.
     pub country: Option<CountryCode>,
     pub score: f32,
 }
 
 impl ParsedQuery {
-    /// The query's words with `label`, in order.
     pub fn words(&self, label: Label) -> impl Iterator<Item = &str> {
         self.tokens
             .iter()
@@ -643,12 +502,10 @@ impl ParsedQuery {
     }
 }
 
-/// The lattice of a parsed query, kept for [`LatticeTagger::explain`].
 #[derive(Debug)]
 pub struct Explanation {
     lattice: Lattice,
     signed: Vec<bool>,
-    /// The score of the best labelling the parse returned.
     pub best: f32,
 }
 
@@ -658,7 +515,6 @@ fn signed_allows(lattice: &Lattice, signed: &[bool], span: &decode::Span, label:
             .any(|unit| signed.get(lattice.units.token_of[unit]) == Some(&true))
 }
 
-/// A set of labels.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LabelSet(u16);
 
@@ -676,31 +532,18 @@ impl LabelSet {
     }
 }
 
-/// Labels the tokens of free-text address queries from the Pack's own
-/// dictionaries and a learned linear model. Cheap to share across threads.
 pub struct LatticeTagger {
     dictionaries: Dictionaries,
     postcodes: &'static Table,
     weights: Weights,
 }
 
-/// The builder of the automata of names within `edits` edits (one or two),
-/// transpositions counted as one: built once per process and shared, as
-/// Tantivy shares its builders, since the two-edit one takes milliseconds
-/// and megabytes to build.
 pub(crate) fn automaton_builder(edits: u8) -> &'static LevenshteinAutomatonBuilder {
     static BUILDERS: [OnceLock<LevenshteinAutomatonBuilder>; 2] =
         [OnceLock::new(), OnceLock::new()];
     BUILDERS[usize::from(edits - 1)].get_or_init(|| LevenshteinAutomatonBuilder::new(edits, true))
 }
 
-/// The other ways `word` is written as a street's: the words a street-type
-/// or direction abbreviation stands for in any language libpostal lists,
-/// and of a word ending in a street type its language glues onto the name,
-/// that word with the type in each other form ("hauptstr" is
-/// "hauptstrasse", as the Pack spells "Hauptstraße"). None when `word` is
-/// neither. A query word is searched in each of them besides itself, so a
-/// list too ambiguous to expand the indexed text by still finds the record.
 pub(crate) fn other_forms(word: &str) -> Vec<String> {
     let table = abbreviations::abbreviations();
     let mut forms = table.full_forms(word).to_vec();
@@ -712,7 +555,6 @@ pub(crate) fn other_forms(word: &str) -> Vec<String> {
     forms
 }
 
-/// Records write either form, "N 34TH ST" or "North 34th Street".
 pub(crate) fn forms_both_ways(word: &str) -> Vec<String> {
     let mut forms = other_forms(word);
     for form in abbreviations::abbreviations().short_forms(word) {
@@ -723,9 +565,6 @@ pub(crate) fn forms_both_ways(word: &str) -> Vec<String> {
     forms
 }
 
-/// The one full form the parser's abbreviation tables give `word`, the
-/// first in order when they give several ("tce" is "terrace"); `None` for
-/// a word that abbreviates nothing.
 pub(crate) fn full_form(word: &str) -> Option<&'static str> {
     abbreviations::abbreviations()
         .full_forms(word)
@@ -734,14 +573,10 @@ pub(crate) fn full_form(word: &str) -> Option<&'static str> {
         .min()
 }
 
-/// The name `word` holds before a street type glued onto it ("haupt" of
-/// "hauptstr" and of "hauptstrasse"), as a type written apart is left out of
-/// a street's key; `None` when no type is glued onto it.
 pub(crate) fn glued_stem(word: &str) -> Option<&str> {
     glued_parts(word).map(|(stem, _)| stem)
 }
 
-/// "wilderinksplein" is "wilderinks" + "plein".
 pub(crate) fn glued_parts(word: &str) -> Option<(&str, &str)> {
     abbreviations::abbreviations().split_glued(word)
 }
@@ -756,14 +591,11 @@ impl fmt::Debug for LatticeTagger {
 }
 
 impl LatticeTagger {
-    /// Open the dictionaries of a Pack file or Pack directory, and the
-    /// weights trained on it when it was built, or else the built-in ones.
     pub fn open(pack: &Path) -> Result<Self> {
         let path = resolve_pack_path(pack)?;
         Self::from_container(&Container::open(&path)?)
     }
 
-    /// The tagger of an open Pack file.
     pub fn from_container(container: &Container) -> Result<Self> {
         let dictionaries = Dictionaries::open(container)?;
         let weights = Weights::from_container(container)?.unwrap_or_else(Weights::built_in);
@@ -786,15 +618,10 @@ impl LatticeTagger {
         &self.weights
     }
 
-    /// Use `weights` from now on.
     pub fn set_weights(&mut self, weights: Weights) {
         self.weights = weights;
     }
 
-    /// Whether `words`, search keys, are the name of a street the Pack
-    /// holds: as written, with its abbreviations expanded the way the text
-    /// index expands them, or in another spelling of its street types and
-    /// directions.
     pub fn names_street(&self, words: &[String]) -> bool {
         let Some(key) = dictionary_key(&words.join(" ")) else {
             return false;
@@ -820,14 +647,10 @@ impl LatticeTagger {
         self.parse_explained(query).0
     }
 
-    /// [`Self::parse`], with the lattice of the whole query kept to tell how
-    /// well a labelling that agrees with an answer reads it (see
-    /// [`Self::explain`]). `None` when the query has no words.
     pub fn parse_explained(&self, query: &str) -> (Vec<ParsedQuery>, Option<Explanation>) {
         self.parse_explained_n(query, N_BEST)
     }
 
-    /// [`Self::parse_explained`] with the best `n` labellings.
     pub fn parse_explained_n(
         &self,
         query: &str,
@@ -908,9 +731,6 @@ impl LatticeTagger {
         decode::best_allowed(lattice, &self.weights, &allows).map(|path| path.score)
     }
 
-    /// Per word of an explained query, the parser's probability that it
-    /// names a place: a locality, region or postcode, over every labelling
-    /// it weighs, not only its best.
     pub fn place_probabilities(&self, explanation: &Explanation) -> Vec<f32> {
         let lattice = &explanation.lattice;
         let marginals = train::label_marginals(lattice, &self.weights);
@@ -935,10 +755,6 @@ impl LatticeTagger {
             .collect()
     }
 
-    /// Where the country the query ends in starts: the longest run of its
-    /// last [`MAX_COUNTRY_TOKENS`] words, after some other word and not
-    /// joined to it, that the country dictionary holds as a name or code of
-    /// a country.
     fn trailing_country(&self, tokens: &Tokens) -> Option<usize> {
         (1..=MAX_COUNTRY_TOKENS.min(tokens.len().saturating_sub(1)))
             .rev()
@@ -953,7 +769,6 @@ impl LatticeTagger {
             })
     }
 
-    /// The best `n` labellings of `tokens`.
     pub fn parse_tokens(&self, tokens: &Tokens, n: usize) -> Vec<ParsedQuery> {
         if tokens.is_empty() || n == 0 {
             return Vec::new();
@@ -962,8 +777,6 @@ impl LatticeTagger {
         self.parse_lattice(tokens, &lattice, n, &[])
     }
 
-    /// The best `n` labellings of `tokens`, a word `signed` marks (see
-    /// [`after_number_sign`]) read as a unit.
     fn parse_lattice(
         &self,
         tokens: &Tokens,
@@ -977,9 +790,6 @@ impl LatticeTagger {
         let flat = |span: &decode::Span, label: Label| signed_allows(lattice, signed, span, label);
         let allows: Option<decode::Allows<'_>> = signed.contains(&true).then_some(&flat);
         let mut paths = decode::best(lattice, &self.weights, n, allows);
-        // The best labellings are almost always addresses; only when one is
-        // not are more decoded to find those that are. When none is, the
-        // best ones still read it.
         if !paths.iter().all(|path| self.is_one_address(lattice, path)) {
             let addresses = decode::best(lattice, &self.weights, n.max(CONSTRAINED_PATHS), allows)
                 .into_iter()
@@ -1016,12 +826,6 @@ impl LatticeTagger {
             .collect()
     }
 
-    /// Whether `path` reads its query as one address can be written: each
-    /// of the country, the region and the postcode is one field at most, a
-    /// house number has a number, and the places it names that the Pack
-    /// knows are each named once and lie one in another (a ward in its city,
-    /// the city in its region), so no admin level is named twice.
-    /// The model scores parts of a labelling; this holds of the whole.
     fn is_one_address(&self, lattice: &Lattice, path: &decode::Path) -> bool {
         let labels = path.labels(lattice);
         for label in [Label::Country, Label::Region, Label::Postcode] {
@@ -1034,7 +838,6 @@ impl LatticeTagger {
                 return false;
             }
         }
-        // A house number has a number in it: "堺" alone is none.
         let numberless_house = path.segments.iter().any(|segment| {
             let span = &lattice.spans[segment.span];
             segment.label == Label::HouseNumber
@@ -1061,9 +864,6 @@ impl LatticeTagger {
                 lattice.place(span.start, span.end)
             })
             .collect::<Vec<_>>();
-        // Each place is named once: a second field naming only the place of
-        // another ("那覇" after "那覇市") is part of something else, a venue
-        // named after its city.
         places.iter().enumerate().all(|(index, left)| {
             places[index + 1..]
                 .iter()
@@ -1071,10 +871,6 @@ impl LatticeTagger {
         })
     }
 
-    /// Every span of the units of `tokens` with its evidence, and the
-    /// countries worth decoding it for. Training passes the token ranges
-    /// whose dictionary hits it hides, to teach the model names the Pack
-    /// does not know.
     fn lattice(&self, tokens: &Tokens, suppression: &Suppression) -> Lattice {
         let units = Units::of(tokens);
         let suppression = suppression.in_units(&units);
@@ -1086,15 +882,11 @@ impl LatticeTagger {
             .collect::<Vec<_>>();
         let mut countries = CountryVotes::default();
         let mut spans = Vec::new();
-        // The span of each unit alone, and the dict_cover features each
-        // unit gets from the longer names it lies in, one bit per feature.
         let mut single = Vec::with_capacity(tokens.len());
         let mut covers = vec![0u16; tokens.len()];
         let longest = MAX_SPAN_TOKENS.max(MAX_UNSPACED_SPAN);
         let runs = units.runs();
         let mut phrases = Phrases::new(self, &units, longest);
-        // Exact area names, `(start, end, is a region)`, and the glued
-        // spans without other evidence, which may be chains of them.
         let mut areas = Vec::new();
         let mut places = Vec::new();
         let mut glued_spans = Vec::new();
@@ -1112,8 +904,6 @@ impl LatticeTagger {
                     set.phrase(kinds);
                 }
                 set.phrase_neighbours(phrases.ending[start], phrases.starting[end]);
-                // A postcode written after its country's letters ("de09496")
-                // is no unit glued to its number.
                 if end - start == 1
                     && !infos[start].unspaced
                     && let Some(field) = self.glued_phrase(&tokens.words[start])
@@ -1127,8 +917,6 @@ impl LatticeTagger {
                 if (end - start == 1 && !infos[start].unspaced) || glued {
                     set.affixes(&key.key);
                 }
-                // A whole run of glued units is an edge of its own, a name
-                // the dictionaries may not hold.
                 if glued && runs.contains(&(start, end)) {
                     evidence = true;
                 }
@@ -1215,8 +1003,6 @@ impl LatticeTagger {
                 }
             }
         }
-        // A glued span that is two or more area names written one after
-        // the other ("横浜市西区") is an edge with the chain it is.
         let chains = Chains::new(&areas);
         for span in spans.iter_mut() {
             if let Some(chain) = chains.of(&units, span.start, span.end) {
@@ -1258,10 +1044,6 @@ impl LatticeTagger {
         lattice
     }
 
-    /// The vocabulary a token glues to its number: "4og" is a floor, "apt4"
-    /// a unit, "4chome" a numbered area. The token is one run of digits and
-    /// one of letters, either way round, and the letters a unit, PO box or
-    /// level phrase or an admin type word.
     fn glued_phrase(&self, word: &str) -> Option<Glued> {
         let split = word
             .char_indices()
@@ -1290,14 +1072,7 @@ impl LatticeTagger {
         .or_else(|| dictionary::is_admin_type(phrase).then_some(Glued::AdminType))
     }
 
-    /// The best hit of `key` in `field`: exact, as written or with its
-    /// abbreviations expanded the way the text index expands them, else the
-    /// nearest name the key's fuzzy automaton accepts, given with the hit.
     fn lookup(&self, field: Field, key: &mut SpanKey) -> Option<(Match, Option<String>)> {
-        // The span as written first: another spelling of it (the name
-        // without its type word, an abbreviation in full) is only read when
-        // the span itself names nothing, so "verwaltungsgemeinschaft
-        // stockach" is the district it names, not the city "stockach".
         let best = |keys: &mut dyn Iterator<Item = &String>| {
             keys.filter_map(|key| self.dictionaries.get(field, key))
                 .max_by_key(|entry| entry.count)
@@ -1326,9 +1101,6 @@ impl LatticeTagger {
         Some((hit, Some(name)))
     }
 
-    /// The countries whose postcode pattern `start..end` matches, written
-    /// with or without the spaces between its tokens. `None` when none does
-    /// or the span cannot be a postcode: one to three tokens with a digit.
     fn postcode_matches(
         &self,
         tokens: &Tokens,
@@ -1346,9 +1118,6 @@ impl LatticeTagger {
         if words.len() > 1 {
             matches.extend(self.postcodes.matches(&words.concat()));
         }
-        // A postcode written after its country's letters ("D-80331",
-        // "de09496", "CA-M5V 1M9"): the rest is a postcode of a country
-        // whose code starts with them.
         if let Some((prefix, rest)) = country_prefix(words) {
             let prefix = prefix.to_ascii_uppercase();
             matches.extend(
@@ -1384,19 +1153,13 @@ impl Tagger for LatticeTagger {
     }
 }
 
-/// A span that is area names written one after the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Chain {
-    /// How many names, two or more.
     pub pieces: usize,
-    /// Whether one of them is a region name.
     pub region: bool,
 }
 
-/// The exact area names of a query, to find the glued spans that are two or
-/// more of them with no break between them.
 struct Chains {
-    /// `(end, is a region)` of the area names starting at each unit.
     from: HashMap<usize, Vec<(usize, bool)>>,
 }
 
@@ -1409,8 +1172,6 @@ impl Chains {
         Self { from }
     }
 
-    /// The chain `start..end` is: the most names that cover it end to end,
-    /// when that is two or more and the span is glued.
     fn of(&self, units: &Units, start: usize, end: usize) -> Option<Chain> {
         if end - start < 2 || self.from.is_empty() || !units.unspaced(start, end) {
             return None;
@@ -1443,21 +1204,11 @@ impl Chains {
     }
 }
 
-/// The vocabulary phrases of a query's units (see [`Field::PHRASES`]): the
-/// kinds of phrase each span is, one bit per field, and the kinds of the
-/// phrases that end before and start at each unit. The dictionary key of
-/// every span is made here once, and taken by the lattice after.
 struct Phrases {
-    /// `(start, end, kinds)` of every span that is a phrase.
     spans: Vec<(usize, usize, u8)>,
-    /// The key of every span looked up, in the order they are looked up.
     keys: Vec<String>,
-    /// The index in `keys` of the first span starting at each unit.
     first_key: Vec<usize>,
-    /// `ending[unit]`: the kinds of the phrases that end right before `unit`.
     ending: Vec<u8>,
-    /// `starting[unit]`: the kinds of the phrases that start at `unit`; one
-    /// past the last unit is empty.
     starting: Vec<u8>,
 }
 
@@ -1494,7 +1245,6 @@ impl Phrases {
         phrases
     }
 
-    /// The key of `start..end`, a span this looked up; once.
     fn take_key(&mut self, start: usize, end: usize) -> String {
         std::mem::take(&mut self.keys[self.first_key[start] + (end - start - 1)])
     }
@@ -1507,31 +1257,14 @@ impl Phrases {
     }
 }
 
-/// A span as dictionary keys, with the fuzzy automaton of its expanded key
-/// built once for every field it is looked up in, and only when an exact
-/// lookup misses.
 struct SpanKey {
     key: String,
     expanded: String,
-    /// The key with its numerals masked ([`mask_numerals`]), which names
-    /// the numbered areas of a kind the Pack holds many of.
     masked: Option<String>,
-    /// The key with its street types and directions in their other forms,
-    /// in every language ([`abbreviations::Abbreviations::spellings`]).
     spellings: Vec<String>,
-    /// Whether the span may be a typo of a name: it is at least
-    /// [`MIN_FUZZY_CHARS`] long, has no digit, not every word of it is a
-    /// known word, and it is not of a script written without spaces. A house
-    /// number is never corrected, a span of real words is no typo, and in a
-    /// script without spaces every character is a word, so one edit names
-    /// another place rather than a typo of this one.
     fuzzy: bool,
-    /// Tokens and characters of the expanded key.
     tokens: usize,
     chars: usize,
-    /// The automaton of the names within one or two edits, and that of the
-    /// names within one for the POI names: one automaton when both allow
-    /// one edit.
     dfa: Option<Rc<DFA>>,
     poi_dfa: Option<Rc<DFA>>,
 }
@@ -1556,8 +1289,6 @@ impl SpanKey {
         }
     }
 
-    /// Edits the automaton of the names allows: two for keys of
-    /// [`TWO_EDIT_CHARS`] to [`MAX_TWO_EDIT_CHARS`] characters, else one.
     fn edits(&self) -> u8 {
         if (TWO_EDIT_CHARS..=MAX_TWO_EDIT_CHARS).contains(&self.chars) {
             2
@@ -1566,9 +1297,6 @@ impl SpanKey {
         }
     }
 
-    /// The automaton of the names within one edit of the expanded key, for
-    /// the POI names: they are many, and two edits of a span reach many
-    /// venues. `None` when the span is no typo.
     fn poi_dfa(&mut self) -> Option<Rc<DFA>> {
         if !self.fuzzy {
             return None;
@@ -1582,10 +1310,6 @@ impl SpanKey {
         self.poi_dfa.clone()
     }
 
-    /// The automaton of the names within [`Self::edits`] edits of the
-    /// expanded key; `None` when the span is no typo. Names are only
-    /// matched when they start with the key's first character, which typing
-    /// errors seldom change (see [`Dictionaries::fuzzy`]).
     fn dfa(&mut self) -> Option<Rc<DFA>> {
         if !self.fuzzy {
             return None;
@@ -1600,9 +1324,6 @@ impl SpanKey {
     }
 }
 
-/// Whether `start..end` is two or three runs of digits, the last joined to
-/// the one before by a dot or a slash, and no digits before them: one house
-/// number written in parts ("993.5", "1384 1/2", not the "1/2" of it).
 fn is_number_in_parts(tokens: &Tokens, infos: &[TokenInfo], start: usize, end: usize) -> bool {
     let digits = |info: &TokenInfo| info.shape == features::Shape::Digits;
     (2..=3).contains(&(end - start))
@@ -1613,8 +1334,6 @@ fn is_number_in_parts(tokens: &Tokens, infos: &[TokenInfo], start: usize, end: u
             .is_some_and(|before| digits(&infos[before]))
 }
 
-/// Whether `start..end` is two or more glued units that are all numerals: a
-/// number written in numeral ideographs, one unit per character.
 fn is_glued_numeral(units: &Units, infos: &[TokenInfo], start: usize, end: usize) -> bool {
     end - start >= 2
         && units.unspaced(start, end)
@@ -1623,20 +1342,14 @@ fn is_glued_numeral(units: &Units, infos: &[TokenInfo], start: usize, end: usize
             .all(|info| info.shape == features::Shape::Digits)
 }
 
-/// What a number is glued to in one token (see
-/// [`LatticeTagger::glued_phrase`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Glued {
     Unit,
     PoBox,
     Level,
-    /// A type of numbered area ("4chome").
     AdminType,
 }
 
-/// The letters of a country a postcode may be written after, one or two
-/// Latin letters as a word of their own ("d 80331") or glued to the digits
-/// ("de09496"), and the rest of the words.
 fn country_prefix(words: &[String]) -> Option<(&str, String)> {
     let is_prefix = |part: &str| {
         (1..=2).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphabetic())
@@ -1654,10 +1367,6 @@ fn country_prefix(words: &[String]) -> Option<(&str, String)> {
     }
 }
 
-/// Other spellings of a dictionary key looked up besides it: its street
-/// types and directions in their other forms, and the key without the admin
-/// type word it is written with ("nordrhein westfalen" of "bundesland
-/// nordrhein westfalen", "nagoya" of "nagoyashi").
 fn spellings(key: &str) -> Vec<String> {
     let mut spellings = abbreviations::abbreviations().spellings(key);
     for alias in dictionary::admin_aliases(key) {
@@ -1668,8 +1377,6 @@ fn spellings(key: &str) -> Vec<String> {
     spellings
 }
 
-/// The label a name of `field` is read as, for the fields whose names a
-/// span is corrected to.
 fn field_label(field: Field) -> Option<Label> {
     match field {
         Field::Locality => Some(Label::Locality),
@@ -1681,8 +1388,6 @@ fn field_label(field: Field) -> Option<Label> {
     }
 }
 
-/// A dictionary key with street-type and direction abbreviations expanded,
-/// as the text index stores names ("king st w" is "king street west").
 fn expand_key(key: &str) -> String {
     let mut words = expand_address_abbreviations(key)
         .split_whitespace()
@@ -1692,8 +1397,6 @@ fn expand_key(key: &str) -> String {
     words.join(" ")
 }
 
-/// Dictionary hits training hides, as `(field, start, end)` token ranges:
-/// every hit of the field on a span that overlaps the range is dropped.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Suppression(Vec<(Field, usize, usize)>);
 
@@ -1702,7 +1405,6 @@ impl Suppression {
         self.0.push((field, start, end));
     }
 
-    /// The same hidden ranges, given in tokens, in units of `units`.
     fn in_units(&self, units: &Units) -> Self {
         Self(
             self.0
@@ -1722,11 +1424,8 @@ impl Suppression {
     }
 }
 
-/// Evidence for which country a query is in, to pick the countries decoded.
 #[derive(Debug, Default)]
 struct CountryVotes {
-    /// Votes from dictionary hits, and the Pack's weight of the countries
-    /// whose postcode pattern matched.
     votes: Vec<(CountryCode, f32, f32)>,
 }
 
@@ -1751,9 +1450,6 @@ impl CountryVotes {
         entry.2 = entry.2.max(known + 1.0);
     }
 
-    /// The `limit` countries with the most dictionary votes, then those whose
-    /// postcode matched and that the Pack or the weights know best, then by
-    /// code, so the choice is deterministic.
     fn top(mut self, limit: usize, weights: &Weights) -> Vec<CountryCode> {
         self.votes.sort_by(|left, right| {
             let known = |code: &CountryCode| f32::from(u8::from(weights.knows(*code)));

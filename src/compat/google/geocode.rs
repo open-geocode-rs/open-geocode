@@ -1,5 +1,3 @@
-//! Address, location and place geocoding of Geocoding API v4.
-
 use axum::{
     extract::{OriginalUri, Path, RawQuery, State},
     http::HeaderMap,
@@ -28,7 +26,6 @@ struct GeocodeResponse {
     plus_code: Option<PlusCode>,
 }
 
-/// `GET /v4/geocode/address/{addressQuery}`.
 pub(super) async fn address_in_path(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -54,7 +51,6 @@ fn path_text(raw: &str) -> Result<String, VendorError> {
         .ok_or_else(|| invalid("Invalid addressQuery"))
 }
 
-/// `GET /v4/geocode/address?addressQuery=` or `?address.*=`.
 pub(super) async fn address(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -107,7 +103,6 @@ async fn geocode_address(
     ))
 }
 
-/// An address as Geocoding takes one, as one text or as postal parts.
 pub(super) struct AddressQuery<'a> {
     pub(super) text: Option<String>,
     pub(super) lines: Vec<&'a str>,
@@ -118,8 +113,6 @@ pub(super) struct AddressQuery<'a> {
 }
 
 impl AddressQuery<'_> {
-    /// og's geocode arguments. `focus` is read only for a search by text,
-    /// the only one a bias applies to.
     pub(super) fn args(
         self,
         focus: impl FnOnce() -> Result<Option<String>, VendorError>,
@@ -145,16 +138,12 @@ impl AddressQuery<'_> {
                     .set("q", text)
                     .maybe("focus", focus()?)
                     .maybe("country", country),
-                // og matches the street line on its own and checks the town,
-                // region and postcode against it.
                 (None, true) if !lines.is_empty() => Args::new()
                     .set("address", lines.join(", "))
                     .maybe("locality", locality)
                     .maybe("region", region)
                     .maybe("postcode", postcode)
                     .maybe("country", country),
-                // No street line. Google reads the parts as one address, and
-                // og searches them as one text.
                 (None, true) => Args::new()
                     .set(
                         "q",
@@ -174,13 +163,10 @@ impl AddressQuery<'_> {
     }
 }
 
-/// `languageCode`. Geocoding's default is the local language, which is og's
-/// own default too.
 fn language<'a>(state: &'a AppState, query: &QueryParams) -> Result<Language<'a>, VendorError> {
     Language::parse(state.pack(), query.get("languageCode"))
 }
 
-/// The middle of `locationBias.rectangle`, as og's `focus`.
 fn bias(query: &QueryParams) -> Result<Option<String>, VendorError> {
     let corner = |prefix: &str| -> Result<Option<LatLng>, VendorError> {
         let latitude = query.double(&format!("{prefix}.latitude"))?;
@@ -205,7 +191,6 @@ fn bias(query: &QueryParams) -> Result<Option<String>, VendorError> {
     Ok(Some(format!("{lon},{lat}")))
 }
 
-/// `GET /v4/geocode/location/{lat},{lng}`.
 pub(super) async fn location_in_path(
     State(state): State<AppState>,
     Path(location): Path<String>,
@@ -220,7 +205,6 @@ pub(super) async fn location_in_path(
     .await
 }
 
-/// `GET /v4/geocode/location?locationQuery=` or `?location.latitude=`.
 pub(super) async fn location(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -248,7 +232,6 @@ pub(super) async fn location(
     .await
 }
 
-/// `"lat,lng"`.
 fn location_query(text: &str) -> Result<LatLng, VendorError> {
     let parse = |part: Option<&str>| part.and_then(|part| part.trim().parse::<f64>().ok());
     let mut parts = text.split(',');
@@ -315,8 +298,6 @@ async fn reverse(
     ))
 }
 
-/// `GET /v4/geocode/places/{place}`, answered with one bare result and no
-/// `results` list.
 pub(super) async fn place(
     State(state): State<AppState>,
     Path(place_id): Path<String>,

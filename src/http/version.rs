@@ -1,8 +1,3 @@
-//! `GET /version`: which build serves which Pack.
-//!
-//! The body names no file path: a version, a content id and the Pack's
-//! build details.
-
 use axum::{Json, extract::State};
 use serde::Serialize;
 

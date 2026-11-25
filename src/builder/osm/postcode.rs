@@ -11,34 +11,22 @@ use crate::{
 
 use super::spill::Fields;
 
-/// Member points kept per postcode. The kept points are the ones with the lowest
-/// hashes, so the sample is the same whatever order addresses come in, and the
-/// memory stays bounded by the number of postcodes, not addresses.
 const SAMPLE_POINTS: usize = 16;
 
-/// Postcode points derived from accepted addresses, one per postcode of each
-/// country. Keyed by country, never by input: a planet file holds AU and NZ
-/// "2110" apart, and a country split over two extracts makes one of each code.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Accumulator {
-    /// Where each postcode's group is in `groups`.
     index: BTreeMap<(Option<CountryCode>, String), usize>,
     groups: Vec<Group>,
-    /// Addresses come in street order, where neighbours mostly state the
-    /// same postcode: the last one as stated, and its group if it has one.
     last: Option<(Option<CountryCode>, String, Option<usize>)>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct Group {
     record_count: u64,
-    /// Distinct member points by ascending hash, at most [`SAMPLE_POINTS`].
     sample: Vec<(u64, [f64; 2])>,
 }
 
 impl Accumulator {
-    /// Count an accepted address stating `postcode` at `point` in
-    /// `country`.
     pub(crate) fn accept(
         &mut self,
         country: Option<CountryCode>,
@@ -76,8 +64,6 @@ impl Accumulator {
     }
 
     pub(crate) fn into_records(self) -> impl Iterator<Item = PostcodeRecord> {
-        // A medoid is 256 great-circle distances, and a country has
-        // hundreds of thousands of postcodes.
         let points = self
             .groups
             .par_iter()
@@ -97,13 +83,9 @@ impl Accumulator {
     }
 }
 
-/// Addresses stating a postcode come first, so an address without one sees
-/// every postcode on its street.
 #[derive(Debug, Default)]
 pub(crate) struct Street {
     pub(super) postcodes: Vec<String>,
-    /// The postcode the street's last address stated, as stated: the same
-    /// one again adds nothing.
     stated: Option<String>,
 }
 
@@ -136,15 +118,12 @@ impl Group {
         }
         let at = self.sample.partition_point(|kept| kept.0 < point.0);
         if self.sample.get(at).is_some_and(|kept| kept.0 == point.0) {
-            return; // the same point again: a block of flats does not outvote a street
+            return;
         }
         self.sample.insert(at, point);
         self.sample.truncate(SAMPLE_POINTS);
     }
 
-    /// The sampled member with the least total distance to the others: always a
-    /// real address, unmoved by a few stray ones, and safe across the antimeridian,
-    /// where a mean of longitudes is not (issue #3).
     fn medoid(&self) -> [f64; 2] {
         let distance_sum = |[lon, lat]: [f64; 2]| -> f64 {
             self.sample
@@ -256,7 +235,7 @@ mod tests {
         let mut points: Vec<(f64, f64)> = (0..9)
             .map(|step| (-79.39 + step as f64 * 0.001, 43.65))
             .collect();
-        points.push((151.2, -33.9)); // one address mistagged with a Toronto postcode
+        points.push((151.2, -33.9));
         let point_of = |reversed: bool| {
             let mut accumulator = Accumulator::default();
             let mut ordered = points.clone();

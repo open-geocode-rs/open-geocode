@@ -38,8 +38,6 @@ struct Fixture {
     router: Router,
 }
 
-/// The vendor id og issues for an address of the fixture: its og id, its
-/// layer and its label, since the catalogue holds no address.
 fn address_vendor_id(og_id: &str) -> String {
     let label = match og_id {
         "osm:node:10" => "10 King Street, Unit 4B, City of Toronto, ON, M5V 1A1, Canada",
@@ -65,8 +63,6 @@ fn us_fixture() -> Fixture {
     fixture_over(&US.join("pack"))
 }
 
-/// Canada > Ontario > Golden Horseshoe > York > Toronto > Old Toronto >
-/// St. Lawrence, holding an address with every part stated and a bakery.
 fn write_pack(dir: &Path) {
     let mut writer = Writer::create(dir).expect("writer");
     let mut place = |layer, name: &str, id| {
@@ -319,8 +315,6 @@ fn bakery_place() -> Value {
         },
         "internationalPhoneNumber": "+1 416-555-0111",
         "websiteUri": "https://queenbakery.example/",
-        // The areas below its town that hold it, smallest first. It is the
-        // only place og holds, so no landmark stands near it.
         "addressDescriptor": {"areas": [
             {
                 "name": format!("places/{}", encode_parts("osm:relation:7", None, "St. Lawrence")),
@@ -343,7 +337,6 @@ fn bakery_place() -> Value {
     })
 }
 
-/// "Mo-Fr 07:00-18:00; Sa 08:00-14:00", as Google's periods.
 fn bakery_hours() -> Value {
     let mut periods = (1..=5)
         .map(|day| json!({"open": {"day": day, "hour": 7, "minute": 0}, "close": {"day": day, "hour": 18, "minute": 0}}))
@@ -662,8 +655,6 @@ async fn autocomplete_maps_region_codes_restriction_and_cursor() {
         json!({})
     );
 
-    // The bakery is 407 m from this centre, so inside a 500 m circle and outside a
-    // 300 m one although inside the box around it.
     let circle = |radius: f64| {
         json!({"input": "Queen Bakery", "locationRestriction": {"circle": {
             "center": {"latitude": 43.0, "longitude": -79.0}, "radius": radius,
@@ -779,7 +770,6 @@ async fn geocode_address_in_the_path_and_as_fields() {
     let router = &fixture.router;
     let one = json!({"results": [address_result()]});
 
-    // `+` is a space in Google's path; `%2C` a comma.
     let path = get(
         router,
         "/compat/google/v4/geocode/address/10+King+Street%2C+Toronto",
@@ -940,8 +930,6 @@ async fn place_geocoding_answers_one_bare_result() {
     assert_eq!(reply.status, StatusCode::OK);
     let mut expected = bakery_place();
     let fields = expected.as_object_mut().expect("a place");
-    // A geocode result has a place's box but none of what a Place holds
-    // of the place itself.
     for field in [
         "name",
         "id",
@@ -1010,7 +998,6 @@ async fn search_nearby_answers_the_places_inside_the_circle() {
         assert_eq!(reply.status, StatusCode::OK, "{request}");
         assert_eq!(reply.body, found, "{request}");
     }
-    // A type og has no category for holds no place og knows.
     let reply = post(
         &fixture.router,
         SEARCH_NEARBY,
@@ -1124,11 +1111,6 @@ async fn unknown_paths_and_wrong_methods() {
     }
 }
 
-/// Every og value of a result lands in its Google slot unchanged, through
-/// every response shape that carries the result. The fixture's results
-/// state every field that has a Google slot, so a slot that goes empty
-/// fails here. `match` has no slot in Places or Geocoding v4, so Google
-/// carries none.
 #[tokio::test]
 async fn every_og_value_lands_in_its_google_slot() {
     let fixture = fixture();
@@ -1152,7 +1134,6 @@ async fn every_og_value_lands_in_its_google_slot() {
             "/places?ids=osm:way:11",
             Some(format!("/compat/google/v1/places/{bakery}")),
             format!("/compat/google/v4/geocode/places/{bakery}"),
-            // A whole category word suggests by kind, with nothing marked.
             "queen bak",
         ),
     ];
@@ -1425,7 +1406,6 @@ async fn every_og_value_lands_in_its_google_slot() {
             areas.map_or_else(|| context["sublocality"]["name"].clone(), Value::from)
         );
     }
-    // A field no case states would leave its slot unchecked.
     for field in [
         "bbox",
         "contact",
@@ -1440,7 +1420,6 @@ async fn every_og_value_lands_in_its_google_slot() {
         assert!(stated.contains(field), "no case states {field}");
     }
 
-    // An area result is its own component, with its own code.
     let ontario = get(router, "/compat/google/v4/geocode/address/Ontario")
         .await
         .body;
@@ -1454,8 +1433,6 @@ async fn every_og_value_lands_in_its_google_slot() {
     );
 }
 
-/// `languageCode` names areas in that language where og has the name, and
-/// says so. An area og names only locally carries no `languageCode`.
 #[tokio::test]
 async fn language_code_names_areas_og_holds_in_that_language() {
     let fixture = fixture();
@@ -1531,16 +1508,12 @@ async fn language_code_names_areas_og_holds_in_that_language() {
         country(&searched, "/places/0/addressComponents")["languageCode"],
         "de"
     );
-    // Places answers in English when no language is named, and og holds no
-    // English name here.
     let english = post(router, SEARCH_TEXT, json!({"textQuery": "Queen Bakery"})).await;
     assert_eq!(
         country(&english, "/places/0/addressComponents")["longText"],
         "Canada"
     );
 
-    // A region og holds no name for reads its base language, and says the
-    // language it read.
     let swiss = get(
         router,
         "/compat/google/v4/geocode/address?addressQuery=10%20King%20Street&languageCode=de-CH",
@@ -1556,8 +1529,6 @@ async fn language_code_names_areas_og_holds_in_that_language() {
         })
     );
 
-    // Autocomplete reads the browser's language when the body names none, and
-    // a header that names no language is no request to refuse.
     for accept in ["de-CH,de;q=0.9", "*", "not a language"] {
         let suggested = post_with(
             router,
@@ -1651,8 +1622,6 @@ async fn photo_media_checks_the_size_then_finds_no_photo_og_holds() {
         )
     );
 
-    // The size is checked before the place, so an unknown place with a bad
-    // size is a bad size.
     for (query, message) in [
         (
             "",
@@ -1737,8 +1706,6 @@ fn bakery_destination() -> Value {
         "formattedAddress".to_string(),
         json!("Queen Bakery, 12 King Street, Toronto, ON M5V 1A1, Canada"),
     );
-    // Its outline is a box, so it is no bare point, and og cannot tell a
-    // building from grounds.
     json!({
         "primary": primary,
         "entrances": [{
@@ -1823,7 +1790,6 @@ async fn destinations_leave_out_areas_and_refuse_what_google_refuses() {
     let fixture = fixture();
     let router = &fixture.router;
 
-    // A town is no destination, by id or by name.
     for request in [
         json!({"place": format!("places/{}", encode_parts("osm:relation:5", Some(Layer::Locality), ""))}),
         json!({"addressQuery": {"addressQuery": "Toronto"}}),
@@ -1886,7 +1852,6 @@ async fn destinations_leave_out_areas_and_refuse_what_google_refuses() {
     }
 }
 
-/// A text search along a route keeps the places by the route.
 #[tokio::test]
 async fn search_text_along_a_route_keeps_the_places_by_it() {
     let fixture = fixture();
@@ -1895,7 +1860,6 @@ async fn search_text_along_a_route_keeps_the_places_by_it() {
         json!({"textQuery": "Queen Bakery",
                "searchAlongRouteParameters": {"polyline": {"encodedPolyline": polyline}}})
     };
-    // 55 m north of Queen Bakery, from 407 m west of it to 407 m east.
     let near = post(router, SEARCH_TEXT, along("cpmeGnsfaN?o}@")).await;
     assert_eq!(near.status, StatusCode::OK, "{}", near.body);
     assert_eq!(near.body["places"][0]["id"], bakery_id(), "{}", near.body);
@@ -1927,8 +1891,6 @@ async fn filters_og_holds_no_data_for_keep_no_place_and_the_rest_apply() {
         let reply = post(router, SEARCH_TEXT, body.clone()).await;
         assert_eq!(reply.body, refused(message), "{body}");
     }
-    // og holds no rating, price or charging options, and no category of
-    // this type, so no place it holds passes them.
     for body in [
         json!({"textQuery": "Queen", "minRating": 4.0}),
         json!({"textQuery": "Queen", "priceLevels": ["PRICE_LEVEL_MODERATE"]}),
@@ -1950,7 +1912,6 @@ async fn filters_og_holds_no_data_for_keep_no_place_and_the_rest_apply() {
             })
             .unwrap_or_default()
     };
-    // A type og maps is held to strictly, or ranked first when not strict.
     let strict = post(
         router,
         SEARCH_TEXT,
@@ -1986,9 +1947,6 @@ async fn filters_og_holds_no_data_for_keep_no_place_and_the_rest_apply() {
     assert_eq!(cities, json!({}), "a bakery is no city");
 }
 
-/// United States > California > Santa Clara County > Mountain View, holding
-/// 1600 Amphitheatre Parkway as its county source writes it, the county
-/// standing in for the town, and the place at that address.
 fn write_us_pack(pack: &Path) {
     let mut writer = Writer::create(pack).expect("writer");
     let (lon, lat) = (-122.0846, 37.4218);
@@ -2072,8 +2030,6 @@ fn write_us_pack(pack: &Path) {
             context.clone(),
         )
         .expect("address");
-    // The same house mapped again as its building's outline, whose middle
-    // lies 115 m off.
     writer
         .write(
             &AddressRecord {
@@ -2186,10 +2142,6 @@ async fn a_us_address_is_written_as_google_writes_it_in_its_town() {
     );
 }
 
-/// A house og holds twice, as its point and its building's outline, is one
-/// result for every vendor, at its point.
-/// HERE writes a US street in the postal abbreviation in its own field, as
-/// its label does.
 #[tokio::test]
 async fn here_writes_a_us_street_in_the_postal_form() {
     let fixture = us_fixture();
@@ -2207,8 +2159,6 @@ async fn here_writes_a_us_street_in_the_postal_form() {
     );
 }
 
-/// Asked for the nearest two houses, a vendor answers two houses, though og
-/// holds the nearest one twice.
 #[tokio::test]
 async fn a_house_held_twice_leaves_room_for_the_next_house() {
     let fixture = us_fixture();
@@ -2290,8 +2240,6 @@ async fn a_house_held_twice_is_answered_once() {
     assert_eq!(houses, 1, "{}", reverse.body);
 }
 
-/// Google answers the house nearest a point on its lot or the street before
-/// it, here 67 m off, past og's own default reach.
 #[tokio::test]
 async fn reverse_answers_the_house_nearest_the_point() {
     let fixture = us_fixture();
@@ -2309,8 +2257,6 @@ async fn reverse_answers_the_house_nearest_the_point() {
     );
 }
 
-/// A house mapped as its building's outline stands at the house, Google's
-/// street-address precision.
 #[tokio::test]
 async fn a_house_mapped_as_an_outline_is_a_rooftop() {
     let fixture = us_fixture();
@@ -2327,8 +2273,6 @@ async fn a_house_mapped_as_an_outline_is_a_rooftop() {
     assert_eq!(result["granularity"], "ROOFTOP", "{result}");
 }
 
-/// Four places near 43 N 79 W: the one asked for, a well known mall whose
-/// outline holds it, a corner shop nearer, and a shop 490 m off.
 fn write_landmarks(writer: &mut Writer) {
     let mut poi = |name: &str, category: &str, lon: f64, id, prominence| {
         writer
@@ -2379,15 +2323,12 @@ fn write_landmarks(writer: &mut Writer) {
         24,
         Default::default(),
     );
-    // The mall's outline holds the cafe.
     writer.set_extents(vec![(
         mall,
         [-790_030_000, 429_990_000, -789_990_000, 430_010_000],
     )]);
 }
 
-/// A place's landmarks are the best known places within a short walk, the
-/// nearer first among equals, each saying whether the place lies inside it.
 #[tokio::test]
 async fn a_place_is_described_by_its_best_known_neighbours() {
     let fixture = us_fixture();
@@ -2428,7 +2369,6 @@ async fn a_place_is_described_by_its_best_known_neighbours() {
             "establishment"
         ])
     );
-    // A mask that leaves the descriptor out costs no lookup and gets none.
     let plain = get_with(
         router,
         &format!("/compat/google/v1/places/{cafe}"),
@@ -2438,7 +2378,6 @@ async fn a_place_is_described_by_its_best_known_neighbours() {
     assert!(plain.body.get("addressDescriptor").is_none());
 }
 
-/// An extent alone cannot establish that a landmark contains the destination.
 #[tokio::test]
 async fn a_destination_does_not_infer_containment_from_an_extent() {
     let fixture = us_fixture();

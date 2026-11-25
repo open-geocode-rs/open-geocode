@@ -1,19 +1,3 @@
-//! Words that name a kind of place, in every language the catalog has, and
-//! the place categories each one names.
-//!
-//! `catalog/categories.json` is generated (see `catalog/catalog.py`). A
-//! category is returned as the words a POI's category is indexed under, such
-//! as `amenity pharmacy`, or the key alone (`shop`) for a preset of any value.
-//! A word is matched by its [`search_key`], so "Apotheke" and "apotheke" are
-//! one word, and a phrase ("drug store") is one word of the table.
-//!
-//! Words come in two strengths, and the weaker answers only when no stronger
-//! one matches. Stronger are a preset's whole name, unless the name is a
-//! regional variant's (en-AU), and every group word. Weaker are single words
-//! of a name ("coffee" of "Coffee Shop"), which can sit in a narrower preset's
-//! name ("park" of "Park and Ride Lot"). Search terms reach wider still
-//! ("coffee" is a restaurant term) and are left out.
-
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::OnceLock,
@@ -25,15 +9,10 @@ use crate::util::fold::search_key;
 
 #[derive(Deserialize)]
 struct Catalog {
-    /// `[preset id, category, group indexes]`.
     presets: Vec<(String, String, Vec<usize>)>,
-    /// `[group id, words of every language]`.
     groups: Vec<(IgnoredAny, Vec<GroupWord>)>,
-    /// Preset names of every language, then preset indexes.
     names: BTreeMap<String, Vec<usize>>,
-    /// Names only a regional variant gives (en-AU "Pharmacy" for a chemist).
     regional: BTreeMap<String, Vec<usize>>,
-    /// Each preset's name in each language as written, by preset index.
     titles: Vec<BTreeMap<String, String>>,
 }
 
@@ -41,21 +20,14 @@ struct Catalog {
 #[serde(untagged)]
 enum GroupWord {
     Whole(String),
-    /// Typed this far, the word already names the group.
     Prefix(String, usize),
 }
 
 struct Table {
-    /// Sorted, so an index order is the categories' order.
     categories: Vec<String>,
     strong: HashMap<String, Box<[usize]>>,
     name_words: HashMap<String, Box<[usize]>>,
-    /// Strong words with a minimum prefix length, sorted by word for a range
-    /// scan from a typed prefix.
     prefixed: Vec<Prefixed>,
-    /// Each category's name in each language as written, from the preset of
-    /// the category's own tag (`amenity/cafe` for `amenity cafe`), else its
-    /// first preset.
     titles: HashMap<String, BTreeMap<String, String>>,
 }
 
@@ -65,7 +37,6 @@ struct Prefixed {
     categories: Box<[usize]>,
 }
 
-/// Builds the catalog's table now rather than on first use.
 pub fn load() {
     table();
 }
@@ -73,7 +44,6 @@ pub fn load() {
 fn table() -> &'static Table {
     static TABLE: OnceLock<Table> = OnceLock::new();
     TABLE.get_or_init(|| {
-        // Compressed, a twelfth of the binary it would add as text.
         let text = zstd::decode_all(&include_bytes!("../catalog/categories.json.zst")[..])
             .expect("catalog/categories.json.zst is zstd");
         let catalog: Catalog =
@@ -185,8 +155,6 @@ pub fn title(category: &str, language: &str) -> Option<&'static str> {
         .map(String::as_str)
 }
 
-/// The categories a whole word or phrase names, sorted, from its strongest
-/// matching words.
 pub fn presets_for_word(word: &str) -> Vec<&'static str> {
     search_key(word).map_or_else(Vec::new, |key| for_key(&key, false))
 }
@@ -210,26 +178,19 @@ pub fn of_query(query: &str) -> Option<Vec<&'static str>> {
     (!found.is_empty()).then_some(found)
 }
 
-/// A query that asks for a kind of place, and where when it names a place
-/// too ("pharmacy amsterdam", "hotel near pike place").
 #[derive(Debug, PartialEq, Eq)]
 pub struct Request {
     pub categories: Vec<&'static str>,
     /// The words of the place, connectors ("near", "in de buurt van") left
     /// out; `None` for the caller's own surroundings.
     pub place: Option<String>,
-    /// Whether the whole query is the kind's name, not found in part of it.
     pub whole: bool,
 }
 
-/// The kind of place a query asks for: all of it, or its longest first or
-/// last words with a place in the rest.
 pub fn of_request(query: &str) -> Option<Request> {
     of_request_with(query, of_query)
 }
 
-/// [`of_request`], each candidate kind named by `kind` ("pharmcy" through a
-/// typo of it).
 pub fn of_request_with(
     query: &str,
     kind: impl Fn(&str) -> Option<Vec<&'static str>>,
@@ -253,7 +214,6 @@ pub fn of_request_with(
         ];
         for (words, rest) in splits {
             let words = words.join(" ");
-            // A word as short as "ho" names a kind somewhere and much else.
             if words.chars().count() < crate::search::MIN_TYPO_CHARS {
                 continue;
             }
@@ -271,7 +231,6 @@ pub fn of_request_with(
     None
 }
 
-/// `words` without the "near" words around them, longest first.
 fn without_connectors<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
     let connectors = connectors();
     let longest = connectors
@@ -298,8 +257,6 @@ fn without_connectors<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
     words
 }
 
-/// Words that place what a query asks for ("near", "bij", "in"), every
-/// language the parser knows.
 fn connectors() -> &'static HashSet<String> {
     static CONNECTORS: OnceLock<HashSet<String>> = OnceLock::new();
     CONNECTORS.get_or_init(|| {
@@ -312,13 +269,10 @@ fn connectors() -> &'static HashSet<String> {
     })
 }
 
-/// Every whole name and group word, for a typo of one.
 pub fn strong_words() -> impl Iterator<Item = &'static str> {
     table().strong.keys().map(String::as_str)
 }
 
-/// Every key the catalog has a category under (`amenity`, `shop`). Together
-/// they hold every kind of place.
 pub fn keys() -> Vec<&'static str> {
     let mut keys = table()
         .categories
@@ -333,8 +287,6 @@ pub fn keys() -> Vec<&'static str> {
     keys
 }
 
-/// Whether the catalog has `category`, written as it writes one
-/// (`amenity pharmacy`, or a bare key).
 pub fn is_known(category: &str) -> bool {
     let table = table();
     table
@@ -443,7 +395,6 @@ mod tests {
 
     #[test]
     fn search_terms_name_nothing() {
-        // "Drugstore" names the chemist; "apothecary" is only a term of both.
         assert_eq!(presets_for_word("drugstore"), vec!["shop chemist"]);
         assert_eq!(presets_for_word("chemist"), vec!["shop chemist"]);
         assert!(presets_for_word("apothecary").is_empty());
@@ -513,8 +464,6 @@ mod tests {
         assert_eq!(title("no such", "en"), None);
     }
 
-    /// The binary carries the compressed copy; it must be the catalog's.
-    /// `OG_UPDATE_CONTRACT=1 cargo test` writes it.
     #[test]
     fn the_compressed_catalog_is_current() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("catalog");

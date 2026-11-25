@@ -1,12 +1,3 @@
-//! A US address in the postal service's standard form.
-//!
-//! Street suffix, direction and unit designator are abbreviated by USPS
-//! Publication 28 (`1700 DISTRICT AVE STE 300`), and the last line is city,
-//! state code and ZIP (`BURLINGTON, MA  01803-5231`). Precisely's geocode,
-//! verify, lookup and reverse write it in capitals; its autocomplete, and
-//! Google and HERE, keep the case (`350 Jordan Ave`, `1600 Amphitheatre
-//! Pkwy`).
-
 use crate::search::road::direction_of;
 
 pub(crate) fn zip_plus_four(postcode: &str) -> Option<(&str, &str)> {
@@ -17,16 +8,12 @@ pub(crate) fn zip_plus_four(postcode: &str) -> Option<(&str, &str)> {
     (digits(zip, 5) && digits(plus_four, 4)).then_some((zip, plus_four))
 }
 
-/// How a product writes the address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Style {
-    /// In capitals, the country as a line of its own.
     Postal,
-    /// In the case written, with no country.
     Display,
 }
 
-/// The parts of a US street address, standardized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UsAddress {
     number: String,
@@ -47,7 +34,6 @@ struct Unit {
     value: String,
 }
 
-/// The parts og holds for an address, as its record writes them.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Parts<'a> {
     pub(crate) number: &'a str,
@@ -64,9 +50,6 @@ pub(crate) struct Parts<'a> {
 }
 
 impl UsAddress {
-    /// The address from og's parts. A street og split no type from may
-    /// still end in a suffix Publication 28 names (`Global View`), so one
-    /// og left whole is split by the table.
     pub(crate) fn of(parts: &Parts<'_>) -> Self {
         let text = |value: &str| value.split_whitespace().collect::<Vec<_>>().join(" ");
         let (prefix, name, kind, suffix_word) =
@@ -92,7 +75,6 @@ impl UsAddress {
         }
     }
 
-    /// `1700 DISTRICT AVE STE 300`.
     pub(crate) fn street_line(&self, style: Style) -> String {
         let unit = self.unit.as_ref();
         style.whole(&join([
@@ -109,9 +91,6 @@ impl UsAddress {
         ]))
     }
 
-    /// The street as Precisely's `street` names it. Postal products name
-    /// the street's own name only (`DISTRICT`); autocomplete names it whole
-    /// (`S Jordan Ave`).
     pub(crate) fn street(&self, style: Style) -> String {
         match style {
             Style::Postal => style.whole(&self.name),
@@ -126,14 +105,12 @@ impl UsAddress {
         }
     }
 
-    /// The street's type, `AVE` in the postal form.
     pub(crate) fn street_type(&self, style: Style) -> Option<String> {
         self.suffix_type
             .as_deref()
             .map(|kind| style.abbreviation(kind))
     }
 
-    /// The unit, its designator first, `Ste 2` in a display.
     pub(crate) fn unit(&self, style: Style) -> Option<String> {
         let unit = self.unit.as_ref()?;
         Some(join([
@@ -156,8 +133,6 @@ impl UsAddress {
         })
     }
 
-    /// `BURLINGTON MA 01803-5231`, an address line and the middle of the
-    /// formatted address.
     pub(crate) fn last_line(&self, style: Style) -> String {
         let city = self.city(style);
         let state_zip = join([Some(self.state.clone()), self.zip()]);
@@ -181,7 +156,6 @@ impl UsAddress {
 }
 
 impl Style {
-    /// A finished line or part, in capitals for the postal form.
     fn whole(self, text: &str) -> String {
         match self {
             Self::Postal => text.to_uppercase(),
@@ -189,8 +163,6 @@ impl Style {
         }
     }
 
-    /// A name as the display writes it, words a source capitalized in full
-    /// written as words.
     fn name(self, text: &str) -> String {
         match self {
             Self::Postal => text.to_string(),
@@ -198,7 +170,6 @@ impl Style {
         }
     }
 
-    /// A Publication 28 abbreviation, `Ave` in a display.
     fn abbreviation(self, short: &str) -> String {
         match self {
             Self::Postal => short.to_string(),
@@ -207,9 +178,6 @@ impl Style {
     }
 }
 
-/// A word a source wrote in capitals, in the case a display writes it:
-/// `JORDAN` as `Jordan`. A word with any small letter is kept, and so is
-/// one standing for initials or a code (`S`, `NE`, `4B`).
 fn word_case(word: &str) -> String {
     let digits = word.chars().take_while(char::is_ascii_digit).count();
     if digits > 0 && ["ST", "ND", "RD", "TH"].contains(&&word[digits..]) {
@@ -242,9 +210,6 @@ fn join(words: impl IntoIterator<Item = Option<String>>) -> String {
         .join(" ")
 }
 
-/// A street name split as Publication 28 reads it, into prefix, name,
-/// suffix and post direction: a direction at either end and a suffix before
-/// the last direction, each only while a word naming the street is left.
 fn split(street: &str) -> (Option<&str>, String, Option<&str>, Option<&str>) {
     let words = street.split_whitespace().collect::<Vec<_>>();
     let (mut first, mut last) = (0, words.len());
@@ -271,9 +236,6 @@ fn is_suffix(word: &str) -> bool {
         .any(|(full, short)| *full == key || *short == key)
 }
 
-/// A street in the postal abbreviation, in its own case: `W El Camino Real`,
-/// `Amphitheatre Pkwy`. og's split of the street, when it made one, else
-/// the Publication 28 tables', decides its parts.
 pub(crate) fn display_street(
     name: &str,
     prefix: Option<&str>,
@@ -290,7 +252,6 @@ pub(crate) fn display_street(
     .street(Style::Display)
 }
 
-/// A direction as the postal service abbreviates it: `North` as `N`.
 fn direction(word: &str) -> Option<&'static str> {
     Some(
         match direction_of(&word.trim_end_matches('.').to_lowercase())? {
@@ -307,10 +268,6 @@ fn direction(word: &str) -> Option<&'static str> {
     )
 }
 
-/// A street suffix as Publication 28 abbreviates it: `Avenue` as `AVE`.
-/// One already written as its abbreviation stays. Another way of writing
-/// one (`AV`) is read through og's own dictionary of street words, and one
-/// neither names stays as written.
 fn suffix(word: &str) -> String {
     let key = word.trim_end_matches('.').to_uppercase();
     let listed = |key: &str| {
@@ -328,7 +285,6 @@ fn suffix(word: &str) -> String {
         .unwrap_or(key)
 }
 
-/// A unit designator as Publication 28 abbreviates it: `Suite` as `STE`.
 pub(crate) fn designator(word: &str) -> String {
     let key = word.trim_end_matches('.').to_uppercase();
     DESIGNATORS
@@ -337,8 +293,6 @@ pub(crate) fn designator(word: &str) -> String {
         .map_or_else(|| key.clone(), |(_, short)| (*short).to_string())
 }
 
-/// USPS Publication 28, appendix C1. Each primary street suffix name and
-/// the postal service's standard abbreviation.
 const SUFFIXES: &[(&str, &str)] = &[
     ("ALLEY", "ALY"),
     ("ANEX", "ANX"),
@@ -548,8 +502,6 @@ const SUFFIXES: &[(&str, &str)] = &[
     ("WELLS", "WLS"),
 ];
 
-/// USPS Publication 28, appendix C2. Each secondary unit designator and
-/// its abbreviation.
 const DESIGNATORS: &[(&str, &str)] = &[
     ("APARTMENT", "APT"),
     ("BASEMENT", "BSMT"),
@@ -674,7 +626,6 @@ mod tests {
         };
         assert_eq!(street("Global View"), "1 GLOBAL VW");
         assert_eq!(street("North Park Row West"), "1 N PARK ROW W");
-        // A suffix that is the whole name is the name.
         assert_eq!(street("Broadway"), "1 BROADWAY");
         assert_eq!(street("Park"), "1 PARK");
     }

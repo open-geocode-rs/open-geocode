@@ -138,7 +138,6 @@ impl PackReverseGeocoder {
         Self::from_pack(Arc::new(pack::Reader::open(pack_path)?))
     }
 
-    /// Open the spatial index using an existing shared pack reader.
     pub fn from_pack(pack: Arc<pack::Reader>) -> Result<Self> {
         let spatial = spatial_index::Reader::open(pack.container(), pack.records().clone())?;
         Ok(Self { pack, spatial })
@@ -177,7 +176,6 @@ impl PackReverseGeocoder {
         if let Some(layer) = options.layer {
             let mut result =
                 self.of_layer(layer, options, &mut context, &mut context_record_ids)?;
-            // Resolved areas still label it, but are no answers of their own.
             if let Some(result) = &mut result {
                 result.evidence.context_record_ids.clear();
             }
@@ -222,7 +220,6 @@ impl PackReverseGeocoder {
             return Ok(Vec::new());
         }
         let (lon, lat) = (options.lon, options.lat);
-        // Each result is labelled by its own areas, in a context of its own.
         let fresh = || (Context::default(), Vec::<RecordId>::new());
         let found = match layer {
             Layer::Address => self
@@ -295,7 +292,6 @@ impl PackReverseGeocoder {
             .into_iter()
             .flatten()
             .map(|mut result| {
-                // Its areas label it, and are no answers of their own.
                 result.evidence.context_record_ids.clear();
                 GeocodeResponse {
                     lon,
@@ -446,8 +442,6 @@ impl PackReverseGeocoder {
                 extended.insert(base.to_string());
             }
         }
-        // A ZIP+4 can break a disagreement only when a separate point for
-        // the same house gives its five-digit ZIP and no other ZIP+4 competes.
         let Some(preferred) = extended
             .first()
             .filter(|preferred| extended.len() == 1 && preferred.as_str() != zip)
@@ -459,7 +453,6 @@ impl PackReverseGeocoder {
             .find_map(|(postcode, candidate)| (postcode == *preferred).then_some(candidate)))
     }
 
-    /// The address result of `candidate`, the address found near the point.
     fn address_at(
         &self,
         options: GeocodeOptions,
@@ -530,8 +523,6 @@ impl PackReverseGeocoder {
             return Ok(None);
         }
         let radius = options.radius_m.min(40.0);
-        // Looking farther than the nearest street could put someone across
-        // a junction on a different road to fetch a range.
         let Some(candidate) = self
             .spatial
             .segment_candidates(options.lon, options.lat, Layer::Street, radius, 1)?
@@ -606,8 +597,6 @@ impl PackReverseGeocoder {
         }))
     }
 
-    /// The estimated address of `candidate`, a range found near the point,
-    /// at the number along it the point is nearest.
     fn estimated_at(
         &self,
         options: GeocodeOptions,
@@ -663,7 +652,6 @@ impl PackReverseGeocoder {
         self.street_at(options, &candidate, context, context_record_ids)
     }
 
-    /// The street result of `candidate`, a street found near the point.
     fn street_at(
         &self,
         options: GeocodeOptions,
@@ -717,7 +705,6 @@ impl PackReverseGeocoder {
         self.poi_at(options, &candidate, context, context_record_ids)
     }
 
-    /// The POI result of `candidate`, a POI found near the point.
     fn poi_at(
         &self,
         options: GeocodeOptions,
@@ -796,8 +783,6 @@ impl PackReverseGeocoder {
         context_record_ids: &mut Vec<RecordId>,
     ) -> Result<Option<GeocodeResult>> {
         self.enrich_context(options, context, context_record_ids)?;
-        // The answer is the area its label leads with, the first found of
-        // the most precise tier, so its id and layer name what it says.
         let mut primary: Option<(usize, RecordId, ContextRecord)> = None;
         for &record_id in context_record_ids.iter() {
             let Some(record) = self.pack.context_record(record_id)? else {
@@ -933,8 +918,6 @@ fn compose_label(primary: &str, context: &Context) -> String {
     parts.join(", ")
 }
 
-/// The area tiers a point's label names, most precise first, as
-/// [`context_only_label`] reads them.
 const LABEL_TIERS: [&str; 7] = [
     "place",
     "neighbourhood",
@@ -1084,7 +1067,6 @@ pub(crate) mod tests {
         writer
             .write(&street_record(POI, 5030).into(), None)
             .expect("street");
-        // An unaddressed POI on top of the query point is not an address.
         writer
             .write(
                 &PoiRecord {

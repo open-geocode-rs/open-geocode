@@ -17,8 +17,6 @@ fn entry(count: u64, country: &str) -> Entry {
     }
 }
 
-/// A small Pack's worth of names: one Toronto street and its areas, and a
-/// French street and town.
 fn dictionaries() -> Dictionaries {
     Dictionaries::from_entries([
         (Field::Street, "king street west", entry(400, "CA")),
@@ -79,7 +77,6 @@ fn tokens_are_the_index_words_with_the_field_breaks_between_them() {
         tokens.words.join(" "),
         crate::util::fold::search_key("Unit 602, 670 King St. W;Toronto\nON M5V-1M9").unwrap()
     );
-    // A break before the first word is no break.
     assert_eq!(Tokens::new(", toronto").breaks, [false]);
     assert!(Tokens::new(" ,; ").is_empty());
 }
@@ -97,8 +94,6 @@ fn the_lattice_has_every_token_and_the_spans_the_dictionaries_know() {
     for index in 0..tokens.len() {
         assert!(spans.contains(&(index, index + 1)), "token {index}");
     }
-    // "king st w" is "king street west" once expanded, and the postcode is
-    // one span written with or without its space.
     assert!(spans.contains(&(1, 4)), "{spans:?}");
     assert!(spans.contains(&(6, 8)), "{spans:?}");
     assert!(!spans.contains(&(0, 2)), "{spans:?}");
@@ -144,8 +139,6 @@ fn hidden_dictionary_hits_leave_only_the_token_spans() {
 #[test]
 fn a_run_of_glued_characters_is_an_edge_whatever_its_length() {
     let tagger = tagger();
-    // Two runs, split by the field break; the second is longer than any
-    // span looked up.
     let tokens = Tokens::new("み な と み ら い, 神奈川県横浜市西区みなとみらい");
     let units = Units::of(&tokens);
     assert_eq!(units.runs(), [(0, 6), (6, 21)]);
@@ -181,12 +174,9 @@ fn fuzzy_lookup_corrects_long_unknown_words_only() {
     assert_eq!(name.as_deref(), Some("toronto"));
     assert_eq!(hit.distance, 1);
     assert_eq!(hit.entry.country, Some(code("CA")));
-    // Three letters are too short to correct.
     assert!(lookup(Field::Street, "kng").is_none());
     assert!(lookup(Field::Locality, "king").is_none());
-    // A typo in the first letter is not corrected.
     assert!(lookup(Field::Locality, "roronto").is_none());
-    // Nor is a name of a script written without spaces.
     let tagger = LatticeTagger::new(
         Dictionaries::from_entries([(Field::Locality, "千代田区", entry(10, "JP"))]),
         Weights::built_in(),
@@ -203,8 +193,6 @@ fn fuzzy_lookup_corrects_long_unknown_words_only() {
 #[test]
 fn a_toy_model_decodes_the_best_labelling() {
     use Label::*;
-    // Two tokens, each a span, and one span over both. Digits are a house
-    // number, letters a street, and the two-token span a locality.
     let mut weights = Weights::zero();
     let set = |weights: &mut Weights, feature: &str, label: Label, value: f32| {
         weights.edge[by_name(feature) as usize * decode::LABELS + label as usize] = value;
@@ -232,7 +220,6 @@ fn a_toy_model_decodes_the_best_labelling() {
     assert_eq!(paths[0].score, 3.0);
     assert_eq!(paths[1].labels(&lattice), [Locality, Locality]);
     assert_eq!(paths[1].score, 2.5);
-    // A transition from the house number to the street can outweigh it.
     weights.global[(HouseNumber as usize) * decode::STATES + Street as usize] = -1.0;
     let paths = decode::best(&lattice, &weights, 1, None);
     assert_eq!(paths[0].labels(&lattice), [Locality, Locality]);
@@ -258,7 +245,6 @@ fn n_best_paths_are_distinct_labellings_best_first() {
 #[test]
 fn a_query_pointing_to_a_country_is_read_as_that_country_only() {
     let tagger = tagger();
-    // Every hit is Canadian: no reading leaves the Canadian evidence out.
     let parses = tagger.parse("670 king st w toronto");
     assert!(!parses.is_empty());
     assert!(
@@ -266,7 +252,6 @@ fn a_query_pointing_to_a_country_is_read_as_that_country_only() {
             .iter()
             .all(|parsed| parsed.country == Some(code("CA")))
     );
-    // Nothing points to a country: the global fallback reads it.
     let parses = tagger.parse("12 nowhere lane");
     assert!(parses.iter().all(|parsed| parsed.country.is_none()));
 }
@@ -307,7 +292,6 @@ fn labellings_whose_places_cannot_be_one_address_are_dropped() {
     };
     let city_and_region =
         |city: &str, region: &str| vec![(city.to_string(), Locality), (region.to_string(), Region)];
-    // A city in its region is read as one; a city of another region never.
     assert_eq!(
         read("名古屋市, 愛知県")[0],
         city_and_region("名古屋市", "愛知県")
@@ -318,7 +302,6 @@ fn labellings_whose_places_cannot_be_one_address_are_dropped() {
         !parses.contains(&city_and_region("京都市", "愛知県")),
         "{parses:?}"
     );
-    // Two places of one level, or two region fields, are no address.
     let lattice = tagger.lattice(
         &Tokens::new("愛知県, 名古屋市, 京都府"),
         &Suppression::default(),
@@ -395,7 +378,6 @@ fn a_query_ending_in_its_country_is_read_as_the_words_before_it_and_the_country(
         assert_eq!(reading.pieces.len(), reading.corrections.len());
         assert_eq!(reading.tokens.len(), 9);
     }
-    // A query of a country alone, or ending in no country, reads as before.
     assert_eq!(
         tagger.parse("canada"),
         tagger.parse_tokens(&Tokens::new("canada"), N_BEST)
@@ -425,7 +407,6 @@ fn a_number_after_the_number_sign_is_a_unit() {
             "{query}"
         );
     }
-    // A sign before the first word, or apart from any word, numbers nothing.
     assert_eq!(
         super::after_number_sign("#5 Main St"),
         [false, false, false]
@@ -449,7 +430,6 @@ fn queries_without_words_tag_nothing() {
     let tagger = tagger();
     assert!(tagger.tag("").is_empty());
     assert!(tagger.parse(" , ").is_empty());
-    // A Pack without dictionaries still labels every token.
     let empty = LatticeTagger::new(Dictionaries::empty(), Weights::built_in());
     assert_eq!(empty.tag("670 king street").len(), 3);
 }
@@ -510,8 +490,6 @@ fn a_number_written_in_parts_is_one_house_number() {
     }
 }
 
-/// The units of `text` as they key and feature a lattice: their words, which
-/// are glued, and the field breaks and joiners before them.
 fn unit_shape(text: &str) -> (Vec<String>, Vec<bool>, Vec<bool>, Vec<Option<char>>) {
     let units = Units::of(&Tokens::new(text));
     (
@@ -522,7 +500,6 @@ fn unit_shape(text: &str) -> (Vec<String>, Vec<bool>, Vec<bool>, Vec<Option<char
     )
 }
 
-/// The label of every unit of `text` in each of its best labellings.
 fn unit_labels(tagger: &LatticeTagger, text: &str) -> Vec<Vec<Label>> {
     let lattice = tagger.lattice(&Tokens::new(text), &Suppression::default());
     decode::best(&lattice, tagger.weights(), N_BEST, None)
@@ -547,10 +524,6 @@ fn spaced_and_unspaced_writing_are_the_same_units_and_labels() {
         ]),
         Weights::built_in(),
     );
-    // Han, hiragana, katakana (fullwidth and halfwidth), Thai, Lao, Khmer
-    // and Myanmar, each with digits before and after its characters. A mark
-    // that is no letter (the Khmer coeng, the Myanmar asat) continues the
-    // word before it, so a spaced form keeps it on its letter.
     for forms in [
         &[
             "愛知県名古屋市中区栄4丁目5番2号",
@@ -612,8 +585,6 @@ fn units_map_labels_back_to_tokens_and_written_words() {
             .chain([HouseNumber])
             .collect::<Vec<_>>()
     );
-    // A name read a character at a time is one word, a name read whole is
-    // its own word.
     let mut segments = (0..3)
         .map(|unit| (unit, unit + 1, Region))
         .collect::<Vec<_>>();
@@ -643,7 +614,6 @@ fn units_map_labels_back_to_tokens_and_written_words() {
         .map(|piece| piece.token)
         .collect::<Vec<_>>();
     assert_eq!(words, ["千代田区", "丸の内"]);
-    // Units with a space between them stay words of their own.
     let spaced = Units::of(&Tokens::new("100-0005 king st"));
     let segments = [(0, 2, Postcode), (2, 4, Street)];
     let words = spaced
@@ -652,7 +622,6 @@ fn units_map_labels_back_to_tokens_and_written_words() {
         .map(|piece| piece.token)
         .collect::<Vec<_>>();
     assert_eq!(words, ["100", "0005", "king", "st"]);
-    // On a tie the first label wins.
     let tie = Units::of(&Tokens::new("丸の内二丁"));
     assert_eq!(
         tie.collapse(&[Street, Street, Locality, Locality, Other]),
@@ -769,7 +738,6 @@ fn vocabulary_phrases_are_spans_and_tell_their_neighbours() {
     assert!(has(&lattice, 0, 3, "phrase:po_box"));
     assert!(has(&lattice, 3, 4, "phrase_before:po_box"));
     assert!(!has(&lattice, 2, 3, "phrase:po_box"));
-    // A phrase of a script written without spaces is its glued units.
     let lattice = tagger.lattice(&Tokens::new("私書箱 819"), &Suppression::default());
     assert!(has(&lattice, 0, 3, "phrase:po_box"));
     assert!(has(&lattice, 3, 4, "phrase_before:po_box"));
@@ -794,10 +762,8 @@ fn glued_area_names_are_a_chain() {
     };
     assert!(features(0, 9).contains(&by_name("chain:3")));
     assert!(features(0, 9).contains(&by_name("chain:with_region")));
-    // Two locality names glued: an edge only because it is a chain.
     assert!(features(4, 9).contains(&by_name("chain:2")));
     assert!(!features(4, 9).contains(&by_name("chain:with_region")));
-    // Written apart, the names are no chain.
     let lattice = tagger.lattice(&Tokens::new("横浜市, 西区"), &Suppression::default());
     assert!(
         lattice

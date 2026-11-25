@@ -1,15 +1,3 @@
-//! The parse benchmark: og's taggers and stored baseline predictions scored
-//! on the same gold rows, per country and per [`Variant`].
-//!
-//! Gold rows live in `fixtures/parse/gold/<cc>.tsv`. Each is scored in three
-//! forms, made from it at load time ([`variant`]), and a baseline's
-//! predictions for one form live in
-//! `fixtures/parse/predictions/<baseline>/<cc>.<variant>.tsv`, row for row
-//! (see [`fixture`]). Every baseline scored must have every predictions file
-//! of every country scored, so every number in one row of the report is on
-//! identical rows. `docs/parse-eval.md` describes the data and how the
-//! predictions were made.
-
 pub mod align;
 pub mod fixture;
 pub mod mapping;
@@ -46,7 +34,6 @@ use crate::parse::{
     types::{Label, Tagger},
 };
 
-/// An og tagger the benchmark can run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 pub enum TaggerKind {
     /// The old comma-based query parser ([`LegacyTagger`]).
@@ -76,50 +63,32 @@ fn open_lattice(pack: Option<&Path>) -> Result<Box<dyn Tagger>> {
     Ok(Box::new(LatticeTagger::open(pack)?))
 }
 
-/// A baseline's predictions file for one country and variant.
 pub fn predictions_path(root: &Path, country: &str, variant: Variant) -> PathBuf {
     root.join(format!("{country}.{}.tsv", variant.name()))
 }
 
 #[derive(Debug, Clone)]
 pub struct ParseBenchOptions {
-    /// The gold directory, `<cc>.tsv` per country.
     pub gold: PathBuf,
-    /// The root of stored baseline predictions, `<baseline>/<cc>.<variant>.tsv`.
     pub predictions: PathBuf,
-    /// Countries to score; empty scores every gold file.
     pub countries: Vec<String>,
     pub pack: Option<PathBuf>,
     pub taggers: Vec<TaggerKind>,
-    /// Baselines to score; `None` scores every one under `predictions`.
     pub baselines: Option<Vec<String>>,
-    /// Worst rows of the first tagger to list, per variant.
     pub show_misses: usize,
-    /// Also score every system apart on the rows whose names the Pack's
-    /// dictionaries all hold and on the others (see [`Coverage`]).
     pub coverage: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ParseBenchReport {
-    /// og taggers first, then baselines.
     pub systems: Vec<String>,
     pub variants: Vec<&'static str>,
-    /// Per country and variant, then per variant over every country
-    /// (`country` "all") when there are several.
     pub groups: Vec<GroupReport>,
-    /// The first tagger's worst rows, up to `show_misses` per variant.
     pub misses: Vec<Miss>,
-    /// Per country and variant, the scores on covered and on uncovered rows,
-    /// with `--coverage`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub coverage: Vec<CoverageGroup>,
 }
 
-/// Whether a gold row's names are all in the Pack's dictionaries: every
-/// locality, region and street span of it, read as the parser reads it
-/// ([`dictionary_key`]), is a name of that field, exactly. A span is a run of
-/// tokens of one label within one part of the row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Coverage {
@@ -181,16 +150,13 @@ pub struct GroupReport {
     pub country: String,
     pub variant: &'static str,
     pub rows: usize,
-    /// Scores per system, every system on the same rows.
     pub systems: BTreeMap<String, Summary>,
 }
 
-/// A gold row the first og tagger got wrong.
 #[derive(Debug, Serialize)]
 pub struct Miss {
     pub country: String,
     pub variant: &'static str,
-    /// The gold row's line in `<cc>.tsv`.
     pub line: usize,
     pub query: String,
     pub wrong: usize,
@@ -201,13 +167,11 @@ pub struct Miss {
     pairs: Vec<(String, Label, Option<Label>)>,
 }
 
-/// One country's counts in one variant, per system.
 struct VariantCounts {
     country: String,
     variant: Variant,
     rows: usize,
     by_system: BTreeMap<String, Counts>,
-    /// Rows and counts per system on covered and on uncovered rows.
     by_coverage: BTreeMap<Coverage, (usize, BTreeMap<String, Counts>)>,
 }
 
@@ -241,8 +205,6 @@ pub fn run_parse_bench(options: &ParseBenchOptions) -> Result<ParseBenchReport> 
     let mut misses = Vec::new();
     for file in &files {
         let gold = read_rows(&file.path)?;
-        // Variants keep the gold rows' tokens and labels, so a gold row's
-        // coverage is its variants'.
         let coverage = coverage_tagger.as_ref().map(|tagger| {
             gold.iter()
                 .map(|row| Coverage::of(row, tagger.dictionaries()))
@@ -316,7 +278,6 @@ pub fn run_parse_bench(options: &ParseBenchOptions) -> Result<ParseBenchReport> 
                 );
                 for (line, (row, predicted)) in rows.iter().zip(&predicted).enumerate() {
                     let Some(predicted) = predicted else {
-                        // The baseline failed on the row: wrong on every token.
                         add_row(baseline, line, &row.labels(), None);
                         continue;
                     };
@@ -407,8 +368,6 @@ fn summaries(by_system: &BTreeMap<String, Counts>) -> BTreeMap<String, Summary> 
         .collect()
 }
 
-/// Keep the `count` worst misses: most tokens wrong, then most of the row
-/// wrong, then in fixture order.
 fn keep_worst(misses: &mut Vec<Miss>, count: usize) {
     misses.sort_by(|left, right| {
         right
@@ -421,7 +380,6 @@ fn keep_worst(misses: &mut Vec<Miss>, count: usize) {
     misses.truncate(count);
 }
 
-/// The baselines with stored predictions: the directories under the root.
 fn discover_baselines(root: &Path) -> Result<Vec<String>> {
     if !root.is_dir() {
         return Ok(Vec::new());
@@ -478,7 +436,6 @@ fn miss(
     }
 }
 
-/// A headline number of a summary, as a fraction.
 type Metric = fn(&Summary) -> f64;
 
 impl ParseBenchReport {
@@ -680,8 +637,6 @@ pub fn normalize_fixtures(
     Ok(written)
 }
 
-/// Write the query of every gold row in every variant, one per line, to
-/// `<output>/<cc>.<variant>.txt`, for a baseline to parse.
 pub fn write_queries(
     gold: &Path,
     countries: &[String],
@@ -706,10 +661,8 @@ pub fn write_queries(
     Ok(written)
 }
 
-/// One baseline answer per line of `<input>/<cc>.<variant>.jsonl`.
 #[derive(Debug, Deserialize)]
 struct RawPrediction {
-    /// `(label, value)` pairs in the baseline's own scheme, in order.
     #[serde(default)]
     components: Vec<(String, String)>,
     #[serde(default)]
@@ -793,7 +746,6 @@ mod tests {
         ]);
         let coverage =
             |line: &str| Coverage::of(&TaggedRow::parse_line(line).expect("row"), &dictionaries);
-        // Each part is its own span: "本州" and "浜松市" are two names.
         assert_eq!(
             coverage(concat!(
                 "ja	jp	日/country 本/country , 静/region 岡/region 県/region , ",
@@ -801,7 +753,6 @@ mod tests {
             )),
             Coverage::Covered
         );
-        // A name in the wrong field is not covered.
         assert_eq!(
             coverage("ja	jp	浜/region 松/region 市/region"),
             Coverage::Uncovered
@@ -829,7 +780,6 @@ mod tests {
         }
     }
 
-    /// Store `predict`'s labels for every variant of every row of `gold`.
     fn store_predictions(
         gold: &Path,
         predictions: &Path,
@@ -867,8 +817,6 @@ mod tests {
         .expect("gold");
         fs::write(gold.join("ca.tsv"), "en\tca\ttoronto/locality\n").expect("gold");
         let predictions = root.join("predictions");
-        // The baseline gets everything right but calls Boston a region on
-        // its own.
         for country in ["us", "ca"] {
             store_predictions(&gold, &predictions.join("base"), country, |row| {
                 Some(if row.country == "us" && row.tokens.len() == 1 {

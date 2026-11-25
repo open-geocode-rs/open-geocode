@@ -48,7 +48,6 @@ pub(super) fn alternate(query: &str) -> Option<String> {
     if let Some(parts) = EXPLICIT_ORDINAL.captures_iter(query).last() {
         let written = parts.get(1)?;
         let prefix = &query[..written.start()];
-        // The regex can start inside a larger numeral that ordinal() cannot read.
         if prefix.ends_with(|c: char| {
             c.is_numeric() || "〇零一二三四五六七八九十百千万億兆壱弐参拾".contains(c)
         }) {

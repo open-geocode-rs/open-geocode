@@ -1,8 +1,3 @@
-//! A place's opening hours as Search Box's `metadata.open_hours`.
-//!
-//! [`Week`] reads OpenStreetMap's value. A value it does not read is not
-//! sent at all.
-
 use serde::Serialize;
 
 use crate::compat::hours::{DAY_MINUTES, Week, Weekday};
@@ -27,7 +22,6 @@ struct Moment {
 }
 
 impl Moment {
-    /// `minutes` past the start of `day`, carried into the day after.
     fn at(day: Weekday, minutes: u16) -> Self {
         let day = if minutes >= DAY_MINUTES {
             day.next()
@@ -43,8 +37,6 @@ impl Moment {
 }
 
 impl OpenHours {
-    /// The weekly periods `value` states, Sunday first, or `None` when
-    /// [`Week`] does not read it.
     pub(super) fn parse(value: &str) -> Option<Self> {
         let week = Week::parse(value)?;
         let mut days = week.days().collect::<Vec<_>>();

@@ -1,9 +1,3 @@
-//! `/compat/google`, serving Places API (New) v1 and Geocoding API v4.
-//!
-//! Routes keep Google's own paths after the prefix, so a client built for
-//! `places.googleapis.com` or `geocode.googleapis.com` needs only its base
-//! URL changed. The two hosts share one prefix, as their paths never collide.
-
 mod destinations;
 mod geocode;
 mod hours;
@@ -87,7 +81,6 @@ where
     on(filter, handler).fallback(|| async { method_not_found() })
 }
 
-/// `google.rpc.Code` names with the HTTP status Google answers each with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Code {
     InvalidArgument,
@@ -122,7 +115,6 @@ impl Code {
     }
 }
 
-/// Google's error envelope.
 pub(super) fn error(code: Code, message: impl Into<String>) -> VendorError {
     let status = code.status();
     VendorError::new(
@@ -143,8 +135,6 @@ fn method_not_found() -> VendorError {
     error(Code::NotFound, "Method not found.")
 }
 
-/// og's failure as Google reports it. og's own detail is kept as the
-/// message, since it names the value rejected and why.
 pub(super) fn from_problem(problem: Problem) -> VendorError {
     let code = match (problem.status(), problem.error_code()) {
         (_, ErrorCode::Timeout) => Code::DeadlineExceeded,
@@ -166,13 +156,10 @@ pub(super) fn from_problem(problem: Problem) -> VendorError {
     error.caused_by(problem)
 }
 
-/// A handler body whose `?` turns into Google's error answer.
 pub(super) async fn run(handler: impl Future<Output = Result<Response, VendorError>>) -> Response {
     handler.await.unwrap_or_else(IntoResponse::into_response)
 }
 
-/// A query string as Google's REST transcoding reads it, with dotted names
-/// for message fields and a repeated field as its key repeated.
 #[derive(Debug, Default)]
 pub(super) struct QueryParams(Vec<(String, String)>);
 
@@ -202,7 +189,6 @@ impl QueryParams {
             .collect()
     }
 
-    /// A double field, as Google names a bad one in its message.
     pub(super) fn double(&self, name: &str) -> Result<Option<f64>, VendorError> {
         self.get(name)
             .map(|value| {
@@ -216,9 +202,6 @@ impl QueryParams {
     }
 }
 
-/// The response field mask, from the `X-Goog-FieldMask` header, else
-/// `$fields`, else `fields`. Google refuses a Places request without one; og answers
-/// every field instead (decision 15a).
 pub(super) fn field_mask(headers: &HeaderMap, query: &QueryParams) -> Option<FieldMask> {
     compat::header(headers, "x-goog-fieldmask")
         .or_else(|| query.get("$fields"))
@@ -226,7 +209,6 @@ pub(super) fn field_mask(headers: &HeaderMap, query: &QueryParams) -> Option<Fie
         .and_then(FieldMask::parse)
 }
 
-/// The JSON answer, pruned to the mask.
 pub(super) fn respond<T: Serialize>(answer: &T, mask: Option<&FieldMask>) -> Response {
     match serde_json::to_value(answer) {
         Ok(mut value) => {
@@ -239,8 +221,6 @@ pub(super) fn respond<T: Serialize>(answer: &T, mask: Option<&FieldMask>) -> Res
     }
 }
 
-/// A JSON request body. Unknown fields are ignored, as they are the
-/// parameters og cannot honour.
 pub(super) fn body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, VendorError> {
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return serde_json::from_slice(b"{}")
@@ -261,7 +241,6 @@ pub(super) struct LatLng {
 }
 
 impl LatLng {
-    /// og's `lon,lat`, once the point is on the globe.
     pub(super) fn checked(self, field: &str) -> Result<[f64; 2], VendorError> {
         if !(-90.0..=90.0).contains(&self.latitude) {
             return Err(invalid(format!(
@@ -279,8 +258,6 @@ impl LatLng {
     }
 }
 
-/// A `Viewport`, whose `low` is the south-west corner and `high` the
-/// north-east.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(default)]
 pub(super) struct Viewport {
@@ -289,9 +266,6 @@ pub(super) struct Viewport {
 }
 
 impl Viewport {
-    /// og's `bbox`. og cannot search a box across the antimeridian, and
-    /// dropping the restriction would return places outside it, so such a
-    /// box is refused.
     pub(super) fn bbox(self, field: &str) -> Result<String, VendorError> {
         let [west, south] = self.low.checked(&format!("{field}.low"))?;
         let [east, north] = self.high.checked(&format!("{field}.high"))?;
@@ -308,7 +282,6 @@ impl Viewport {
         Ok(format!("{west},{south},{east},{north}"))
     }
 
-    /// The middle of the box, across the antimeridian too, as og's `focus`.
     pub(super) fn center(self, field: &str) -> Result<[f64; 2], VendorError> {
         let [west, south] = self.low.checked(&format!("{field}.low"))?;
         let [east, north] = self.high.checked(&format!("{field}.high"))?;
@@ -332,7 +305,6 @@ pub(super) struct Circle {
     pub(super) radius: f64,
 }
 
-/// `locationBias` or `locationRestriction`, a circle or a rectangle.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(default)]
 pub(super) struct Area {
@@ -341,8 +313,6 @@ pub(super) struct Area {
 }
 
 impl Area {
-    /// The point a bias prefers results near, as og's `focus`. og breaks
-    /// ties by nearness to one point and has no radius or box to bias by.
     pub(super) fn focus(self, field: &str) -> Result<Option<String>, VendorError> {
         let point = match (self.circle, self.rectangle) {
             (Some(_), Some(_)) => return Err(both_shapes(field)),

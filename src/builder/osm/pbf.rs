@@ -17,17 +17,8 @@ use rayon::prelude::*;
 use crate::builder::progress::{BuildStage, InputCounter, Progress};
 
 const READ_BUFFER_BYTES: usize = 4 << 20;
-/// Blobs decoded per parallel batch, per worker thread.
 const BLOBS_PER_THREAD: usize = 4;
 
-/// Decode PBF data blocks in parallel and hand each block's result to `sink`
-/// in file order. With `offsets`, only the blobs starting at those byte
-/// offsets are read, which lets later passes skip blocks they do not need.
-///
-/// Memory stays bounded: one batch of blobs is decoded at a time while the
-/// next is read. The stage is measured in bytes when the whole file is read
-/// and in blocks when only `offsets` are. Returns the bytes read from the
-/// file, which on a disk-bound input is what a pass costs.
 pub(crate) fn for_each_block<T, M, S>(
     input: &Path,
     progress: &Progress,
@@ -109,7 +100,6 @@ where
             }
         });
 
-        // Dropping the receiver on an early return stops the reader thread.
         for batch in receiver {
             progress.check()?;
             let outputs = batch?
@@ -134,9 +124,6 @@ where
     Ok(read_bytes.load(Ordering::Relaxed))
 }
 
-/// When the extract's data was taken from OpenStreetMap, as its header
-/// states it, in seconds since the Unix epoch. `None` when the header does
-/// not say; Geofabrik and planet extracts do.
 pub fn replication_timestamp(input: &Path) -> Result<Option<i64>> {
     let file = File::open(input).map_err(|source| Error::IoPath {
         action: "failed to open",
@@ -154,8 +141,6 @@ pub fn replication_timestamp(input: &Path) -> Result<Option<i64>> {
     }
 }
 
-/// The bounding box the extract's header states, `[min_lon, min_lat, max_lon,
-/// max_lat]`; Geofabrik sets it to the bounds of the extract's polygon.
 pub(crate) fn header_bbox(input: &Path) -> Result<Option<[f64; 4]>> {
     let file = File::open(input).map_err(|source| Error::IoPath {
         action: "failed to open",
@@ -226,8 +211,6 @@ impl<R: Seek> Seek for Buffered<R> {
     }
 }
 
-/// Counts what is read from the input, and the time it takes, for the
-/// build report; and advances the stage when it is measured in bytes.
 struct ProgressReader<R> {
     inner: R,
     progress: Option<Progress>,
@@ -284,8 +267,6 @@ mod tests {
         for offset in [0, 10, 100, 4_000, 3_000, 9_999] {
             assert_eq!(read_at(offset), data[offset as usize]);
         }
-        // The first buffer serves every offset below 4,096, back to 3,000
-        // after 4,000 too; only 9,999 is read again.
         assert_eq!(read_bytes.load(Ordering::Relaxed), 4_096 + 1);
         assert_eq!(reader.seek(SeekFrom::Current(-1)).expect("seek"), 9_999);
     }

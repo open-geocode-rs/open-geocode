@@ -1,92 +1,34 @@
-//! The answer to a query that states no house number. Such a query asks
-//! for the finest thing it names, and the coarser things it names say where
-//! that thing is. "Exeter, RI" asks for Exeter, which Rhode Island holds;
-//! "Cranston Street, Cranston" asks for the street, which Cranston holds.
-//!
-//! The query is cut into parts at commas, except where the comma is part of
-//! a recorded locality name. Within each field the best reading can split
-//! it into runs of one label. Each part is read against each record the
-//! same way, whatever label the parser gave it:
-//!
-//! - a part **names** a record when the part is one of the record's names,
-//!   whole, or whole bar a word of a type og's vocabulary holds ("Town of
-//!   Bristol" names Bristol, "Mooresfield" names Mooresfield Road), then
-//!   misspelt when it holds every word of a name, some misspelt, and in
-//!   part when it holds only some of a name's words;
-//! - a part **places** a record when it names an area that holds the
-//!   record, and places it by a longer name when the record lies in an area
-//!   whose name holds the part's words and more ("Providence" for East
-//!   Providence);
-//! - a part that names nothing in the Pack says nothing of any record.
-//!
-//! A part is *where* when a record it names holds a record another part
-//! names, misspelt or better, and the first part that is left is *sought*.
-//! A name written in part says nothing of where: "Washington" never makes
-//! Kirkland where for holding Lake Washington Boulevard. The records the
-//! sought part names come first, by how the other parts place them, then
-//! by how well the sought part names them, then in the order the sought
-//! part alone gives them, then in the order the search gave them. Each key
-//! is compared in turn, and none is summed with another.
-
 use super::*;
 
-/// How a part names a record, best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Naming {
-    /// The part is one of the record's names as written, accents and all.
     AsWritten,
-    /// The part is one of the record's names.
     Whole,
-    /// The part is one of its names bar a word of the name's type, on
-    /// either side.
     BarType,
-    /// The part holds every word of one of its names, some misspelt.
     Misspelt,
-    /// The part holds only some of the words of one of its names.
     InPart,
-    /// No name of the record holds the part.
     None,
 }
 
-/// How the other parts of a query place a record, best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Placing {
-    /// Every part that names something names an area the record lies in.
     Placed,
-    /// One of them only by a longer name of an area it lies in.
     ByLonger,
-    /// One of them names no area it lies in.
     Not,
 }
 
-/// How the parts that place a record name the areas they place it by,
-/// best first. It counts after how the sought part names the record:
-/// "Cranston, Providence" asks for the town Providence County holds, not
-/// Cranston Street in the city, while "Cranston Street, Providence" asks
-/// for the street in the city over the one in the county.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum PlacedBy {
-    /// Every one names its area whole.
     Whole,
-    /// One names it only bar a type word ("Providence" of Providence
-    /// County).
     BarType,
-    /// The record lies in no area of a kind one of them names and that
-    /// could hold it, so the Pack cannot tell whether that part holds it: a
-    /// village past the border of an extract, one whose country no
-    /// boundary gives. Such a part neither places it nor leaves it out.
     Unknown,
 }
 
-/// One part of a query: the words of a run of one label.
 #[derive(Debug, Clone)]
 struct Part {
-    /// The words, as [`search_key`] folds them.
     key: String,
     label: Label,
-    /// The areas the part names.
     areas: HashSet<RecordId>,
-    /// The records the part names whole or bar a type word.
     named: Vec<RecordId>,
 }
 
@@ -96,34 +38,23 @@ impl Part {
     }
 }
 
-/// A query's parts and the records they name.
 #[derive(Debug)]
 pub(super) struct NameOrder {
     parts: Vec<Part>,
-    /// Every record a part names whole or bar a type word, in the order
-    /// the parts give them, for the answers.
     found: Vec<TextSearchHit>,
-    /// The query as written, as [`exact_key`] keeps it, between spaces.
     written: String,
 }
 
-/// What [`NameOrder`] reads of one record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Keys {
-    /// Named by the sought part at all: such a record comes before any
-    /// other.
     unnamed: bool,
     placing: Placing,
     naming: Naming,
     placed_by: PlacedBy,
-    /// Its place in the order the sought part's words give asked alone.
     alone: usize,
 }
 
 impl TextSearcher {
-    /// The order of the answers to a query of `pieces` (its best reading)
-    /// that states no house number. `None` when no part of it names
-    /// anything in the Pack, so nothing is known to sort by.
     pub(super) fn name_order(
         &self,
         query_text: &str,
@@ -148,7 +79,6 @@ impl TextSearcher {
                 parts.push(part);
                 continue;
             }
-            // Keep compound names whole unless the split names real parts and the whole does not.
             let mut runs = Vec::new();
             for (words, label) in &field {
                 runs.extend(self.part(words, *label, filters, focus)?);
@@ -194,8 +124,6 @@ impl TextSearcher {
         }))
     }
 
-    // A comma still ends a field unless a stored locality name uses it
-    // at that position. Folding punctuation alone would join unrelated fields.
     fn literal_comma_locality(
         &self,
         left: &[(Vec<String>, Label)],
@@ -249,7 +177,6 @@ impl TextSearcher {
         Ok(None)
     }
 
-    /// Whether `part` names a record whole, among those its lookup found.
     fn names_whole(&self, (part, hits): &(Part, Vec<TextSearchHit>)) -> Result<bool> {
         for hit in hits {
             if self.naming(&part.key, hit.record_id, &hit.record.layer)? == Naming::Whole {
@@ -259,18 +186,10 @@ impl TextSearcher {
         Ok(false)
     }
 
-    /// Which part of `order` is sought, among `hits` and the records its
-    /// parts name. A part is where when an area it names holds a record
-    /// another part names, whole, bar a type word or in part ("Mooresfeild
-    /// Road, Wakefield", misspelt, still places the road in Wakefield). The
-    /// first part left that names anything is sought, else the first that
-    /// names anything, as og reads a query today.
     fn sought(&self, order: &NameOrder, hits: &[TextSearchHit]) -> Result<usize> {
         let records = hits.iter().chain(&order.found).collect::<Vec<_>>();
         let mut named = Vec::with_capacity(order.parts.len());
         for part in &order.parts {
-            // What its own lookup found, a postcode by its code among them,
-            // and what else it names misspelt.
             let mut by_part = part.named.clone();
             for hit in &records {
                 if self.naming(&part.key, hit.record_id, &hit.record.layer)? <= Naming::Misspelt {
@@ -309,8 +228,6 @@ impl TextSearcher {
         Ok(first.unwrap_or_default())
     }
 
-    /// The part of `words`, with the records it names whole or bar a type
-    /// word. `None` for words that fold to nothing.
     fn part(
         &self,
         words: &[String],
@@ -338,7 +255,6 @@ impl TextSearcher {
             }
         }
         let mut hits = self.records_named(&key, filters, focus)?;
-        // A postcode is named by its code, which no name lookup reads.
         if key.chars().any(|c| c.is_ascii_digit())
             && let Some(code) = crate::text_index::compact_postcode(&key)
         {
@@ -349,8 +265,6 @@ impl TextSearcher {
                 }
             }
         }
-        // The areas a code or the dictionary gives are named by the part
-        // too, so they are candidates ("USA" alone answers the country).
         let mut given = areas.iter().copied().collect::<Vec<_>>();
         given.sort();
         for record in given {
@@ -379,9 +293,6 @@ impl TextSearcher {
         )))
     }
 
-    /// The records `key` names whole or bar a word of a type, in the order
-    /// it gives them alone: whole first, then each type it may be written
-    /// with or without.
     fn records_named(
         &self,
         key: &str,
@@ -389,7 +300,6 @@ impl TextSearcher {
         focus: Option<[f64; 2]>,
     ) -> Result<Vec<TextSearchHit>> {
         let mut named = Vec::new();
-        // Names can include or omit an area type, as in Bristol County or Town of Bristol.
         let mut keys = vec![key.to_string()];
         for kind in [Kind::Area, Kind::Street] {
             keys.extend(type_free(key, kind, self.tagger.dictionaries()));
@@ -408,7 +318,6 @@ impl TextSearcher {
         Ok(named)
     }
 
-    /// How the part `key` names `record`, of `layer`.
     fn naming(&self, key: &str, record: RecordId, layer: &str) -> Result<Naming> {
         let mut best = Naming::None;
         for spelling in spellings(key) {
@@ -417,9 +326,6 @@ impl TextSearcher {
         Ok(best)
     }
 
-    /// Whether `key` is a code of `record`, which its names need not hold:
-    /// a country's ISO code, by two letters or three, or a region's as the
-    /// addresses of the Pack state it ("RI").
     fn is_code_of(&self, key: &str, record: RecordId, layer: &str) -> bool {
         if layer == Layer::Country.as_str() {
             return country_code(key)
@@ -441,13 +347,10 @@ impl TextSearcher {
         }
         let dictionaries = self.tagger.dictionaries();
         let part = key.split_whitespace().collect::<Vec<_>>();
-        // A type word counts only as one of the record's own kind: "park"
-        // types a street, not a neighbourhood.
         let kind = Kind::of(layer);
         let part_free = kind.map_or_else(Vec::new, |kind| type_free(key, kind, dictionaries));
         let mut best = Naming::None;
         let mut names = self.pack.records().names(record)?;
-        // A postcode is named by its code, which is its record's name only.
         if layer == Layer::Postcode.as_str() {
             names.push(self.pack.record_summary(record)?.name);
         }
@@ -481,7 +384,6 @@ impl TextSearcher {
         Ok(best)
     }
 
-    /// The areas `record` lies in, by record id.
     fn areas_holding(&self, record: RecordId) -> Result<Vec<RecordId>> {
         Ok(self
             .pack
@@ -497,7 +399,6 @@ impl TextSearcher {
             .unwrap_or_default())
     }
 
-    /// How the parts of `order` other than `sought` place `record`.
     fn placing(
         &self,
         order: &NameOrder,
@@ -511,8 +412,6 @@ impl TextSearcher {
             if at == sought || !part.names_anything() {
                 continue;
             }
-            // The kinds of area the part names that could hold the record;
-            // when it lies in none of them, the Pack cannot tell.
             let own = coarseness(&self.pack.record_summary(record)?.layer);
             let mut could_hold = HashSet::new();
             for &area in &part.areas {
@@ -551,9 +450,6 @@ impl TextSearcher {
         Ok((placing, placed_by))
     }
 
-    /// Whether `part`'s words are some of the words of a name of an area of
-    /// `holding`, one longer than the part ("Providence" of East
-    /// Providence).
     fn placing_by_longer(&self, part: &Part, holding: &[RecordId]) -> Result<bool> {
         let words = part.key.split_whitespace().collect::<Vec<_>>();
         for &area in holding {
@@ -570,8 +466,6 @@ impl TextSearcher {
         Ok(false)
     }
 
-    /// Whether `key` holds every word of a name of `hit`, bar a street
-    /// type on a street.
     fn writes_a_name(&self, key: &str, hit: &TextSearchHit) -> Result<bool> {
         let dictionaries = self.tagger.dictionaries();
         let street = Kind::of(&hit.record.layer) == Some(Kind::Street);
@@ -592,21 +486,15 @@ impl TextSearcher {
         Ok(false)
     }
 
-    /// Whether the query writes a name of `record` as it is written, words
-    /// whole, accents and all.
     fn written_as(&self, order: &NameOrder, record: RecordId) -> Result<bool> {
         Ok(self.pack.records().names(record)?.iter().any(|name| {
             exact_key(name).is_some_and(|name| order.written.contains(&format!(" {name} ")))
         }))
     }
 
-    /// The keys of `hit`, its place in the bare order left last
-    /// ([`usize::MAX`]) for the caller to fill.
     fn keys(&self, order: &NameOrder, sought: usize, hit: &TextSearchHit) -> Result<Keys> {
         let part = &order.parts[sought];
         let naming = match self.naming(&part.key, hit.record_id, &hit.record.layer)? {
-            // Of names alike once folded, the one written as asked ("Cà
-            // Baldino" before "Ca' Baldino").
             Naming::Whole if self.written_as(order, hit.record_id)? => Naming::AsWritten,
             naming => naming,
         };
@@ -620,10 +508,6 @@ impl TextSearcher {
         })
     }
 
-    /// `hits` and the records `order`'s parts name, the answers to its
-    /// query first (see the module), each once, else in the order they
-    /// came. A record found only by name is judged on the parts by how
-    /// they name and place it.
     pub(super) fn order_by_names(
         &self,
         order: &NameOrder,
@@ -638,14 +522,12 @@ impl TextSearcher {
                 hits.push(hit.clone());
             }
         }
-        // Keep the original match evidence for results the sought part does not name.
         for hit in hits.iter_mut() {
             let part = &order.parts[sought];
             if self.naming(&part.key, hit.record_id, &hit.record.layer)? < Naming::None {
                 hit.matched = self.judged_by_names(order, sought, hit)?;
             }
         }
-        // Bare names keep the existing search order after exact names.
         let first = match order.parts.len() {
             1 => {
                 let part = &order.parts[sought];
@@ -666,13 +548,10 @@ impl TextSearcher {
             keyed.push((self.keys(order, sought, &hit)?, at, hit));
         }
         keyed.sort_by_key(|(keys, at, _)| (order_key(*keys), *at));
-        // Only search the isolated name when ties can change the visible results.
         let shown = (effective_limit(options.limit) + 1).min(keyed.len());
         let tied = keyed[..shown]
             .windows(2)
             .any(|pair| !pair[0].0.unnamed && order_key(pair[0].0) == order_key(pair[1].0));
-        // A country can distinguish a locality from a namesake region.
-        // With a namesake street, keep the usual bare-name tie-break.
         let locality_in_country = order.parts.len() == 2
             && order.parts[1 - sought].label == Label::Country
             && matches!(
@@ -705,9 +584,6 @@ impl TextSearcher {
         Ok(())
     }
 
-    /// Whether the structured stage's `answer` is first among itself and
-    /// the records `order`'s parts name, so nothing found by name could
-    /// come before it.
     pub(super) fn answers_first(
         &self,
         order: &NameOrder,
@@ -716,8 +592,6 @@ impl TextSearcher {
         let Some(first) = answer.first() else {
             return Ok(false);
         };
-        // Without the bare order, which needs a search of its own: a record
-        // the other keys tie with it may come first by that order.
         let sought = self.sought(order, answer)?;
         let ahead = |hit: &TextSearchHit| -> Result<_> {
             let (unnamed, placing, naming, placed_by, _) =
@@ -733,10 +607,6 @@ impl TextSearcher {
         Ok(true)
     }
 
-    /// How the parts of `order` match a record: the sought part by how it
-    /// names it, each other by how it places it. A part fills the slot of
-    /// what it names or places by, whatever the parser labelled it: "USA"
-    /// read as a region places by a country, so it fills `country`.
     fn judged_by_names(
         &self,
         order: &NameOrder,
@@ -749,7 +619,6 @@ impl TextSearcher {
             let (how, layer) = if at == sought {
                 let how = match self.naming(&part.key, hit.record_id, &hit.record.layer)? {
                     Naming::AsWritten | Naming::Whole => PartMatch::Matched,
-                    // Ignoring an area type cannot turn a name prefix into a full match.
                     Naming::BarType => match self.writes_a_name(&part.key, hit)? {
                         true => PartMatch::Matched,
                         false => PartMatch::Partial,
@@ -768,7 +637,6 @@ impl TextSearcher {
                     true => PartMatch::Partial,
                     false => PartMatch::Unmatched,
                 };
-                // The slot of an area it names, the finest first.
                 let mut named = Vec::new();
                 for &area in &part.areas {
                     named.push(self.pack.record_summary(area)?.layer);
@@ -793,8 +661,6 @@ impl TextSearcher {
     }
 }
 
-/// The order [`Keys`] give, a record the sought part does not name after
-/// every one it does, whatever else is true of it.
 fn order_key(keys: Keys) -> (bool, Placing, Naming, PlacedBy, usize) {
     match keys.unnamed {
         true => (
@@ -808,8 +674,6 @@ fn order_key(keys: Keys) -> (bool, Placing, Naming, PlacedBy, usize) {
     }
 }
 
-/// The spellings a part is tried as: as written, and initials written
-/// apart or with dots also as one word ("R.I." and "R I" as "RI").
 fn spellings(key: &str) -> Vec<String> {
     let mut spellings = vec![key.to_string()];
     let words = key.split_whitespace().collect::<Vec<_>>();
@@ -819,7 +683,6 @@ fn spellings(key: &str) -> Vec<String> {
     spellings
 }
 
-/// The country `key` is the ISO code of, by two letters or by three.
 fn country_code(key: &str) -> Option<CountryCode> {
     if !key.chars().all(|c| c.is_ascii_alphabetic()) {
         return None;
@@ -831,8 +694,6 @@ fn country_code(key: &str) -> Option<CountryCode> {
     }
 }
 
-/// How coarse an area of `layer` is, coarsest first: an area holds only
-/// records finer than itself. Any other record is finest.
 fn coarseness(layer: &str) -> usize {
     [
         Layer::Country,
@@ -846,7 +707,6 @@ fn coarseness(layer: &str) -> usize {
     .unwrap_or(usize::MAX)
 }
 
-/// The slot of the query's match a record of `layer` fills, if it has one.
 fn slot_label(layer: &str) -> Option<Label> {
     [
         (Layer::Street, Label::Street),
@@ -860,10 +720,8 @@ fn slot_label(layer: &str) -> Option<Label> {
     .map(|(_, label)| label)
 }
 
-/// Records a part's name lookup reads, at most.
 const NAMED_WINDOW: usize = 50;
 
-/// Whether a record of `layer` is an area, which may hold others.
 fn is_area(layer: &str) -> bool {
     [
         Layer::Country,
@@ -878,18 +736,13 @@ fn is_area(layer: &str) -> bool {
     .any(|area| area.as_str() == layer)
 }
 
-/// What kind of type word a record's name may be written with or without.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    /// An area: "county", "town of".
     Area,
-    /// A street: "road", "rue".
     Street,
 }
 
 impl Kind {
-    /// The kind of a record of `layer`, `None` for one whose name carries
-    /// no type word, such as a POI.
     fn of(layer: &str) -> Option<Self> {
         if is_area(layer) {
             Some(Self::Area)
@@ -901,10 +754,6 @@ impl Kind {
     }
 }
 
-/// `key` without a type word of `kind` it is written with, each way of
-/// leaving one out: "bristol" of "town of bristol" for an area,
-/// "mooresfield" of "mooresfield road" for a street. Empty when it holds
-/// none.
 fn type_free(key: &str, kind: Kind, dictionaries: &Dictionaries) -> Vec<String> {
     let mut free = match kind {
         Kind::Area => lattice::dictionary::admin_aliases(key),
@@ -935,12 +784,8 @@ fn type_free(key: &str, kind: Kind, dictionaries: &Dictionaries) -> Vec<String> 
     free
 }
 
-/// The fields of a query, between its field breaks (commas), each as the
-/// runs of one label of `pieces`, its best reading.
 fn query_fields(query_text: &str, pieces: &[Tagged]) -> Vec<Vec<(Vec<String>, Label)>> {
     let tokens = Tokens::new(query_text);
-    // The reading labels the query's own words, so the breaks between them
-    // line up; a reading of other words (a corrected spelling) has none.
     let breaks = match tokens.words.len() == pieces.len() {
         true => tokens.breaks,
         false => vec![false; pieces.len()],
@@ -979,12 +824,8 @@ mod tests {
         test_support::TempDir,
     };
 
-    /// A word no record of the fixture is named by.
     const NOTHING: &str = "Zqxjvbr";
 
-    /// The fixture's elements: a country, a region known by its code,
-    /// counties and towns drawn as squares, and streets, a village and
-    /// addresses in them.
     fn elements() -> Vec<Vec<TestElement>> {
         let (mut nodes, mut ways, mut relations) = (Vec::new(), Vec::new(), Vec::new());
         let mut next_node = 1;
@@ -1063,10 +904,8 @@ mod tests {
         street(110, "Abovyan Street", 5.4, 42.5);
         street(111, "Quonset Point Road", 1.4, 41.8);
         street(112, "USA Avenue", 5.4, 41.8);
-        // A street a town's name names bar its type, in another town.
         street(113, "Providence Street", 7.4, 41.8);
         street(114, "Rue de la Grande Vingtaine", 1.4, 41.9);
-        // Houses of Hope Street, in Bristol's postcode.
         for (at, number) in ["1", "2", "3", "4", "5"].into_iter().enumerate() {
             nodes.push(node(
                 800 + at as i64,
@@ -1080,7 +919,6 @@ mod tests {
                 ],
             ));
         }
-        // A village with a street of its name in the next town.
         nodes.push(node(
             900,
             41.5,
@@ -1093,7 +931,6 @@ mod tests {
             20.0,
             &[("place", "village"), ("name", "Quonset")],
         ));
-        // Two hamlets whose names fold alike.
         nodes.push(node(
             902,
             41.3,
@@ -1172,7 +1009,6 @@ mod tests {
             .map(|hit| hit.record.id)
     }
 
-    /// The record of `id`, its layer and its name.
     fn record(searcher: &TextSearcher, id: &str) -> (String, String) {
         let pack = &searcher.pack;
         (0..pack.records().record_count())
@@ -1258,16 +1094,11 @@ mod tests {
         answers("Գյումրի, RI", "osm:relation:17");
     }
 
-    /// How the sought part names a record counts before how the other
-    /// parts name the area they place it by: the county places the town,
-    /// the city places a street named bar its type.
     #[test]
     fn a_town_its_county_holds_comes_before_a_street_its_namesake_city_holds() {
         answers("Cranston, Providence", "osm:relation:16");
     }
 
-    /// "Wharf" names Town Wharf only in part, so it never makes Hopkinton,
-    /// which holds the wharf, where.
     #[test]
     fn a_part_named_only_in_part_never_makes_another_where() {
         answers("Hopkinton, Wharf", "osm:relation:12");
@@ -1279,11 +1110,6 @@ mod tests {
         answers("Plainfield, US", "osm:node:906");
     }
 
-    /// A field the parser labels in pieces is one name when it names
-    /// something whole. One that names nothing whole is read as its pieces
-    /// ("Lincoln RI", where "ri" types a street as "rise"); this fixture's
-    /// parser reads such a field as one street, so the Rhode Island Pack's
-    /// "<town> RI" sweep guards that half.
     #[test]
     fn a_field_naming_something_whole_is_one_name() {
         answers("Providence County, RI", "osm:relation:5");
@@ -1294,8 +1120,6 @@ mod tests {
         for query in ["US", "U.S.A."] {
             answers(query, "osm:relation:1");
         }
-        // Alone, "USA" answers as the search does, USA Avenue, and the rule
-        // adds the country after it, named whole by its code.
         let hits = ask(searcher(), "USA");
         assert_eq!(hits[0].record.id, "osm:way:112");
         let country = hits
@@ -1312,8 +1136,6 @@ mod tests {
         answers("Exeter, RI, USA", "osm:relation:11");
     }
 
-    /// A bare name answers as it did: what it names whole first, then a
-    /// town holding the word before a street named for it bar its type.
     #[test]
     fn a_bare_name_keeps_the_order_the_search_gives() {
         let ids = |query: &str| {
@@ -1351,15 +1173,11 @@ mod tests {
         assert_eq!(one[0].record.id, "osm:node:902");
     }
 
-    /// A village in no area at all is one the state can neither hold nor
-    /// leave out, so its whole name comes before a road named for it.
     #[test]
     fn a_place_in_no_area_is_neither_in_nor_out_of_the_state() {
         answers("Quonset, RI", "osm:node:901");
     }
 
-    /// A part fills the slot of what it names or places by, whatever the
-    /// parser labelled it, and one that holds no answer is unmatched.
     #[test]
     fn each_part_is_judged_by_what_it_names() {
         use crate::api::PartMatch;
@@ -1371,8 +1189,6 @@ mod tests {
         let initials = matched("Exeter, R.I.");
         assert_eq!(initials.region, Some(PartMatch::Matched));
         assert_eq!(initials.unit, None);
-        // Every word of Bristol is written, but not "county" of Providence
-        // County.
         assert_eq!(
             matched("Town of Bristol, RI").locality,
             Some(PartMatch::Matched)
@@ -1387,7 +1203,6 @@ mod tests {
         assert_eq!(elsewhere.locality, Some(PartMatch::Unmatched));
     }
 
-    /// Every area and street of the fixture, by id.
     fn areas_and_streets(searcher: &TextSearcher) -> Vec<(u64, String, String)> {
         let pack = &searcher.pack;
         (0..pack.records().record_count())
@@ -1415,14 +1230,11 @@ mod tests {
         })
     }
 
-    /// P1 and P2: where a record lies, and a part that names nothing, never
-    /// change which record answers.
     #[test]
     fn where_a_record_lies_and_a_part_naming_nothing_never_change_the_answer() {
         let searcher = searcher();
         let mut cases = Vec::new();
         for (record, id, name) in areas_and_streets(searcher) {
-            // The parser reads an isolated postcode as a house number in this fixture.
             if record_layer(searcher, &id) == "postcode" {
                 continue;
             }
@@ -1450,8 +1262,6 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
-    /// P1 for a street written with its town: the areas holding the town
-    /// never change the answer.
     #[test]
     fn a_street_with_its_town_keeps_its_answer_with_the_areas_holding_the_town() {
         let searcher = searcher();
@@ -1489,7 +1299,6 @@ mod tests {
         record(searcher, id).0
     }
 
-    /// The fixture's houses as held-out address rows, one per line.
     fn rows(dir: &Path) -> PathBuf {
         let path = dir.join("rows.geojson");
         let rows = (0..5)
@@ -1542,7 +1351,6 @@ mod tests {
         dir
     });
 
-    /// The fixture calibrated: a ranker and a confidence model beside it.
     fn calibrated() -> &'static TextSearcher {
         static SEARCHER: OnceLock<TextSearcher> = OnceLock::new();
         SEARCHER.get_or_init(|| {
@@ -1552,14 +1360,11 @@ mod tests {
         })
     }
 
-    /// P3: calibration never changes the answer to a query with no house
-    /// number, and rates none of it.
     #[test]
     fn calibration_never_changes_an_answer_to_a_query_with_no_number() {
         let (plain, calibrated) = (searcher(), calibrated());
         let mut queries = Vec::new();
         for (_, id, name) in areas_and_streets(plain) {
-            // The postcode sweep uses a Pack that parses isolated postcodes as postcodes.
             if record_layer(plain, &id) == "postcode" {
                 continue;
             }
@@ -1589,8 +1394,6 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
-    /// P4: on a calibrated Pack every answer to a query that states a house
-    /// number carries a confidence, whichever reading found it.
     #[test]
     fn every_answer_to_a_numbered_query_carries_a_confidence() {
         let calibrated = calibrated();
@@ -1600,8 +1403,6 @@ mod tests {
             "2 Hope Street, Bristol, RI 02809",
             "9 Hope Street, Bristol",
             "7 Main Street, Providence",
-            // This fixture's parser reads the postcode as a house number,
-            // and the postcode answers: rated though no number names it.
             "02809, Bristol",
         ] {
             let hits = ask(calibrated, query);

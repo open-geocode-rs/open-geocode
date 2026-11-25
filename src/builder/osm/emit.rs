@@ -1,9 +1,3 @@
-//! The way pass: read the way blocks again, give each kept way its nodes'
-//! coordinates from the node store, and emit its records.
-//!
-//! Each block is assembled on its own, so blocks run in parallel and their
-//! records are merged in file order, the order the scan kept the ways in.
-
 use std::collections::{BTreeMap, HashSet};
 
 use geo::MultiPolygon;
@@ -33,34 +27,22 @@ pub(crate) struct FeatureOutput {
     pub boundary_ways: Vec<BoundaryWay>,
 }
 
-/// One node of a way, with its address tags when the way reads them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WayNode {
     pub id: i64,
     pub location: Location,
     pub tags: Option<BTreeMap<String, String>>,
-    /// The value of its `entrance` tag, when it has one.
     pub entrance: Option<String>,
 }
 
-/// What one way block gave.
 #[derive(Debug, Default)]
 pub(crate) struct Assembled {
     pub output: FeatureOutput,
-    /// Boundary relation member ways, in file order: each with its vertices
-    /// when every one is stored, and how many are.
     pub members: Vec<(i64, Option<Vec<Vertex>>, u64)>,
-    /// Node references of the block's kept ways that have coordinates.
     pub resolved: u64,
-    /// The nodes of the member ways that are tagged `entrance`, each with
-    /// the tag's value. A relation's outline is assembled after the node
-    /// store is gone.
     pub entrances: Vec<(i64, String)>,
 }
 
-/// The nodes of `refs`, when `locations` has every one, and how many it has.
-/// Each with its address tags when `tags` asks, and with whether it is an
-/// entrance when `entrances` does, as most ways read neither.
 fn resolve(
     refs: &[i64],
     locations: &Locations,
@@ -96,8 +78,6 @@ fn resolve(
     (nodes, found)
 }
 
-/// Emit the kept ways of `block` and gather the vertices of the boundary
-/// relation members among its ways (`members`).
 pub(crate) fn assemble(
     block: &PrimitiveBlock,
     locations: &Locations,
@@ -153,8 +133,6 @@ fn vertex(node: &WayNode) -> Vertex {
     }
 }
 
-/// Emit the records of a kept way whose nodes are `nodes`, `None` when any
-/// lacks coordinates.
 pub(crate) fn emit_feature(
     feature: WayFeature,
     nodes: Option<Vec<WayNode>>,
@@ -167,7 +145,6 @@ pub(crate) fn emit_feature(
             .map(|node| (node.location.lat(), node.location.lon()))
             .collect::<Vec<_>>()
     };
-    // A closed way ends on its first node, which is one entrance, not two.
     let entrances = |nodes: &[WayNode]| {
         let mut seen = HashSet::new();
         nodes

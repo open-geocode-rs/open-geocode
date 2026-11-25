@@ -1,14 +1,3 @@
-//! Merging sorted runs: one pass when memory allows, else the fewest.
-//!
-//! Every run is merged at once when a read buffer for each fits the
-//! sorter's share (two blocks per run, so a 1 GiB share merges over a
-//! thousand runs; Aggarwal and Vitter). When it does not, runs are merged
-//! first in groups, the smallest first, sized as Knuth gives for an optimal
-//! merge pattern (TAOCP 5.4.9): the first group takes (r - 1) mod (k - 1) + 1
-//! runs and every later one k, so the final merge is a full k-way one and
-//! no item is merged more often than it must be. A loser tree picks the
-//! next item with one comparison per level.
-
 use std::sync::Arc;
 
 use super::{
@@ -21,14 +10,9 @@ use crate::{
     memory::{Budget, Reservation},
 };
 
-/// Threads that read ahead for one merge.
 const PREFETCH_THREADS: usize = 4;
-/// The least memory a run is read with.
 const MIN_READ_BYTES: usize = 64 << 10;
 
-/// Tournament tree over `k` sources: `tree[0]` is the winner, every other
-/// node the loser of the match played there. A source's next item replays
-/// only the matches on its path to the root.
 #[derive(Debug)]
 struct LoserTree {
     tree: Vec<usize>,
@@ -38,7 +22,6 @@ impl LoserTree {
     fn new(sources: usize, beats: impl Fn(usize, usize) -> bool) -> Self {
         let mut tree = vec![0; sources.max(1)];
         if sources > 1 {
-            // Winners of every node, leaves at `sources..2 * sources`.
             let mut winners = vec![0; 2 * sources];
             for source in 0..sources {
                 winners[sources + source] = source;
@@ -62,7 +45,6 @@ impl LoserTree {
         self.tree[0]
     }
 
-    /// Replay the path of `source`, the last winner, after its item changed.
     fn replay(&mut self, source: usize, beats: impl Fn(usize, usize) -> bool) {
         let sources = self.tree.len();
         let mut winner = source;
@@ -77,7 +59,6 @@ impl LoserTree {
     }
 }
 
-/// K-way merge over sorted runs, each removed chunk by chunk as it is read.
 #[derive(Debug)]
 pub struct Merge<T> {
     prefetch: Prefetch,
@@ -85,13 +66,10 @@ pub struct Merge<T> {
     heads: Vec<Option<T>>,
     tree: LoserTree,
     failed: bool,
-    /// Read buffers of the open runs.
     _buffers: Reservation,
 }
 
 impl<T: Spill + Ord> Merge<T> {
-    /// Read buffers are needed to make progress, so they are reserved even
-    /// when the pool is full; the fan-in was sized to fit them.
     pub(super) fn open(
         scratch: &Arc<Scratch>,
         runs: Vec<Run>,
@@ -121,7 +99,6 @@ impl<T: Spill + Ord> Merge<T> {
         self._buffers.bytes()
     }
 
-    /// The next item of `source`, or `None` once it is exhausted.
     fn pull(&mut self, source: usize) -> Result<Option<T>> {
         loop {
             if let Some(block) = &mut self.blocks[source] {
@@ -138,8 +115,6 @@ impl<T: Spill + Ord> Merge<T> {
     }
 }
 
-/// Whether source `left`'s head comes before `right`'s: an exhausted source
-/// loses to every other, and equal items go by source.
 fn beats<T: Ord>(heads: &[Option<T>], left: usize, right: usize) -> bool {
     match (&heads[left], &heads[right]) {
         (Some(a), Some(b)) => (a, left) < (b, right),
@@ -172,7 +147,6 @@ impl<T: Spill + Ord> Iterator for Merge<T> {
     }
 }
 
-/// The runs a merge may read at once within `share_bytes`: at least two.
 pub(super) fn fan_in(runs: &[Run], share_bytes: usize) -> usize {
     let widest = runs
         .iter()
@@ -183,8 +157,6 @@ pub(super) fn fan_in(runs: &[Run], share_bytes: usize) -> usize {
     (share_bytes / widest).max(2)
 }
 
-/// How many of `runs` runs the next premerge takes, so every merge after
-/// it, the final one included, reads `fan_in` runs.
 pub(super) fn premerge_width(runs: usize, fan_in: usize) -> usize {
     match (runs - 1) % (fan_in - 1) + 1 {
         1 => fan_in,
@@ -192,8 +164,6 @@ pub(super) fn premerge_width(runs: usize, fan_in: usize) -> usize {
     }
 }
 
-/// Merge runs until at most `fan_in` are left, smallest first, each group
-/// into one run.
 pub(super) fn premerge<T: Spill + Ord>(
     scratch: &Arc<Scratch>,
     owner: &Arc<Owner>,
@@ -212,7 +182,6 @@ pub(super) fn premerge<T: Spill + Ord>(
     Ok(runs)
 }
 
-/// Merge `runs` into one run at the current zstd level.
 pub(super) fn merge_into<T: Spill + Ord>(
     scratch: &Arc<Scratch>,
     owner: &Arc<Owner>,
@@ -274,7 +243,6 @@ mod tests {
 
     #[test]
     fn premerges_leave_full_merges_after_the_first() {
-        // Knuth's example: 6 runs, 3 at once, merges 2, then 3, then 3.
         assert_eq!(premerge_width(6, 3), 2);
         assert_eq!(premerge_width(5, 3), 3);
         assert_eq!(premerge_width(9, 4), 3);

@@ -1,10 +1,3 @@
-//! Tantivy text index.
-//!
-//! The index is built in the scratch directory, merged to one segment, and its
-//! files are copied into the Pack as `text/<file>` sections. At runtime a
-//! read-only [`Directory`] serves those sections straight from the Pack
-//! mapping, so the text index needs no files of its own.
-
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap},
@@ -43,41 +36,22 @@ use crate::{
 
 pub const TEXT_SECTION_PREFIX: &str = "text/";
 pub const TEXT_INDEX_SCHEMA_VERSION: u32 = 15;
-/// Postcode data within this radius describes where a record is: a record
-/// with no postcode of its own is ranked by the nearest postcode centroid
-/// within it, and the batch check compares the postcode areas within it.
 pub(crate) const POSTCODE_AREA_RADIUS_M: f64 = 10_000.0;
 
 /// Tantivy needs at least 15 MB per indexing thread (it uses fewer threads
 /// when given less) and gains little beyond 1.6 GB.
 const MIN_INDEX_MEMORY_BYTES: usize = 16 << 20;
 const MAX_INDEX_MEMORY_BYTES: usize = 1_600_000_000;
-/// Memory each part's indexing thread gets at least: less makes many small
-/// segments for the final merge to join.
 const INDEX_THREAD_MEMORY_BYTES: usize = 32 << 20;
-/// Parts at most, each indexed on a thread of its own. Tantivy's default is
-/// 8 threads, which leaves the cores of a larger machine idle while every
-/// record waits on the index.
 const MAX_INDEX_PARTS: usize = 16;
-/// Documents a part takes in a row before the next part takes the next
-/// ones. Documents come in Hilbert order, so a part's documents, and so
-/// every posting list, run in stretches of the map this long: a town's
-/// documents are a few long runs, which pack into far fewer bits than the
-/// one-by-one spread a writer of many threads makes. Each part's queue holds
-/// a whole chunk, so every part is at work while the next is fed.
 const CHUNK_DOCUMENTS: u64 = 8_192;
-/// Where in the scratch directory Tantivy writes, and whose bytes they are.
 const DIRECTORY: &str = "text";
-/// The directory of `DIRECTORY` the parts are joined into.
 const MERGED_DIR: &str = "merged";
 
-/// The directory of part `part` in `DIRECTORY`.
 fn part_dir(part: usize) -> String {
     format!("part-{part}")
 }
 
-/// How many parts a writer of `memory_bytes` indexes in: one per thread of
-/// the build's worker pool, each with at least [`INDEX_THREAD_MEMORY_BYTES`].
 fn part_count(memory_bytes: usize) -> usize {
     rayon::current_num_threads()
         .min(MAX_INDEX_PARTS)
@@ -113,63 +87,40 @@ pub(crate) const RECORD_COUNT_FIELD: &str = "record_count";
 pub(crate) const NAME_WORDS_FIELD: &str = "name_words";
 pub(crate) const PLACE_RANK_FIELD: &str = "place_rank";
 pub(crate) const PROMINENCE_FIELD: &str = "prominence";
-/// Addresses one document holds at most, so finding a number in a group reads
-/// a bounded run of records.
 const MAX_GROUP_RECORDS: u64 = 1_024;
 
-/// The text index as a checkpoint leaves it: its parts committed in their
-/// directories.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WriterState {
     document_count: u64,
     parts: usize,
-    /// Whether the parts were joined into one segment, which is then all
-    /// there is.
     merged: bool,
 }
 
 pub struct Writer {
-    /// One writer per part, created with the first document, so their
-    /// buffers are reserved only for the phase that writes records.
     writers: Option<(Vec<IndexWriter>, Reservation)>,
     budget: Arc<Budget>,
     memory_bytes: usize,
-    /// The parts, each an index of its own in a directory of `path`, joined
-    /// into one segment by [`Self::merge`].
     parts: Vec<Index>,
     path: PathBuf,
     scratch: Arc<Scratch>,
     fields: Fields,
     chunk_documents: u64,
     document_count: u64,
-    /// Documents a checkpoint committed: a checkpoint commits again only
-    /// once there are more, so the directory it synced stays as it was.
     committed: u64,
-    /// The address group the next address may join, and its numbers.
     group: Option<(Document, Numbers)>,
-    /// Whether [`Self::merge`] ran: the index takes no more documents.
     merged: bool,
 }
 
-/// What a record adds to the text index: a document of its own, or, for an
-/// address, its share of the document of its street group.
 #[derive(Debug)]
 pub enum Prepared {
     Document(TantivyDocument),
     Address(Box<Document>, Numbers),
 }
 
-/// What a document's house numbers and units are indexed as. An address's
-/// are worked out as it is prepared, in parallel, and a group's are its
-/// addresses' joined in order, so the writer, which takes records one at a
-/// time, only joins them.
 #[derive(Debug, Default)]
 pub struct Numbers {
-    /// The units' search texts, in order.
     units: Vec<String>,
-    /// Every term of every house number, then the flat numbers.
     terms: Vec<String>,
-    /// The lowest base house number.
     lowest: Option<u32>,
 }
 
@@ -208,67 +159,34 @@ impl Numbers {
 #[derive(Debug, Clone, Copy)]
 pub struct Fields {
     pub record_id: Field,
-    /// How many records from `record_id` on the document stands for: the
-    /// addresses of one street group, else 1.
     pub record_count: Field,
     pub layer: Field,
-    /// What a record is: its name, street or place, house number, unit and
-    /// category.
     pub content_text: Field,
-    /// Where a record is: the locality, region, country and postcode it
-    /// states, and the names of the admin areas it lies in.
     pub context_text: Field,
     pub name_text: Field,
-    /// The street (or `addr:place`) an address, a POI's address or a range
-    /// is on, and a street's own name: what the words beside a house number
-    /// name.
     pub street_text: Field,
     pub address_number: Field,
     pub postcode_exact: Field,
     pub autocomplete_subject_text: Field,
-    /// Apart from the address fields, so a word common in shop names stays
-    /// rare among street names. Context stays shared: documents run in map
-    /// order, so one list of a town's neighbours compresses far better than
-    /// two. Search splits the products by layer (`product_clause`).
     pub place_name_text: Field,
     pub place_content_text: Field,
     pub place_autocomplete_subject_text: Field,
     pub place_address_number: Field,
-    /// First and last number of an interpolation range, so a search finds the
-    /// ranges that contain a requested house number.
     pub interpolation_start: Field,
     pub interpolation_end: Field,
-    /// The smallest number a stated house number starts with ("407" of
-    /// "407A"). Ranking asks only whether a record states one, so a street
-    /// group keeps one value, not one per address.
     pub house_number: Field,
-    /// The postcodes a record is in by its own data: the one it states,
-    /// else for an address the ones its street's addresses state.
     pub rank_postcode: Field,
-    /// For a record with no `rank_postcode`, the nearest postcode centroid
-    /// (see [`PostcodeAreas`]): a guess, which never contradicts a query.
     pub area_postcode: Field,
     /// The ISO 3166-1 alpha-2 code of the country the record lies in, upper
     /// case, so a Pack covering several countries can be searched one at a
     /// time. Exact, like `layer`: it is filtered on, never matched as text.
     pub country_code: Field,
-    /// The [`Extent`] of the records a document stands for, so a bounding
-    /// box narrows a search before it ranks, and a caller's location ranks
-    /// the documents near it into the window.
     pub min_lon: Field,
     pub min_lat: Field,
     pub max_lon: Field,
     pub max_lat: Field,
-    /// The words of the record's own name, as the name field spells them,
-    /// so that of records a query scores alike the text index keeps the
-    /// ones whose name it covers with the fewest words left over.
     pub name_words: Field,
-    /// The [`place_rank`] of a place, so that of places a query scores
-    /// alike the text index keeps the larger.
     pub place_rank: Field,
-    /// The [`crate::record::Prominence::rank`] of a POI or a place, so
-    /// that of records a query scores alike the text index keeps the
-    /// better known.
     pub prominence: Field,
 }
 
@@ -325,45 +243,27 @@ pub struct Commit {
     pub bytes: u64,
 }
 
-/// The text document of one record, or of the run of addresses a group
-/// document holds: consecutive addresses whose documents differ only in their
-/// numbers and units.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
     pub record_id: RecordId,
     pub record_count: u64,
-    /// Layers a `layer` filter finds the record under: its own, and `address`
-    /// for a POI that carries one.
     pub layers: Vec<String>,
     pub content_text: String,
     pub context_text: String,
     pub name: Option<String>,
-    /// The names of the street (see [`Fields::street_text`]): a
-    /// street's every name, an address's one.
     pub streets: Vec<String>,
-    /// The house numbers of the record, or of each address of a group.
     pub address_numbers: Vec<String>,
-    /// Flats as their units and numbers are written together, "10 1367":
-    /// found as written, but no house number.
     pub flat_numbers: Vec<String>,
-    /// The units of a group's addresses, searched with what it is.
     pub units: Vec<String>,
     pub postcode: Option<String>,
     pub autocomplete_subject_text: String,
-    /// First and last number of an interpolation range.
     pub interpolation_range: Option<(u32, u32)>,
-    /// Normalized without spaces, as [`compact_postcode`] gives.
     pub rank_postcodes: Vec<String>,
-    /// Normalized the same way.
     pub area_postcode: Option<String>,
-    /// The country the record lies in, from its admin context.
     pub country_code: Option<String>,
     pub extent: Option<Extent>,
-    /// Words of the record's own name (see [`Fields::name_words`]).
     pub name_words: Option<u64>,
-    /// See [`Fields::place_rank`].
     pub place_rank: Option<u8>,
-    /// See [`Fields::prominence`].
     pub prominence: Option<u64>,
 }
 
@@ -390,12 +290,8 @@ impl Writer {
             path: path.clone(),
             source,
         })?;
-        // Tantivy writes its segments itself, so the ledger measures them
-        // at checkpoints instead of reserving each write.
         scratch.watch(LABEL, &path);
         let memory_bytes = memory_bytes.clamp(MIN_INDEX_MEMORY_BYTES, MAX_INDEX_MEMORY_BYTES);
-        // As many as the build's worker pool, which is sized to the CPUs and
-        // memory the process can use.
         let parts = (0..part_count(memory_bytes))
             .map(|part| {
                 let dir = create_dir(&path.join(part_dir(part)))?;
@@ -422,8 +318,6 @@ impl Writer {
         self.fields
     }
 
-    /// Commit every document, for a checkpoint, once every record is
-    /// added: the open address group is closed, as [`Self::finish`] would.
     pub fn state(&mut self) -> Result<WriterState> {
         self.close_group()?;
         if let Some((writers, _)) = &mut self.writers
@@ -441,13 +335,10 @@ impl Writer {
         })
     }
 
-    /// The directory Tantivy writes the index to.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// The index a checkpoint committed, ready to be merged and copied into
-    /// the Pack.
     pub fn restore(
         scratch: &Arc<Scratch>,
         budget: &Arc<Budget>,
@@ -483,8 +374,6 @@ impl Writer {
 
     fn writers(&mut self) -> Result<&mut Vec<IndexWriter>> {
         if self.writers.is_none() {
-            // Reserve before Tantivy allocates; the share was sized within the
-            // budget, so this only overshoots if a caller asked for more.
             let mut memory = Reservation::empty(&self.budget);
             if !memory.try_grow(self.memory_bytes) {
                 memory.force_grow(self.memory_bytes);
@@ -495,8 +384,6 @@ impl Writer {
                 .iter()
                 .map(|part| {
                     let writer = part.writer_with_num_threads(1, share)?;
-                    // No merges during the build: the only one is the one
-                    // [`Self::merge`] runs.
                     writer.set_merge_policy(Box::new(NoMergePolicy));
                     Ok(writer)
                 })
@@ -506,11 +393,6 @@ impl Writer {
         Ok(&mut self.writers.as_mut().expect("writers created").0)
     }
 
-    /// Index one document. Tantivy's indexing queue holds a bounded number of
-    /// messages, so handing it documents one at a time bounds the documents
-    /// waiting in memory: when the indexer falls behind, this blocks instead
-    /// of queuing every record of the build (a batch of documents would be
-    /// one message, and the queue would hold thousands of batches).
     pub fn add(&mut self, document: TantivyDocument) -> Result<()> {
         self.close_group()?;
         self.add_document(document)
@@ -524,9 +406,6 @@ impl Writer {
         Ok(())
     }
 
-    /// Index the address `document` projects: into the group of the address
-    /// before it when it is the next record and states the same, else into a
-    /// group of its own.
     pub fn add_address(&mut self, document: Box<Document>, numbers: Numbers) -> Result<()> {
         if let Some((group, group_numbers)) = &mut self.group
             && group.record_id + group.record_count == document.record_id
@@ -554,7 +433,6 @@ impl Writer {
         Ok(())
     }
 
-    /// Commit, merge to a single segment and copy the index into the Pack.
     pub fn finish(mut self, pack: &mut container::Writer) -> Result<Commit> {
         if !self.merged {
             self.merge()?;
@@ -583,8 +461,6 @@ impl Writer {
             bytes += fs::metadata(&file)?.len();
             pack.add_file(&section, TEXT_INDEX_SCHEMA_VERSION, &file)?;
         }
-        // The segments are in the Pack now; their scratch goes before the
-        // parser trains, not after.
         let Self {
             parts,
             path,
@@ -601,17 +477,12 @@ impl Writer {
         })
     }
 
-    /// Commit every part and join them into the one segment [`Self::finish`]
-    /// copies into the Pack. Apart from it, so the merge can run while the
-    /// part sealed before it is copied in.
     pub fn merge(&mut self) -> Result<()> {
         if self.merged {
             return Ok(());
         }
         self.close_group()?;
         let mut writers = std::mem::take(self.writers()?);
-        // A commit writes out what its part still holds in memory, on one
-        // thread: together, not one part after another.
         std::thread::scope(|scope| {
             let commits = writers
                 .iter_mut()
@@ -628,7 +499,6 @@ impl Writer {
             writer.wait_merging_threads()?;
         }
         self.writers = None;
-        // A build resumed from a checkpoint before the merge merges again.
         let merged = self.path.join(MERGED_DIR);
         if merged.exists() {
             self.scratch.remove_dir(&merged)?;
@@ -638,8 +508,6 @@ impl Writer {
             .map_err(|error| Error::Inconsistent(format!("text index directory: {error}")))?;
         let index = merge_indices(&self.parts, directory)?;
         drop(index);
-        // The parts stay until [`Self::finish`] removes the whole directory:
-        // a checkpoint taken before the merge still names them.
         self.merged = true;
         Ok(())
     }
@@ -678,9 +546,6 @@ impl Fields {
         })
     }
 
-    /// What a record adds to the text index. Pure, so callers can prepare
-    /// records in parallel before handing them to the writer.
-    /// `context_names` are the admin areas the record lies in.
     pub fn prepare(
         self,
         record_id: RecordId,
@@ -714,8 +579,6 @@ impl Fields {
         }
     }
 
-    /// The document of `projected`, whose numbers and units index as
-    /// `numbers`. A place's words go to the place fields alone.
     fn to_tantivy_document(self, projected: &Document, numbers: Numbers) -> TantivyDocument {
         let place = projected
             .layers
@@ -750,9 +613,6 @@ impl Fields {
             document.add_text(self.context_text, &projected.context_text);
         }
         add_text_if_present(&mut document, self.name_text, projected.name.as_deref());
-        // One value of each word, as the name and content fields are: a
-        // street known by several names ("Upper Queen Street", "Belgium
-        // Street") would else score its repeated words over a street of one.
         add_text_if_present(
             &mut document,
             self.street_text,
@@ -811,8 +671,6 @@ impl Fields {
 }
 
 impl Document {
-    /// Whether `other` belongs to this document's group: it states the same
-    /// in every field but its numbers and units.
     fn same_group(&self, other: &Self) -> bool {
         self.layers == other.layers
             && self.content_text == other.content_text
@@ -827,16 +685,6 @@ impl Document {
             && self.country_code == other.country_code
     }
 
-    /// What a record is and where it is go to separate fields, so a word that
-    /// names what is sought is not matched by an area's name ("Kingston Road"
-    /// by an address in Kingston, "Danforth Avenue" by one in the Danforth
-    /// neighbourhood). Where it is holds the locality, region, country and
-    /// postcode the record states and `context_names`, the admin areas it lies
-    /// in: a POI name alone rarely identifies one place ("Tim Hortons"), and
-    /// most addresses carry no `addr:city`.
-    ///
-    /// Every record but a place is ranked by the postcodes it is in by its
-    /// own data, or else by the nearest of `postcode_areas`.
     pub fn from_record(
         record_id: RecordId,
         record: &Record,
@@ -880,24 +728,15 @@ impl Document {
             Record::Poi(poi) => document.prominence = Some(poi.prominence.rank()),
             _ => {}
         }
-        // A record repeats words across its names and address ("Walmer Road
-        // Parkette, 227 Walmer Road", "Upper Queen Street" also named
-        // "Belgium Street"). Without field norms every repeat would add to
-        // its score, so each word counts once: a record must not outrank the
-        // one a query names on repetition alone.
         document.name = document.name.as_deref().and_then(unique_words);
         document.content_text = unique_words(&document.content_text).unwrap_or_default();
         document
     }
 
     fn project_address(record_id: RecordId, address: &AddressRecord) -> ProjectionBuilder {
-        // Named by its street alone, and its number and unit kept apart, so
-        // the addresses of one street project alike and share a group.
         let mut builder = ProjectionBuilder::new(record_id, "address");
         if let Some(subject) = address.address.subject() {
             builder.name_for_search(subject);
-            // Its name is its number and street ("10 Queen Street"), so of
-            // documents a street's words match alike the street comes first.
             if let Some(words) = &mut builder.projected.name_words {
                 *words += 1;
             }
@@ -972,8 +811,6 @@ pub fn open_text_index(container: &Container) -> Result<Index> {
     Ok(Index::open(PackDirectory::new(container)?)?)
 }
 
-/// Read-only Tantivy directory over the `text/` sections of a Pack. Writes the
-/// reader needs (lock files) go to a private in-memory directory.
 #[derive(Clone)]
 struct PackDirectory {
     files: Arc<HashMap<PathBuf, Bytes>>,
@@ -1192,7 +1029,6 @@ struct ProjectionBuilder {
     projected: Document,
     name_parts: Vec<String>,
     content_parts: Vec<String>,
-    /// Where the record says it is, one part per stated value.
     context_parts: Vec<String>,
     autocomplete_subject_parts: Vec<String>,
 }
@@ -1234,8 +1070,6 @@ impl ProjectionBuilder {
         self.add_autocomplete_subject_text(value);
     }
 
-    /// A name of the record; the first is its own (see
-    /// [`Fields::name_words`]).
     fn name_for_search(&mut self, value: &str) {
         if let Some(text) = search_text(value) {
             self.projected
@@ -1246,8 +1080,6 @@ impl ProjectionBuilder {
         self.add_content_text(value);
     }
 
-    /// A name of the street or place a house number is on, spelled as
-    /// [`street_search_text`] gives.
     fn street(&mut self, value: Option<&str>) {
         if let Some(street) = value.and_then(street_search_text)
             && !self.projected.streets.contains(&street)
@@ -1256,15 +1088,12 @@ impl ProjectionBuilder {
         }
     }
 
-    /// A POI's address: its number and unit are part of what it is.
     fn address(&mut self, address: &AddressComponents) {
         self.add_content_text(&address.number);
         self.address_parts(address);
         self.add_optional_content_text(address.unit.as_deref());
     }
 
-    /// Every part of an address but its unit; the number only as a house
-    /// number.
     fn address_parts(&mut self, address: &AddressComponents) {
         self.street(address.subject());
         self.projected
@@ -1292,7 +1121,6 @@ impl ProjectionBuilder {
         self.add_optional_context_text(address.country.as_deref());
     }
 
-    /// A postcode record: the postcode is what it is.
     fn postcode(&mut self, value: &str) {
         self.projected.postcode = collapse_whitespace(value);
         self.add_content_text(value);
@@ -1323,7 +1151,6 @@ impl ProjectionBuilder {
         }
     }
 
-    /// The postcode an address states: where it is, and a prefix to complete.
     fn add_optional_postcode_text(&mut self, value: Option<&str>) -> Option<String> {
         let cleaned = self.add_optional_postcode_for_search(value)?;
         if let Some(normalized) = search_key(&cleaned) {
@@ -1353,9 +1180,6 @@ impl ProjectionBuilder {
         }
     }
 
-    /// The document, placed in the stated areas and in `context_names`. Each
-    /// area word is indexed once, and each name is expanded on its own, as a
-    /// query's comma-separated parts are ("St Catharines" keeps its "st").
     fn build(mut self, context_names: &[&str]) -> Document {
         let name_parts = unique_parts(self.name_parts);
         self.projected.name = (!name_parts.is_empty()).then(|| name_parts.join(" "));
@@ -1375,8 +1199,6 @@ impl ProjectionBuilder {
     }
 }
 
-/// A normalized postcode as written, and without its spaces when it has any:
-/// "m5v 1a1" and "m5v1a1".
 fn postcode_forms(normalized: &str) -> Vec<String> {
     let compact = normalized.split_whitespace().collect::<String>();
     if compact == normalized {
@@ -1402,8 +1224,6 @@ fn add_normalized_text_if_present(
     }
 }
 
-/// Street-type abbreviations and the words they stand for, in normalized
-/// text. A word's first abbreviation here is its usual one.
 pub(crate) const STREET_TYPE_ABBREVIATIONS: &[(&str, &str)] = &[
     ("ave", "avenue"),
     ("av", "avenue"),
@@ -1430,14 +1250,6 @@ pub(crate) const STREET_TYPE_ABBREVIATIONS: &[(&str, &str)] = &[
     ("wy", "way"),
 ];
 
-/// Expand the common abbreviations of street types and of directions that
-/// follow a street type, in normalized text: "king st w" becomes "king street
-/// west". Indexed text and queries are expanded alike, so either spelling
-/// finds the other. An initial or post-number "st" is left alone: there it is
-/// usually "Saint" ("St Clair Avenue", "12 St George Street"). An English
-/// ordinal written out before a street type is written as its number.
-/// "fifth avenue" is "5th avenue", "twenty first street" is "21st street",
-/// and "first baptist church" keeps its word.
 pub(crate) fn expand_address_abbreviations(value: &str) -> String {
     let mut words = Vec::<Cow<'_, str>>::new();
     let mut previous: Option<&str> = None;
@@ -1457,7 +1269,6 @@ pub(crate) fn expand_address_abbreviations(value: &str) -> String {
                 }),
         };
         let word = replacement.unwrap_or(token);
-        // Checked after expansion, so "fifth ave" finds its type too.
         if is_street_type(word)
             && let Some(ordinal) = words.last().and_then(|last| ordinal_number(last))
         {
@@ -1477,8 +1288,6 @@ pub(crate) fn expand_address_abbreviations(value: &str) -> String {
     words.join(" ")
 }
 
-/// The number an English ordinal written as one word stands for ("fifth"
-/// is 5), below the hundredth.
 fn ordinal_number(word: &str) -> Option<u32> {
     Some(match word {
         "first" => 1,
@@ -1512,8 +1321,6 @@ fn ordinal_number(word: &str) -> Option<u32> {
     })
 }
 
-/// The tens an English ordinal above the twentieth starts with ("twenty" of
-/// "twenty first").
 fn tens_number(word: &str) -> Option<u32> {
     Some(match word {
         "twenty" => 20,
@@ -1528,7 +1335,6 @@ fn tens_number(word: &str) -> Option<u32> {
     })
 }
 
-/// `number` as an ordinal written in digits, such as "1st", "12th" or "22nd".
 fn numbered_ordinal(number: u32) -> String {
     let suffix = match (number % 100, number % 10) {
         (11..=13, _) => "th",
@@ -1540,10 +1346,6 @@ fn numbered_ordinal(number: u32) -> String {
     format!("{number}{suffix}")
 }
 
-/// A street name as the street field indexes it: like [`search_text`], and a
-/// direction abbreviation that ends it is expanded whatever word precedes it
-/// ("The Donway E" is "the donway east"). A query's street is expanded alike
-/// (see [`expand_final_direction`]).
 pub(crate) fn street_search_text(value: &str) -> Option<String> {
     let text = search_text(value)?;
     let mut street = String::with_capacity(text.len() + 4);
@@ -1558,7 +1360,6 @@ pub(crate) fn street_search_text(value: &str) -> Option<String> {
     Some(street)
 }
 
-/// Expand a direction abbreviation that is the last of a street's words.
 pub(crate) fn expand_final_direction(words: &mut [String]) {
     if let Some(last) = words.last_mut()
         && let Some(direction) = direction_word(last)
@@ -1581,7 +1382,6 @@ pub(crate) fn direction_word(abbreviation: &str) -> Option<&'static str> {
     })
 }
 
-/// Whether an expanded word is a street type ("street", "avenue").
 pub(crate) fn is_street_type(word: &str) -> bool {
     matches!(
         word,
@@ -1624,15 +1424,10 @@ pub(crate) fn is_numeric_token(token: &str) -> bool {
     token.chars().all(|character| character.is_ascii_digit())
 }
 
-/// The terms a house number is indexed under: each value of a list ("12;14")
-/// is a number of its own, normalized ("407A" is "407a").
 pub(crate) fn address_number_terms(number: &str) -> impl Iterator<Item = String> + '_ {
     number.split(';').filter_map(search_key)
 }
 
-/// The term a flat is also found under: its unit and number as a slash
-/// number writes them, "10 1367" for unit 10 of 1367 ("10/1367"). Only a unit
-/// of one word: "Flat 4" is written before no number.
 pub(crate) fn flat_number_term(number: &str, unit: Option<&str>) -> Option<String> {
     let unit = search_key(unit?)?;
     if unit.contains(' ') {
@@ -1641,8 +1436,6 @@ pub(crate) fn flat_number_term(number: &str, unit: Option<&str>) -> Option<Strin
     Some(format!("{unit} {}", search_key(number)?))
 }
 
-/// The digits a house number starts with: 407 of "407A", "407 1/2" and
-/// "407;409". `None` when it does not start with one.
 pub(crate) fn base_house_number(number: &str) -> Option<u32> {
     let number = number.trim_start();
     let digits = number
@@ -1651,18 +1444,12 @@ pub(crate) fn base_house_number(number: &str) -> Option<u32> {
     number[..digits].parse().ok()
 }
 
-/// A postcode normalized without spaces: "M5V 1A1" is "m5v1a1".
 pub(crate) fn compact_postcode(value: &str) -> Option<String> {
     search_key(value.trim()).map(|value| value.split_whitespace().collect())
 }
 
-/// Postcode centroids, so a record that states no postcode can be ranked by
-/// the one nearest it. Most addresses state none, and without this a query's
-/// postcode could rank only the few that do.
 #[derive(Default)]
 pub struct PostcodeAreas {
-    /// Centroids as unit vectors, where straight-line nearness is nearness
-    /// on the sphere, each with its index in `postcodes`.
     centroids: RTree<GeomWithData<[f64; 3], usize>>,
     postcodes: Vec<(String, [f64; 2])>,
 }
@@ -1677,7 +1464,6 @@ impl fmt::Debug for PostcodeAreas {
 }
 
 impl PostcodeAreas {
-    /// `centroids` are postcodes and their `[lon, lat]` centroids.
     pub fn new(centroids: impl IntoIterator<Item = (String, [f64; 2])>) -> Self {
         let postcodes = centroids
             .into_iter()
@@ -1706,8 +1492,6 @@ impl PostcodeAreas {
         let (postcode, [centroid_lon, centroid_lat]) = &self.postcodes[nearest.data];
         let inside_radius =
             haversine_m(lon, lat, *centroid_lon, *centroid_lat) <= POSTCODE_AREA_RADIUS_M;
-        // Unit-vector rounding can split equal chords. Allow for coordinate error
-        // before squaring, so tolerance stays small near coincident points.
         let tie_limit = (distance.sqrt() + 64.0 * f64::EPSILON).powi(2);
         (inside_radius
             && !neighbors
@@ -1722,13 +1506,10 @@ fn unit_vector(lon: f64, lat: f64) -> [f64; 3] {
     [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
 }
 
-/// Text as the searchable fields index it: normalized, with address
-/// abbreviations expanded.
 fn search_text(value: &str) -> Option<String> {
     search_key(value).map(|text| expand_address_abbreviations(&text))
 }
 
-/// Normalized words of `value`, each once, in order of first use.
 fn unique_words(value: &str) -> Option<String> {
     let normalized = search_key(value)?;
     let mut seen = BTreeSet::new();
@@ -1744,13 +1525,6 @@ fn unique_words(value: &str) -> Option<String> {
     Some(words)
 }
 
-/// Words of the area and context names, each name expanded on its own, each
-/// word once.
-///
-/// Records come in Hilbert order, so a thread's next record mostly repeats
-/// the names of its last. Normalizing them was most of a record's indexing
-/// time. The text depends on the names alone, so each thread keeps recent
-/// ones.
 fn context_text(names: &[&str]) -> String {
     const SLOTS: usize = 1 << 10;
     type Slot = Option<(Vec<String>, String)>;
@@ -1815,8 +1589,6 @@ mod tests {
     fn documents_run_in_chunks_of_neighbours_in_one_segment() {
         let dir = TempDir::new("text-parts");
         let chunk = 64;
-        // Each address on a street of its own, so each is a document; past
-        // two chunks, so a part's chunk ends inside the index.
         let count = 2 * chunk + 5;
         let mut writer = crate::pack::Writer::create(&dir).expect("writer");
         writer.text.chunk_documents = chunk;

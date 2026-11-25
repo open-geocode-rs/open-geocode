@@ -1,21 +1,3 @@
-//! The parser's linear model.
-//!
-//! An edge scores the sum of the weights of its features under its label; a
-//! path adds the transition between each pair of consecutive labels, from the
-//! global table plus the table of the country it is decoded as. Weights are
-//! learned by [`super::train`] when the Pack is built and stored in it
-//! (`parse/weights`), in the format [`Weights::to_bytes`] writes. A Pack too
-//! small to train on carries none, and [`Weights::built_in`] holds hand-set
-//! weights that read the common address shapes for it.
-//!
-//! ```text
-//! magic "OGPARSEW" | version u32 | schema u64 | features u32 | labels u32
-//! | states u32 | edge f32 x features*labels | global f32 x states^2
-//! | countries u32 | per country: code u16, f32 x states^2
-//! ```
-//!
-//! Every number is little-endian.
-
 use std::collections::BTreeMap;
 
 use crate::error::{Error, Result};
@@ -27,24 +9,17 @@ use super::{
 };
 use crate::{container::Container, parse::types::Label};
 
-/// The Pack section that carries trained weights.
 pub const WEIGHTS_SECTION: &str = "parse/weights";
-/// Format version of the weights, in the file and in the Pack section.
 pub const WEIGHTS_VERSION: u32 = 1;
 const MAGIC: &[u8; 8] = b"OGPARSEW";
 
-/// Edge and transition weights of the parser.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Weights {
-    /// `edge[feature * LABELS + label]`.
     pub(super) edge: Vec<f32>,
-    /// `global[previous * STATES + next]`, with the start and end states.
     pub(super) global: Vec<f32>,
-    /// Per-country transitions added to the global ones.
     pub(super) countries: BTreeMap<CountryCode, Vec<f32>>,
 }
 
-/// The transitions of one decoding: global plus one country's.
 #[derive(Debug, Clone, Copy)]
 pub struct Transitions<'a> {
     global: &'a [f32],
@@ -52,7 +27,6 @@ pub struct Transitions<'a> {
 }
 
 impl Transitions<'_> {
-    /// The weight of moving from state `previous` to state `next`.
     pub fn get(&self, previous: usize, next: usize) -> f32 {
         let index = previous * STATES + next;
         self.global[index] + self.country.map_or(0.0, |country| country[index])
@@ -60,9 +34,6 @@ impl Transitions<'_> {
 }
 
 impl Weights {
-    /// All weights zero.
-    /// The mean of `all`, each table entry by entry. A country one of them
-    /// has no table for counts as zeros there.
     pub(super) fn mean<'a>(all: impl Iterator<Item = &'a Weights>) -> Self {
         let mut sum = Self::zero();
         let mut count = 0usize;
@@ -104,10 +75,6 @@ impl Weights {
         }
     }
 
-    /// Hand-set weights for a Pack nothing was trained for. They read a house
-    /// number before or after its street, unit text, a street ending or
-    /// starting with its type, names the Pack's dictionaries know, and a
-    /// postcode some country's pattern matches.
     pub fn built_in() -> Self {
         use Label::*;
         let mut weights = Self::zero();
@@ -208,8 +175,6 @@ impl Weights {
         );
         set("vocabulary:street_type_suffix", &[(Street, 2.0)]);
         set("vocabulary:unknown_word", &[(Street, 0.5), (Other, 0.3)]);
-        // One character of a script written without spaces is seldom a whole
-        // name; the names it is part of say what it is.
         set("vocabulary:unspaced", &[(Street, -2.5), (Other, -0.8)]);
         set("neighbour:prev_number", &[(Street, 1.0)]);
         set("neighbour:next_street_type", &[(Street, 1.5)]);
@@ -290,7 +255,6 @@ impl Weights {
         set("joined:number_parts", &[(HouseNumber, 30.0)]);
         set("joined:hyphen_after", &[(Unit, 1.5), (HouseNumber, -0.5)]);
         set("joined:hyphen_before", &[(HouseNumber, 0.5)]);
-        // A place or postcode the Pack does not explain is seldom one.
         set("grounding:no_locality", &[(Locality, -0.5)]);
         set("grounding:no_region", &[(Region, -1.0)]);
         set("grounding:no_country", &[(Country, -1.0)]);
@@ -345,17 +309,14 @@ impl Weights {
         weights
     }
 
-    /// Whether the weights carry a transition table of `country`.
     pub fn knows(&self, country: CountryCode) -> bool {
         self.countries.contains_key(&country)
     }
 
-    /// The countries the weights carry a transition table of.
     pub fn countries(&self) -> impl Iterator<Item = CountryCode> + '_ {
         self.countries.keys().copied()
     }
 
-    /// The transitions of a decoding as `country`, or the global ones.
     pub fn transitions(&self, country: Option<CountryCode>) -> Transitions<'_> {
         Transitions {
             global: &self.global,
@@ -365,7 +326,6 @@ impl Weights {
         }
     }
 
-    /// The score of `span` labelled `label`, decoded as `country`.
     pub(super) fn edge(&self, span: &Span, label: Label, country: Option<CountryCode>) -> f32 {
         let label = label as usize;
         span.features_in(country)
@@ -373,9 +333,6 @@ impl Weights {
             .sum()
     }
 
-    /// The score of `span` for every label, decoded as `country`: each
-    /// label's sum in the order [`Weights::edge`] adds it, from one walk of
-    /// the span's features, whose weights lie side by side.
     pub(super) fn edges(&self, span: &Span, country: Option<CountryCode>) -> [f32; LABELS] {
         let mut sums = [0.0; LABELS];
         for feature in span.features_in(country) {
@@ -421,7 +378,6 @@ impl Weights {
         bytes
     }
 
-    /// Weights written by [`Self::to_bytes`] for this build's feature layout.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut reader = Reader(bytes);
         if reader.take(MAGIC.len())? != MAGIC {
@@ -465,8 +421,6 @@ impl Weights {
         })
     }
 
-    /// The `limit` largest edge weights, as `(feature, label, weight)`, for
-    /// inspecting what a model learned.
     pub fn strongest(&self, limit: usize) -> Vec<(String, Label, f32)> {
         let mut all = self
             .edge
@@ -487,7 +441,6 @@ impl Weights {
     }
 }
 
-/// Reads the little-endian fields of a weights file in order.
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {

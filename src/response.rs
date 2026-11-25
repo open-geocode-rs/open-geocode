@@ -1,19 +1,3 @@
-//! The response contract of `/geocode`, `/places`, `/autocomplete` and `/reverse`
-//! (ADR 0022).
-//!
-//! Every response is one GeoJSON FeatureCollection: a `geocoding` block that
-//! says what was asked, then one Feature per answer. Forward features carry a
-//! `score`, from a calibrated Pack a `confidence`, and a `distance_m` from
-//! the request's `focus` when it gives one; reverse features a `distance_m`
-//! from the queried point; nothing else differs. The types here are the only
-//! definition of that shape. The contract tests
-//! compare real answers with the committed examples in
-//! `contract/responses/`, so a change to the shape lands with its examples.
-//!
-//! The same features are the result columns of `geocode batch`
-//! ([`flat_columns`]), so a CSV row and a JSON answer never drift apart
-//! either.
-
 use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{Error, Result};
@@ -49,7 +33,6 @@ pub struct ForwardCollection {
     pub features: Vec<ForwardFeature>,
 }
 
-// See [`ForwardCollection`] for why the two directions are written out.
 /// A GeoJSON FeatureCollection answering `/reverse`.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct ReverseCollection {
@@ -100,9 +83,6 @@ pub struct Source {
     pub dataset: String,
 }
 
-/// The credits of an answer whose results are `results`. They are
-/// OpenStreetMap, each other data set a result comes from, and the timezone
-/// boundaries when a result carries a timezone.
 pub(crate) fn attribution<'a>(
     pack: &Reader,
     results: impl Iterator<Item = &'a Common>,
@@ -195,9 +175,6 @@ pub enum PointType {
     Point,
 }
 
-// Not a response type of its own: flattened into [`ForwardProperties`] and
-// [`ReverseProperties`], which add the field each direction ranks by, so both
-// are one flat object on the wire.
 /// Properties shared by forward and reverse results.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct Common {
@@ -325,10 +302,8 @@ pub struct Common {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = json!({"de": "Genf"}))]
     pub translations: Option<BTreeMap<String, String>>,
-    /// The record behind the result, for the names `lang` asks for.
     #[serde(skip)]
     pub record_id: Option<RecordId>,
-    /// The result's local name, when `lang` renamed it.
     #[serde(skip)]
     pub local_name: Option<String>,
 }
@@ -454,7 +429,6 @@ pub struct QueryMatch {
 }
 
 impl QueryMatch {
-    /// Whether the query states no part.
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
@@ -488,10 +462,6 @@ pub struct ReverseProperties {
     pub distance_m: Option<f64>,
 }
 
-// From the Pack's point precision: `point` is rooftop, `estimated` is
-// interpolated, `representative_point` is street, a way or relation
-// `centroid` is centroid, and a node standing for something larger is
-// approximate.
 /// How precisely the coordinates locate the result, most precise first.
 ///
 /// - `rooftop`: the address or POI itself.
@@ -513,7 +483,6 @@ pub enum Accuracy {
 }
 
 impl Accuracy {
-    /// The accuracy of a record's own point.
     pub fn of(precision: records::PointPrecision, source: &records::Source) -> Self {
         match precision {
             records::PointPrecision::Point => Self::Rooftop,
@@ -602,7 +571,6 @@ impl Address {
         }
     }
 
-    /// Fills the parts read from `street`.
     pub fn with_parts(mut self) -> Self {
         self.street_parts = self
             .street
@@ -621,7 +589,6 @@ impl Address {
         *self == Self::default()
     }
 
-    /// Only a postcode, as a postcode record states it.
     pub fn postcode(postcode: &str) -> Self {
         Self {
             postcode: stated(Some(postcode)),
@@ -674,9 +641,6 @@ fn stated(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-// The `sub` tiers exist for countries that map levels between the
-// conventional ones: Germany's three `state_district` levels would otherwise
-// lose two.
 /// Areas containing the result, one per tier, most specific first. A tier
 /// the country does not map is absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, ToSchema)]
@@ -742,17 +706,12 @@ pub struct ContextArea {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = json!({"de": "Genf"}))]
     pub translations: Option<BTreeMap<String, String>>,
-    /// The area's record, for the names `lang` asks for.
     #[serde(skip)]
     pub record_id: RecordId,
-    /// The area's local name, when `lang` renamed it.
     #[serde(skip)]
     pub local_name: Option<String>,
-    /// The area's Wikidata item, for the vendors that write one.
     #[serde(skip)]
     pub wikidata: Option<u32>,
-    /// The code on the area's vehicle plates (`SIM`), for the vendors that
-    /// write one.
     #[serde(skip)]
     pub plate_code: Option<String>,
     #[serde(skip)]
@@ -812,13 +771,10 @@ impl ReverseFeature {
     }
 }
 
-/// The areas records lie in, each read from the Pack once per answer: the
-/// hits of one query mostly share them.
 #[derive(Debug)]
 pub struct Contexts<'a> {
     pack: &'a Reader,
     areas: HashMap<RecordId, Option<ContextArea>>,
-    /// Every name of each area, as search compares them.
     keys: HashMap<RecordId, Vec<String>>,
 }
 
@@ -831,8 +787,6 @@ impl<'a> Contexts<'a> {
         }
     }
 
-    /// The areas the record's boundary context names. A record outside
-    /// every boundary has none.
     pub fn of(&mut self, record_id: RecordId) -> Result<Context> {
         let Some(context) = self.pack.boundary_context(record_id)? else {
             return Ok(Context::default());
@@ -851,9 +805,6 @@ impl<'a> Contexts<'a> {
         })
     }
 
-    /// Whether `stated` is area `record_id`'s ISO code or the short code
-    /// after its country's (`CA` of `US-CA`). A code is written one way in
-    /// every language, so it stays as the source writes it.
     fn is_code(&self, record_id: RecordId, stated: &str) -> bool {
         self.code(record_id).is_some_and(|code| {
             code.eq_ignore_ascii_case(stated)
@@ -863,7 +814,6 @@ impl<'a> Contexts<'a> {
         })
     }
 
-    /// Whether `stated` is a name of area `record_id`, in any language.
     fn names_area(&mut self, record_id: RecordId, stated: &str) -> Result<bool> {
         let Some(stated) = crate::util::fold::search_key(stated) else {
             return Ok(false);
@@ -881,7 +831,6 @@ impl<'a> Contexts<'a> {
         Ok(self.keys[&record_id].contains(&stated))
     }
 
-    /// An area's ISO code: a country's own, else its subdivision code.
     fn code(&self, record_id: RecordId) -> Option<String> {
         self.pack
             .country_code(record_id)
@@ -918,8 +867,6 @@ impl<'a> Contexts<'a> {
     }
 }
 
-/// The answer to `/geocode`, `/places` or `/autocomplete`: one feature per hit, in the
-/// order search ranked them.
 pub fn forward_collection(
     pack: &Reader,
     query: String,
@@ -957,12 +904,9 @@ pub struct Languages(Vec<String>);
 /// an answer.
 pub const MAX_LANGUAGES: usize = 20;
 
-/// Why `lang` cannot be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LanguagesError {
-    /// The first code that is not a language code.
     NotACode(String),
-    /// More than [`MAX_LANGUAGES`] distinct codes, with how many.
     TooMany(usize),
 }
 
@@ -1011,10 +955,6 @@ fn is_language_code(code: &str) -> bool {
         })
 }
 
-/// Names a result or area in `languages`. The first gives `name`, or the
-/// local name stays when it has none in that language. A renamed one keeps
-/// its local name in `local_name`. Each other language it has a name in goes
-/// into `translations`.
 fn localize_names(
     pack: &Reader,
     record_id: RecordId,
@@ -1043,8 +983,6 @@ fn localize_names(
     *translations = (!found.is_empty()).then_some(found);
 }
 
-/// Names a result and its areas in `languages`, and rewrites its label to
-/// match. Returns how each part of the old label moved (see [`relabel`]).
 fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) -> Vec<Moved> {
     if let Some(record_id) = common.record_id {
         localize_names(
@@ -1080,8 +1018,6 @@ fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) ->
             &mut area.translations,
         );
     }
-    // A part the source states that names an area was written as the area
-    // (see [`name_stated_parts`]), so it is renamed with it.
     let address = &mut common.address;
     for part in [
         &mut address.locality,
@@ -1127,22 +1063,15 @@ fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) ->
     moved
 }
 
-/// Where a part of an old label went in a new one, in characters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Moved {
     start: usize,
     end: usize,
-    /// Where the part starts in the new label, `None` when it was renamed.
     to: Option<usize>,
 }
 
-/// Separates the parts of a label.
 const LABEL_SEPARATOR: &str = ", ";
 
-/// `label` with each part that is a local name of `renamed` replaced by its
-/// new name, and how each old part moved. A part is the label's text
-/// between separators; the parts that name the result and its areas are
-/// their names as written.
 fn relabel(label: &str, renamed: &[(String, String)]) -> (String, Vec<Moved>) {
     let mut parts = Vec::new();
     let mut moved = Vec::new();
@@ -1166,8 +1095,6 @@ fn relabel(label: &str, renamed: &[(String, String)]) -> (String, Vec<Moved>) {
     (parts.join(LABEL_SEPARATOR), moved)
 }
 
-/// `highlights` moved with their label's parts. A highlight in a renamed
-/// part is dropped: the typed text matched the local name, not the new one.
 fn move_highlights(highlights: &mut Vec<Highlight>, moved: &[Moved]) {
     highlights.retain_mut(|highlight| {
         let Some(part) = moved
@@ -1185,8 +1112,6 @@ fn move_highlights(highlights: &mut Vec<Highlight>, moved: &[Moved]) {
     });
 }
 
-/// Names every result and context area of a forward answer in the
-/// languages `lang` asked for.
 pub fn localize_forward(pack: &Reader, collection: &mut ForwardCollection, languages: &Languages) {
     for feature in &mut collection.features {
         let moved = localize_common(pack, &mut feature.properties.common, languages);
@@ -1194,14 +1119,12 @@ pub fn localize_forward(pack: &Reader, collection: &mut ForwardCollection, langu
     }
 }
 
-/// [`localize_forward`] for a reverse answer.
 pub fn localize_reverse(pack: &Reader, collection: &mut ReverseCollection, languages: &Languages) {
     for feature in &mut collection.features {
         localize_common(pack, &mut feature.properties.common, languages);
     }
 }
 
-/// Sets each result's distance from `focus`, when the request gave one.
 pub fn measure_from(collection: &mut ForwardCollection, focus: Option<[f64; 2]>) {
     let Some([lon, lat]) = focus else {
         return;
@@ -1209,14 +1132,10 @@ pub fn measure_from(collection: &mut ForwardCollection, focus: Option<[f64; 2]>)
     for feature in &mut collection.features {
         let [feature_lon, feature_lat] = feature.geometry.coordinates;
         let metres = crate::util::geo::haversine_m(lon, lat, feature_lon, feature_lat);
-        // To the centimetre: finer is noise next to the point's own precision.
         feature.properties.distance_m = Some((metres * 100.0).round() / 100.0);
     }
 }
 
-/// One search hit as a feature. The hit's summary already holds what search
-/// placed or estimated (an interpolated house number, a street's centre
-/// line), so nothing is read again but its context.
 pub fn forward_feature(contexts: &mut Contexts, hit: TextSearchHit) -> Result<ForwardFeature> {
     let point = hit
         .record
@@ -1373,7 +1292,6 @@ pub fn reverse_collection(pack: &Reader, response: &GeocodeResponse) -> Result<R
     })
 }
 
-/// The house number at the start of an estimated address's label.
 fn estimated_number(label: &str) -> Result<u32> {
     label
         .split_whitespace()
@@ -1386,7 +1304,6 @@ fn estimated_number(label: &str) -> Result<u32> {
         })
 }
 
-/// Order of context areas: precise to broad, the place area last.
 fn breadth(layer: &str) -> usize {
     const ORDER: [Layer; 7] = [
         Layer::Postcode,
@@ -1403,7 +1320,6 @@ fn breadth(layer: &str) -> usize {
         .unwrap_or(ORDER.len())
 }
 
-/// The fields both directions share, read once from the record.
 fn common(
     contexts: &mut Contexts,
     record_id: RecordId,
@@ -1503,14 +1419,6 @@ fn common(
     })
 }
 
-/// Writes each place the source states, its town, region, country or a
-/// named part of a town, as the area of the result's context it names, so
-/// one answer never names a place two ways: an address tagged `Vienna` in
-/// Wien says `Wien`, and with `lang` says what the area does. A code (`CA`,
-/// `AT`) is the same in every language and stays. The label
-/// follows, and how its parts moved is returned (see [`relabel`]), none when
-/// nothing was renamed. A part that names no area of the context stays as
-/// the source wrote it.
 fn name_stated_parts(contexts: &mut Contexts, common: &mut Common) -> Result<Vec<Moved>> {
     let areas = common
         .context
@@ -1560,8 +1468,6 @@ pub fn flat_columns(feature: Option<&ForwardFeature>) -> Vec<(&'static str, Stri
     )
 }
 
-/// [`flat_columns`] for a reverse feature. `score` and `confidence` rank
-/// forward results only, so they stay empty.
 pub fn reverse_flat_columns(feature: Option<&ReverseFeature>) -> Vec<(&'static str, String)> {
     flat(
         feature.map(|feature| (&feature.properties.common, feature.geometry.coordinates)),
@@ -1674,7 +1580,6 @@ mod tests {
         assert_eq!(label, "Casino, Place du Casino, Монако-Вилль, 98000, MC");
         let mut highlights = vec![
             Highlight { start: 0, end: 3 },
-            // "Mon" of the local name, which the label no longer writes.
             Highlight { start: 25, end: 28 },
             Highlight { start: 33, end: 38 },
         ];
@@ -1688,7 +1593,6 @@ mod tests {
         );
     }
 
-    /// Twenty distinct codes, the cap, are read in the order given.
     const TWENTY: [&str; MAX_LANGUAGES] = [
         "ar", "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "he", "hu", "it", "ja",
         "ko", "nl", "pl", "pt", "ru",

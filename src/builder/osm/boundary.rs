@@ -36,8 +36,6 @@ use super::{
     timezone::Timezones,
 };
 
-/// Tags a boundary keeps after the scan besides its names. Its Wikidata
-/// and Wikipedia links rank it (see [`prominence`]).
 const BOUNDARY_TAG_KEYS: [&str; 12] = [
     "ISO3166-1:alpha2",
     "ISO3166-1:alpha3",
@@ -57,7 +55,6 @@ const BOUNDARY_TAG_KEYS: [&str; 12] = [
 pub(crate) struct BoundaryRelationStub {
     pub object_id: i64,
     pub members: Vec<BoundaryRelationMember>,
-    /// The node its relation's `label` member references.
     pub label: Option<i64>,
     pub tags: BTreeMap<String, String>,
 }
@@ -74,7 +71,6 @@ pub(crate) enum BoundaryMemberRole {
     Inner,
 }
 
-/// A resolved vertex of a boundary member way. Rings are stitched on node ids.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Vertex {
     pub node_id: i64,
@@ -82,7 +78,6 @@ pub(crate) struct Vertex {
     pub lon: f64,
 }
 
-/// A boundary-tagged way whose vertices all resolved.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundaryWay {
     pub object_id: i64,
@@ -95,26 +90,18 @@ pub(crate) struct BoundaryIndex {
     boundaries: Vec<AcceptedBoundary>,
     tree: RTree<BoundaryBox>,
     shapes: Arc<Shapes>,
-    /// The towns mapped only as a point, which a record near one may lie in.
     dots: RTree<TownDot>,
-    /// Each boundary by its record id.
     by_record: HashMap<RecordId, usize>,
-    /// Each boundary by the OSM object it was built from.
     by_source: HashMap<(ObjectType, i64), usize>,
 }
 
-/// A town mapped only as a point, a city, town, village or hamlet node that
-/// merged into no boundary.
 #[derive(Debug, Clone)]
 pub(crate) struct TownDot {
     pub(crate) record_id: RecordId,
     pub(crate) point: [f64; 2],
     pub(crate) name: String,
     pub(crate) settlement: Settlement,
-    /// How far the town names the points around it (see
-    /// [`super::towns::measure_reach`]).
     pub(crate) reach_m: f64,
-    /// The country it lies in, so a town never names a point across a border.
     country: Option<RecordId>,
 }
 
@@ -136,8 +123,6 @@ impl TownDot {
     }
 }
 
-/// How important a settlement is as the town a record lies in, by its kind
-/// ([`place_rank`]) and how well known it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Settlement {
     pub(crate) rank: u8,
@@ -145,7 +130,6 @@ pub(crate) struct Settlement {
 }
 
 impl Settlement {
-    /// The more important of two, the first when they are alike.
     pub(crate) fn max(self, other: Self) -> Self {
         if other.cmp_importance(self).is_lt() {
             other
@@ -154,7 +138,6 @@ impl Settlement {
         }
     }
 
-    /// `Less` when `self` is the more important.
     fn cmp_importance(self, other: Self) -> Ordering {
         self.rank
             .cmp(&other.rank)
@@ -162,20 +145,16 @@ impl Settlement {
     }
 }
 
-/// How much the town envelope outgrows its reach, so rounding never drops a point at the edge.
 const ENVELOPE_SLACK: f64 = 1.000_001;
 
-/// A town point is found by the points its reach holds.
 impl RTreeObject for TownDot {
     type Envelope = AABB<[f64; 2]>;
 
     fn envelope(&self) -> Self::Envelope {
         let [lon, lat] = self.point;
-        // The spherical cap of the reach, as `haversine_m` measures, widened a hair for rounding.
         let angle = self.reach_m / EARTH_RADIUS_M * ENVELOPE_SLACK;
         let tall = angle.to_degrees();
         let (south, north) = ((lat - tall).max(-90.0), (lat + tall).min(90.0));
-        // A cap that holds a pole spans every longitude.
         if lat.abs() + tall >= 90.0 {
             return AABB::from_corners([-180.0, south], [180.0, north]);
         }
@@ -198,13 +177,8 @@ pub(crate) struct SourceContext<'a> {
 struct AcceptedBoundary {
     record_id: RecordId,
     layer: PlaceLayer,
-    /// Everything this area is. Usually just `layer`, but a boundary whose
-    /// own `place` tag names a different tier is both: Berlin is a German
-    /// state by its admin level and a city by its tag, and an address there
-    /// has to answer a query for either.
     tiers: TierSet,
     name: String,
-    /// `None` for a place drawn as an area.
     admin_level: Option<u8>,
     inferred_country_record_id: Option<RecordId>,
     source_object_type: ObjectType,
@@ -213,8 +187,6 @@ struct AcceptedBoundary {
     shape: ShapeRef,
     area: f64,
     interior_point: Option<[f64; 2]>,
-    /// The settlement it is, when its own `place` tag, a town node merged
-    /// into it or a town point of its name inside it makes it one.
     town: Option<Settlement>,
 }
 
@@ -224,60 +196,35 @@ struct BoundaryBox {
     boundary_id: usize,
 }
 
-/// An area records lie in: an admin boundary, or a place drawn as a closed
-/// way or a multipolygon (`place=island`, `place=suburb`).
 #[derive(Clone)]
 struct BuiltBoundary {
     layer: PlaceLayer,
-    /// `None` for a place area, which takes its layer from its `place` tag
-    /// and stays out of the admin level ranking.
     admin_level: Option<u8>,
-    /// The `place` tag of a place area, its record's place type.
     place_type: Option<String>,
     name: String,
     alt_names: Vec<String>,
-    /// Its name in each language a `name:<lang>` tag states.
     language_names: Vec<(String, String)>,
     prominence: Prominence,
     wikidata: Option<u32>,
-    /// The layer its `place` tag names, if any (`place=city` is a locality).
     place_layer: Option<PlaceLayer>,
-    /// Its `designation` tag (`unitary_authority`), which libpostal's table
-    /// reads in some countries.
     designation: Option<String>,
     inferred_country_code: Option<String>,
-    /// The `ISO3166-2` code of a boundary below its country, upper case:
-    /// `CA-ON`. Kept whatever tier the boundary is ranked at, which for a
-    /// country with many levels need not be the region tier.
     subdivision_code: Option<String>,
     area_tags: AreaTags,
-    /// Its `license_plate_code` tag, the code of its vehicle plates (`SIM`).
     plate_code: Option<String>,
-    /// Its `default_language` tag, the language its local names are written
-    /// in, as it writes it (`en`, `nl;fr`).
     default_language: Option<String>,
-    /// Where its shape lies in the shape file; nothing until it is written.
     shape: ShapeRef,
     bounds: Rect<f64>,
-    /// The box an answer gives. It is `bounds` the short way round, which
-    /// for an area over the antimeridian is not the least and greatest
-    /// longitude.
     extent: Extent,
     area: f64,
     representative_point: [f64; 2],
-    /// A point inside the outline; the representative point of a C-shaped
-    /// area lies outside it.
     interior_point: Option<[f64; 2]>,
     /// Whether every outer way closed into a ring. A relation one of whose
     /// rings is left open, such as Russia's mainland, keeps the rings that
     /// closed (Kaliningrad) and covers only them.
     rings_closed: bool,
-    /// A town, city or other settlement node was merged into it.
     settled: bool,
-    /// The [`place_rank`] of the most important town node merged into it.
     town: Option<u8>,
-    /// Names gained from merged place points. They go on this boundary's own
-    /// record only; as area names of every record inside it they'd bloat the text index.
     point_names: Vec<String>,
 }
 
@@ -285,37 +232,28 @@ struct BuiltBoundary {
 pub(crate) struct BoundaryCandidate {
     source_object_type: ObjectType,
     source_object_id: i64,
-    /// The node its relation's `label` member references.
     label: Option<i64>,
     boundary: BuiltBoundary,
 }
 
-/// Where a context record came from, so its final record id can be wired into
-/// the boundary index after records are sorted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ContextOrigin {
     Boundary(u32),
     DerivedCountry(String),
 }
 
-/// Admin boundaries built from the input, before record ids are known.
 pub(crate) struct BoundarySet {
     candidates: Vec<BoundaryCandidate>,
     derived_countries: Vec<(String, PlaceRecord)>,
-    /// The ways and relations libpostal's admin table names for the
-    /// countries of the input that the input does not have.
     unmatched_admin_ids: Vec<String>,
     shapes: Arc<Shapes>,
 }
 
-/// A boundary assembled, and the block of its shape not yet written.
 struct Draft {
     candidate: BoundaryCandidate,
     block: Vec<u8>,
 }
 
-/// Boundaries as they are assembled. Each shape goes to the shape file as
-/// soon as it is built, so the heap holds only what describes the areas.
 pub(crate) struct BoundaryBuilder {
     candidates: Vec<BoundaryCandidate>,
     shapes: ShapeWriter,
@@ -333,8 +271,6 @@ impl BoundaryBuilder {
         })
     }
 
-    /// The closed boundary and place ways among `ways`, assembled in
-    /// parallel.
     pub(crate) fn add_ways(&mut self, ways: &[BoundaryWay]) -> crate::error::Result<()> {
         let drafts = ways
             .par_iter()
@@ -354,9 +290,6 @@ impl BoundaryBuilder {
         self.write(drafts)
     }
 
-    /// The areas `relations` make, assembled in parallel. `member_line`
-    /// gives a member way's vertices, `None` when it was not kept or a node
-    /// of it is missing.
     pub(crate) fn add_relations(
         &mut self,
         relations: &[BoundaryRelationStub],
@@ -395,19 +328,14 @@ impl BoundaryBuilder {
         Ok(())
     }
 
-    /// Heap the boundaries assembled so far hold.
     pub(crate) fn heap_bytes(&self) -> usize {
         self.heap_bytes
     }
 
-    /// Vertices of the shapes written so far.
     pub(crate) fn vertices(&self) -> u64 {
         self.vertices
     }
 
-    /// Rank the boundaries into layers, which is only knowable once every
-    /// one is in hand, and derive the countries the input has no boundary
-    /// of.
     pub(crate) fn finish(self) -> crate::error::Result<BoundarySet> {
         let shapes = Arc::new(self.shapes.finish()?);
         let mut candidates = self.candidates;
@@ -422,7 +350,6 @@ impl BoundaryBuilder {
     }
 }
 
-/// Vertices a shape block holds: its first count.
 fn shape_vertices(block: &[u8]) -> u32 {
     block.get(..4).map_or(0, |count| {
         u32::from_le_bytes(count.try_into().expect("4 bytes"))
@@ -430,7 +357,6 @@ fn shape_vertices(block: &[u8]) -> u32 {
 }
 
 impl BoundaryCandidate {
-    /// Heap the candidate holds; its shape is on disk.
     fn heap_bytes(&self) -> usize {
         let boundary = &self.boundary;
         let text = |value: &Option<String>| value.as_ref().map_or(0, String::capacity);
@@ -466,7 +392,6 @@ impl BoundaryCandidate {
     }
 }
 
-/// Whether `boundary` covers `point`, its box tested first.
 fn covers_point(shapes: &Shapes, boundary: &BuiltBoundary, [lon, lat]: [f64; 2]) -> bool {
     let (min, max) = (boundary.bounds.min(), boundary.bounds.max());
     (min.x..=max.x).contains(&lon)
@@ -475,9 +400,6 @@ fn covers_point(shapes: &Shapes, boundary: &BuiltBoundary, [lon, lat]: [f64; 2])
 }
 
 impl BoundarySet {
-    /// Heap the boundaries hold, for the memory budget. Their shapes are
-    /// mapped from the shape file, page cache the system reclaims, so only
-    /// what describes them counts.
     pub(crate) fn heap_bytes(&self) -> usize {
         self.candidates
             .iter()
@@ -485,13 +407,10 @@ impl BoundarySet {
             .sum()
     }
 
-    /// The shape file, which the index and a checkpoint keep.
     pub(crate) fn shapes(&self) -> &Arc<Shapes> {
         &self.shapes
     }
 
-    /// The objects libpostal's admin table names that the input lacks: a
-    /// rule for an id OSM no longer has applies to nothing.
     pub(crate) fn unmatched_admin_ids(&self) -> &[String] {
         &self.unmatched_admin_ids
     }
@@ -500,7 +419,6 @@ impl BoundarySet {
         self.candidates.len()
     }
 
-    /// Place records for every boundary and derived country.
     pub(crate) fn place_records(&self, report: &mut BuilderReport) -> Vec<(ContextOrigin, Record)> {
         let mut records = Vec::new();
         for (code, record) in &self.derived_countries {
@@ -551,8 +469,6 @@ impl BoundarySet {
         records
     }
 
-    /// What can link a place point to a boundary: its `label` node, its
-    /// Wikidata item, or its name, each at the boundary's layer.
     pub(crate) fn place_links(&mut self) -> PlaceLinks {
         let mut links = PlaceLinks {
             labels: HashMap::new(),
@@ -583,9 +499,6 @@ impl BoundarySet {
         links
     }
 
-    /// Finds the boundary the place point at position `at` names, if any.
-    /// Nothing merges until every point is matched, so no match depends on
-    /// the order the points arrive in.
     pub(crate) fn match_place_point(
         &self,
         links: &mut PlaceLinks,
@@ -619,9 +532,6 @@ impl BoundarySet {
         }
     }
 
-    /// Matches the points that named no boundary to one a point of their
-    /// Wikidata item named, when its box holds them: one item is one place,
-    /// whichever of its points the boundary was matched by.
     pub(crate) fn group_place_points(&self, links: &mut PlaceLinks) {
         for (at, item, layer, point) in std::mem::take(&mut links.waiting) {
             let held = links.brought.get(&(item, layer)).and_then(|boundaries| {
@@ -637,10 +547,6 @@ impl BoundarySet {
         }
     }
 
-    /// Merges the place point at position `at` into the boundary it was
-    /// matched to, if any. The boundary takes its names, fame and settlement
-    /// now, and its point and item once every point is in
-    /// ([`Self::finish_place_merges`]).
     pub(crate) fn merge_place_point(
         &mut self,
         links: &mut PlaceLinks,
@@ -651,8 +557,6 @@ impl BoundarySet {
             return false;
         };
         let boundary = &mut self.candidates[index].boundary;
-        // The strongest link wins, so a `label` node beats a name or Wikidata
-        // match; of equal links, the first.
         if links.strongest[index].is_none_or(|held| held.link < link)
             && let Some(point) = point_lon_lat(&place.geometry)
         {
@@ -680,11 +584,6 @@ impl BoundarySet {
         true
     }
 
-    /// Gives each boundary the point of the place point its strongest link
-    /// came from, and that point's Wikidata item when the boundary has none.
-    /// A boundary's own item names the boundary. A `label` node's item often
-    /// names something else: the settlement inside a commune, the district a
-    /// cadastral quarter shares its name with, or a historical region.
     pub(crate) fn finish_place_merges(&mut self, links: PlaceLinks) {
         for (candidate, strongest) in self.candidates.iter_mut().zip(links.strongest) {
             if let Some(Strongest { point, item, .. }) = strongest {
@@ -694,20 +593,16 @@ impl BoundarySet {
         }
     }
 
-    /// Whether boundary `index`'s box holds `point`.
     fn holds(&self, index: usize, [lon, lat]: [f64; 2]) -> bool {
         let bounds = self.candidates[index].boundary.bounds;
         let (min, max) = (bounds.min(), bounds.max());
         (min.x..=max.x).contains(&lon) && (min.y..=max.y).contains(&lat)
     }
 
-    /// Whether a town, city or other settlement node was merged into boundary `index`.
     pub(crate) fn is_settled(&self, index: usize) -> bool {
         self.candidates[index].boundary.settled
     }
 
-    /// Names of the records admin context tuples can point at, by record id:
-    /// each area's `name` first, then its alternate names.
     pub(crate) fn context_names(
         &self,
         boundary_record_ids: &[RecordId],
@@ -747,10 +642,6 @@ impl BoundarySet {
             .collect()
     }
 
-    /// What the boundaries cover: the countries whose own boundary is
-    /// whole, and the regions of the others. A country boundary assembles only
-    /// from every one of its ways, so an extract of one province has the
-    /// province but not its country.
     pub(crate) fn coverage(&self) -> crate::builder::addresses::Coverage {
         let mut coverage = crate::builder::addresses::Coverage::default();
         for candidate in &self.candidates {
@@ -774,10 +665,6 @@ impl BoundarySet {
         coverage
     }
 
-    /// Whether a point lies in the country (`JP`) or region (`CA-ON`) of
-    /// ISO 3166 code `code`; `None` when the Pack has no boundary of that
-    /// code to tell by, or one of its boundaries left a ring open and so
-    /// covers only part of the area.
     pub(crate) fn area(&self, code: &str) -> Option<impl Fn([f64; 2]) -> bool + '_> {
         let region = code.contains('-');
         let boundaries = self
@@ -807,8 +694,6 @@ impl BoundarySet {
         })
     }
 
-    /// The country code of each country record, by record id: the country
-    /// boundaries that state one, and the derived countries.
     pub(crate) fn country_codes(
         &self,
         boundary_record_ids: &[RecordId],
@@ -829,8 +714,6 @@ impl BoundarySet {
         boundaries.chain(derived).collect()
     }
 
-    /// The names in other languages of each area record whose boundary
-    /// states any, by record id.
     pub(crate) fn language_names(
         &self,
         boundary_record_ids: &[RecordId],
@@ -843,8 +726,6 @@ impl BoundarySet {
             .collect()
     }
 
-    /// The ISO 3166-2 code of each area record below a country whose
-    /// boundary states one (`CA-ON`), by record id.
     pub(crate) fn subdivision_codes(
         &self,
         boundary_record_ids: &[RecordId],
@@ -859,8 +740,6 @@ impl BoundarySet {
             .collect()
     }
 
-    /// The vehicle plate code of each area record whose boundary states one
-    /// (`SIM`), by record id.
     pub(crate) fn plate_codes(
         &self,
         boundary_record_ids: &[RecordId],
@@ -874,8 +753,6 @@ impl BoundarySet {
             .collect()
     }
 
-    /// The default language of each area record whose boundary states one,
-    /// as it writes it, by record id.
     pub(crate) fn default_languages(
         &self,
         boundary_record_ids: &[RecordId],
@@ -889,7 +766,6 @@ impl BoundarySet {
             .collect()
     }
 
-    /// The box around each area, by record id.
     pub(crate) fn extents(&self, boundary_record_ids: &[RecordId]) -> Vec<(RecordId, Extent)> {
         self.candidates
             .iter()
@@ -898,10 +774,6 @@ impl BoundarySet {
             .collect()
     }
 
-    /// The groups of regions each admin region lies in, by record id: the
-    /// larger admin regions of another name covering its representative
-    /// point ("関東地方" of "千葉県"). A record keeps the smaller region as
-    /// its own, yet queries name either.
     pub(crate) fn region_groups(
         &self,
         boundary_record_ids: &[RecordId],
@@ -939,7 +811,6 @@ impl BoundarySet {
             .collect()
     }
 
-    /// Index the boundaries under their final record ids.
     pub(crate) fn into_index(
         self,
         boundary_record_ids: &[RecordId],
@@ -986,9 +857,6 @@ impl BoundarySet {
     }
 }
 
-/// Admin context for a record, from the boundaries covering its display point.
-/// Values the source data states (an `addr:city`, a place's own name) win ties
-/// between overlapping boundaries.
 pub(crate) fn record_context(
     index: &BoundaryIndex,
     record: &Record,
@@ -1087,8 +955,6 @@ impl BoundaryIndex {
         codes
     }
 
-    /// The timezone of each area that lies wholly in one, by record id, and
-    /// how many areas there are.
     pub(crate) fn timezones(&self, zones: &Timezones) -> (Vec<(RecordId, u16)>, u64) {
         let zoned = self
             .boundaries
@@ -1130,9 +996,6 @@ impl BoundaryIndex {
         }
     }
 
-    /// Learns the towns the boundaries alone do not say. These are the areas
-    /// a town point of their name lies in, with that point's rank, and the
-    /// town points that lie in no area of their name.
     pub(crate) fn add_towns(
         &mut self,
         named: impl IntoIterator<Item = (RecordId, Settlement)>,
@@ -1165,8 +1028,6 @@ impl BoundaryIndex {
         self.dots = RTree::bulk_load(dots);
     }
 
-    /// The reach of each town point, in whole metres, by its record id, as
-    /// a checkpoint saves it.
     pub(crate) fn town_reach(&self) -> Vec<(RecordId, u32)> {
         let mut reach = self
             .dots
@@ -1177,7 +1038,6 @@ impl BoundaryIndex {
         reach
     }
 
-    /// The settlement areas, by record id, with their rank and inner point.
     pub(crate) fn settlement_areas(&self) -> impl Iterator<Item = (RecordId, u8, [f64; 2])> + '_ {
         self.boundaries.iter().filter_map(|boundary| {
             Some((
@@ -1188,7 +1048,6 @@ impl BoundaryIndex {
         })
     }
 
-    /// The areas under the country at a point.
     pub(crate) fn areas_at(&self, lon: f64, lat: f64) -> impl Iterator<Item = RecordId> + '_ {
         self.covered(lon, lat)
             .into_iter()
@@ -1196,7 +1055,6 @@ impl BoundaryIndex {
             .map(|boundary| boundary.record_id)
     }
 
-    /// The smallest area under the country at a point that `holds` accepts.
     pub(crate) fn smallest_area_at(
         &self,
         lon: f64,
@@ -1210,10 +1068,6 @@ impl BoundaryIndex {
             .map(|boundary| boundary.record_id)
     }
 
-    /// The context of an area of `tier`: the areas at its point that are
-    /// broader than it and whose box holds its own. An island's point lies
-    /// in one of the towns on it, which does not hold the island. An area
-    /// with no outline, a place mapped as a node, is its point.
     pub(crate) fn area_context(
         &self,
         tier: PlaceLayer,
@@ -1258,8 +1112,6 @@ impl BoundaryIndex {
         self.context_around(lon, lat, source_context, None)
     }
 
-    /// The area and inner point of the boundary a [`ContextOrigin::Boundary`]
-    /// record was made from.
     pub(crate) fn own_area(&self, origin: u32) -> Option<OwnArea> {
         self.boundaries
             .get(usize::try_from(origin).ok()?)
@@ -1269,11 +1121,6 @@ impl BoundaryIndex {
             })
     }
 
-    /// [`Self::context_for_point`], for a record made from an area of its own:
-    /// `enclosing` lists the areas around a point inside `own`, larger than
-    /// it. The point of the record is a centroid, which can lie outside its
-    /// outline, in the hole of a ring or a bay of a C, inside areas that it
-    /// does not lie in.
     pub(crate) fn context_around(
         &self,
         lon: f64,
@@ -1337,14 +1184,6 @@ impl BoundaryIndex {
         }
     }
 
-    /// The town a point lies in, when the tiers alone do not hold it in
-    /// `locality`. The settlement areas around the point no smaller than the
-    /// area the tiers put in `locality` compete, and so do the town points
-    /// whose reach holds it, in its country, where the tiers put no boundary
-    /// in `locality`, so a commune that holds a hamlet's point stays the town.
-    /// A town point is the town of no other town point. The best area and
-    /// the best point are found apart (see [`Candidate`]), then the one the
-    /// source names wins, else the more important, else the area.
     fn town<'a>(
         &'a self,
         covered: &[&'a AcceptedBoundary],
@@ -1358,7 +1197,6 @@ impl BoundaryIndex {
                 .is_some_and(|locality| same_text(locality, name))
         };
         let tiered = best[PlaceLayer::Locality as usize];
-        // Merged municipality stays the town over the village it grew from.
         let areas = covered
             .iter()
             .filter(|boundary| tiered.is_none_or(|tiered| boundary.area >= tiered.area))
@@ -1370,7 +1208,6 @@ impl BoundaryIndex {
                     size: boundary.area,
                 })
             });
-        // Town points are towns themselves, never inside another (Te Awamutu, Hamilton).
         let is_dot = |dot: &TownDot| {
             dot.point == [lon, lat] && source_context.place.is_some_and(|place| place == dot.name)
         };
@@ -1398,8 +1235,6 @@ impl BoundaryIndex {
         (tiered.map(|tiered| tiered.record_id) != Some(town.record_id())).then_some(town)
     }
 
-    /// The town points whose reach holds a point, in the country the point
-    /// lies in, with the share of its reach each lies away.
     fn dots_reaching<'a>(
         &'a self,
         lon: f64,
@@ -1407,7 +1242,6 @@ impl BoundaryIndex {
         best: &Best<'_>,
     ) -> impl Iterator<Item = (&'a TownDot, f64)> {
         let country = country_of(best);
-        // An envelope past the antimeridian holds the point a full turn over.
         [lon, lon + 360.0, lon - 360.0]
             .into_iter()
             .flat_map(move |turned| {
@@ -1422,13 +1256,6 @@ impl BoundaryIndex {
             })
     }
 
-    /// Whether `inner` lies inside `outer`, as `outer` covers a point inside
-    /// `inner` and `inner` is the smaller and not drawn over the same
-    /// ground. Two areas each covering the other's inner point, the smaller
-    /// more than half the size of the larger, are drawn over the same
-    /// ground, such as a borough and its county, and lie inside neither. The
-    /// inner point of a municipality lies in one of the villages it is made
-    /// of, which is still a part of it.
     fn lies_inside(&self, inner: &AcceptedBoundary, outer: &AcceptedBoundary) -> bool {
         let covers = |area: &AcceptedBoundary, point: Option<[f64; 2]>| {
             point.map(|[lon, lat]| self.shapes.covers(area.shape, lon, lat))
@@ -1446,14 +1273,6 @@ impl BoundaryIndex {
         }
     }
 
-    /// The context of a point around its town. The country, the region and
-    /// the areas whose tier agrees with their size keep their tiers. The town
-    /// takes `locality`. An area the tiers put on the wrong side of the town
-    /// moves to a free tier on its own side, nearer the town the fewer of the
-    /// other moving areas lie between. A Moscow district inside the city
-    /// moves below it, the county around a village above it. Areas wanting one
-    /// tier keep one, by [`compare_side_by_side`]; the others stay in the
-    /// chain the Pack stores.
     fn around_town<'a>(
         &self,
         town: &Town<'_>,
@@ -1535,10 +1354,6 @@ impl BoundaryIndex {
     }
 }
 
-/// Orders areas wanting one tier of which neither lies inside the other, the
-/// best first. The one the source names wins. Areas drawn over the same
-/// ground, such as a borough and its county, are the same size, so the finer
-/// level of the two counts as the smaller; else the smaller wins.
 fn compare_side_by_side(
     tier: PlaceLayer,
     left: &AcceptedBoundary,
@@ -1555,22 +1370,14 @@ fn compare_side_by_side(
         .then_with(|| compare_boundary(tier, left, right, source_context))
 }
 
-/// A settlement a point may lie in, as [`BoundaryIndex::town`] weighs it.
-/// Each order puts the one the source names first.
 struct Candidate<'a> {
     town: Town<'a>,
     named: bool,
     settlement: Settlement,
-    /// An area's size, or the share of its reach a town point lies away.
     size: f64,
 }
 
 impl Candidate<'_> {
-    /// Of two areas, or two town points, the more important kind, then the
-    /// smaller area or the point whose reach the point lies furthest inside:
-    /// a village drawn inside a city is part of the city. How well known
-    /// each is says nothing here. A house by one village's point is in that
-    /// village, whatever the next village is called in other languages.
     fn cmp_alike(left: &Self, right: &Self) -> Ordering {
         right
             .named
@@ -1580,9 +1387,6 @@ impl Candidate<'_> {
             .then(left.town.record_id().cmp(&right.town.record_id()))
     }
 
-    /// The best area against the best point, the more important first, then
-    /// the area. A borough that is a city by its own tags yields to the city
-    /// point inside it, which is better known.
     fn cmp_across(left: &Self, right: &Self) -> Ordering {
         right
             .named
@@ -1592,13 +1396,6 @@ impl Candidate<'_> {
     }
 }
 
-/// The best covering boundary ranked into each tier, and whether any tier was
-/// wanted by two.
-///
-/// One pass over the covering boundaries, keeping the best of each tier,
-/// rather than one filtering pass per tier: this runs for every record of
-/// the build, and a pass per tier allocated a vector for each of the ten even
-/// though all but two or three are empty.
 fn best_of_each_tier<'a>(
     covered: &[&'a AcceptedBoundary],
     source_context: &SourceContext<'_>,
@@ -1620,12 +1417,8 @@ fn best_of_each_tier<'a>(
     (best, flags)
 }
 
-/// The best boundary of each tier, by tier.
 type Best<'a> = [Option<&'a AcceptedBoundary>; PlaceLayer::ALL.len()];
 
-/// Each tier takes the best boundary ranked into it, and a boundary that is
-/// more than one thing is set under each: it stays one entry of the chain
-/// carrying both tiers.
 fn tiered(best: &Best<'_>) -> AdminContextTuple {
     AdminContextTuple::from_tiers(PlaceLayer::ALL.into_iter().flat_map(|tier| {
         best[tier as usize]
@@ -1634,7 +1427,6 @@ fn tiered(best: &Best<'_>) -> AdminContextTuple {
     }))
 }
 
-/// The town a point lies in, where its tiers did not put it.
 enum Town<'a> {
     Area(&'a AcceptedBoundary),
     Dot(&'a TownDot),
@@ -1652,8 +1444,6 @@ impl Town<'_> {
         matches!(self, Self::Dot(_))
     }
 
-    /// Whether `unit` lies inside the town, by area against an area and by
-    /// [`place_rank`] against a point, which has none.
     fn is_inside(&self, unit: &AcceptedBoundary) -> Option<bool> {
         match self {
             Self::Area(area) => Some(unit.area < area.area),
@@ -1662,8 +1452,6 @@ impl Town<'_> {
     }
 }
 
-/// The tiers between the region and the town, nearest the town first, and
-/// those inside the town, nearest first.
 const ABOVE_TOWN: [PlaceLayer; 3] = [
     PlaceLayer::SubDistrict,
     PlaceLayer::District,
@@ -1675,13 +1463,10 @@ const INSIDE_TOWN: [PlaceLayer; 3] = [
     PlaceLayer::SubNeighbourhood,
 ];
 
-/// A unit's [`place_rank`]: twice its admin level.
 fn unit_rank(unit: &AcceptedBoundary) -> Option<u8> {
     unit.admin_level.map(|level| level.saturating_mul(2))
 }
 
-/// The [`place_rank`] of a settlement a record's town can be. Its parts
-/// (`suburb`, `quarter`) and the areas above a town (`municipality`) are not.
 pub(crate) fn town_rank(place_type: &str) -> Option<u8> {
     TOWN_KINDS
         .contains(&place_type)
@@ -1689,11 +1474,8 @@ pub(crate) fn town_rank(place_type: &str) -> Option<u8> {
         .flatten()
 }
 
-/// The kinds of settlement a record's town can be.
 const TOWN_KINDS: [&str; 4] = ["city", "town", "village", "hamlet"];
 
-/// The record of an area that a record was made from, as far as its list of
-/// enclosing areas is concerned.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OwnArea {
     area: f64,
@@ -1707,15 +1489,11 @@ struct Covering<'a> {
     derived_country: Option<RecordId>,
 }
 
-/// The covering areas, smallest first, and only those larger than
-/// `larger_than`.
 fn enclosing(
     mut covered: Vec<&AcceptedBoundary>,
     derived_country: Option<RecordId>,
     larger_than: Option<f64>,
 ) -> Vec<RecordId> {
-    // Size orders them; it does not prove one lies in the next. Ties break
-    // on the source object so one input gives one order.
     let source = |boundary: &AcceptedBoundary| {
         let object_type = source_type_rank(boundary.source_object_type);
         (object_type, boundary.source_object_id)
@@ -1731,8 +1509,6 @@ fn enclosing(
         .collect()
 }
 
-/// Whether the tags make an area records can lie in: an admin boundary, or
-/// a named place of a layer the Pack has (see [`area_parts`]).
 pub(crate) fn has_area_tags(tags: &BTreeMap<String, String>) -> bool {
     area_parts(tags).is_some()
 }
@@ -1756,20 +1532,16 @@ pub(crate) fn required_boundary_way_ids(relations: &[BoundaryRelationStub]) -> H
         .collect()
 }
 
-/// The country a region names when no boundary is the country.
 fn inferred_country(best: &Best<'_>) -> Option<RecordId> {
     best[PlaceLayer::Region as usize].and_then(|region| region.inferred_country_record_id)
 }
 
-/// The country boundary of a point, else the one its region names, so a town and the points it names agree.
 fn country_of(best: &Best<'_>) -> Option<RecordId> {
     best[PlaceLayer::Country as usize]
         .map(|country| country.record_id)
         .or_else(|| inferred_country(best))
 }
 
-/// Region boundaries whose ISO 3166-2 code names a country that has no
-/// country boundary in the input get a derived country record.
 fn derived_country_records(candidates: &[BoundaryCandidate]) -> Vec<(String, PlaceRecord)> {
     let actual_country_codes = candidates
         .iter()
@@ -1812,8 +1584,6 @@ fn derived_country_records(candidates: &[BoundaryCandidate]) -> Vec<(String, Pla
     sources.into_iter().collect()
 }
 
-/// Whether a boundary way can be an area of its own: closed, and tagged as
-/// one.
 pub(crate) fn may_be_area(way: &BoundaryWay) -> bool {
     way.vertices.len() >= 4
         && ends(&way.vertices).is_some_and(|(first, last)| first == last)
@@ -1846,8 +1616,6 @@ fn boundary_from_relation(
     Ok(built(parts, &stub.tags, &geometry, rings_closed))
 }
 
-/// Point inside the outline, not the centre: a ring's centre can lie in its
-/// hole. [`super::poi::emit_poi`] decides from the tags whether it is a place.
 pub(crate) fn place_relations(
     relations: &[BoundaryRelationStub],
     member_line: impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>> + Sync,
@@ -1867,7 +1635,6 @@ pub(crate) fn place_relations(
                 .flatten()
                 .map(|vertex| vertex.node_id)
                 .collect();
-            // Two member ways meet at a node, which is one entrance.
             let mut seen = HashSet::new();
             let entrances = lines
                 .outer
@@ -1902,13 +1669,11 @@ pub(crate) fn place_relations(
         .collect()
 }
 
-/// The lines of a relation's members by role, before they are stitched.
 struct MemberLines {
     outer: Vec<Vec<Vertex>>,
     inner: Vec<Vec<Vertex>>,
 }
 
-/// None when a member's line is missing.
 fn member_lines(
     stub: &BoundaryRelationStub,
     member_line: &impl Fn(i64) -> crate::error::Result<Option<Vec<Vertex>>>,
@@ -1931,8 +1696,6 @@ fn member_lines(
     }))
 }
 
-/// The shape the rings of `lines` make, and whether every outer way closed
-/// into a ring.
 fn rings_geometry(lines: MemberLines) -> Option<(MultiPolygon<f64>, bool)> {
     let (outer_rings, outer_closed) = stitch_rings(lines.outer);
     if outer_rings.is_empty() {
@@ -1945,9 +1708,6 @@ fn rings_geometry(lines: MemberLines) -> Option<(MultiPolygon<f64>, bool)> {
     ))
 }
 
-/// The boundary an area's tags and geometry make, and the block of its
-/// shape: what is asked of the geometry later is read off it now, so it
-/// need not stay in memory.
 fn built(
     parts: AreaParts,
     tags: &BTreeMap<String, String>,
@@ -2042,8 +1802,6 @@ fn ring_line_string(ring: &[Vertex]) -> LineString<f64> {
     )
 }
 
-/// The rings `segments` join into, and whether every segment ended in one:
-/// a chain that cannot close is left out.
 fn stitch_rings(mut segments: Vec<Vec<Vertex>>) -> (Vec<Vec<Vertex>>, bool) {
     segments.retain(|segment| segment.len() >= 2);
     let mut rings = Vec::new();
@@ -2105,7 +1863,6 @@ fn join_segment(ring: &mut Vec<Vertex>, mut segment: Vec<Vertex>) {
     }
 }
 
-/// What the tags of an area say about it.
 struct AreaParts {
     layer: PlaceLayer,
     admin_level: Option<u8>,
@@ -2116,9 +1873,6 @@ struct AreaParts {
     designation: Option<String>,
 }
 
-/// An admin boundary, or else a named place of a layer the Pack has drawn as
-/// an area: an island, a city or a district mapped as a closed way or a
-/// multipolygon rather than as a node.
 fn area_parts(tags: &BTreeMap<String, String>) -> Option<AreaParts> {
     admin_boundary_parts(tags).or_else(|| place_area_parts(tags))
 }
@@ -2131,8 +1885,6 @@ fn admin_boundary_parts(tags: &BTreeMap<String, String>) -> Option<AreaParts> {
     let layer = admin_level_layer(admin_level)?;
     let name = tags.cleaned("name")?;
     let mut alt_names = alternate_names(tags, &name);
-    // The codes a country or a region is written as: "DEU", and "NW" of
-    // "DE-NW" or "ON" of "CA-ON".
     let codes = [
         tags.cleaned("ISO3166-1:alpha3")
             .filter(|_| admin_level <= COUNTRY_ADMIN_LEVEL),
@@ -2247,20 +1999,12 @@ fn admin_level_layer(admin_level: u8) -> Option<PlaceLayer> {
     Some(conventional_admin_layer(admin_level).unwrap_or(PlaceLayer::SubNeighbourhood))
 }
 
-/// What one level of a country wants: the tier, and whether that is stated
-/// by libpostal's table or the level's own `place` tags rather than only the
-/// convention for the number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Want {
     layer: Option<PlaceLayer>,
     stated: bool,
 }
 
-/// The level of a country that anchors the locality tier, the tier an
-/// address query matches a town on. It is the outermost level the table
-/// calls a city, else the outermost below the district -- Australia's level
-/// 9 is tagged a suburb and is still the town an address names, and without
-/// an anchor an Australian Pack answers no structured query at all.
 fn anchor_level(levels: &BTreeMap<u8, Want>) -> Option<u8> {
     levels
         .iter()
@@ -2273,14 +2017,6 @@ fn anchor_level(levels: &BTreeMap<u8, Want>) -> Option<u8> {
         .map(|(level, _)| *level)
 }
 
-/// The levels above a country's anchor that give up a tier of their own,
-/// when more levels lie above the anchor than tiers above `locality_at`.
-/// They are the outermost of the levels that claim no tier, as many as it
-/// takes.
-/// France in the planet has 3 (France métropolitaine) and 5 (Collectivité
-/// européenne d'Alsace), which no table row names, beside 2, 4, 6 and 7
-/// above its communes. Without this its arrondissements took the locality
-/// tier and the communes the one below.
 fn folded_levels(levels: &BTreeMap<u8, Want>, locality_at: usize) -> BTreeSet<u8> {
     let Some(anchor) = anchor_level(levels) else {
         return BTreeSet::new();
@@ -2294,42 +2030,11 @@ fn folded_levels(levels: &BTreeMap<u8, Want>, locality_at: usize) -> BTreeSet<u8
         .collect()
 }
 
-/// Layers that admin boundaries are ranked into, outermost first. `Place` is
-/// left out: it belongs to place nodes, not to administrative boundaries.
 const ADMIN_LAYER_ORDER: [PlaceLayer; 9] = PlaceLayer::ADMIN;
 
-/// Boundaries of one level and country whose `place` tag names a layer: at
-/// least this many...
 const MIN_PLACE_TAGGED_BOUNDARIES: usize = 10;
-/// ...and at least this share of them naming the same one, for the level to
-/// take that layer.
 const PLACE_TAG_AGREEMENT: f64 = 0.8;
 
-/// Give every boundary its layer, per country and admin level.
-///
-/// A level whose boundaries say what they are wins first: when enough of
-/// them carry a `place` tag and nearly all of those name one layer, the
-/// whole level takes it. Japan puts its cities, towns, villages and Tokyo's
-/// special wards at level 7 and tags many `place=city`, `town` or `village`,
-/// and the wards of its designated cities at level 8 with `place=suburb`, so
-/// 7 is the locality layer and 8 lies below it. Counting the whole level
-/// keeps neighbouring boundaries of one level in one layer.
-///
-/// The default numbers carry real meaning where a country follows the
-/// convention, so the levels tags say nothing about keep them: a level 8
-/// stays a locality, a level 10 stays a neighbourhood. The off-convention
-/// levels move into whichever layers a country leaves empty. An Australian
-/// extract has every suburb at level 9 and nothing at 8, so 9 becomes the
-/// locality layer that address queries match on; a German extract fills 8, 9
-/// and 10, so 8 keeps locality and 9 settles below it.
-///
-/// Filling gaps and reading tags needs no per-country table to maintain, so
-/// a country nobody has looked at still gets a locality layer.
-///
-/// Gaps are counted **per country**, because a level means different things on
-/// either side of a border, and per country rather than per individual chain so
-/// that one sparsely mapped region cannot classify differently to its
-/// neighbours, the usual way a relative-depth scheme goes wrong.
 fn assign_layers_by_containment(
     candidates: &mut Vec<BoundaryCandidate>,
     shapes: &Shapes,
@@ -2354,19 +2059,12 @@ fn assign_layers_by_containment(
         .collect::<Vec<_>>();
     let tagged = tagged_level_layers(candidates, &country_ids);
 
-    // What each country's levels want, before any of them compete. A level
-    // the table names, whose boundaries tag what they are, or that follows
-    // the convention has a preference; the rest have none and take whatever
-    // their depth earns them.
     let mut wanted: BTreeMap<CountryId, BTreeMap<u8, Want>> = BTreeMap::new();
     for (index, candidate) in candidates.iter().enumerate() {
         let Some(level) = candidate.boundary.admin_level else {
             continue;
         };
         let country = country_ids[index];
-        // Whether the tier is stated -- by the table or by the level's own
-        // tags -- or only the convention for the number. A stated tier
-        // outranks a conventional one when the two want the same place.
         let stated = verdicts[index].or_else(|| tagged.get(&(country, level)).copied());
         let want = Want {
             layer: stated.or_else(|| conventional_admin_layer(level)),
@@ -2377,8 +2075,6 @@ fn assign_layers_by_containment(
             .or_default()
             .entry(level)
             .or_insert(want);
-        // One level, one tier: a level whose boundaries disagree keeps the
-        // outermost reading, so neighbouring boundaries stay in one tier.
         if let (Some(have), Some(layer)) = (slot.layer, want.layer)
             && layer < have
         {
@@ -2386,16 +2082,6 @@ fn assign_layers_by_containment(
         }
     }
 
-    // Hand each country's levels a tier, outermost level first, never going
-    // back up. A level takes the tier it wants when that tier is still free
-    // and no deeper level has already passed it; otherwise it takes the next
-    // free tier below the last one handed out.
-    //
-    // There is no slot to compete for any more: with a sub-tier under each
-    // conventional one there are eight, which covers the deepest hierarchy
-    // the table maps (Germany's nine levels, three of them state_district).
-    // A country deeper than that runs out at the innermost tier, where the
-    // chain keeps the outermost of the pair rather than dropping it.
     const LOCALITY_AT: usize = 5;
     let mut assigned: BTreeMap<(CountryId, u8), PlaceLayer> = BTreeMap::new();
     for (country, all_levels) in &wanted {
@@ -2410,21 +2096,12 @@ fn assign_layers_by_containment(
 
         let mut next = 0usize;
         for (index, (&level, want)) in levels.iter().enumerate() {
-            // Keep one tier for each level still to come, so an outer level's
-            // preference cannot eat the ladder and strand the rest at the
-            // innermost tier. Taiwan calls its level 4 a city, which alone
-            // would spend six tiers before its five deeper levels are placed.
-            // A country deeper than the tiers has no tier to keep for each: it
-            // fills them in order and its innermost levels share the last.
             let innermost = ADMIN_LAYER_ORDER.len() - 1;
             let cap = innermost.saturating_sub(levels.len() - index - 1);
             let at = if Some(index) == anchor_index {
                 next.max(LOCALITY_AT.min(cap))
             } else {
                 let at = match want.layer {
-                    // Respect the preference only when it does not go
-                    // backwards; a country that maps two levels onto one
-                    // conventional tier puts the second in its sub-tier.
                     Some(layer) => ADMIN_LAYER_ORDER
                         .iter()
                         .position(|tier| *tier == layer)
@@ -2432,11 +2109,6 @@ fn assign_layers_by_containment(
                         .max(next),
                     None => next,
                 };
-                // Yield a tier for every deeper level wanting this one or
-                // shallower, so the innermost of them keeps the tier they all
-                // name. Australia calls both its 9 and its 10 a suburb; 10 is
-                // the neighbourhood and 9 the sub-locality above it, where
-                // before one of the two was dropped.
                 let contested = levels
                     .values()
                     .skip(index + 1)
@@ -2445,8 +2117,6 @@ fn assign_layers_by_containment(
                     .filter(|wanted| *wanted <= at)
                     .count();
                 let at = next.max(at - contested.min(at));
-                // Leave the anchor room to reach the locality tier: an outer
-                // level that settles too deep would push it past its own.
                 let at = match anchor_index {
                     Some(anchor) if index < anchor => {
                         at.min(next.max(LOCALITY_AT.saturating_sub(anchor - index)))
@@ -2459,8 +2129,6 @@ fn assign_layers_by_containment(
             assigned.insert((*country, level), ADMIN_LAYER_ORDER[at]);
             next = at + 1;
         }
-        // Folded level shares the tier inside it. Smaller boundary wins a tier
-        // (`compare_boundary`), so Nouvelle-Aquitaine beats France métropolitaine.
         for &level in &folded {
             if let Some(layer) = levels
                 .range(level..)
@@ -2483,10 +2151,6 @@ fn assign_layers_by_containment(
     unmatched
 }
 
-/// What libpostal's admin table says of each boundary (see
-/// [`admin_levels`]): a layer, `Some(None)` for no area of the Pack, `None`
-/// when it says nothing. Also the objects the table names for the input's
-/// countries that the input lacks.
 fn table_layers(
     candidates: &[BoundaryCandidate],
     shapes: &Shapes,
@@ -2494,9 +2158,6 @@ fn table_layers(
     country_ids: &[CountryId],
 ) -> (Vec<Option<Option<PlaceLayer>>>, Vec<String>) {
     let table = admin_levels();
-    // Lower-cased once per country rather than once per boundary: the table
-    // is keyed in lower case and a build has hundreds of thousands of
-    // boundaries across a handful of countries.
     let lowered = countries.lowercased();
     let present = lowered.iter().flatten().cloned().collect::<BTreeSet<_>>();
     let by_object = candidates
@@ -2538,9 +2199,6 @@ fn table_layers(
     (verdicts, unmatched)
 }
 
-/// The layer the `place` tags of each country's levels agree on, where they
-/// do (see [`MIN_PLACE_TAGGED_BOUNDARIES`] and [`PLACE_TAG_AGREEMENT`]).
-/// Country levels are left to their number.
 fn tagged_level_layers(
     candidates: &[BoundaryCandidate],
     countries: &[CountryId],
@@ -2574,7 +2232,6 @@ fn tagged_level_layers(
         .collect()
 }
 
-/// The layer a level maps to when a country follows the usual convention.
 fn conventional_admin_layer(admin_level: u8) -> Option<PlaceLayer> {
     match admin_level {
         0..=2 => Some(PlaceLayer::Country),
@@ -2655,24 +2312,14 @@ fn country_of_each_boundary(
         .collect()
 }
 
-/// The countries of a build, each code stored once.
-///
-/// Every per-country map of the ranking is keyed by boundary, so a `String`
-/// key meant cloning a code per boundary per lookup. A build sees a handful
-/// of countries and hundreds of thousands of boundaries, so the codes are
-/// interned once and the maps key on the index.
 #[derive(Debug, Default)]
 struct Countries {
     codes: Vec<String>,
 }
 
-/// Which country a boundary lies in, as an index into [`Countries`].
-/// `None` where the extract gives no code at all, which groups those
-/// boundaries together as one unknown country.
 type CountryId = Option<u16>;
 
 impl Countries {
-    /// Interns `codes`, giving each boundary its id.
     fn intern(codes: Vec<Option<String>>) -> (Self, Vec<CountryId>) {
         let mut countries = Self::default();
         let mut ids = Vec::with_capacity(codes.len());
@@ -2691,8 +2338,6 @@ impl Countries {
         Some(at)
     }
 
-    /// Each country's code in lower case, by id: libpostal's table is keyed
-    /// that way and the codes come off OSM tags in upper.
     fn lowercased(&self) -> Vec<Option<String>> {
         self.codes
             .iter()
@@ -2701,12 +2346,6 @@ impl Countries {
     }
 }
 
-/// Every tier an area is: the one the ranking gave it, and the one its own
-/// `place` tag names where that differs.
-///
-/// Only an admin boundary gains a second tier. A place area takes its layer
-/// from its tag in the first place, so the two can never disagree, and
-/// giving it both would say an island is also a city.
 fn boundary_tiers(boundary: &BuiltBoundary) -> TierSet {
     let mut tiers = TierSet::of(boundary.layer);
     // The tag is what the ranking reads to place a level in the first place,
@@ -2728,7 +2367,6 @@ fn boundary_tiers(boundary: &BuiltBoundary) -> TierSet {
     tiers
 }
 
-/// Boundaries at or above this level are countries whatever their depth.
 const COUNTRY_ADMIN_LEVEL: u8 = 2;
 
 fn representative_point(geometry: &MultiPolygon<f64>) -> Option<[f64; 2]> {
@@ -2749,8 +2387,6 @@ fn compare_boundary(
         .map(|value| same_text(value, &right.name))
         .unwrap_or(false);
 
-    // An admin boundary of the layer wins over a place drawn as an area,
-    // which fills the layers admin boundaries leave empty.
     right_match
         .cmp(&left_match)
         .then_with(|| left.admin_level.is_none().cmp(&right.admin_level.is_none()))
@@ -2772,8 +2408,6 @@ fn source_value_for_layer<'a>(
     layer: PlaceLayer,
     source_context: &SourceContext<'a>,
 ) -> Option<&'a str> {
-    // A sub-tier is a subdivision of the tier above and the source address
-    // states it in the same field, so both read one value.
     match layer {
         PlaceLayer::Country => source_context.country,
         PlaceLayer::Region | PlaceLayer::SubRegion => source_context.region,
@@ -2784,7 +2418,6 @@ fn source_value_for_layer<'a>(
     }
 }
 
-/// Whether box `outer` holds box `inner`, edges included.
 fn holds(outer: Rect<f64>, inner: Rect<f64>) -> bool {
     outer.min().x <= inner.min().x
         && outer.min().y <= inner.min().y
@@ -2809,7 +2442,6 @@ fn source_type_rank(object_type: ObjectType) -> u8 {
     }
 }
 
-/// How a place point names a boundary, weakest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PlaceLink {
     Name,
@@ -2817,32 +2449,18 @@ enum PlaceLink {
     Label,
 }
 
-/// Lookups from a place point to the boundary it names, all keyed by layer so
-/// that a city node labelling its county stays a separate city, and what
-/// matching found.
 pub(crate) struct PlaceLinks {
     labels: HashMap<(i64, PlaceLayer), usize>,
-    /// Every boundary of each item and layer: one item can be several
-    /// disjoint boundaries.
     items: HashMap<(u32, PlaceLayer), Vec<usize>>,
-    /// The boundaries of each normalized name and layer.
     names: HashMap<(String, PlaceLayer), Vec<usize>>,
-    /// The boundary each matched point names and how, by the point's position.
     matched: HashMap<u64, (usize, PlaceLink)>,
-    /// The boundaries matched points of each item and layer named.
     brought: HashMap<(u32, PlaceLayer), Vec<usize>>,
-    /// Points with an item that named no boundary: position, item, layer, point.
     waiting: Vec<(u64, u32, PlaceLayer, [f64; 2])>,
-    /// Each boundary's strongest link merged so far.
     strongest: Vec<Option<Strongest>>,
-    /// Heap of the lookups above, which stay as built.
     lookup_bytes: usize,
-    /// Heap the lists inside `brought` hold.
     brought_list_bytes: usize,
 }
 
-/// The strongest link merged into a boundary, with the point and the
-/// Wikidata item of the place point it came from.
 #[derive(Debug, Clone, Copy)]
 struct Strongest {
     link: PlaceLink,
@@ -2850,7 +2468,6 @@ struct Strongest {
     item: Option<u32>,
 }
 
-/// Heap a hash table of `map`'s capacity holds, its control bytes included.
 fn table_bytes<K, V>(map: &HashMap<K, V>) -> usize {
     map.capacity() * 8 / 7 * (std::mem::size_of::<(K, V)>() + 1)
 }
@@ -2860,7 +2477,6 @@ impl PlaceLinks {
         self.labels.is_empty() && self.items.is_empty() && self.names.is_empty()
     }
 
-    /// Heap the lookups hold, which matching does not change.
     fn measure_lookups(&self) -> usize {
         let word = std::mem::size_of::<usize>();
         table_bytes(&self.labels)
@@ -2879,8 +2495,6 @@ impl PlaceLinks {
             + self.strongest.capacity() * std::mem::size_of::<Option<Strongest>>()
     }
 
-    /// Heap the links hold now, outside the memory budget unless a caller
-    /// reserves it: the lookups, and what matching has found so far.
     pub(crate) fn heap_bytes(&self) -> usize {
         self.lookup_bytes
             + table_bytes(&self.matched)
@@ -2889,8 +2503,6 @@ impl PlaceLinks {
             + self.waiting.capacity() * std::mem::size_of::<(u64, u32, PlaceLayer, [f64; 2])>()
     }
 
-    /// The boundary a place point names, and how. An `admin_centre` member doesn't
-    /// count: a county's centre is a town in its own right.
     fn find(
         &self,
         layer: PlaceLayer,
@@ -2905,8 +2517,6 @@ impl PlaceLinks {
             return Some((*index, PlaceLink::Label));
         }
         let point = point_lon_lat(&place.geometry)?;
-        // Within the box only, so a mistagged Wikidata item can't pull in a
-        // distant point, and of an item's boundaries the one whose box holds it.
         let item = place
             .wikidata
             .and_then(|item| self.items.get(&(item, layer)))
@@ -2914,7 +2524,6 @@ impl PlaceLinks {
         if let Some(&index) = item {
             return Some((index, PlaceLink::Item));
         }
-        // Names repeat, so a name only matches a boundary that contains the point.
         self.names
             .get(&(normalize_for_compare(&place.name), layer))?
             .iter()
@@ -2923,7 +2532,6 @@ impl PlaceLinks {
     }
 }
 
-/// A part of a [`BoundarySet`] as a checkpoint saves it.
 pub(crate) enum SetItem {
     Candidate(Box<BoundaryCandidate>),
     DerivedCountry(String, Box<PlaceRecord>),
@@ -2931,7 +2539,6 @@ pub(crate) enum SetItem {
 }
 
 impl BoundarySet {
-    /// Save the set to a spool, for a checkpoint.
     pub(crate) fn save(
         &self,
         scratch: &std::sync::Arc<crate::extsort::Scratch>,
@@ -2952,7 +2559,6 @@ impl BoundarySet {
         spool.finish()
     }
 
-    /// The set a checkpoint saved, its shapes in `shapes`.
     pub(crate) fn load(
         saved: &crate::extsort::SpoolFile<SetItem>,
         shapes: Arc<Shapes>,
@@ -3238,13 +2844,11 @@ mod tests {
         index.dots_reaching(lon, lat, &Default::default()).count() == 1
     }
 
-    /// A point a hair under the reach, due north, is still a candidate.
     #[test]
     fn a_town_reaches_a_point_due_north_at_its_reach() {
         assert!(reaches(dot_with_reach([0.0, 0.0], 11_120.0), [0.0, 0.1]));
     }
 
-    /// A degree of longitude shrinks to nothing at the pole.
     #[test]
     fn a_town_near_the_pole_reaches_across_it() {
         assert!(reaches(
@@ -3253,7 +2857,6 @@ mod tests {
         ));
     }
 
-    /// Longitude wraps at the antimeridian.
     #[test]
     fn a_town_reaches_across_the_antimeridian() {
         assert!(reaches(
@@ -3298,10 +2901,6 @@ mod tests {
         assert_eq!(assignment.flags, CONTEXT_FLAG_AMBIGUOUS_ADMIN);
     }
 
-    /// Several boundaries of one tier over a point pick the same one however
-    /// many there are, and flag the point ambiguous. The selection folds over
-    /// the covering set in place rather than collecting each tier and taking
-    /// a minimum, so the tie-break has to stay on the first of equals.
     #[test]
     fn one_tier_many_boundaries_picks_the_smallest_and_flags_it() {
         let big = square_boundary(1, "Big", PlaceLayer::Locality, -2.0, -2.0, 2.0, 2.0);
@@ -3325,10 +2924,6 @@ mod tests {
         }
     }
 
-    /// A boundary that is two things reaches a point as both. Berlin's
-    /// relation is a German state by its admin level and a city by its
-    /// `place` tag; an address there has to answer a query for its state
-    /// and one for its city, which one tier per area cannot do.
     #[test]
     fn a_dual_role_boundary_carries_both_tiers_to_a_point() {
         let germany = square_boundary(1, "Deutschland", PlaceLayer::Country, -9.0, -9.0, 9.0, 9.0);
@@ -3347,12 +2942,6 @@ mod tests {
         assert_eq!(tuple.entries().len(), 2, "one entry for Berlin: {tuple:?}");
     }
 
-    /// A boundary is two tiers only where its `place` tag disagrees with
-    /// what its admin level means. The tag is what the ranking reads to
-    /// place a level, so taking it as a second role whenever it differs
-    /// from the ranked tier files every tagged suburb under two tiers --
-    /// which it did, putting every ACT suburb in both the neighbourhood and
-    /// the sub-locality of its address.
     #[test]
     fn only_a_tag_that_contradicts_the_level_is_a_second_tier() {
         let mut berlin = test_boundary(PlaceLayer::Region);
@@ -3373,8 +2962,6 @@ mod tests {
             "a suburb is one thing"
         );
 
-        // A place area takes its layer from its tag, so the two can never
-        // disagree and an island is never also a city.
         let mut area = test_boundary(PlaceLayer::Place);
         area.admin_level = None;
         area.place_layer = Some(PlaceLayer::Place);
@@ -3385,8 +2972,6 @@ mod tests {
         );
     }
 
-    /// A saved boundary keeps whether its rings closed, so a resumed build
-    /// judges sources by it as the first did.
     #[test]
     fn a_saved_boundary_keeps_whether_its_rings_closed() {
         use crate::extsort::Spill;
@@ -3438,8 +3023,6 @@ mod tests {
         );
     }
 
-    /// A merged point's names are added to the boundary's record, not to the
-    /// area names of the records inside it.
     #[test]
     fn a_merged_points_names_are_the_records_not_the_areas() {
         let (_dir, scratch) = test_scratch();
@@ -3535,10 +3118,6 @@ mod tests {
         }
     }
 
-    /// The ACT as it really is: a district at 7 and a suburb at 9, nested.
-    /// A point in both must carry both -- the suburb reached no context at
-    /// all while only the conventional tiers were looked for, so every
-    /// Canberra address named its district and lost its suburb.
     #[test]
     fn a_point_carries_every_tier_it_lies_in() {
         let district = square_boundary(
@@ -3561,8 +3140,6 @@ mod tests {
         assert_eq!(tuple.entries().len(), 2, "both, not one: {tuple:?}");
     }
 
-    /// A union of countries is no area of the Pack (see
-    /// [`RANKED_ADMIN_LEVELS`]), a country is.
     #[test]
     fn a_union_of_countries_is_no_area() {
         let tags = |level: &str| {
@@ -3583,9 +3160,6 @@ mod tests {
         );
     }
 
-    /// Australia puts its suburbs at level 9 and uses no level 8, so without
-    /// gap filling an Australian pack has no locality layer for an address
-    /// query to match on.
     #[test]
     fn an_off_convention_level_fills_the_layer_its_country_leaves_empty() {
         let layers = layers_for_levels(&[2, 4, 6, 9]);
@@ -3594,11 +3168,6 @@ mod tests {
         assert_eq!(layers[&6], PlaceLayer::District);
     }
 
-    /// The ACT's real shape: a district at 7, suburbs at 9, nothing at 6 or
-    /// 8. Two spare levels in one country must take two layers -- before the
-    /// filled set was updated as each was placed, both asked for the same one
-    /// and the second fell to the innermost layer, leaving an address there
-    /// with a neighbourhood and no locality.
     #[test]
     fn two_spare_levels_take_two_layers() {
         let layers = layers_for_levels(&[2, 4, 7, 9]);
@@ -3608,8 +3177,6 @@ mod tests {
         assert_ne!(layers[&7], layers[&9], "two levels, two layers");
     }
 
-    /// Germany fills 8, 9 and 10, so the conventional levels must keep their
-    /// layers and 9 settle below the locality it nests inside.
     #[test]
     fn an_off_convention_level_never_displaces_a_conventional_one() {
         let layers = layers_for_levels(&[2, 4, 8, 9, 10]);
@@ -3618,8 +3185,6 @@ mod tests {
         assert_ne!(layers[&9], PlaceLayer::Locality, "9 cannot take locality");
     }
 
-    /// The pre-existing mapping has to survive unchanged, or every pack built
-    /// from a country that follows the convention would shift.
     #[test]
     fn a_conventional_hierarchy_is_left_alone() {
         let layers = layers_for_levels(&[2, 4, 6, 8, 10]);
@@ -3630,10 +3195,6 @@ mod tests {
         assert_eq!(layers[&10], PlaceLayer::Neighbourhood);
     }
 
-    /// Japan tags many of its level 7 cities `place=city`, `town` or
-    /// `village` and the level 8 wards of its designated cities
-    /// `place=suburb`: 7 is the locality layer, 8 lies below it, and the
-    /// untagged levels keep their numbers' layers.
     #[test]
     fn a_level_whose_place_tags_agree_takes_their_layer() {
         let layers = layers_for_tagged_levels(&[
@@ -3649,16 +3210,11 @@ mod tests {
         assert_eq!(layers[&4], PlaceLayer::Region);
         assert_eq!(layers[&6], PlaceLayer::District);
         assert_eq!(layers[&7], PlaceLayer::Locality, "tagged cities");
-        // The wards sit below the locality and above the level 10
-        // neighbourhoods. Both were the neighbourhood tier while there was
-        // one for them to share, which dropped whichever lost the race.
         assert_eq!(layers[&8], PlaceLayer::SubLocality, "tagged wards");
         assert_eq!(layers[&10], PlaceLayer::Neighbourhood);
         assert_ne!(layers[&8], layers[&10], "one tier each");
     }
 
-    /// Too few tagged boundaries, or tags that disagree, leave a level to
-    /// its number.
     #[test]
     fn scarce_or_split_place_tags_leave_a_level_to_its_number() {
         let layers = layers_for_tagged_levels(&[
@@ -3672,17 +3228,6 @@ mod tests {
         assert_eq!(layers[&10], PlaceLayer::Neighbourhood, "split tags");
     }
 
-    /// Every country whose levels include a town must fill the locality
-    /// tier: that is the tier an address query matches a town on, so a
-    /// country that fills none answers no structured query.
-    ///
-    /// The countries the table gives no town at all (the UAE is a country
-    /// and its emirates, nothing below) are left out: no ranking can invent
-    /// a tier the source data does not describe.
-    ///
-    /// This is a smoke test over the whole table, not a check that each
-    /// country's tiers are the right ones -- only a fixture with ground
-    /// truth can say that.
     #[test]
     fn every_country_in_the_table_fills_locality() {
         let mut empty = Vec::new();
@@ -3703,10 +3248,6 @@ mod tests {
         );
     }
 
-    /// The same, for a sub-national extract: a Geofabrik state download holds
-    /// no level 2 boundary, so the country is known only from the region's
-    /// ISO3166-2 tag. Without that fallback the whole table is skipped and
-    /// every level of the extract falls back on the convention.
     #[test]
     fn every_country_fills_locality_without_a_country_boundary() {
         let mut empty = Vec::new();
@@ -3731,11 +3272,6 @@ mod tests {
         );
     }
 
-    /// The claim this change exists for: a country deeper than the
-    /// conventional five keeps every level, each in a tier of its own.
-    /// Germany maps nine, three of them `state_district` and two
-    /// `city_district`; with five tiers four of the nine were dropped from
-    /// every German address.
     #[test]
     fn a_deep_country_keeps_every_level() {
         let layers = layers_for_levels_in(Some("de"), &[2, 4, 5, 6, 7, 8, 9, 10, 11]);
@@ -3747,10 +3283,6 @@ mod tests {
         assert_eq!(layers[&4], PlaceLayer::Region);
     }
 
-    /// France in the planet has levels no table row names (3, France
-    /// métropolitaine; 5, Collectivité européenne d'Alsace) beside the ones
-    /// a row names. Its communes (8) are still its towns, and the outermost
-    /// unnamed level shares the regions' tier.
     #[test]
     fn a_country_with_unnamed_outer_levels_keeps_its_town_the_locality() {
         use PlaceLayer::*;
@@ -3781,9 +3313,6 @@ mod tests {
         assert_eq!(subdivision_code_from_tags(&tags, PlaceLayer::Country), None);
     }
 
-    /// Ten levels for nine tiers, as a Pack of Canada with every level from 2
-    /// to 11 has: 3, which no table row names, shares the tier inside it, so
-    /// the town keeps the locality tier and the innermost level the last.
     #[test]
     fn a_country_deeper_than_the_tiers_ends_on_the_innermost() {
         let levels = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
@@ -3807,9 +3336,6 @@ mod tests {
         );
     }
 
-    /// Every country of the table keeps each of its levels in its own tier.
-    /// Unsatisfiable while there were five, which is why the levels that
-    /// lost the race were dropped rather than ranked.
     #[test]
     fn no_country_drops_a_level() {
         let mut dropped = Vec::new();
@@ -3828,8 +3354,6 @@ mod tests {
         );
     }
 
-    /// Builds one candidate per level inside a shared country boundary and
-    /// returns the layer each one ends up in.
     fn layers_for_levels(levels: &[u8]) -> BTreeMap<u8, PlaceLayer> {
         layers_for_tagged_levels(
             &levels
@@ -3839,9 +3363,6 @@ mod tests {
         )
     }
 
-    /// Like [`layers_for_levels`], in a named country, so the table's
-    /// per-country rows apply. Every boundary carries the code, which is what
-    /// an extract with no level 2 boundary has to fall back on.
     fn layers_for_levels_in(country: Option<&str>, levels: &[u8]) -> BTreeMap<u8, PlaceLayer> {
         let tagged = levels
             .iter()
@@ -3850,8 +3371,6 @@ mod tests {
         layers_for_tagged_levels_in(country, &tagged)
     }
 
-    /// Like [`layers_for_levels`], with `count` boundaries of each level and
-    /// `place` tag layer. Every boundary of a level must end in one layer.
     fn layers_for_tagged_levels(
         levels: &[(u8, Option<PlaceLayer>, usize)],
     ) -> BTreeMap<u8, PlaceLayer> {
@@ -4008,7 +3527,6 @@ mod tests {
             ),
             (3, None),
         ]);
-        // As the scan keeps them, so a tag it drops is missed here too.
         let tags = |name: &str, iso: &str| {
             boundary_tags(&BTreeMap::from([
                 ("boundary".to_string(), "administrative".to_string()),
@@ -4103,8 +3621,6 @@ mod tests {
             Vec::new(),
         );
         let geometry = MultiPolygon::new(vec![polygon]);
-        // The shape is written when the boundaries are indexed, from the
-        // square its box is: see `test_index`.
         AcceptedBoundary {
             record_id,
             layer,
@@ -4128,8 +3644,6 @@ mod tests {
         (dir, scratch)
     }
 
-    /// `geometry` written to `shapes` as the boundary stage writes it, with
-    /// its box and area.
     fn with_shape(
         shapes: &mut ShapeWriter,
         geometry: &MultiPolygon<f64>,
@@ -4143,7 +3657,6 @@ mod tests {
         )
     }
 
-    /// An index of square boundaries, each the square its box is.
     fn test_index(mut boundaries: Vec<AcceptedBoundary>) -> BoundaryIndex {
         let (_dir, scratch) = test_scratch();
         let mut shapes = ShapeWriter::create(&scratch, SHAPES_LABEL).expect("shape file");

@@ -1,14 +1,3 @@
-//! `/jobs`: a CSV or JSONL file of lookups, answered while it uploads.
-//!
-//! Rows are looked up as they arrive and their results streamed back in the
-//! same response, so nothing waits for the whole file. The results are also
-//! written to disk as they are made: `GET /jobs/{id}/results` streams
-//! them again, live while the job still runs, to a client that lost its
-//! connection or asked to be answered at once (`Prefer: respond-async`).
-//!
-//! Each row is the item a `QUERY /geocode` or `QUERY /reverse` would carry,
-//! read by the same code, so its answer is the one its `GET` returns.
-
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
@@ -51,33 +40,20 @@ use crate::{
     runtime::{AppState, GEOCODE, REVERSE},
 };
 
-/// The media types a job's file is read and written as.
 const CSV: &str = "text/csv";
 const JSONL: &str = "application/jsonl";
-/// What JSONL went by before it had a name of its own; still common.
 const NDJSON: &str = "application/x-ndjson";
 
-/// Rows read before they are looked up. They are looked up in Pack order
-/// within it, so a window is the reach of that ordering.
 const WINDOW_ROWS: usize = 256;
 
-/// Lookups one job has queued or running, per pool thread. Enough to keep
-/// every core busy without one job filling the pool's queue ahead of the
-/// others.
 const IN_FLIGHT_PER_THREAD: usize = 2;
 
-/// Answers kept for rows that repeat a query. Cleared when full: a repeat
-/// then costs one more lookup, never wrong output.
 const REPEAT_CACHE_ENTRIES: usize = 100_000;
 
-/// Seconds a job refused for a full store is told to wait: results free
-/// space only as they expire or are deleted.
 const STORE_FULL_RETRY_AFTER_SECONDS: u32 = 60;
 
-/// Bytes read from the results file per streamed chunk.
 const STREAM_CHUNK_BYTES: usize = 64 << 10;
 
-/// How much of the upload is read to tell its CSV delimiter.
 const SNIFF_BYTES: usize = 64 << 10;
 
 const BYTE_ORDER_MARK: &[u8] = "\u{feff}".as_bytes();
@@ -130,7 +106,6 @@ impl Format {
         }
     }
 
-    /// The first format `Accept` names that a job can be written as.
     fn accepted(headers: &HeaderMap) -> Option<Self> {
         headers
             .get(header::ACCEPT)?
@@ -187,20 +162,16 @@ pub(crate) struct JobStatus {
     pub(crate) error: Option<String>,
 }
 
-/// Bytes of results on disk, and whether more will come.
 #[derive(Debug, Clone, Copy, Default)]
 struct Progress {
     bytes: u64,
     done: bool,
 }
 
-/// One job, running or kept.
 pub(crate) struct Job {
     status: Mutex<JobStatus>,
     progress: watch::Sender<Progress>,
-    /// Shared with each row's lookup, which it stops.
     cancel: Arc<AtomicBool>,
-    /// Deleted while running: its files go when it stops.
     deleted: AtomicBool,
     results: PathBuf,
     record: PathBuf,
@@ -211,33 +182,25 @@ impl Job {
         self.status.lock().expect("job status").clone()
     }
 
-    /// Stops the job at its next row; it records `cancelled` with the rows
-    /// answered so far.
     pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Resolves once the job has stopped, however it stopped.
     pub(crate) async fn ended(&self) {
         let mut progress = self.progress.subscribe();
-        // A sender dropped first means the job is gone, which is an end too.
         let _ = progress.wait_for(|progress| progress.done).await;
     }
 
-    /// The results written so far, from the start.
     pub(crate) fn open_results(&self) -> io::Result<File> {
         File::open(&self.results)
     }
 
-    /// Where the results are written.
     #[cfg(test)]
     pub(crate) fn results_path(&self) -> &std::path::Path {
         &self.results
     }
 
     fn save(&self, status: &JobStatus) {
-        // A status that fails to save leaves the job served from memory;
-        // only a restart loses it.
         if let Ok(json) = serde_json::to_vec(status) {
             let _ = fs::write(&self.record, json);
         }
@@ -249,16 +212,12 @@ impl Job {
     }
 }
 
-/// Every job this server keeps, and the directory that holds their files.
 pub(crate) struct JobStore {
     dir: PathBuf,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
 }
 
 impl JobStore {
-    /// Open the store in `dir`, keeping the jobs a past run left there.
-    /// One that was running then is failed: its upload went with the server,
-    /// and its results are kept for `retention` from now.
     pub(crate) fn open(dir: PathBuf, retention: Duration) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
         let store = Self {
@@ -318,7 +277,6 @@ impl JobStore {
         })
     }
 
-    /// Results files no status names, left by a crash between the two.
     fn remove_orphans(&self) {
         let jobs = self.jobs.lock().expect("jobs");
         let Ok(entries) = fs::read_dir(&self.dir) else {
@@ -337,8 +295,6 @@ impl JobStore {
         }
     }
 
-    /// Where the store keeps its files. A `/compat` batch flow keeps its own
-    /// beside them, under the same retention.
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }
@@ -347,14 +303,12 @@ impl JobStore {
         self.get(id).map(|job| job.snapshot())
     }
 
-    /// Stop a job's rows; those already answered are kept.
     pub(crate) fn cancel(&self, id: &str) -> Option<JobStatus> {
         let job = self.get(id)?;
         job.cancel();
         Some(job.snapshot())
     }
 
-    /// The job's results file, written as `output_format`.
     pub(crate) fn results_path(&self, id: &str) -> Option<PathBuf> {
         self.get(id).map(|job| job.results.clone())
     }
@@ -368,8 +322,6 @@ impl JobStore {
         Some(job)
     }
 
-    /// Bytes the results of every kept job take on disk, so far for the
-    /// ones still running.
     fn used_bytes(&self) -> u64 {
         self.jobs
             .lock()
@@ -397,7 +349,6 @@ impl JobStore {
         Some(job)
     }
 
-    /// Delete every job past its retention.
     pub(crate) fn sweep(&self) {
         let now = unix_now();
         let expired = self
@@ -413,8 +364,6 @@ impl JobStore {
         }
     }
 
-    /// Each job records `cancelled` with its rows; one left `running` would
-    /// be failed by the next start, with no sign of how far it got.
     pub(crate) fn cancel_running(&self) {
         for job in self.running() {
             job.cancel.store(true, Ordering::Relaxed);
@@ -442,10 +391,7 @@ impl JobStore {
     }
 }
 
-/// What a row's answer adds to a CSV row: `geocode batch`'s audit columns.
 pub(crate) trait Answer: Serialize + Clone + Send + Sync + 'static {
-    /// The row's status (`resolved`, `fallback` or `unresolved`), the query
-    /// it was looked up as, and the result columns.
     fn columns(&self) -> (&'static str, String, Vec<String>);
 }
 
@@ -482,10 +428,8 @@ impl Answer for ReverseCollection {
     }
 }
 
-/// The columns of a CSV upload that a row's lookup reads, by place.
 #[derive(Debug, Default)]
 struct Columns {
-    /// Joined with `, ` into one `address`.
     address: Vec<usize>,
     locality: Option<usize>,
     region: Option<usize>,
@@ -494,12 +438,8 @@ struct Columns {
     lon: Option<usize>,
 }
 
-/// The query-string parameters that name CSV columns rather than apply to
-/// every row.
 const COLUMN_PARAMETERS: [&str; 6] = ["address", "locality", "region", "postcode", "lat", "lon"];
 
-/// Header names read as each column when the request names none, compared
-/// without regard to case, spaces, hyphens or underscores.
 const ADDRESS_HEADERS: [&str; 8] = [
     "address",
     "streetaddress",
@@ -531,8 +471,6 @@ fn header_key(name: &str) -> String {
 }
 
 impl Columns {
-    /// The columns the request names, or failing that the ones the header
-    /// row's names suggest, and the endpoint they mean.
     fn resolve(
         headers: &[String],
         named: &[(String, String)],
@@ -604,7 +542,6 @@ impl Columns {
         }
     }
 
-    /// The row as a batch item: the fields its `GET` would carry.
     fn item(&self, endpoint: Endpoint, row: &ByteRecord) -> RawItem {
         let cell = |index: Option<usize>| -> Option<String> {
             let value = text(row.get(index?)?);
@@ -638,15 +575,12 @@ impl Columns {
     }
 }
 
-/// The upload as a [`Read`], fed chunk by chunk from the request body.
 struct Upload {
     chunks: channel::Receiver<Result<Bytes, String>>,
     chunk: Bytes,
 }
 
 impl Upload {
-    /// At least `bytes` of what comes next, or all of it if less, left in
-    /// place to be read again.
     fn peek(&mut self, bytes: usize) -> io::Result<Vec<u8>> {
         let mut head = self.chunk.to_vec();
         while head.len() < bytes {
@@ -681,30 +615,23 @@ impl Read for Upload {
     }
 }
 
-/// One input row, as the output writes it back.
 struct RowIn {
     index: usize,
     id: Option<String>,
-    /// The CSV row's own cells; none for JSONL.
     cells: Option<ByteRecord>,
 }
 
-/// Rows answered alike: one row, or every row of a window that asked the
-/// same query.
 struct Answered<A> {
     rows: Vec<RowIn>,
     item: Item<A>,
 }
 
-/// How the reader ends, for the job's status.
 enum Ending {
     Read,
     Cancelled,
     Failed(String),
 }
 
-/// The CSV header and the columns its rows are read from, or the JSONL
-/// format, known before the response starts.
 enum Layout {
     Csv {
         headers: ByteRecord,
@@ -715,8 +642,6 @@ enum Layout {
     Jsonl,
 }
 
-/// The request's parameters, split: which lookup, which columns, and what
-/// applies to every row.
 struct Plan {
     endpoint: Option<Endpoint>,
     named: Vec<(String, String)>,
@@ -850,8 +775,6 @@ pub(crate) async fn create(State(state): State<AppState>, request: Request) -> R
     }
 }
 
-/// [`create`], with the Problem left to the caller. A vendor route starts
-/// its jobs here and answers a refusal in the vendor's own shape.
 pub(crate) async fn start(state: AppState, request: Request) -> Result<Response, Problem> {
     let started = Instant::now();
     let input = batch::media_type(request.headers())
@@ -914,9 +837,6 @@ pub(crate) async fn start(state: AppState, request: Request) -> Result<Response,
     Ok(response)
 }
 
-/// Start a job reading its rows from `body`, kept under `id`, with its
-/// input and output formats and the plan its query string made. Answers once
-/// the header row is read, with the job and a signal that the upload is in.
 async fn launch(
     state: &AppState,
     id: uuid::Uuid,
@@ -926,8 +846,6 @@ async fn launch(
     request_id: Option<String>,
     started: Instant,
 ) -> Result<(Arc<Job>, oneshot::Receiver<()>), Problem> {
-    // Checked once, at the start: a job already running may take the store
-    // past its cap, and the next one waits for results to expire.
     if state.jobs().used_bytes() >= state.limits().max_job_store_bytes() {
         return Err(Problem::busy(STORE_FULL_RETRY_AFTER_SECONDS).with_detail(
             "the server keeps as many job results as it can hold; retry once older ones expire",
@@ -951,8 +869,6 @@ async fn launch(
         chunk: Bytes::new(),
     };
 
-    // The header row is read before answering, so a CSV the job cannot
-    // read is a 400 rather than a stream that stops.
     let (upload, layout, endpoint, plan) = task::spawn_blocking(move || {
         let (layout, endpoint) = read_layout(&mut upload, input, &plan)?;
         Ok::<_, Problem>((upload, layout, endpoint, plan))
@@ -993,9 +909,6 @@ async fn launch(
     Ok((job, uploaded_rx))
 }
 
-/// A JSONL job of `endpoint` items read from `body`, written as JSONL, for a
-/// `/compat` batch flow that translates its vendor's files to and from og's.
-/// Answers once the job runs; it is kept and listed as any other.
 pub(crate) async fn submit(
     state: &AppState,
     id: uuid::Uuid,
@@ -1013,8 +926,6 @@ pub(crate) async fn submit(
     Ok(job)
 }
 
-/// `Prefer: respond-async` (RFC 7240): answer once the upload is in, with
-/// the job's status, instead of streaming its results.
 fn prefers_async(headers: &HeaderMap) -> bool {
     headers
         .get_all("prefer")
@@ -1024,7 +935,6 @@ fn prefers_async(headers: &HeaderMap) -> bool {
         .any(|preference| preference.trim().eq_ignore_ascii_case("respond-async"))
 }
 
-/// Read the CSV header, or nothing for JSONL, and settle the endpoint.
 fn read_layout(
     upload: &mut Upload,
     input: Format,
@@ -1079,9 +989,6 @@ fn read_layout(
     Ok((layout, endpoint))
 }
 
-/// Pass the request body to the reader, a chunk at a time, refusing one that
-/// grows past `max_bytes` or stalls. Tells `uploaded` once it is all in.
-/// Ends with the server, so a reader parked on a slow upload stops too.
 async fn forward_upload(
     body: Body,
     max_bytes: u64,
@@ -1123,7 +1030,6 @@ async fn forward_upload(
                 .await;
             break;
         }
-        // A reader that stopped (the job was cancelled) ends the upload.
         if chunks.send(Ok(chunk)).await.is_err() {
             break;
         }
@@ -1131,7 +1037,6 @@ async fn forward_upload(
     let _ = uploaded.send(());
 }
 
-/// One running job's pipeline.
 struct Run {
     state: AppState,
     job: Arc<Job>,
@@ -1142,7 +1047,6 @@ struct Run {
 }
 
 impl Run {
-    /// Read, look up and write the whole job, then record how it ended.
     fn go<P, Q, A, K>(
         self,
         lookup: Lookup<P, Q, A, K>,
@@ -1191,7 +1095,6 @@ impl Run {
             }
         };
         let ending = self.read(lookup, upload, layout, &answers_tx);
-        // The writer ends once every sender is gone.
         drop(answers_tx);
         let written = writer
             .join()
@@ -1200,8 +1103,6 @@ impl Run {
         self.finish(ending, written);
     }
 
-    /// Read rows a window at a time and hand each window's lookups to the
-    /// pool, in Pack order, repeated queries once.
     fn read<P, Q, A, K>(
         &self,
         lookup: Lookup<P, Q, A, K>,
@@ -1284,9 +1185,6 @@ impl Run {
             let mut groups = groups.into_iter().collect::<Vec<_>>();
             groups.sort_by(|(_, (left, ..)), (_, (right, ..))| left.cmp(right));
             for (key, (_, query, rows)) in groups {
-                // Waits while this job already has its share queued, which
-                // leaves the pool to batches and other jobs and holds memory
-                // flat.
                 if tokens_rx.recv().is_err() {
                     break;
                 }
@@ -1298,10 +1196,7 @@ impl Run {
                 self.state.batch_pool().spawn(move || {
                     if !job.cancel.load(Ordering::Relaxed) {
                         let item = batch::look_up(&state, lookup, None, query, &job.cancel);
-                        // A row the cancel stopped was never answered.
                         if !job.cancel.load(Ordering::Relaxed) {
-                            // Busy or out of time depends on the moment, so a
-                            // repeat of the row is looked up again.
                             if item.status != StatusCode::SERVICE_UNAVAILABLE.as_u16() {
                                 let mut repeats = repeats.lock().expect("repeats");
                                 if repeats.len() >= REPEAT_CACHE_ENTRIES {
@@ -1324,7 +1219,6 @@ impl Run {
     fn finish(self, ending: Ending, written: io::Result<()>) {
         let now = unix_now();
         let mut status = self.job.status.lock().expect("job status");
-        // A cancelled job's upload, cut short, reads as complete.
         let ending = match ending {
             Ending::Read if self.job.cancel.load(Ordering::Relaxed) => Ending::Cancelled,
             other => other,
@@ -1353,7 +1247,6 @@ impl Run {
     }
 }
 
-/// The upload's rows, each as its cells (CSV only) and the item it asks.
 struct Rows {
     csv: Option<(csv::Reader<Upload>, Columns, Endpoint)>,
     jsonl: Option<BufReader<Upload>>,
@@ -1371,7 +1264,6 @@ impl Rows {
                 endpoint,
                 ..
             } => {
-                // Reads the header row again, past it to the first row.
                 let reader = ReaderBuilder::new()
                     .delimiter(delimiter)
                     .has_headers(true)
@@ -1422,9 +1314,6 @@ impl Rows {
     }
 }
 
-/// Write each answer as it comes, CSV in input order and JSONL in the order
-/// rows finish, flushing whenever no answer waits so a reader sees each
-/// result about as soon as it exists.
 #[allow(clippy::too_many_arguments)]
 fn write_results<A: Answer>(
     job: &Job,
@@ -1492,8 +1381,6 @@ fn write_results<A: Answer>(
         }
         publish(&mut sink)?;
     }
-    // Rows a cancelled job never answered leave gaps; what was answered
-    // is still written, in order.
     if let Some(pending) = csv {
         for bytes in pending.into_values() {
             sink.write(&bytes)?;
@@ -1502,8 +1389,6 @@ fn write_results<A: Answer>(
     publish(&mut sink)
 }
 
-/// Count a row in the summary, and log and stamp it if it failed inside the
-/// server.
 fn count<A>(
     job: &Job,
     state: &AppState,
@@ -1535,7 +1420,6 @@ fn count<A>(
     });
 }
 
-/// A JSONL result: the row's place in the upload, and its item.
 #[derive(Serialize)]
 struct Line<'a, A> {
     row: usize,
@@ -1543,8 +1427,6 @@ struct Line<'a, A> {
     item: &'a Item<A>,
 }
 
-/// A CSV result: the row's own cells, padded to the header's width, then
-/// `geocode batch`'s audit columns.
 fn csv_row<A: Answer>(row: &RowIn, width: usize, item: &Item<A>) -> io::Result<Vec<u8>> {
     let mut record = ByteRecord::new();
     match &row.cells {
@@ -1594,7 +1476,6 @@ fn csv_row<A: Answer>(row: &RowIn, width: usize, item: &Item<A>) -> io::Result<V
     writer.into_inner().map_err(|error| error.into_error())
 }
 
-/// The results file, counting what it holds.
 struct Sink {
     file: BufWriter<File>,
     written: u64,
@@ -1619,8 +1500,6 @@ impl Sink {
     }
 }
 
-/// The results file as a body: what is written so far, then the rest as it
-/// is written, until the job stops.
 fn tail(job: Arc<Job>) -> Body {
     let progress = job.progress.subscribe();
     let stream = futures_util::stream::unfold(
@@ -1648,7 +1527,6 @@ fn tail(job: Arc<Job>) -> Body {
                             let next = offset + chunk.len() as u64;
                             (Ok(Bytes::from(chunk)), (job, progress, next, Some(file)))
                         }
-                        // The job was deleted under the reader; end here.
                         Err(error) => (Err(error), (job, progress, u64::MAX, None)),
                     });
                 }
@@ -1778,15 +1656,10 @@ pub(crate) async fn delete(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Where a server on `port` keeps its jobs: under the system's temporary
-/// directory, which it may clear. One directory per port, because a server
-/// starting up fails the jobs it finds running, and two servers sharing
-/// one would fail each other's.
 pub(crate) fn default_dir(port: u16) -> PathBuf {
     std::env::temp_dir().join(format!("open-geocode-jobs-{port}"))
 }
 
-/// Run [`JobStore::sweep`] every so often, for as long as the server runs.
 pub(crate) async fn sweep_forever(state: AppState) {
     let mut every = tokio::time::interval(Duration::from_secs(600));
     loop {

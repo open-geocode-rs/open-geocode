@@ -1,20 +1,11 @@
-//! One answer of all candidates, chosen by what each one's own record
-//! states against what the query names: its house number, its road, its
-//! postcode and its town. The same fields hold the neighbours a number is
-//! placed between and the stretch a street answer stands on.
-
 use super::*;
 use crate::parse::lattice::{dictionary::same_admin_name, dictionary_key};
 
-/// The house number, road, postcodes and towns a query's best reading
-/// names, as a record's own fields are compared with them.
 #[derive(Debug, Default)]
 pub(super) struct Named {
     number: Option<u32>,
     road: Option<road::RoadName>,
-    /// Each postcode, its letters and digits only, upper case.
     postcodes: Vec<String>,
-    /// Each town, as [`dictionary_key`] folds it.
     towns: Vec<String>,
 }
 
@@ -44,8 +35,6 @@ impl Named {
         }
     }
 
-    /// Whether `postcode` is one the query names, or begins one ("92025"
-    /// of "92025-7619") or is begun by one.
     fn postcode_is(&self, postcode: Option<&str>) -> bool {
         let Some(postcode) = postcode.and_then(letters) else {
             return false;
@@ -55,18 +44,12 @@ impl Named {
         })
     }
 
-    /// Whether `locality` is a town the query names, either perhaps with
-    /// the word of its type. A query for "Narva linn" names the houses that
-    /// state "Narva".
     fn town_is(&self, locality: Option<&str>) -> bool {
         locality
             .and_then(dictionary_key)
             .is_some_and(|town| self.towns.iter().any(|named| same_admin_name(named, &town)))
     }
 
-    /// Whether an address that states `postcode` and `locality` may be
-    /// one of the query's places: it states the postcode or the town the
-    /// query names, or it states neither field, or the query names neither.
     pub(super) fn holds(&self, postcode: Option<&str>, locality: Option<&str>) -> bool {
         (self.postcodes.is_empty() && self.towns.is_empty())
             || (postcode.is_none() && locality.is_none())
@@ -74,12 +57,6 @@ impl Named {
             || self.town_is(locality)
     }
 
-    /// What `hit`'s own record agrees with, in the order an answer is
-    /// chosen by: it carries the house number on the road, lies on the
-    /// road, states the postcode, states the town. The number and the road
-    /// count only inside the query's places (see [`Self::holds`]): the same
-    /// number on another road, or on a road of the name in another town, is
-    /// no better than any other answer.
     fn agreement(&self, hit: &TextSearchHit) -> (bool, bool, bool, bool) {
         let address = &hit.record.address;
         let placed = self.holds(address.postcode.as_deref(), address.locality.as_deref());
@@ -105,17 +82,11 @@ impl Named {
         )
     }
 
-    /// `hits` with those carrying the house number on the road first (see
-    /// [`Self::agreement`]), each the same in the order they came. The road,
-    /// postcode and town alone reorder nothing: an address whose locality
-    /// is its postal town, not the town the query names, would go below
-    /// the street.
     pub(super) fn choose(&self, hits: &mut [TextSearchHit]) {
         hits.sort_by_key(|hit| std::cmp::Reverse(self.agreement(hit).0));
     }
 }
 
-/// A postcode's letters and digits, upper case; `None` for none.
 fn letters(postcode: &str) -> Option<String> {
     compact_postcode(postcode)
         .map(|postcode| postcode_letters(&postcode))
@@ -123,14 +94,6 @@ fn letters(postcode: &str) -> Option<String> {
 }
 
 impl TextSearcher {
-    /// The street answers of `found` as one, at the middle of the stretch
-    /// of the road inside the postcode the query names: the largest run of
-    /// the addresses of `docs` that state it, each within
-    /// [`road::ROAD_LINK_M`] of another (a postcode may hold two roads of
-    /// the name). The street answer nearest that middle stands there and the
-    /// others go; unchanged for a query with a house number (the text
-    /// search may find the house), when no address states the postcode, or
-    /// when no street answer lies within [`road::ROAD_LINK_M`] of it.
     pub(super) fn postcode_stretch(
         &self,
         plan: &QueryPlan,
@@ -182,11 +145,8 @@ impl TextSearcher {
     }
 }
 
-/// Address points a street's stretch is read from, at most.
 const STRETCH_POINTS: usize = 2_000;
 
-/// The largest run of `points`, each within [`road::ROAD_LINK_M`] of
-/// another of it.
 fn largest_run(points: &[[f64; 2]]) -> Vec<[f64; 2]> {
     let mut run_of = vec![usize::MAX; points.len()];
     let mut runs = Vec::<Vec<[f64; 2]>>::new();

@@ -1,6 +1,3 @@
-//! og's results in Google's response shapes. A field og has no value for is
-//! left out, as Google leaves out a field it has no data for.
-
 use serde::Serialize;
 
 use super::{hours, language::Language};
@@ -76,8 +73,6 @@ impl PlusCode {
 
 fn global_plus_code(lon: f64, lat: f64) -> String {
     const DIGITS: &[u8; 20] = b"23456789CFGHJMPQRVWX";
-    // Apply the origin offset in integer space so decimal grid edges do
-    // not move when a rounded degree offset is added.
     const CELLS_PER_DEGREE: i64 = 8_000;
     let cell = |degrees: f64| (degrees * CELLS_PER_DEGREE as f64).floor() as i64;
     let lat_cell =
@@ -116,8 +111,6 @@ impl Viewport {
             if !matches!(common.layer, Layer::Address | Layer::Interpolation) {
                 return None;
             }
-            // A display window for an address represented only by a point.
-            // It has no bearing on the record geometry or its accuracy.
             const HALF_SPAN: f64 = 0.00135;
             let wrap = |longitude: f64| {
                 if longitude < -180.0 {
@@ -138,14 +131,11 @@ impl Viewport {
     }
 }
 
-/// Google's `timeZone`. og knows the IANA name, not which release of the
-/// database it is from, so `version` is left out.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(super) struct TimeZone {
     pub(super) id: String,
 }
 
-/// A Place's `entrances` entry, an entrance og maps for it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(super) struct PlaceEntrance {
     pub(super) location: LatLng,
@@ -153,8 +143,6 @@ pub(super) struct PlaceEntrance {
     pub(super) tags: Vec<&'static str>,
 }
 
-/// `PREFERRED` marks an entrance into the main part of the place, which is
-/// what an `entrance=main` tag states. Any other entrance is untagged.
 fn entrance_tags(access: &AccessPoint) -> Vec<&'static str> {
     if access.kind == "main" {
         vec!["PREFERRED"]
@@ -163,9 +151,6 @@ fn entrance_tags(access: &AccessPoint) -> Vec<&'static str> {
     }
 }
 
-/// A phone number as its source writes it. One written with its country
-/// code (`+1 401 ...`) is the international form; any other is the form
-/// dialled inside its country.
 fn phones(common: &Common) -> (Option<String>, Option<String>) {
     let Some(phone) = common
         .contact
@@ -182,8 +167,6 @@ fn phones(common: &Common) -> (Option<String>, Option<String>) {
     }
 }
 
-/// `languageCode` is set only when og holds the name in the language asked.
-/// A local name is in a language og does not know, so it goes without one.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct LocalizedText {
@@ -221,7 +204,6 @@ pub(super) struct PostalAddress {
     pub(super) address_lines: Vec<String>,
 }
 
-/// A Places API `Place`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Place {
@@ -256,8 +238,6 @@ pub(super) struct Place {
     pub(super) regular_opening_hours: Option<hours::OpeningHours>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) time_zone: Option<TimeZone>,
-    /// The place's offset from UTC now, in minutes, daylight saving time
-    /// included.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) utc_offset_minutes: Option<i32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -274,7 +254,6 @@ pub(super) struct Attribution {
     pub(super) provider_uri: Option<String>,
 }
 
-/// Where a place is, told by the places near it and the areas holding it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(super) struct AddressDescriptor {
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -283,7 +262,6 @@ pub(super) struct AddressDescriptor {
     pub(super) areas: Vec<DescriptorArea>,
 }
 
-/// A place near another, and how it stands to it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Landmark {
@@ -295,7 +273,6 @@ pub(super) struct Landmark {
     pub(super) straight_line_distance_meters: f64,
 }
 
-/// An area holding a place.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct DescriptorArea {
@@ -306,8 +283,6 @@ pub(super) struct DescriptorArea {
 }
 
 impl AddressDescriptor {
-    /// The descriptor of the place at `point`, from the landmarks og found
-    /// near it and the areas below its town that hold it, smallest first.
     pub(super) fn of(
         point: [f64; 2],
         common: &Common,
@@ -419,7 +394,6 @@ impl Place {
     }
 }
 
-/// A Geocoding API v4 `GeocodeResult`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct GeocodeResult {
@@ -438,8 +412,6 @@ pub(super) struct GeocodeResult {
     pub(super) types: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) viewport: Option<Viewport>,
-    /// The whole area's box, which Google sends for an area and not for an
-    /// address.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) bounds: Option<Viewport>,
 }
@@ -464,7 +436,6 @@ impl GeocodeResult {
     }
 }
 
-/// A Geocoding API v4 `PlaceView`, the place a destination is or holds.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct PlaceView {
@@ -519,7 +490,6 @@ impl PlaceView {
     }
 }
 
-/// A destination's `Entrance`, one of the entrances og maps for a place.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Entrance {
@@ -539,31 +509,22 @@ impl Entrance {
     }
 }
 
-/// Google's `granularity` for what og's point stands for. An address mapped
-/// as an outline stands at the outline's centre, the house itself, which
-/// is Google's street-address precision.
 pub(super) fn granularity(common: &Common) -> &'static str {
     match common.accuracy {
         Accuracy::Rooftop => "ROOFTOP",
         Accuracy::Centroid if common.layer == Layer::Address => "ROOFTOP",
         Accuracy::Interpolated => "RANGE_INTERPOLATED",
-        // og's street point is a point on the street's own geometry, its
-        // nearest equivalent of Google's centre of a feature.
         Accuracy::Centroid | Accuracy::Street => "GEOMETRIC_CENTER",
         Accuracy::Approximate => "APPROXIMATE",
     }
 }
 
-/// The text after a result's name in its label, which is a POI's address
-/// or where an address or area lies. `None` when the label is the name alone.
 pub(super) fn after_name(common: &Common) -> Option<String> {
     let rest = common.label.strip_prefix(common.name.as_str())?;
     let rest = rest.strip_prefix(", ")?;
     (!rest.is_empty()).then(|| rest.to_string())
 }
 
-/// A POI's address is its label after its name; for anything else the label
-/// is the address.
 fn formatted_address(common: &Common) -> Option<String> {
     if common.layer == Layer::Poi {
         return after_name(common);
@@ -571,9 +532,6 @@ fn formatted_address(common: &Common) -> Option<String> {
     (!common.label.is_empty()).then(|| common.label.clone())
 }
 
-/// The postal address, and the formatted address: a house or a place's
-/// postal lines in its country's form, one line after another, else og's
-/// label. Google writes the United States as `USA` there.
 fn address_fields(common: &Common, language: &Language) -> (Option<PostalAddress>, Option<String>) {
     let mut postal = postal_address(common);
     if let Some(postal) = postal.as_mut() {
@@ -605,9 +563,6 @@ fn is_us(common: &Common) -> bool {
     compat::country_code(&common.context) == Some("US")
 }
 
-/// A US state's two-letter code, which Google writes as its administrative
-/// area: the code of the state holding the house, else a code the source
-/// states.
 fn us_state_code(common: &Common, postal: &PostalAddress) -> Option<String> {
     common
         .context
@@ -623,8 +578,6 @@ fn us_state_code(common: &Common, postal: &PostalAddress) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The house number and street (or `addr:place`) as one line, joined as og
-/// joins them in an address's own name. A US street is abbreviated.
 fn street_line(common: &Common) -> Option<String> {
     let address = &common.address;
     let street = is_us(common)
@@ -641,8 +594,6 @@ fn street_line(common: &Common) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// The postal address as the source states it, with the areas og found the
-/// result in standing in for a part the source leaves out.
 fn postal_address(common: &Common) -> Option<PostalAddress> {
     let address = &common.address;
     let context = &common.context;
@@ -653,7 +604,6 @@ fn postal_address(common: &Common) -> Option<PostalAddress> {
         postal_code: address.postcode.clone(),
         administrative_area: address.region.clone().or_else(|| area(&context.region)),
         locality: compat::town_of(address, context).map(str::to_string),
-        // `areas` is outermost first, as an envelope lists them.
         sublocality: if address.areas.is_empty() {
             area(&context.sublocality)
         } else {
@@ -676,8 +626,6 @@ fn component(text: &str, types: &[&'static str]) -> AddressComponent {
     }
 }
 
-/// Google's address components, most specific first. Areas come from the
-/// areas og found the result in, falling back to the part the source states.
 fn address_components(common: &Common, language: &Language) -> Vec<AddressComponent> {
     const LOWER_ADMIN: [&str; 3] = [
         "administrative_area_level_2",
@@ -686,7 +634,6 @@ fn address_components(common: &Common, language: &Language) -> Vec<AddressCompon
     ];
     let address = &common.address;
     let context = &common.context;
-    // A name says which language it is in. A number or a code is in none.
     let area = |area: &ContextArea, types: &[&'static str]| AddressComponent {
         language_code: language.of(Some(area.record_id), context),
         ..component(&area.name, types)
@@ -754,15 +701,11 @@ fn address_components(common: &Common, language: &Language) -> Vec<AddressCompon
     for (level, found) in lower.iter().enumerate().rev() {
         components.push(area(found, &[LOWER_ADMIN[level], "political"]));
     }
-    // The region's short text is its code within its country (`ON` of
-    // `CA-ON`) when og knows it.
     match &context.region {
         Some(region) => components.push(AddressComponent {
             short_text: region_short(region.code.as_deref(), &region.name),
             ..area(region, &["administrative_area_level_1", "political"])
         }),
-        // A region result is not in its own context, so it is its own
-        // component, with its own code.
         None if common.layer == Layer::Region => components.push(AddressComponent {
             short_text: region_short(common.code.as_deref(), &common.name),
             language_code: language.of(common.record_id, context),
@@ -804,33 +747,22 @@ fn address_components(common: &Common, language: &Language) -> Vec<AddressCompon
     components
 }
 
-/// A region's short text, its code within its country (`ON` of `CA-ON`)
-/// when og knows it, else its name.
 fn region_short(code: Option<&str>, name: &str) -> String {
     code.and_then(|code| code.split_once('-'))
         .map_or_else(|| name.to_string(), |(_, own)| own.to_string())
 }
 
-/// What a result is, in Google's place types. Partial on purpose, so a
-/// layer or POI category gets types only where Google's type means the same
-/// thing, and nothing otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
     Types(&'static [&'static str]),
-    /// A place: Google's type of its category, and whether OSM maps it as a
-    /// shop, which Google writes `store` whatever its type.
     Poi {
         primary: Option<&'static str>,
         shop: bool,
-        /// Google's types of the kinds of food it serves
-        /// (`pizza_restaurant`), as its `cuisine` lists them, each by where
-        /// it stands in [`RESTAURANT_TYPES`].
         cuisine: [Option<u8>; CUISINE_TYPES],
     },
     Unknown,
 }
 
-/// The most types of food one place's `cuisine` adds to its types.
 const CUISINE_TYPES: usize = 4;
 
 impl Kind {
@@ -852,8 +784,6 @@ impl Kind {
                     cuisine,
                 }
             }
-            // An address naming the building it is drawn as is that
-            // building, a premise, as well as its street address.
             Layer::Address
                 if common
                     .building
@@ -866,8 +796,6 @@ impl Kind {
         }
     }
 
-    /// What a result of `layer` is, for any layer but a POI's, which its
-    /// category says.
     fn of_layer(layer: Layer) -> Self {
         match layer {
             Layer::Address | Layer::Interpolation => Self::Types(&["street_address"]),
@@ -877,7 +805,6 @@ impl Kind {
             Layer::Region => Self::Types(&["administrative_area_level_1", "political"]),
             Layer::Country => Self::Types(&["country", "political"]),
             Layer::Postcode => Self::Types(&["postal_code"]),
-            // OG districts span multiple admin tiers, so no single Google level applies.
             Layer::District => Self::Types(&["political"]),
             Layer::Place | Layer::Poi => Self::Unknown,
         }
@@ -910,8 +837,6 @@ impl Kind {
         }
     }
 
-    /// Google's word for what the place is, as `primaryType`. Never a generic
-    /// type such as `establishment`.
     pub(super) fn primary(self) -> Option<&'static str> {
         match self {
             Self::Poi { primary, .. } => primary,
@@ -921,9 +846,6 @@ impl Kind {
     }
 }
 
-/// Google's type of a kind of food, as OpenStreetMap's `cuisine` names it,
-/// by where it stands in [`RESTAURANT_TYPES`]. It is the restaurant type of
-/// the same name (`pizza` is `pizza_restaurant`), when Google has one.
 fn cuisine_type(value: &str) -> Option<u8> {
     let wanted = format!("{}_restaurant", value.trim().replace(' ', "_"));
     RESTAURANT_TYPES
@@ -932,7 +854,6 @@ fn cuisine_type(value: &str) -> Option<u8> {
         .and_then(|at| u8::try_from(at).ok())
 }
 
-/// Google's restaurant types, as its place type tables list them.
 const RESTAURANT_TYPES: [&str; 116] = [
     "afghani_restaurant",
     "african_restaurant",
@@ -1052,8 +973,6 @@ const RESTAURANT_TYPES: [&str; 116] = [
     "yakitori_restaurant",
 ];
 
-/// og's POI categories, as the catalog writes them, each beside Google's
-/// Table A type of the same meaning.
 const CATEGORY_TYPES: &[(&str, &str)] = &[
     ("aeroway aerodrome", "airport"),
     ("amenity arts_centre", "cultural_center"),
@@ -1177,9 +1096,6 @@ const CATEGORY_TYPES: &[(&str, &str)] = &[
     ("tourism zoo", "zoo"),
 ];
 
-/// The general types Google writes beside a type of one of its groups:
-/// `food` for Food and Drink, `store` for Shopping, `lodging`, `finance`,
-/// `health` and `place_of_worship`, as its place type tables group them.
 fn groups_of(named: &str) -> &'static [&'static str] {
     const FOOD: &[&str] = &[
         "bakery",
@@ -1241,10 +1157,8 @@ fn groups_of(named: &str) -> &'static [&'static str] {
     }
 }
 
-/// Google's types every place has, whatever its kind.
 const ANY_PLACE: [&str; 2] = ["point_of_interest", "establishment"];
 
-/// og's POI category (`key:value`) as Google's type.
 fn category_type(category: &str) -> Option<&'static str> {
     let (key, value) = category.split_once(':')?;
     CATEGORY_TYPES
@@ -1257,9 +1171,6 @@ fn category_type(category: &str) -> Option<&'static str> {
         .map(|(_, google)| *google)
 }
 
-/// og's categories of the places Google's `types` name, as the catalog
-/// writes them. A type every place has names every kind, and a type og has
-/// no category for names none.
 pub(super) fn categories_of<'a>(types: impl IntoIterator<Item = &'a str>) -> Vec<&'static str> {
     let mut categories = Vec::new();
     for named in types {
@@ -1280,8 +1191,6 @@ pub(super) fn categories_of<'a>(types: impl IntoIterator<Item = &'a str>) -> Vec
 mod type_tests {
     use super::{Kind, categories_of};
 
-    /// A place carries its group's general type beside its own, and a shop
-    /// is a store whatever its kind.
     #[test]
     fn a_place_carries_the_general_type_of_its_group() {
         let types = |primary, shop| {
@@ -1316,7 +1225,6 @@ mod type_tests {
         );
     }
 
-    /// Google's transit types find og's stations and stops.
     #[test]
     fn transit_types_find_og_stations_and_stops() {
         for (google, category) in [

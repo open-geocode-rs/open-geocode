@@ -1,7 +1,3 @@
-//! Work that runs beside the interface: building a Pack, with the download
-//! and checksum before it when the extract is not on disk yet. The job runs
-//! on its own thread; the screens read its steps as they change.
-
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -29,45 +25,31 @@ use crate::{
     regions::{self, Region},
 };
 
-/// What a step's work is counted in.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unit {
     Bytes,
     Count(&'static str),
-    /// Only the step's time is known.
     None,
 }
 
-/// One line of a running job.
 pub(crate) struct Step {
-    /// What it did, once finished: `Scanned`.
     pub did: &'static str,
-    /// What it does while it runs: `Scanning`.
     pub doing: &'static str,
-    /// What it works on: `OSM objects`.
     pub object: String,
-    /// Two lines on what the step does, for the details view.
     pub explain: [&'static str; 2],
     pub unit: Unit,
     pub total: Option<u64>,
     pub started: Option<Instant>,
-    /// Seconds the step took, once finished.
     pub secs: Option<f64>,
 }
 
-/// A job's steps and where it is, shared with its thread.
 pub(crate) struct Progress {
     pub steps: Mutex<Vec<Step>>,
-    /// The running step, by index.
     pub current: AtomicU64,
-    /// Work done in the running step.
     pub done: AtomicU64,
     pub started: Instant,
-    /// The plan the build runs with, once it is made.
     pub plan: Mutex<Option<BuildPlan>>,
-    /// What the build warned about, in order.
     pub warnings: Mutex<Vec<String>>,
-    /// The running stage's throughput and what bounds it, as measured.
     pub live: Mutex<Option<String>>,
 }
 
@@ -96,8 +78,6 @@ impl Progress {
         let mut steps = self.steps.lock().expect("steps lock");
         let step = &mut steps[index];
         step.secs = Some(step.started.map_or(0.0, |at| at.elapsed().as_secs_f64()));
-        // A step with a total ends with all of it done, which the last
-        // advance may not have said.
         if let Some(total) = step.total {
             self.done.store(total, Ordering::Relaxed);
         }
@@ -112,48 +92,32 @@ impl Progress {
     }
 }
 
-/// A build to run: a region's extract into its Pack.
-/// One region a build reads, with the extract it reads it from.
 #[derive(Clone)]
 pub(crate) struct BuildInput {
     pub region: &'static Region,
     pub extract: PathBuf,
-    /// Download the extract first, also when one is on disk.
     pub download: bool,
 }
 
 pub(crate) struct BuildRequest {
-    /// The regions the Pack covers, in the order they are read. Several make
-    /// one Pack: one text index, one spatial index, one process to serve it.
     pub inputs: Vec<BuildInput>,
     pub pack: PathBuf,
-    /// Memory for the build's buffers; derived from what the machine can
-    /// give when not set.
     pub memory_budget_bytes: Option<usize>,
-    /// The most scratch disk the build may hold at once; the scratch
-    /// volume's free space caps it either way.
     pub scratch_budget_bytes: Option<u64>,
-    /// Build even when the plan finds too little memory or disk.
     pub force: bool,
-    /// What to do with a build of the Pack that stopped.
     pub leftover: Leftover,
-    /// Add the OpenAddresses points of the countries the Pack covers.
     pub openaddresses: bool,
     pub tiger: bool,
 }
 
-/// A finished build.
 pub(crate) struct Built {
     pub pack: PackInfo,
-    /// The build itself, without the download.
     pub build_secs: f64,
-    /// What each stage cost, as a table.
     pub costs: String,
 }
 
 pub(crate) struct BuildJob {
     pub progress: Arc<Progress>,
-    /// The Pack it writes, and the extracts it reads or downloads.
     pack: PathBuf,
     extracts: Vec<PathBuf>,
     cancel: Arc<AtomicBool>,
@@ -163,8 +127,6 @@ pub(crate) struct BuildJob {
 impl Progress {
     pub(crate) fn of(request: &BuildRequest) -> Arc<Self> {
         let mut steps = Vec::new();
-        // One download and checksum pair per input that needs fetching, each
-        // named after its region so a build of several says which it is on.
         for input in request.inputs.iter().filter(|input| input.download) {
             let named = |what: &str| {
                 if request.inputs.len() > 1 {
@@ -237,12 +199,10 @@ impl BuildJob {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
-    /// The flag that stops the job, for a signal handler to set.
     pub(crate) fn cancel_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.cancel)
     }
 
-    /// Whether the job writes this Pack, or reads or downloads this extract.
     pub(crate) fn touches(&self, pack: &Path, extract: &Path) -> bool {
         self.pack == pack || self.extracts.iter().any(|own| own == extract)
     }
@@ -251,7 +211,6 @@ impl BuildJob {
         self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
-    /// The job's outcome, once it is finished.
     pub(crate) fn take(&mut self) -> Option<Result<Built>> {
         if !self.is_finished() {
             return None;
@@ -265,8 +224,6 @@ impl BuildJob {
     }
 }
 
-/// A job let go of is stopped, and waited for: the builder removes its
-/// unfinished Pack generation only while it still runs.
 impl Drop for BuildJob {
     fn drop(&mut self) {
         self.cancel();
@@ -276,7 +233,6 @@ impl Drop for BuildJob {
     }
 }
 
-/// Whether an error is a job stopping because it was asked to.
 pub(crate) fn cancelled(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<open_geocode::Error>(),
@@ -404,10 +360,8 @@ fn build_step(stage: BuildStage) -> Step {
     }
 }
 
-/// Hands the builder's stages and warnings to the job's progress.
 struct Observer {
     progress: Arc<Progress>,
-    /// Steps before the build's own: the download and the checksum.
     offset: usize,
 }
 
@@ -445,8 +399,6 @@ fn run(
 ) -> Result<Built> {
     let mut offset = 0;
     let mut index = None;
-    // Each input that needs its extract is downloaded and checked before any
-    // of them is built, so a build never starts on a set it cannot finish.
     for input in request.inputs.iter().filter(|input| input.download) {
         // Geofabrik's index says where the extract is now. The catalog's own
         // link is only for what the index does not hold, the planet.
@@ -538,9 +490,6 @@ fn run(
     };
     let plan = plan_osm_build(&options)?;
     *progress.plan.lock().expect("plan lock") = Some(plan.clone());
-    // The process's global pool is the batch runs', sized to every CPU the
-    // first time one runs. The build gets a pool of its own, sized by the
-    // plan unless RAYON_NUM_THREADS sets it.
     let threads = if std::env::var_os("RAYON_NUM_THREADS").is_some() {
         0
     } else {
@@ -555,10 +504,6 @@ fn run(
     let build_secs = started.elapsed().as_secs_f64();
     let pack = PackInfo::read(&request.pack)
         .with_context(|| format!("the new Pack at {} cannot be read", request.pack.display()))?;
-    // One row per region, each with the bytes it contributed, so the picker's
-    // estimate for a region stays about that region however it was built.
-    // The seconds are shared out by input size, since the stages after the
-    // per-input passes run once over all of them together.
     let finished_at = format::now();
     for (input, reported) in request.inputs.iter().zip(&report.inputs) {
         let share = if report.input_bytes > 0 {

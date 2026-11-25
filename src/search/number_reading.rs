@@ -67,7 +67,6 @@ impl AddressVariant {
         {
             return None;
         }
-        // No confidence model was fitted to alternate readings.
         first.confidence = None;
         Some(first)
     }
@@ -176,14 +175,12 @@ static COMPOUND_END: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"{DIGITS}(?:{DASH}{DIGITS}){{1,3}}\z")).unwrap());
 
 fn written_street(prefix: &str, street: &str) -> bool {
-    // A shortened parse can mark its street matched after dropping part of the name.
     let compact = |text: &str| search_key(text).map(|key| key.replace(' ', ""));
     compact(street)
         .is_some_and(|street| compact(prefix).is_some_and(|prefix| prefix.ends_with(&street)))
 }
 
 fn same_number(stored: &str, reading: &str) -> bool {
-    // Search keys fold slashes and other punctuation to the same gap as dashes.
     STORED_NUMBER.is_match(stored) && search_key(stored).as_deref() == Some(reading)
 }
 

@@ -1,6 +1,3 @@
-//! `/v1/autocomplete/postal-city`, the postcodes or towns that start with
-//! what is typed, each with the areas around it.
-
 use axum::{
     Json,
     extract::{Request, State},
@@ -38,9 +35,6 @@ enum Kind {
 }
 
 impl Kind {
-    /// The kind asked for. With none named, text with a digit in it is read
-    /// as a postcode, since a town's name rarely has one and nearly every
-    /// country's postcodes do.
     fn of(named: Option<&str>, text: &str) -> Result<Self, VendorError> {
         match named.map(str::to_ascii_uppercase).as_deref() {
             Some("POSTAL") => Ok(Self::Postal),
@@ -123,8 +117,6 @@ fn prediction(feature: &Feature, kind: Kind) -> Prediction {
     };
     Prediction {
         address: PredictionAddress {
-            // The postal-city answer names the country by its alpha-3 code
-            // alone.
             country: address
                 .country
                 .and_then(|country| country.iso_alpha3_code)

@@ -1,17 +1,9 @@
-//! Precisely's Global Match Code, `V4-P4S4A0T4R6Z4C4-5`.
-//!
-//! A verify result carries one, built from how og judged each address part
-//! the request stated, and `/v1/explain-addresscode` reads one back. The
-//! code is three segments. The address match status and verification
-//! level, a value per address component, and the match confidence.
-
 use std::{collections::BTreeMap, fmt::Write as _};
 
 use serde::Serialize;
 
 use crate::api::{PartMatch, QueryMatch};
 
-/// The parts og judged of the parts a request stated.
 fn judged_parts(judged: QueryMatch) -> impl Iterator<Item = PartMatch> {
     [
         judged.housenumber,
@@ -26,8 +18,6 @@ fn judged_parts(judged: QueryMatch) -> impl Iterator<Item = PartMatch> {
     .flatten()
 }
 
-/// Every component the extended code may carry, in the order the code
-/// writes them, with the label Precisely gives each.
 const COMPONENTS: [(char, &str); 19] = [
     ('D', "Department"),
     ('M', "Company"),
@@ -50,11 +40,8 @@ const COMPONENTS: [(char, &str); 19] = [
     ('C', "Country"),
 ];
 
-/// The components of the simple code, a subset in the same order.
 const SIMPLE: [char; 7] = ['P', 'S', 'A', 'T', 'R', 'Z', 'C'];
 
-/// The components og writes in an extended code. `N` is left out, since
-/// og judges no place name apart from the street line.
 const EXTENDED: [char; 18] = [
     'D', 'M', 'B', 'U', 'F', 'G', 'P', 'S', 'Q', 'X', 'A', 'T', 'E', 'R', 'W', 'Z', 'Y', 'C',
 ];
@@ -65,7 +52,6 @@ const CORRECTED: u8 = 3;
 const VERIFIED: u8 = 4;
 const APPENDED: u8 = 6;
 
-/// What a result holds for each component og can fill.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct Holds {
     pub(super) housenumber: bool,
@@ -79,7 +65,6 @@ pub(super) struct Holds {
     pub(super) country: bool,
 }
 
-/// A Global Match Code og derives for one result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MatchCode {
     level: u8,
@@ -88,19 +73,6 @@ pub(super) struct MatchCode {
 }
 
 impl MatchCode {
-    /// The code for a result og judged against the stated parts, or `None`
-    /// when no stated part was verified or one contradicts the result. A
-    /// result in another town than the one asked for is no verified
-    /// address, and Precisely's `M` and `U` statuses are not issued, so it
-    /// has no code at all.
-    ///
-    /// A stated part og matched exactly is verified without change, one it
-    /// accepted under another spelling is corrected. A part the request
-    /// left out and the result fills in is appended from og's data, which
-    /// stands in for the reference data the code speaks of. The confidence
-    /// is the result's `score` in fifths. A result with no `score`, from a
-    /// Pack never calibrated, has no code, since its last segment is that
-    /// confidence.
     pub(super) fn derive(judged: QueryMatch, holds: Holds, score: Option<u8>) -> Option<Self> {
         if judged_parts(judged).any(|part| part == PartMatch::Unmatched) {
             return None;
@@ -137,8 +109,6 @@ impl MatchCode {
         } else {
             return None;
         };
-        // The last segment rates the match, which only a calibrated score
-        // says; without one there is no whole code to give.
         let confidence = (score? + 10) / 20;
         Some(Self {
             level,
@@ -166,7 +136,6 @@ impl MatchCode {
     }
 }
 
-/// A Global Match Code read from a client, any status Precisely defines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ParsedCode {
     status: char,
@@ -186,8 +155,6 @@ fn position(letter: char) -> Option<usize> {
     COMPONENTS.iter().position(|(known, _)| *known == letter)
 }
 
-/// Read a code, or say what is wrong with it, as the detail after
-/// Precisely's `(DIS-LI-1040):`.
 pub(super) fn parse(code: &str) -> Result<ParsedCode, String> {
     let segments = code.trim().split('-').collect::<Vec<_>>();
     let [status, components, confidence] = segments[..] else {
@@ -325,8 +292,6 @@ struct MatchConfidence {
 }
 
 impl ParsedCode {
-    /// One line a person reads, such as `Address premise verified with high
-    /// confidence.`, then a sentence for each component that changed.
     pub(super) fn summary(&self) -> String {
         let mut summary = match self.status {
             'V' => format!(
@@ -446,8 +411,6 @@ mod tests {
             ..QueryMatch::default()
         };
         assert_eq!(level(nothing), None);
-        // The house in another town than the one asked for is no verified
-        // address, though its number and street match.
         let elsewhere = QueryMatch {
             housenumber: Some(PartMatch::Matched),
             street: Some(PartMatch::Matched),
@@ -476,7 +439,6 @@ mod tests {
         assert_eq!(confidence(Some(75)).as_deref(), Some("4"));
         assert_eq!(confidence(Some(100)).as_deref(), Some("5"));
         assert_eq!(confidence(Some(9)).as_deref(), Some("0"));
-        // A Pack never calibrated rates no match, so no code is whole.
         assert_eq!(confidence(None), None);
     }
 

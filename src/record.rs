@@ -5,8 +5,6 @@ use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
 use crate::{labels, parse::lattice::CountryCode, util::geo::point_lon_lat};
 
-/// One normalized geocoding record, as the builder emits it and the Pack
-/// stores it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Record {
     Address(AddressRecord),
@@ -29,19 +27,12 @@ pub struct Building {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AddressRecord {
     pub address: AddressComponents,
-    /// The building its source draws it as, if it does (see [`Building`]).
     pub building: Option<Building>,
-    /// For an address that states no postcode, the postcodes the other
-    /// addresses of its street state: the evidence of where it is. Empty when
-    /// it states one, or its street's addresses state none.
     pub street_postcodes: Vec<String>,
     pub geometry: Geometry,
     pub location_precision: LocationPrecision,
     pub source: SourceProvenance,
-    /// Whether another source places the same house farther from this point
-    /// than sources placing one house ever disagree: the point may be wrong.
     pub disputed: bool,
-    /// The entrances its source maps (see [`Entrance`]).
     pub access: Vec<Entrance>,
 }
 
@@ -49,7 +40,6 @@ pub struct AddressRecord {
 pub struct InterpolationRecord {
     pub address: InterpolationAddressComponents,
     pub interpolation: InterpolationRange,
-    /// OSM node ids of the low and high numbered anchors.
     pub anchor_node_ids: [i64; 2],
     pub geometry: Geometry,
     pub representative_point: [f64; 2],
@@ -60,10 +50,7 @@ pub struct InterpolationRecord {
 pub struct StreetRecord {
     pub name: String,
     pub road_class: RoadClass,
-    /// The other names the feature is known by (see [`PlaceRecord::alt_names`]).
     pub alt_names: Vec<String>,
-    /// The town or city it lies in, which its label names: one name is
-    /// many streets across a country.
     pub locality: Option<String>,
     pub geometry: Geometry,
     pub representative_point: [f64; 2],
@@ -75,14 +62,11 @@ pub struct StreetRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PostcodeRecord {
     pub postcode: String,
-    /// The country its addresses lie in. A code names a postcode only within
-    /// one country: AU and NZ both have a "2110".
     pub country: Option<CountryCode>,
     pub geometry: Geometry,
     pub source: DerivedSourceProvenance,
 }
 
-// Discriminants are the Pack encoding: renumbering needs a `RECORDS_VERSION`.
 /// What kind of road a street is, from its OSM `highway` tag, most important
 /// first. A link road (`motorway_link`) is its road's class.
 #[derive(
@@ -196,14 +180,10 @@ impl RoadClass {
     }
 }
 
-/// A named point of interest. One that also states a valid address carries it,
-/// so the same OSM object is found by its name and by its address.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoiRecord {
     pub name: String,
-    /// The other names the feature is known by (see [`PlaceRecord::alt_names`]).
     pub alt_names: Vec<String>,
-    /// The tag that made it a POI, as `key:value`, for example `amenity:cafe`.
     pub category: String,
     pub address: Option<AddressComponents>,
     pub geometry: Geometry,
@@ -213,7 +193,6 @@ pub struct PoiRecord {
     pub wikidata: Option<u32>,
     pub brand: Option<Brand>,
     pub details: Option<Box<PoiDetails>>,
-    /// Ids of objects merged into it: they still find it.
     pub aliases: Vec<(ObjectType, i64)>,
 }
 
@@ -234,19 +213,14 @@ pub struct Brand {
     pub wikidata: Option<u32>,
 }
 
-/// A way in that OpenStreetMap maps for a record, which is a node tagged
-/// `entrance` on the outline of the building or site the record is drawn
-/// with, or the record's own node when it is so tagged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entrance {
     /// Its longitude and latitude in 1e-7 degrees.
     pub at: [i32; 2],
-    /// The value of its `entrance` tag as written, such as `main`.
     pub kind: String,
 }
 
 impl Entrance {
-    /// The entrance a node's tags make of it, if they do.
     pub fn of_tag(kind: Option<&str>, lon: f64, lat: f64) -> Option<Self> {
         let kind = kind
             .map(str::trim)
@@ -291,24 +265,16 @@ impl From<&Entrance> for AccessPoint {
 /// antimeridian, and only then.
 pub type Extent = [i32; 4];
 
-/// What few POIs state. Boxed on the record: every record of a build is as
-/// wide as the widest, and most would carry these empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PoiDetails {
     pub contact: Option<Contact>,
-    /// The `opening_hours` tag as written, never parsed.
     pub opening_hours: Option<String>,
-    /// The box around its outline, when it is drawn as an area.
     pub extent: Option<Extent>,
-    /// The entrances its source maps (see [`Entrance`]).
     pub access: Vec<Entrance>,
-    /// The kinds of food it serves, as its `cuisine` tag lists them, in
-    /// lower case and in order (`pizza`, `italian`).
     pub cuisine: Vec<String>,
 }
 
 impl PoiDetails {
-    /// What a POI's tags state of it.
     pub fn stated(contact: Option<Contact>, opening_hours: Option<String>) -> Option<Box<Self>> {
         Self {
             contact,
@@ -318,7 +284,6 @@ impl PoiDetails {
         .kept()
     }
 
-    /// None when it holds nothing, as a record never holds empty details.
     pub fn kept(self) -> Option<Box<Self>> {
         (self != Self::default()).then(|| Box::new(self))
     }
@@ -343,7 +308,6 @@ pub struct Contact {
 }
 
 impl Contact {
-    /// None when nothing is stated: a record never holds an empty contact.
     pub fn stated(
         phone: Option<String>,
         website: Option<String>,
@@ -383,27 +347,18 @@ fn deserialize_item<'de, D: serde::Deserializer<'de>>(
     Ok(text.and_then(|text| text.strip_prefix('Q').and_then(|item| item.parse().ok())))
 }
 
-/// How well known a POI or a place is: what breaks ties between records the
-/// query names alike, never against an address or a street.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 pub struct Prominence {
-    /// QRank, 0 when none. First field: it orders before the tags.
     pub importance: u8,
-    /// It carries `wikidata=` or `wikipedia=`.
     pub linked: bool,
-    /// The languages of its `name:<lang>` tags, `ja`, `ja-Hira` and `ja_rm`
-    /// counted once, up to [`Prominence::MAX_LANGUAGES`].
     pub languages: u8,
 }
 
 impl Prominence {
-    /// Languages counted at most: the Pack stores the count in seven bits,
-    /// and past a few dozen a name is everywhere already.
     pub const MAX_LANGUAGES: u8 = 127;
 
-    /// Importance stored apart.
     pub fn to_byte(self) -> u8 {
         self.languages.min(Self::MAX_LANGUAGES) << 1 | u8::from(self.linked)
     }
@@ -416,8 +371,6 @@ impl Prominence {
         }
     }
 
-    /// One number that orders as the struct does, for the text index to
-    /// collect by.
     pub fn rank(self) -> u64 {
         u64::from(self.importance) << 8
             | u64::from(self.linked) << 7
@@ -427,7 +380,6 @@ impl Prominence {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaceRecord {
-    /// The OSM `name`, the label the record is shown by.
     pub name: String,
     /// Every other name the feature is known by, in tag order: each
     /// `name:<lang>` (`name:ja-Hira`, `name:en`), `alt_name`, `official_name`,
@@ -508,8 +460,6 @@ impl Layer {
         Self::ALL.into_iter().find(|layer| layer.as_str() == value)
     }
 
-    /// Layers that describe the surroundings of a point (admin areas, named
-    /// places and postcodes) rather than a specific address or road.
     pub const fn is_context(self) -> bool {
         matches!(
             self,
@@ -536,20 +486,6 @@ impl Layer {
     }
 }
 
-/// A tier of the admin hierarchy, outermost first.
-///
-/// The tiers between the conventional ones (`SubRegion`, `SubDistrict`,
-/// `SubLocality`) exist because a country's hierarchy is deeper than the
-/// conventional five. Germany maps nine admin levels, three of them
-/// `state_district` and two `city_district`; with one tier each those
-/// collapse and all but one boundary of each is dropped from every German
-/// address.
-///
-/// Ordering is the hierarchy, outermost to innermost, and is relied on: a
-/// chain is sorted by it. `Place` sorts last because it is no admin tier at
-/// all -- an island can be smaller than a locality or larger than a region.
-/// The discriminants are the Pack's on-disk encoding of a context tier, so a
-/// variant may not be reordered or renumbered without a `CONTEXT_VERSION`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
@@ -582,8 +518,6 @@ impl PlaceLayer {
 }
 
 impl PlaceLayer {
-    /// Every admin tier, outermost first. `Place` is left out: it belongs to
-    /// place areas, not to the admin hierarchy.
     pub const ADMIN: [PlaceLayer; 9] = [
         PlaceLayer::Country,
         PlaceLayer::Region,
@@ -606,20 +540,12 @@ impl PlaceLayer {
         }
     }
 
-    /// The record layer a tier is stored as. The tiers [`Layer`] has no
-    /// variant for are stored as the conventional tier above them, which is
-    /// what they are a subdivision of.
     pub const fn record_layer(self) -> Layer {
         Layer::from_place(self)
     }
 }
 
 impl Layer {
-    /// The record layer a place tier is stored and searched as. A `Sub` tier
-    /// has no [`Layer`] of its own: it is a subdivision of the tier above and
-    /// is searched as one, so a query for a district still matches a
-    /// subdistrict. The tier itself is kept on the context entry, which is
-    /// what the response reports.
     pub const fn from_place(layer: PlaceLayer) -> Self {
         match layer {
             PlaceLayer::Country => Layer::Country,
@@ -651,10 +577,6 @@ pub struct AddressComponents {
     pub unit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locality: Option<String>,
-    /// The areas below the locality the address states, outermost first:
-    /// `addr:suburb`, `addr:quarter` and `addr:neighbourhood`. An address
-    /// of the Japanese block scheme names no street, only these and its
-    /// block and house numbers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub areas: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -666,8 +588,6 @@ pub struct AddressComponents {
 }
 
 impl AddressComponents {
-    /// What the house number is on: the street, else the `addr:place`, else
-    /// the innermost area the address states.
     pub fn subject(&self) -> Option<&str> {
         self.street
             .as_deref()
@@ -701,11 +621,7 @@ pub struct InterpolationRange {
     pub step: u32,
 }
 
-/// A range runs from `start` at the first vertex of its line to `end` at the
-/// last, so a house number and its fraction of the line's length estimate
-/// each other.
 impl InterpolationRange {
-    /// The number in the range nearest to `fraction` of the way along it.
     pub fn number_at(&self, fraction: f64) -> u32 {
         let fraction = fraction.clamp(0.0, 1.0);
         let span = self.end.saturating_sub(self.start);
@@ -784,8 +700,6 @@ pub struct RejectedRecord {
     Hash,
     utoipa::ToSchema,
 )]
-/// Source object type: an OSM `node`, `way` or `relation`, or a `row` of an
-/// address dataset such as OpenAddresses.
 #[serde(rename_all = "snake_case")]
 pub enum ObjectType {
     Node,
@@ -828,8 +742,6 @@ impl Record {
         }
     }
 
-    /// The names of a named record (street, place, POI): its `name`, then
-    /// its alternate names. Empty for the other layers.
     pub fn names(&self) -> Vec<&str> {
         let (name, alt_names) = match self {
             Record::Street(record) => (&record.name, &record.alt_names),
@@ -853,8 +765,6 @@ impl Record {
         }
     }
 
-    /// The point used to place the record on a map: the point itself for point
-    /// records, the representative point for lines.
     pub fn display_point(&self) -> Option<[f64; 2]> {
         match self {
             Record::Address(record) => point_lon_lat(&record.geometry),
@@ -1241,11 +1151,9 @@ fn serialize_alt_names<S: SerializeStruct>(
     }
 }
 
-/// The dataset id of records built from OpenStreetMap.
 pub const OSM_DATASET: &str = "osm";
 
 impl SourceProvenance {
-    /// Row `row` of an imported address dataset.
     pub fn imported(dataset: impl Into<String>, row: i64) -> Self {
         Self {
             dataset: dataset.into(),

@@ -1,17 +1,3 @@
-//! The three forms each gold row is put to a parser in.
-//!
-//! A variant is a pure function of the gold row, so the fixture stays one
-//! file per country and every system sees the same perturbed rows. Tokens
-//! move with their labels, so the gold labels of a variant are the labels of
-//! the row it returns.
-//!
-//! - [`Variant::AsIs`]: the row as the corpus wrote it, parts joined with
-//!   commas.
-//! - [`Variant::Stripped`]: the same tokens without the commas.
-//! - [`Variant::Messy`]: no commas, the parts in a shuffled order, street-type
-//!   words abbreviated or fused onto the word before them, and one typo. See
-//!   [`messy`] for the exact rules.
-
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use super::fixture::TaggedRow;
@@ -21,10 +7,8 @@ use crate::{
     util::fold::search_key,
 };
 
-/// The seed every messy row's random draws derive from.
 pub const SEED: u64 = 2026;
 
-/// How a gold row's query is put to a system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Variant {
     AsIs,
@@ -35,7 +19,6 @@ pub enum Variant {
 impl Variant {
     pub const ALL: [Variant; 3] = [Variant::AsIs, Variant::Stripped, Variant::Messy];
 
-    /// The name in reports and file names: `jp.as-is.txt`, `jp.messy.tsv`.
     pub fn name(self) -> &'static str {
         match self {
             Variant::AsIs => "as-is",
@@ -44,8 +27,6 @@ impl Variant {
         }
     }
 
-    /// The row in this form: its query is [`TaggedRow::query`] and its gold
-    /// labels are [`TaggedRow::labels`].
     pub fn apply(self, row: &TaggedRow) -> TaggedRow {
         match self {
             Variant::AsIs => row.clone(),
@@ -58,28 +39,6 @@ impl Variant {
     }
 }
 
-/// The messy form of a row. Its random draws come from a generator seeded by
-/// [`SEED`] and the row's text, so the same row is always perturbed the same
-/// way, wherever it sits in the file. In order:
-///
-/// 1. The parts (the runs of tokens between the row's commas) are shuffled
-///    into a uniformly random order; the tokens of a part keep their order.
-///    The commas are dropped.
-/// 2. Each street-labelled token that is a street-type word is either
-///    abbreviated or fused onto the token before it, on a fair coin. A word is
-///    abbreviated to its usual abbreviation in the text index's table
-///    ([`STREET_TYPE_ABBREVIATIONS`], read backwards: `street` becomes `st`),
-///    and fused when the token before it in its part is also a street token
-///    (`manosquer strasse` becomes the single token `manosquerstrasse`, labelled
-///    `street`). When the coin's pick is impossible for the word the other is
-///    used, and when neither is the word is left alone.
-/// 3. Exactly one typo goes into one token of five or more characters, all of
-///    them alphabetic, when the row has one: a substitution, a deletion or a
-///    transposition of two adjacent characters, picked uniformly, at a uniform
-///    position. A substitution draws a different letter from `a-z` for a Latin
-///    letter, from `а-я` for a Cyrillic one, and otherwise from the token's
-///    other characters. A transposition swaps two different characters; a
-///    substitution or transposition with no such choice is a deletion.
 pub fn messy(row: &TaggedRow) -> TaggedRow {
     let mut rng = Rng::new(xxh3_64_with_seed(row.to_line().as_bytes(), SEED));
 
@@ -129,7 +88,6 @@ pub fn messy(row: &TaggedRow) -> TaggedRow {
     }
 }
 
-/// The row's parts: the runs of tokens between its part boundaries.
 fn parts(row: &TaggedRow) -> Vec<Vec<Tagged>> {
     let mut parts = Vec::with_capacity(row.breaks.len() + 1);
     let mut start = 0;
@@ -140,9 +98,6 @@ fn parts(row: &TaggedRow) -> Vec<Vec<Tagged>> {
     parts
 }
 
-/// Street-type words beyond the text index's English table, for the
-/// countries the benchmark covers, so their streets can be fused too. They
-/// have no abbreviation in the table.
 const OTHER_STREET_TYPES: &[&str] = &[
     "strasse",
     "weg",
@@ -173,8 +128,6 @@ fn is_street_type_word(token: &str) -> bool {
     is_street_type(token) || abbreviation(token).is_some() || OTHER_STREET_TYPES.contains(&token)
 }
 
-/// A street-type word's usual abbreviation: the first the text index's table
-/// expands to it.
 pub fn abbreviation(word: &str) -> Option<&'static str> {
     STREET_TYPE_ABBREVIATIONS
         .iter()
@@ -197,9 +150,6 @@ fn add_typo(tokens: &mut [Tagged], rng: &mut Rng) {
     typo(&mut tokens[eligible[rng.below(eligible.len())]].token, rng);
 }
 
-/// One substitution, deletion or transposition of two adjacent characters
-/// in `token`, picked uniformly, at a uniform position (see [`messy`]).
-/// `token` must not be empty.
 pub(crate) fn typo(token: &mut String, rng: &mut Rng) {
     let mut chars = token.chars().collect::<Vec<_>>();
     match rng.below(3) {
@@ -230,7 +180,6 @@ pub(crate) fn typo(token: &mut String, rng: &mut Rng) {
     *token = chars.into_iter().collect();
 }
 
-/// A different character to put in place of `original` in `chars`.
 fn substitute(chars: &[char], original: char, rng: &mut Rng) -> Option<char> {
     let alphabet = if original.is_ascii_lowercase() {
         ('a'..='z').collect::<Vec<_>>()
@@ -249,8 +198,6 @@ fn substitute(chars: &[char], original: char, rng: &mut Rng) -> Option<char> {
     (!choices.is_empty()).then(|| choices[rng.below(choices.len())])
 }
 
-/// SplitMix64: small, fast and fixed, so the variants never change with a
-/// dependency.
 #[derive(Debug)]
 pub(crate) struct Rng(u64);
 
@@ -267,7 +214,6 @@ impl Rng {
         z ^ (z >> 31)
     }
 
-    /// A uniform index in `0..bound`; `bound` must be positive.
     pub(crate) fn below(&mut self, bound: usize) -> usize {
         ((u128::from(self.next()) * bound as u128) >> 64) as usize
     }
@@ -276,7 +222,6 @@ impl Rng {
         self.next() >> 63 == 1
     }
 
-    /// Fisher-Yates.
     pub(crate) fn shuffle<T>(&mut self, items: &mut [T]) {
         for index in (1..items.len()).rev() {
             items.swap(index, self.below(index + 1));
@@ -299,7 +244,6 @@ mod tests {
             .collect()
     }
 
-    /// Edit distance of one substitution, deletion or adjacent swap.
     fn one_typo_apart(left: &str, right: &str) -> bool {
         let left = left.chars().collect::<Vec<_>>();
         let right = right.chars().collect::<Vec<_>>();
@@ -339,7 +283,6 @@ mod tests {
 
     #[test]
     fn messy_shuffles_whole_parts_and_carries_labels() {
-        // Without street types or long words, only the shuffle applies.
         let gold =
             row("en\tus\t1/house_number a/street , b/locality c/locality , d/region , e/country");
         let mut orders = std::collections::BTreeSet::new();
@@ -393,11 +336,8 @@ mod tests {
     #[test]
     fn a_street_type_with_one_form_possible_takes_it() {
         for index in 0..50 {
-            // First in its part: "avenue" can only be abbreviated.
             let out = messy(&row(&format!("fr{index}\tfr\tavenue/street foch/street")));
             assert_eq!(tokens(&out), ["ave", "foch"]);
-            // No abbreviation: "strasse" can only be fused, and the fused
-            // token is the row's one typo candidate.
             let out = messy(&row(&format!(
                 "de{index}\tde\tmanosquer/street strasse/street"
             )));

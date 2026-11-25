@@ -13,26 +13,19 @@ pub(crate) mod lines;
 
 use std::collections::BTreeMap;
 
-/// `CC<TAB>template` rows, `ZZ` the default.
 const TEMPLATES: &str = include_str!("templates.tsv");
 
-/// A parsed address template, its fields named as `F`.
 #[derive(Debug, Clone)]
 pub(crate) enum Node<F> {
     Text(String),
     Field(F),
-    /// The alternatives of `{{#first}} a || b {{/first}}`, of which the
-    /// first with a value is written.
     First(Vec<Vec<Node<F>>>),
 }
 
-/// What a template writes, in order.
 #[derive(Debug)]
 pub(crate) enum Piece<'a, F> {
     Text(&'a str),
-    /// A field, whether or not it has a value.
     Field(&'a F),
-    /// A choice none of whose alternatives has a value.
     Unfilled,
 }
 
@@ -65,8 +58,6 @@ fn parse<F>(template: &str, field: &impl Fn(&str) -> F) -> Vec<Node<F>> {
     nodes
 }
 
-/// Every country's template by its ISO 3166-1 alpha-2 code, each field
-/// named by `field` from its name in the template.
 pub(crate) fn table<F>(field: impl Fn(&str) -> F) -> BTreeMap<String, Vec<Node<F>>> {
     TEMPLATES
         .lines()
@@ -88,9 +79,6 @@ fn has_value<F>(nodes: &[Node<F>], has: &impl Fn(&F) -> bool) -> bool {
     })
 }
 
-/// Hands `out` what `nodes` write, each choice settled on its first
-/// alternative with a field `has` a value for. `has` is asked when the
-/// choice is reached, after `out` got everything before it.
 pub(crate) fn write<'a, F>(
     nodes: &'a [Node<F>],
     has: &impl Fn(&F) -> bool,

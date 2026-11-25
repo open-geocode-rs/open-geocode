@@ -7,34 +7,22 @@ use crate::{
     record::{ObjectType, Record, RejectedRecord, SourceProvenance},
 };
 
-/// Everything one worker produces for a batch of OSM objects. Workers run in
-/// parallel; their outputs are merged in input order.
 #[derive(Debug, Default)]
 pub(crate) struct Emitted {
     pub report: BuilderReport,
     pub records: Vec<Record>,
-    /// What [`Emitted::prepare`] made of `records`, which it empties.
     pub ready: Vec<Ready>,
-    /// Kept apart from `records`: a place carries what resolves it.
     pub places: Vec<Place>,
     pub rejections: Vec<RejectedRecord>,
 }
 
-/// A record as the merge takes it.
 #[derive(Debug)]
 pub(crate) enum Ready {
-    /// An address cut into its sort key, but for the sequence number the
-    /// merge gives it.
     Address(PendingAddress),
-    /// Boxed: a record is several times an address key's size, and most
-    /// of a batch is addresses.
     Record(Box<Record>),
 }
 
 impl Emitted {
-    /// Cut every address into its sort key. The merge of a batch's outputs
-    /// is one thread's work in input order; this is the part of it that
-    /// needs no order, left to the workers.
     pub(crate) fn prepare(&mut self) -> Result<()> {
         self.ready = std::mem::take(&mut self.records)
             .into_iter()
@@ -48,8 +36,6 @@ impl Emitted {
         Ok(())
     }
 
-    /// Count a rejection in the report and keep the rejected object for the
-    /// build audit.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn reject(
         &mut self,
@@ -76,7 +62,6 @@ impl Emitted {
         });
     }
 
-    /// Count a rejection in the report only; nothing is kept for the audit.
     pub(crate) fn reject_in_report(
         &mut self,
         issue: CandidateIssue,

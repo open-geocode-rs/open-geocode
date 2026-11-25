@@ -13,12 +13,8 @@ use super::{
     tags::{OsmTags, alternate_names, name_tags},
 };
 
-/// Tags a street feature keeps after the scan besides its names: what the
-/// audit needs to explain a rejection.
 const STREET_TAG_KEYS: [&str; 2] = ["highway", "ref"];
 
-// Footways, paths and steps stay streets: houses stand on them. So does a
-// road under construction: its addresses often exist before it opens.
 const NOT_STREETS: [&str; 7] = [
     "abandoned",
     "bus_stop",
@@ -58,7 +54,6 @@ pub(crate) fn missing_street_name_issue(tags: &BTreeMap<String, String>) -> Cand
     }
 }
 
-/// Emit a street from its resolved vertices (`None` when any node is missing).
 pub(crate) fn emit_street(
     way_id: i64,
     tags: &BTreeMap<String, String>,
@@ -96,18 +91,8 @@ pub(crate) fn emit_street(
     }
 }
 
-/// Ways of one name in one area this close at an end are one street: the
-/// ways of a road split at its junctions share a node there, and a
-/// roundabout or a bridge named otherwise leaves a gap of tens of metres.
-/// Two roads of one name in one locality lie farther apart than that.
 pub(crate) const JOIN_GAP_M: f64 = 50.0;
 
-/// The ways of one street name in one area, as streets: a way whose end
-/// lies within [`JOIN_GAP_M`] of another's line joins it, and a street is
-/// every way so joined. It keeps the name, source and id of its lowest way,
-/// the ids of its other ways, every other name its ways have, the most
-/// important class of its ways, a line part per way, and the vertex nearest
-/// the middle of its ways as its point.
 pub(crate) fn join_ways(mut ways: Vec<StreetRecord>) -> Vec<StreetRecord> {
     if ways.len() < 2 {
         return ways;
@@ -127,9 +112,6 @@ pub(crate) fn join_ways(mut ways: Vec<StreetRecord>) -> Vec<StreetRecord> {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    // A cell is the gap wide, so any vertex within the gap of an end lies in
-    // a cell beside the end's. The ways of one area span little latitude, so
-    // one longitude scale serves them all.
     let latitude = ways
         .iter()
         .map(|way| way.representative_point[1])
@@ -203,7 +185,6 @@ pub(crate) fn join_ways(mut ways: Vec<StreetRecord>) -> Vec<StreetRecord> {
         .collect()
 }
 
-/// One street of `members`, lowest way first, each with its vertices.
 fn join(mut members: Vec<(StreetRecord, &[[f64; 2]])>) -> StreetRecord {
     if members.len() == 1 {
         return members.remove(0).0;
@@ -255,7 +236,6 @@ fn join(mut members: Vec<(StreetRecord, &[[f64; 2]])>) -> StreetRecord {
             }
         }
     }
-    // Two inputs can hold one way twice.
     let own = street.source.object_id;
     street.other_ways.sort_unstable();
     street.other_ways.dedup();
@@ -265,9 +245,6 @@ fn join(mut members: Vec<(StreetRecord, &[[f64; 2]])>) -> StreetRecord {
     street
 }
 
-/// Whether a place of `place_type` is a settlement or a part of one, by the
-/// OSM `place=` values for them. An admin area that is none (a ward, a local
-/// board) is not where its streets are said to be.
 pub(crate) fn is_settlement(place_type: &str) -> bool {
     matches!(
         place_type,
@@ -384,7 +361,6 @@ mod tests {
                 source: SourceProvenance::osm(ObjectType::Way, id),
             }
         };
-        // 0.0003 degrees of longitude is some 30 m here: within the gap.
         let streets = join_ways(vec![
             way(3, &[[-79.002, 43.0], [-79.003, 43.0]], &["Rue King"]),
             way(1, &[[-79.0, 43.0], [-79.001, 43.0]], &[]),

@@ -1,10 +1,3 @@
-//! Search Destinations of Geocoding API v4.
-//!
-//! og knows a destination's place, the entrances OpenStreetMap maps for it,
-//! the places whose outline holds it and the best known places near it.
-//! Navigation points, outlines and the places a destination holds are left
-//! out, as og has none of them.
-
 use axum::{
     body::Bytes,
     extract::{RawQuery, State},
@@ -83,30 +76,22 @@ struct Destination {
     landmarks: Vec<Landmark>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     entrances: Vec<Entrance>,
-    /// og's id of the primary place and where it is, to find its
-    /// surroundings.
     #[serde(skip)]
     og_id: String,
     #[serde(skip)]
     point: [f64; 2],
 }
 
-/// A place near a destination that tells where it is.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Landmark {
     place: PlaceView,
-    /// `Near ...`, written in English only, the one language og words it in.
     #[serde(skip_serializing_if = "Option::is_none")]
     relational_description: Option<LocalizedText>,
-    /// A landmark og finds tells where the address is. og cannot tell
-    /// where one arrives, so it never tags `ARRIVAL`.
     tags: [&'static str; 1],
     straight_line_distance_meters: f64,
 }
 
-/// How far around a destination its surroundings are looked for, a short
-/// walk, and how many landmarks tell where it is.
 const SURROUNDINGS_RADIUS_M: f64 = 300.0;
 const MAX_LANDMARKS: usize = 5;
 
@@ -127,7 +112,6 @@ impl Destination {
         }
     }
 
-    /// A bounding box alone cannot establish that a place contains the destination.
     async fn with_surroundings(
         mut self,
         state: &AppState,
@@ -171,7 +155,6 @@ fn is_destination(common: &Common) -> bool {
     matches!(common.layer, Layer::Address | Layer::Poi)
 }
 
-/// `POST /v4/geocode/destinations`.
 pub(super) async fn search(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -182,7 +165,6 @@ pub(super) async fn search(
         let query = QueryParams::parse(query.as_deref())?;
         let mask = field_mask(&headers, &query);
         let request: SearchDestinationsRequest = body(&bytes)?;
-        // Geocoding's default is the local language, og's own default too.
         let language = Language::parse(state.pack(), request.language_code.as_deref())?;
         let destinations = match (request.place, request.address_query, request.location_query) {
             (Some(place), None, None) => by_place(&state, &place, &language).await?,
@@ -199,8 +181,6 @@ pub(super) async fn search(
                 ));
             }
         };
-        // The surroundings are a lookup of their own, so a mask that leaves
-        // them out costs none.
         let surroundings = FieldMask::asks(mask.as_ref(), &["destinations", "landmarks"]);
         let mut described = Vec::new();
         for destination in destinations {
@@ -236,8 +216,6 @@ async fn by_place(
         .collect())
 }
 
-/// Each address og finds is a destination of its own, which is how Google
-/// offers a choice when an address is ambiguous.
 async fn by_address(
     state: &AppState,
     address: AddressQueryBody,
@@ -268,7 +246,6 @@ async fn by_address(
         .collect())
 }
 
-/// The address or place nearest the point is the destination there.
 async fn by_location(
     state: &AppState,
     location: LocationQueryBody,

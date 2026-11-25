@@ -1,6 +1,3 @@
-//! Text Search, Nearby Search, Autocomplete and Place Details of Places API
-//! (New) v1.
-
 use axum::{
     body::Bytes,
     extract::{Path, RawQuery, State},
@@ -27,10 +24,8 @@ use crate::{
     util::geo::haversine_m,
 };
 
-/// Google's own cap on one page of Text Search results.
 const MAX_PAGE_SIZE: i64 = 20;
 
-/// Google's cap on suggestions in one Autocomplete answer.
 const MAX_SUGGESTIONS: usize = 5;
 
 const METERS_PER_DEGREE: f64 = 111_320.0;
@@ -71,25 +66,17 @@ struct SearchTextRequest {
 }
 
 impl SearchTextRequest {
-    /// Refuses what og cannot answer either way. Whether a place is open
-    /// now needs its local time, which the Pack does not hold.
     fn refuse_unheld(&self) -> Result<(), VendorError> {
         let unheld = |what: &str| invalid(format!("{what} is not supported by this server."));
         if self.open_now {
             return Err(unheld("openNow"));
         }
-        // og answers in one page and so never issues a token.
         if let Some(token) = self.page_token.as_deref().filter(|token| !token.is_empty()) {
             return Err(invalid(format!("Invalid pageToken \"{token}\".")));
         }
         Ok(())
     }
 
-    /// Whether the request keeps only places of a rating, a price or EV
-    /// charging options. og holds none of these for any place, so no place
-    /// it holds is one of them.
-    /// The route `searchAlongRouteParameters` names, as a corridor of
-    /// [`ALONG_ROUTE_M`] either side of it.
     fn corridor(&self) -> Result<Option<Corridor>, VendorError> {
         let Some(parameters) = &self.search_along_route_parameters else {
             return Ok(None);
@@ -116,12 +103,8 @@ impl SearchTextRequest {
     }
 }
 
-/// How far from a route a place along it may lie: a place a kilometre off
-/// the road is a short detour, and one further is no longer on the way.
 const ALONG_ROUTE_M: f64 = 1_000.0;
 
-/// A Text Search `rankPreference`. og ranks by relevance, and by distance
-/// only from a point the request gives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextRank {
     Relevance,
@@ -182,7 +165,6 @@ pub(super) async fn search_text(
             .included_type
             .as_deref()
             .filter(|named| !named.is_empty());
-        // A type filter or a reordering reads more than the page holds.
         let corridor = request.corridor()?;
         let window = match (included, rank, &corridor) {
             (None, TextRank::Relevance, None) => limit,
@@ -245,14 +227,9 @@ pub(super) async fn search_text(
     .await
 }
 
-/// Google's cap on one Nearby Search answer, and its default.
 const MAX_NEARBY: i64 = 20;
-/// The widest circle Nearby Search takes, in metres.
 const MAX_NEARBY_RADIUS: f64 = 50_000.0;
-/// The most types one list of a Nearby Search request holds.
 const MAX_TYPES: usize = 50;
-/// How many of the nearest places are read before the request's own type
-/// rules pick among them. It is the most one og search answers.
 const NEARBY_WINDOW: usize = crate::http::bounds::MAX_SEARCH_LIMIT;
 
 #[derive(Debug, Default, Deserialize)]
@@ -276,11 +253,6 @@ struct SearchNearbyRequest {
     language_code: Option<String>,
 }
 
-/// Search places around a point (Places API v1)
-///
-/// The answer is the places inside the circle, nearest first, under either
-/// `rankPreference`: og holds no measure of how popular a place is. A type og
-/// has no category for names no place.
 pub(super) async fn search_nearby(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -339,8 +311,6 @@ pub(super) async fn search_nearby(
     .await
 }
 
-/// The circle Nearby Search is held to, as og's `focus` point and a radius
-/// in metres.
 fn nearby_circle(restriction: Option<&Area>) -> Result<([f64; 2], f64), VendorError> {
     let circle = match restriction {
         Some(Area {
@@ -366,8 +336,6 @@ fn nearby_circle(restriction: Option<&Area>) -> Result<([f64; 2], f64), VendorEr
     Ok((center, circle.radius))
 }
 
-/// The four type lists of a Nearby Search request. A place must pass each
-/// list that is sent.
 struct TypeRules<'a> {
     included: &'a [String],
     excluded: &'a [String],
@@ -407,15 +375,12 @@ impl<'a> TypeRules<'a> {
         })
     }
 
-    /// og's categories that can hold a place the lists admit. With no type
-    /// asked for they are every kind.
     fn categories(&self) -> Vec<&'static str> {
         let named = |list: &'a [String]| categories_of(list.iter().map(String::as_str));
         match (self.included.is_empty(), self.included_primary.is_empty()) {
             (true, true) => crate::categories::keys(),
             (false, true) => named(self.included),
             (true, false) => named(self.included_primary),
-            // A place must pass both, so the narrower list finds them all.
             (false, false) => {
                 let (types, primary) = (named(self.included), named(self.included_primary));
                 if primary.len() <= types.len() {
@@ -452,8 +417,6 @@ fn page_size(size: Option<i64>) -> Result<i64, VendorError> {
     }
 }
 
-/// og's `focus` from `locationBias` and its `bbox` from a rectangle
-/// `locationRestriction`. Google takes one or the other.
 fn bias_and_restriction(
     bias: Option<&Area>,
     restriction: Option<&Area>,
@@ -500,14 +463,9 @@ fn place(feature: &ForwardFeature, language: &Language) -> Place {
     )
 }
 
-/// How far around a place its landmarks lie, a short walk, and how many
-/// tell where it is without naming the whole district.
 const LANDMARK_RADIUS_M: f64 = 300.0;
 const MAX_LANDMARKS: usize = 5;
 
-/// The place, with its address descriptor when the mask asks for one at
-/// `path`. The landmarks are a lookup of their own, so a mask that leaves
-/// the descriptor out costs none.
 async fn described(
     state: &AppState,
     feature: &ForwardFeature,
@@ -546,7 +504,6 @@ async fn described(
     Ok(found)
 }
 
-/// Each place, described as [`described`] does.
 async fn all_described(
     state: &AppState,
     features: impl IntoIterator<Item = &ForwardFeature>,
@@ -569,7 +526,6 @@ async fn all_described(
     Ok(places)
 }
 
-/// Places names its results in `languageCode`, English when none is sent.
 fn places_language(state: &AppState, code: Option<String>) -> Result<Language<'_>, VendorError> {
     let code = code.filter(|code| !code.trim().is_empty());
     Language::parse(state.pack(), Some(code.as_deref().unwrap_or("en")))
@@ -599,12 +555,8 @@ pub(super) async fn details(
     .await
 }
 
-/// The bounds Google puts on each side of a photo asked for.
 const PHOTO_SIZE: std::ops::RangeInclusive<i64> = 1..=4800;
 
-/// `GET /v1/places/{place}/photos/{photo}/media`. og holds no photos, so a
-/// place og knows has none by any name, and the name is refused as Google
-/// refuses one it never issued.
 pub(super) async fn photo_media(
     State(state): State<AppState>,
     Path((place_id, photo)): Path<(String, String)>,
@@ -644,7 +596,6 @@ pub(super) async fn photo_media(
     .await
 }
 
-/// The record a Google place id names, shared with Place Geocoding.
 pub(super) async fn by_place_id(
     state: &AppState,
     place_id: &str,
@@ -684,10 +635,8 @@ struct AutocompleteRequest {
     included_primary_types: Vec<String>,
 }
 
-/// The most types `includedPrimaryTypes` takes.
 const MAX_PRIMARY_TYPES: usize = 5;
 
-/// Google's collection types for Autocomplete, by the types each admits.
 fn collection(named: &str) -> Option<&'static [&'static str]> {
     match named {
         "(cities)" => Some(&["locality"]),
@@ -759,7 +708,6 @@ struct StringRange {
     end_offset: usize,
 }
 
-/// Where a circle restriction is, once og has searched its bounding box.
 struct Circle {
     center: [f64; 2],
     radius: f64,
@@ -823,7 +771,6 @@ pub(super) async fn autocomplete(
             .map(|code| code.trim())
             .filter(|code| !code.is_empty())
             .collect::<Vec<_>>();
-        // Autocomplete reads the browser's language when the body names none.
         let language = places_language(
             &state,
             request
@@ -831,7 +778,6 @@ pub(super) async fn autocomplete(
                 .filter(|code| !code.trim().is_empty())
                 .or_else(|| accept_language(&headers)),
         )?;
-        // A type filter reads more than the answer holds.
         let window = match primary.is_empty() {
             true => MAX_SUGGESTIONS,
             false => crate::search::MAX_AUTOCOMPLETE_LIMIT,
@@ -891,7 +837,6 @@ pub(super) async fn autocomplete(
     .await
 }
 
-/// The text before the cursor, which is what the user has typed so far.
 fn typed_before_cursor(input: &str, offset: Option<i64>) -> Result<String, VendorError> {
     let Some(offset) = offset else {
         return Ok(input.to_string());
@@ -905,10 +850,6 @@ fn typed_before_cursor(input: &str, offset: Option<i64>) -> Result<String, Vendo
     Ok(typed)
 }
 
-/// og's `bbox` for a restriction. A circle is searched as the box around it
-/// and the results outside the circle dropped after, so no result lies
-/// outside it. Clamped at the poles and the antimeridian, which loses only
-/// the part of the circle beyond them.
 fn restriction(area: &Area) -> Result<(Option<String>, Option<Circle>), VendorError> {
     match (area.circle, area.rectangle) {
         (Some(_), Some(_)) => Err(both_shapes("locationRestriction")),
@@ -958,8 +899,6 @@ fn prediction(
         .iter()
         .map(|highlight| (highlight.start, highlight.end))
         .collect::<Vec<_>>();
-    // og marks what was typed in the label. The name leads the label, and
-    // the text after it follows its ", ", so each is a window of it.
     let name_chars = common.name.chars().count();
     let main_text = match common.label.starts_with(common.name.as_str()) {
         true => within(&common.name, &highlights, 0),
@@ -989,9 +928,6 @@ fn plain(text: &str) -> FormattableText {
     }
 }
 
-/// `text`, which starts at character `from` of the label, with og's
-/// highlights of the label that fall in it, cut to it. Both count Unicode
-/// scalar values, as Google's offsets do.
 fn within(text: &str, highlights: &[(usize, usize)], from: usize) -> FormattableText {
     let characters = text.chars().collect::<Vec<_>>();
     let mut matches: Vec<StringRange> = Vec::new();
@@ -1001,7 +937,6 @@ fn within(text: &str, highlights: &[(usize, usize)], from: usize) -> Formattable
         if start >= end {
             continue;
         }
-        // Words typed together read as one match, the gap between them too.
         match matches.last_mut() {
             Some(last)
                 if last.end_offset <= start

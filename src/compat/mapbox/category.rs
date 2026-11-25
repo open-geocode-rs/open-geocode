@@ -1,10 +1,3 @@
-//! Search Box v1 category search: `category/{id}` and `list/category`.
-//!
-//! og knows a place's kind as its map tag (`amenity:cafe`). The list below
-//! gives the kinds callers ask for most a canonical id, a name and an icon,
-//! and is what `list/category` answers. `category/{id}` also takes any id
-//! whose words name a kind in og's own catalog, such as `swimming_pool`.
-
 use axum::{
     Json,
     extract::{Path, Query, State, rejection::QueryRejection},
@@ -19,22 +12,16 @@ use crate::{
     runtime::AppState,
 };
 
-/// The most results one category search answers.
 const MAX_LIMIT: usize = 25;
-/// Metres to a degree of latitude, for `radius`, which is in degrees.
 const METRES_PER_DEGREE: f64 = 111_320.0;
 
-/// A kind of place under a canonical id.
 struct Category {
     id: &'static str,
     name: &'static str,
-    /// The Maki icon.
     icon: &'static str,
-    /// og's categories of the kind, as the catalog writes them.
     og: &'static [&'static str],
 }
 
-/// A kind after every kind it holds, so a place lists its closest kind first.
 const CATEGORIES: &[Category] = &[
     category("coffee", "Coffee", "cafe", &["amenity cafe"]),
     category("cafe", "Cafe", "cafe", &["amenity cafe"]),
@@ -196,9 +183,6 @@ const fn category(
     Category { id, name, icon, og }
 }
 
-/// og's categories under a canonical id. A listed id names its own. Any
-/// other names what its words name in og's catalog, in any language the
-/// catalog has, and `None` when they name no kind of place.
 pub(super) fn og_categories(id: &str) -> Option<Vec<&'static str>> {
     let id = id.trim().to_ascii_lowercase();
     if let Some(listed) = CATEGORIES.iter().find(|category| category.id == id) {
@@ -208,11 +192,6 @@ pub(super) fn og_categories(id: &str) -> Option<Vec<&'static str>> {
     (!named.is_empty()).then_some(named)
 }
 
-/// The listed kinds a place of og's `category` (`amenity:cafe`) is, as their
-/// names and their canonical ids, closest kind first.
-/// The listed kinds a place of og's `category` is, as a place states them:
-/// their names in lower case, in the order of their names, and their ids
-/// beside them.
 pub(super) fn kinds(category: &str) -> Option<(Vec<String>, Vec<&'static str>)> {
     let mut listed = CATEGORIES
         .iter()
@@ -224,7 +203,6 @@ pub(super) fn kinds(category: &str) -> Option<(Vec<String>, Vec<&'static str>)> 
     (!listed.is_empty()).then(|| listed.into_iter().unzip())
 }
 
-/// `list/category`'s answer.
 #[derive(Debug, Serialize)]
 pub(super) struct List {
     #[serde(rename = "listItems")]
@@ -263,7 +241,6 @@ pub(super) async fn list(
                 uuid: uuid::Uuid::new_v4().to_string(),
             })
             .collect(),
-        // The list is og's own, so it credits no data source.
         attribution: "",
         version,
     }))
@@ -331,7 +308,6 @@ pub(super) async fn search(
     )))
 }
 
-/// `radius`, degrees around `proximity`, as metres.
 fn radius_metres(value: &str) -> Result<f64, VendorError> {
     value
         .parse::<f64>()

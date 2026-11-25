@@ -1,16 +1,3 @@
-//! Going on with a Pack build that stopped.
-//!
-//! A build checkpoints after each stage (see [`crate::builder::osm`]): its
-//! outputs are on disk and a manifest in the scratch directory names them,
-//! with a fingerprint of everything the result depends on. A build that
-//! fails, is cancelled, runs out of disk or loses power leaves the scratch
-//! directory, its unpublished generation and the last manifest behind. The
-//! next build of the Pack finds them ([`find`]): asked to resume, it checks
-//! the fingerprint and goes on after the last stage the manifest reached;
-//! asked to start over, it clears them; asked neither, it refuses and says
-//! what was left and how to do either, rather than delete hours of work or
-//! fill the disk twice.
-
 use std::{
     fmt,
     fs::{self, File},
@@ -28,33 +15,22 @@ use crate::{
     pack::{self, SCRATCH_POINTER_FILE},
 };
 
-/// Checkpoint format, including the saved scratch files.
 pub const FORMAT_VERSION: u32 = 10;
-/// Bytes of an input's start and end the fingerprint hashes: a PBF's header
-/// and its last blocks, enough to tell an extract from a newer one of the
-/// same size and time.
 const STAMP_BYTES: u64 = 1 << 20;
 
-/// What a build does with a build of the same Pack that stopped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Leftover {
-    /// Refuse to start, saying what was left and how to resume or clear it.
     #[default]
     Refuse,
-    /// Go on from its last checkpoint; start over when there is none.
     Resume,
-    /// Remove it and start over.
     Clear,
 }
 
-/// A file a build reads, as a fingerprint knows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileStamp {
     pub path: PathBuf,
     pub bytes: u64,
-    /// Last modified, in nanoseconds since the Unix epoch.
     pub modified_ns: Option<u128>,
-    /// XXH3 of its first and of its last [`STAMP_BYTES`].
     pub head: u64,
     pub tail: u64,
 }
@@ -93,7 +69,6 @@ impl FileStamp {
         })
     }
 
-    /// How this file differs from `now`, the same file read again.
     fn differences(&self, now: &Self, what: &str, out: &mut Vec<String>) {
         let name = self.path.display();
         if self.path != now.path {
@@ -111,30 +86,21 @@ impl FileStamp {
     }
 }
 
-/// Everything that decides what a build makes: its inputs, og's version,
-/// the formats it writes and the options that change the Pack. The memory
-/// and scratch budgets, threads and the scratch directory do not: a build
-/// sorts and writes the same records whatever it spills.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fingerprint {
     pub og_version: String,
-    /// Each format the build writes, by name, with its version.
     pub formats: Vec<(String, u32)>,
     pub inputs: Vec<FileStamp>,
     pub input_sources: Vec<String>,
-    /// The address source the build adds addresses from, as it describes
-    /// itself, if any.
     pub addresses: Option<String>,
     #[serde(default)]
     pub tiger: bool,
     #[serde(default)]
     pub timezones: Option<FileStamp>,
-    /// The address files it imported, once it has.
     pub imported: Vec<FileStamp>,
 }
 
 impl Fingerprint {
-    /// Read every input again.
     pub fn of(
         inputs: &[PathBuf],
         input_sources: &[String],
@@ -231,37 +197,26 @@ fn formats() -> Vec<(String, u32)> {
     .collect()
 }
 
-/// A checkpoint: the build's fingerprint, the last stage it completed and
-/// what it carries into the next, `S`, which the builder defines.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest<S> {
     pub format: u32,
-    /// The last stage completed, as people read it.
     pub stage: String,
     pub fingerprint: Fingerprint,
-    /// The build's time up to the checkpoint, every run before it together.
     pub elapsed_ms: u64,
-    /// Every file and directory in the scratch directory it names; the
-    /// rest is removed when a build goes on from it.
     pub files: Vec<String>,
     pub state: S,
 }
 
-/// What a manifest says without knowing the builder's state.
 #[derive(Debug, Deserialize)]
 struct Summary {
     stage: String,
 }
 
-/// A build of the Pack that stopped: its generation, its scratch directory
-/// and how far it got.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found {
     pub generation: PathBuf,
     pub scratch: PathBuf,
-    /// The last stage of its readable checkpoint.
     pub stage: Option<String>,
-    /// Bytes it holds on disk, scratch and unpublished Pack file together.
     pub bytes: u64,
 }
 
@@ -270,7 +225,6 @@ impl Found {
         self.scratch.join(MANIFEST_FILE)
     }
 
-    /// Whether it can be resumed.
     pub fn resumable(&self) -> bool {
         self.stage.is_some()
     }
@@ -294,8 +248,6 @@ impl fmt::Display for Found {
     }
 }
 
-/// The builds of the Pack at `destination` that stopped, the last
-/// checkpointed first.
 pub fn find(destination: &Path) -> Result<Vec<Found>> {
     let mut found = Vec::new();
     for generation in pack::unpublished_generations(destination)? {
@@ -303,8 +255,6 @@ pub fn find(destination: &Path) -> Result<Vec<Found>> {
             continue;
         };
         let scratch = PathBuf::from(pointer.trim());
-        // An incompatible checkpoint reaches resume's version check. Clearing
-        // it as unfinished would discard the saved build on --resume.
         let summary = fs::read(scratch.join(MANIFEST_FILE))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Summary>(&bytes).ok());
@@ -330,7 +280,6 @@ pub fn find(destination: &Path) -> Result<Vec<Found>> {
     Ok(found.into_iter().map(|(_, found)| found).collect())
 }
 
-/// Remove a stopped build: its scratch directory and its generation.
 pub fn clear(found: &Found) -> Result<()> {
     for path in [&found.scratch, &found.generation] {
         match fs::remove_dir_all(path) {
@@ -348,8 +297,6 @@ pub fn clear(found: &Found) -> Result<()> {
     Ok(())
 }
 
-/// Why a build of `destination` will not start beside `found`, and the two
-/// ways to go on.
 pub fn refusal(destination: &Path, found: &[Found]) -> Error {
     let listed = found
         .iter()
@@ -371,7 +318,6 @@ pub fn refusal(destination: &Path, found: &[Found]) -> Error {
     )
 }
 
-/// Bytes of the files under `path`.
 fn tree_bytes(path: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(path) else {
         return 0;

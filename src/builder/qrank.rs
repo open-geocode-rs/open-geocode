@@ -88,7 +88,6 @@ impl QRank {
     }
 }
 
-// 7.5 steps a doubling: the most read item, ~5 billion views, still fits a byte.
 fn importance(rank: u64) -> u8 {
     let doublings = (rank as f64 + 1.0).log2();
     (1.0 + doublings * 7.5).clamp(1.0, 255.0) as u8
