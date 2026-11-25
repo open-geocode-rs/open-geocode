@@ -1796,6 +1796,14 @@ mod tests {
         );
         // Two edits reach both "torino" and "toronto" from "toroino"; the
         // nearer wins, then the more used.
+        let (name, hit) = dictionaries
+            .fuzzy(Field::Locality, &two.build_dfa("toroino"), "t")
+            .expect("nearer");
+        assert_eq!((name.as_str(), hit.distance), ("torino", 1));
+        let (name, hit) = dictionaries
+            .fuzzy(Field::Locality, &two.build_dfa("toranio"), "t")
+            .expect("tie");
+        assert_eq!((name.as_str(), hit.distance), ("toronto", 2));
         let (_, hit) = dictionaries
             .fuzzy(Field::Locality, &two.build_dfa("torino"), "t")
             .expect("exact");

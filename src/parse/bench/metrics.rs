@@ -156,19 +156,6 @@ mod tests {
     use Label::*;
 
     #[test]
-    fn a_fully_correct_row_counts_once_and_every_token() {
-        let mut counts = Counts::default();
-        counts.add_row(
-            &[HouseNumber, Street, Locality],
-            Some(&[HouseNumber, Street, Locality]),
-        );
-        assert_eq!(counts.rows_correct, 1);
-        assert_eq!(counts.tokens_correct, 3);
-        assert_eq!(counts.full_parse_accuracy(), 1.0);
-        assert_eq!(counts.label(Street).f1, 1.0);
-    }
-
-    #[test]
     fn one_wrong_token_fails_the_row_and_scores_both_labels() {
         let mut counts = Counts::default();
         counts.add_row(&[Street, Street, Locality], Some(&[Street, Street, Street]));

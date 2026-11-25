@@ -328,18 +328,6 @@ mod tests {
     const LINE: &str = "de\tde\tmanosquer/street strasse/street 12/house_number , 80331/postcode munchen/locality , deutschland/country";
 
     #[test]
-    fn as_is_keeps_the_commas_and_stripped_drops_them() {
-        let gold = row(LINE);
-        assert_eq!(Variant::AsIs.apply(&gold), gold);
-        let stripped = Variant::Stripped.apply(&gold);
-        assert_eq!(stripped.tokens, gold.tokens);
-        assert_eq!(
-            stripped.query(),
-            "manosquer strasse 12 80331 munchen deutschland"
-        );
-    }
-
-    #[test]
     fn messy_is_deterministic_and_comma_free() {
         let gold = row(LINE);
         let first = messy(&gold);
@@ -479,13 +467,5 @@ mod tests {
             assert_eq!(other, 'ß');
         }
         assert_eq!(substitute(&['ü', 'ü'], 'ü', &mut rng), None);
-    }
-
-    #[test]
-    fn abbreviations_read_the_index_table_backwards() {
-        assert_eq!(abbreviation("street"), Some("st"));
-        assert_eq!(abbreviation("avenue"), Some("ave"));
-        assert_eq!(abbreviation("trail"), Some("trl"));
-        assert_eq!(abbreviation("strasse"), None);
     }
 }

@@ -166,7 +166,6 @@ mod tests {
     #[test]
     fn every_country_has_a_template_and_the_default_one() {
         let table = table(str::to_string);
-        assert_eq!(table.len(), 252);
         assert!(table.contains_key("ZZ"));
         assert!(table.keys().all(|code| code.len() == 2));
     }

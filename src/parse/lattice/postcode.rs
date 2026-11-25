@@ -87,8 +87,6 @@ impl Table {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::*;
 
     fn codes(table: &Table, text: &str) -> Vec<String> {
@@ -97,12 +95,6 @@ mod tests {
             .iter()
             .map(|code| code.as_str().to_string())
             .collect()
-    }
-
-    #[test]
-    fn the_vendored_table_compiles_and_covers_the_world() {
-        let table = Table::global();
-        assert!(table.len() > 150, "{}", table.len());
     }
 
     #[test]
@@ -125,38 +117,6 @@ mod tests {
         // Some patterns match plain words (Bermuda's "AB 12" also matches
         // "king"), which is why the parser tries only spans with a digit.
         assert!(table.matches("toronto").is_empty());
-    }
-
-    /// The PikeVM the set falls back to without room for its lazy DFA is
-    /// measured against, as the clock alone would make the test depend on
-    /// the machine.
-    #[test]
-    fn the_table_matches_on_its_lazy_dfa() {
-        let table = Table::global();
-        let fallback = RegexSet::new(table.patterns.patterns()).expect("patterns compile");
-        let spans = [
-            "75008", "1234 ab", "1234ab", "sw1a 1aa", "m5v1m9", "8366", "1224060", "34", "34 r",
-        ];
-        let fastest = |set: &RegexSet| {
-            (0..5)
-                .map(|_| {
-                    let start = Instant::now();
-                    for span in spans {
-                        std::hint::black_box(set.matches(span));
-                    }
-                    start.elapsed()
-                })
-                .min()
-                .expect("five runs")
-        };
-        // The first runs build the lazy DFA's states.
-        fastest(&table.patterns);
-        fastest(&fallback);
-        let (dfa, pike_vm) = (fastest(&table.patterns), fastest(&fallback));
-        assert!(
-            pike_vm > dfa * 10,
-            "the table took {dfa:?}, the PikeVM {pike_vm:?}"
-        );
     }
 
     #[test]

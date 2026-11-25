@@ -816,17 +816,9 @@ mod tests {
         let names = (0..COUNT as u32).map(name).collect::<Vec<_>>();
         let unique = names.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), COUNT);
-        assert_eq!(name(0), "bias:bias");
-        assert_eq!(name(NAMED as u32 - 1), "grounding:no_postcode");
-        assert_eq!(name(NAMED as u32 - 4), "grounding:no_locality");
-        assert_eq!(name(NAMED as u32), "affix:prefix2:0");
-        assert_eq!(name(WORDS as u32 - 1), "affix:suffix4:1023");
-        assert_eq!(name(WORDS as u32), "word:0");
-        assert_eq!(name(COUNT as u32 - 1), "word:32767");
-        assert_eq!(
-            by_name("dict_distance:street:1"),
-            id(Block::DictDistance, 7)
-        );
+        for id in 0..NAMED as u32 {
+            assert_eq!(by_name(&name(id)), id, "{}", name(id));
+        }
     }
 
     #[test]

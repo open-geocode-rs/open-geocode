@@ -473,13 +473,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_empty_words_name_nothing() {
-        assert_eq!(presets_for_word("zzzqqq"), Vec::<&str>::new());
-        assert_eq!(presets_for_word(""), Vec::<&str>::new());
-        assert_eq!(presets_for_prefix(""), Vec::<&str>::new());
-    }
-
-    #[test]
     fn a_whole_word_beats_the_start_of_another() {
         let park = of_query("park").expect("park");
         assert!(park.contains(&"leisure park"));

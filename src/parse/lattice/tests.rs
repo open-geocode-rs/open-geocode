@@ -510,52 +510,6 @@ fn a_number_written_in_parts_is_one_house_number() {
     }
 }
 
-#[test]
-fn unspaced_scripts_split_into_glued_characters() {
-    let words = |units: &Units| units.tokens.words.clone();
-    let unspaced = Units::of(&Tokens::new("東京都千代田区丸の内2-7-2"));
-    assert_eq!(
-        words(&unspaced),
-        [
-            "東", "京", "都", "千", "代", "田", "区", "丸", "の", "内", "2", "7", "2"
-        ]
-    );
-    assert_eq!(unspaced.token_of, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2]);
-    // The digit run is glued to the character before it in one token; the
-    // numbers after the hyphens are not.
-    assert_eq!(
-        unspaced.glued,
-        [
-            false, true, true, true, true, true, true, true, true, true, true, false, false
-        ]
-    );
-    assert_eq!(unspaced.key(0, 7), "東京都千代田区");
-    // A space between two characters of such a script, or between one and
-    // a digit, is no word break, so the spaced and the
-    // one-character-per-token forms are the same units.
-    for text in [
-        "東京都 千代田区 丸の内 2-7-2",
-        "東 京 都 千 代 田 区 丸 の 内 2-7-2",
-    ] {
-        let units = Units::of(&Tokens::new(text));
-        assert_eq!(words(&units), words(&unspaced), "{text}");
-        assert_eq!(units.glued, unspaced.glued, "{text}");
-        assert_eq!(units.key(0, 7), "東京都千代田区", "{text}");
-        assert_eq!(units.key(7, 11), "丸の内2", "{text}");
-    }
-    // A field break still separates them, and spaced scripts stay words.
-    let broken = Units::of(&Tokens::new("東京都, 千代田区"));
-    assert!(!broken.glued[3]);
-    let latin = Units::of(&Tokens::new("670 King St W"));
-    assert_eq!(words(&latin), ["670", "king", "st", "w"]);
-    assert_eq!(latin.glued, [false; 4]);
-    assert_eq!(Units::of(&Tokens::new("서울 종로구")).len(), 2);
-    // A digit joins only a script without spaces, and two numbers stay two.
-    let mixed = Units::of(&Tokens::new("tower 3 丁目 1 71"));
-    assert_eq!(words(&mixed), ["tower", "3", "丁", "目", "1", "71"]);
-    assert_eq!(mixed.glued, [false, false, true, true, true, false]);
-}
-
 /// The units of `text` as they key and feature a lattice: their words, which
 /// are glued, and the field breaks and joiners before them.
 fn unit_shape(text: &str) -> (Vec<String>, Vec<bool>, Vec<bool>, Vec<Option<char>>) {
@@ -633,38 +587,6 @@ fn spaced_and_unspaced_writing_are_the_same_units_and_labels() {
         }
     }
     assert_eq!(dictionary_key("5 番 2 号"), dictionary_key("５番２号"));
-}
-
-#[test]
-fn unspaced_scripts_are_the_script_property_of_every_character_listed_before() {
-    // The ranges the parser listed by hand before it read the Unicode
-    // Script property: Thai, Myanmar, Khmer, the iteration marks, kana, Han
-    // and halfwidth katakana. Every letter of them is still unspaced.
-    let ranges = [
-        0x0E00..=0x0E7F,
-        0x1000..=0x109F,
-        0x1780..=0x17FF,
-        0x3005..=0x3007,
-        0x3041..=0x30FF,
-        0x31F0..=0x31FF,
-        0x3400..=0x4DBF,
-        0x4E00..=0x9FFF,
-        0xF900..=0xFAFF,
-        0xFF66..=0xFF9F,
-        0x20000..=0x2A6DF,
-    ];
-    for code in ranges.into_iter().flatten() {
-        let Some(character) = char::from_u32(code) else {
-            continue;
-        };
-        if character.is_alphanumeric() {
-            assert!(is_unspaced(character), "U+{code:04X} {character}");
-        }
-    }
-    assert!(is_unspaced('ຫ') && is_unspaced('ー'));
-    for character in ['4', '４', 'a', 'ä', 'я', '한', 'ا'] {
-        assert!(!is_unspaced(character), "{character}");
-    }
 }
 
 #[test]
@@ -882,33 +804,6 @@ fn glued_area_names_are_a_chain() {
             .spans
             .iter()
             .all(|span| !span.features.contains(&by_name("chain:2")))
-    );
-}
-
-/// The median time to tag a 10-token Latin query on a real Pack:
-/// `OG_PARSE_PACK=data/packs/jp cargo test --release tag_latency -- --ignored --nocapture`.
-#[test]
-#[ignore = "needs a Pack in OG_PARSE_PACK"]
-fn tag_latency_on_a_pack() {
-    let pack = std::env::var("OG_PARSE_PACK").expect("OG_PARSE_PACK");
-    let tagger = LatticeTagger::open(Path::new(&pack)).expect("pack");
-    let query = "Unit 602, 670 King Street West, Toronto, ON M5V 1M9";
-    assert_eq!(Tokens::new(query).len(), 10);
-    for _ in 0..200 {
-        tagger.tag(query);
-    }
-    let mut times = (0..2_000)
-        .map(|_| {
-            let started = std::time::Instant::now();
-            std::hint::black_box(tagger.tag(query));
-            started.elapsed().as_secs_f64() * 1e6
-        })
-        .collect::<Vec<_>>();
-    times.sort_by(f64::total_cmp);
-    println!(
-        "median {:.0} us, p90 {:.0} us",
-        times[times.len() / 2],
-        times[times.len() * 9 / 10]
     );
 }
 

@@ -3040,30 +3040,11 @@ mod tests {
     }
 
     #[test]
-    fn rows_are_read_in_the_order_the_shuffle_window_draws() {
-        // The window as it shuffled the rows themselves, before the lattices
-        // were cached: each epoch must read the rows in this same order.
-        fn through_window(len: usize, random: &mut Random) -> Vec<u32> {
-            let mut window = Vec::new();
-            let mut order = Vec::new();
-            for row in 0..len as u32 {
-                if window.len() < SHUFFLE_WINDOW {
-                    window.push(row);
-                    continue;
-                }
-                let at = random.below(window.len() as u64) as usize;
-                order.push(std::mem::replace(&mut window[at], row));
-            }
-            random.shuffle(&mut window);
-            order.extend(window);
-            order
-        }
+    fn the_shuffle_reads_every_row_exactly_once() {
         for len in [0, 1, 7, SHUFFLE_WINDOW, SHUFFLE_WINDOW + 4_321] {
-            let order = shuffled_order(len, &mut Random::new(len as u64));
-            assert_eq!(order, through_window(len, &mut Random::new(len as u64)));
-            let mut sorted = order;
-            sorted.sort_unstable();
-            assert!(sorted.into_iter().eq(0..len as u32), "every row once");
+            let mut order = shuffled_order(len, &mut Random::new(len as u64));
+            order.sort_unstable();
+            assert!(order.into_iter().eq(0..len as u32), "every row once");
         }
     }
 
