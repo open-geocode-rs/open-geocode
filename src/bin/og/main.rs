@@ -638,34 +638,34 @@ mod tests {
         let mut app = App::new(Home {
             root: home.root.clone(),
         });
-        let job = crate::job::BuildJob::start(
-            crate::job::BuildRequest {
-                inputs: vec![crate::job::BuildInput {
-                    region,
-                    extract: Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("fixtures/smoke/monaco.osm.pbf"),
-                    download: false,
-                }],
-                pack: pack.clone(),
-                memory_budget_bytes: None,
-                scratch_budget_bytes: None,
-                force: false,
-                leftover: open_geocode::builder::Leftover::Refuse,
-                openaddresses: false,
-                tiger: false,
-            },
-            std::sync::Arc::new(home),
-        );
-        // Held steps block the build at its first stage, just after its generation is made.
-        let progress = std::sync::Arc::clone(&job.progress);
+        let request = crate::job::BuildRequest {
+            inputs: vec![crate::job::BuildInput {
+                region,
+                extract: Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("fixtures/smoke/monaco.osm.pbf"),
+                download: false,
+            }],
+            pack: pack.clone(),
+            memory_budget_bytes: None,
+            scratch_budget_bytes: None,
+            force: false,
+            leftover: open_geocode::builder::Leftover::Refuse,
+            openaddresses: false,
+            tiger: false,
+        };
+        let progress = crate::job::Progress::of(&request);
+        // Held before the build starts, the steps stop it at its first stage, once its generation is made.
         let steps = progress.steps.lock().unwrap();
-        assert!(steps.iter().all(|step| step.started.is_none()));
-        let waiting = std::time::Instant::now();
+        let mut job = crate::job::BuildJob::spawn(
+            request,
+            std::sync::Arc::new(home),
+            std::sync::Arc::clone(&progress),
+        );
         while generations(&pack) == 0 {
-            assert!(
-                waiting.elapsed() < std::time::Duration::from_secs(30),
-                "the build made no generation"
-            );
+            if job.is_finished() {
+                let ended = job.take().map(|built| built.map(|_| ()));
+                panic!("the build ended before it made a generation: {ended:?}");
+            }
             std::thread::yield_now();
         }
         app.job = Some(job);
