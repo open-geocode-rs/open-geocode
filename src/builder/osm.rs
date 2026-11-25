@@ -862,6 +862,7 @@ impl<'a> Run<'a> {
         WriterOptions {
             memory: Arc::clone(&self.memory),
             text_index_memory_bytes: (self.budget / 2).max(1),
+            sorter_bytes: self.budget,
         }
     }
 

@@ -408,6 +408,8 @@ fn zone_of(entry: &[u8; AREA_ZONE_BYTES]) -> u16 {
 pub struct WriterOptions {
     pub memory: Arc<Budget>,
     pub text_index_memory_bytes: usize,
+    /// The most one sorter of the writer may hold before it spills.
+    pub sorter_bytes: usize,
 }
 
 impl Default for WriterOptions {
@@ -415,6 +417,7 @@ impl Default for WriterOptions {
         Self {
             memory: Budget::unlimited(),
             text_index_memory_bytes: DEFAULT_TEXT_INDEX_MEMORY_BYTES,
+            sorter_bytes: MAX_DERIVED_BUDGET_BYTES,
         }
     }
 }
@@ -450,6 +453,7 @@ struct AreaZones {
 pub struct Writer {
     scratch: Arc<Scratch>,
     memory: Arc<Budget>,
+    sorter_bytes: usize,
     records: records::Writer,
     contexts: TupleWriter,
     text: text_index::Writer,
@@ -582,8 +586,10 @@ impl Writer {
                 options.text_index_memory_bytes,
             )?,
             spatial: spatial_index::Writer::new(&scratch)?,
+            dictionaries: Builder::new(&scratch, &options.memory, options.sorter_bytes),
             scratch,
             memory: Arc::clone(&options.memory),
+            sorter_bytes: options.sorter_bytes,
             generation,
             layer_counts: BTreeMap::new(),
             context_names: Arc::default(),
@@ -597,7 +603,6 @@ impl Writer {
             timezones: None,
             postcode_areas: Arc::default(),
             postcode_addresses: PostcodeAddresses::default(),
-            dictionaries: Builder::default(),
         })
     }
 
@@ -711,7 +716,7 @@ impl Writer {
         } = self;
         let placed = &placed;
         std::thread::scope(|scope| {
-            let named = scope.spawn(move || {
+            let named = scope.spawn(move || -> Result<()> {
                 for (offset, (names, (_, context))) in names.into_iter().zip(placed).enumerate() {
                     let context = context.as_ref().filter(|context| !context.is_area_list());
                     if let Some(context) = context
@@ -719,8 +724,9 @@ impl Writer {
                     {
                         dictionaries.add_place(first + offset as u64, context, &names);
                     }
-                    dictionaries.add(names, context);
+                    dictionaries.add(names, context)?;
                 }
+                Ok(())
             });
             let indexed = scope.spawn(move || {
                 documents
@@ -750,7 +756,7 @@ impl Writer {
                 });
             named
                 .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
             indexed
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
@@ -867,8 +873,9 @@ impl Writer {
     pub fn finish(self) -> Result<Manifest> {
         let scratch = Arc::clone(&self.scratch);
         let memory = Arc::clone(&self.memory);
+        let sorter_bytes = self.sorter_bytes;
         let (mut sealed, _) = self.seal()?;
-        crate::structured::add_to(&mut sealed, &scratch, &memory, MAX_DERIVED_BUDGET_BYTES)?;
+        crate::structured::add_to(&mut sealed, &scratch, &memory, sorter_bytes)?;
         crate::ids::add_to(&mut sealed)?;
         sealed.publish()
     }
@@ -2094,6 +2101,7 @@ mod tests {
             &WriterOptions {
                 memory: Arc::clone(&memory),
                 text_index_memory_bytes: 16 << 20,
+                ..WriterOptions::default()
             },
         )
         .expect("writer");
