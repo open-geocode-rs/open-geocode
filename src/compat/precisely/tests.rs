@@ -1,10 +1,6 @@
 //! `/compat/precisely` driven through og's router on a small Pack.
 
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{collections::BTreeSet, path::Path, sync::LazyLock};
 
 use axum::{
     Router,
@@ -28,30 +24,24 @@ use crate::{
         PlaceRecord, PoiRecord, PostcodeRecord, Record, SourceProvenance, point_geometry,
     },
     runtime::{AppState, build_router},
+    test_support::TempDir,
 };
 
-/// A Pack and its job directory, removed when the test ends, failed or not.
-struct Fixture {
-    pack: PathBuf,
-}
+static PACK: LazyLock<TempDir> = LazyLock::new(|| {
+    let dir = TempDir::new("compat-precisely");
+    write_pack(&dir.join("pack"));
+    dir
+});
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.pack);
-        let _ = std::fs::remove_dir_all(self.pack.with_extension("jobs"));
-    }
+struct Fixture {
+    jobs: TempDir,
 }
 
 impl Fixture {
     fn new(name: &str) -> Self {
-        let pack = std::env::temp_dir().join(format!(
-            "open-geocode-precisely-{name}-{}",
-            std::process::id()
-        ));
-        let fixture = Self { pack };
-        let _ = std::fs::remove_dir_all(fixture.pack.with_extension("jobs"));
-        write_pack(&fixture.pack);
-        fixture
+        Self {
+            jobs: TempDir::new(&format!("compat-precisely-{name}")),
+        }
     }
 
     fn router(&self) -> Router {
@@ -63,7 +53,7 @@ impl Fixture {
     }
 
     fn state(&self, limits: Limits) -> AppState {
-        AppState::open(&self.pack, &self.pack.with_extension("jobs"), limits).expect("state")
+        AppState::open(&PACK.join("pack"), &self.jobs, limits).expect("state")
     }
 }
 
@@ -80,7 +70,6 @@ fn address_vendor_id(og_id: &str) -> String {
 }
 
 fn write_pack(dir: &Path) {
-    let _ = std::fs::remove_dir_all(dir);
     let mut writer = Writer::create(dir).expect("writer");
     let mut place = |layer, name: &str, id| {
         writer
@@ -1273,17 +1262,21 @@ async fn upload(router: &Router, csv: &str) -> String {
     file_id
 }
 
+async fn wait_until_the_og_job_ends(router: &Router, og_id: &str) {
+    get(router, &format!("/jobs/{og_id}/results")).await;
+}
+
 async fn finished(router: &Router, job_id: &str) -> Value {
-    for _ in 0..500 {
-        let status = get(router, &format!("/compat/precisely/v2/bulk/jobs/{job_id}")).await;
-        assert_eq!(status.status, StatusCode::OK, "{}", status.text());
-        let status = status.json();
-        if status["status"] != "RUNNING" {
-            return status;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("job {job_id} never finished");
+    let og_id = uuid::Uuid::try_parse(job_id)
+        .expect("a UUID")
+        .simple()
+        .to_string();
+    wait_until_the_og_job_ends(router, &og_id).await;
+    let status = get(router, &format!("/compat/precisely/v2/bulk/jobs/{job_id}")).await;
+    assert_eq!(status.status, StatusCode::OK, "{}", status.text());
+    let status = status.json();
+    assert_ne!(status["status"], "RUNNING", "{status}");
+    status
 }
 
 #[tokio::test]
@@ -1671,6 +1664,110 @@ async fn an_upload_may_be_as_large_as_a_job_upload() {
     );
 }
 
+fn mentions(dir: &Path, needle: &str) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .expect("dir")
+        .map(|entry| entry.expect("entry"))
+    {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(mentions(&path, needle));
+        } else if path.to_string_lossy().contains(needle)
+            || std::fs::read(&path)
+                .expect("file")
+                .windows(needle.len())
+                .any(|window| window == needle.as_bytes())
+        {
+            found.push(path);
+        }
+    }
+    found
+}
+
+fn age_the_upload_record_past_retention_on_disk(jobs: &Path, file_id: &str) {
+    let record = mentions(jobs, &format!("\"fileId\":\"{file_id}\""));
+    let [record] = record.as_slice() else {
+        panic!("one record for {file_id}, found {record:?}");
+    };
+    let mut aged =
+        serde_json::from_slice::<Value>(&std::fs::read(record).expect("record")).expect("JSON");
+    aged["createdNs"] = json!(0);
+    std::fs::write(record, aged.to_string()).expect("write");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uploads_and_jobs_expire_with_og_jobs() {
+    let fixture = Fixture::new("sweep");
+    let state = fixture.state(Limits::DEFAULT);
+    let router = build_router(state.clone(), None, None);
+    let kept = upload(&router, "addressid|address|country\n1|99 Nowhere Lane|CA\n").await;
+    let expired = upload(&router, "addressid|address|country\n2|7 Stale Lane|CA\n").await;
+    age_the_upload_record_past_retention_on_disk(&fixture.jobs, &expired);
+
+    let submit = async |file_id: &str| {
+        let reply = post(&router, "/v2/bulk-geocode", &json!({"fileId": file_id})).await;
+        assert_eq!(reply.status, StatusCode::ACCEPTED, "{}", reply.text());
+        reply.json()["statusUrl"]
+            .as_str()
+            .and_then(|url| url.rsplit('/').next())
+            .expect("job id")
+            .to_string()
+    };
+    let dropped = submit(&kept).await;
+    assert_eq!(finished(&router, &dropped).await["status"], "COMPLETED");
+    let og_id = uuid::Uuid::try_parse(&dropped)
+        .expect("a UUID")
+        .simple()
+        .to_string();
+    let deleted = send(
+        &router,
+        Request::delete(format!("/jobs/{og_id}"))
+            .body(Body::empty())
+            .expect("delete"),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+    let fresh = submit(&kept).await;
+    assert_eq!(finished(&router, &fresh).await["status"], "COMPLETED");
+
+    super::sweep(&state);
+    for gone in [
+        expired.as_str(),
+        "7 Stale Lane",
+        dropped.as_str(),
+        og_id.as_str(),
+    ] {
+        assert_eq!(
+            mentions(&fixture.jobs, gone),
+            Vec::<std::path::PathBuf>::new(),
+            "{gone}"
+        );
+    }
+
+    assert_eq!(
+        get(&router, "/compat/precisely/v2/files").await.json(),
+        json!({"results": [{"fileId": kept, "fileName": "test"}]})
+    );
+    let resubmitted = post(&router, "/v2/bulk-geocode", &json!({"fileId": expired})).await;
+    assert_eq!(resubmitted.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resubmitted.json(),
+        errors("INVALID_REQUEST", "Invalid File Id (DIS-LI-1052)")
+    );
+    let gone = get(
+        &router,
+        &format!("/compat/precisely/v2/bulk/jobs/{dropped}"),
+    )
+    .await;
+    assert_eq!(gone.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        gone.json(),
+        errors("INVALID_REQUEST", "Invalid Job Id (DIS-LI-1051)")
+    );
+    assert_eq!(finished(&router, &fresh).await["status"], "COMPLETED");
+}
+
 #[test]
 fn a_country_is_read_as_any_iso_code() {
     for (sent, sent_on) in [
@@ -1686,69 +1783,6 @@ fn a_country_is_read_as_any_iso_code() {
     ] {
         assert_eq!(super::country_code(sent), sent_on, "{sent}");
     }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn uploads_and_job_records_expire_with_og_jobs() {
-    let fixture = Fixture::new("sweep");
-    let state = fixture.state(Limits::DEFAULT);
-    let router = build_router(state.clone(), None, None);
-    let kept = upload(&router, "addressid|address|country\n1|99 Nowhere Lane|CA\n").await;
-    let expired = upload(&router, "addressid|address|country\n").await;
-    let files = state.jobs().dir().join("precisely/files");
-    let record = files.join(format!("{expired}.json"));
-    let mut stale =
-        serde_json::from_slice::<Value>(&std::fs::read(&record).expect("record")).expect("JSON");
-    stale["createdNs"] = json!(0);
-    std::fs::write(&record, stale.to_string()).expect("write");
-    assert_eq!(
-        get(&router, "/compat/precisely/v2/files").await.json(),
-        json!({"results": [{"fileId": kept, "fileName": "test"}]})
-    );
-
-    let submitted = post(&router, "/v2/bulk-geocode", &json!({"fileId": kept})).await;
-    let job_id = submitted.json()["statusUrl"]
-        .as_str()
-        .and_then(|url| url.rsplit('/').next())
-        .expect("job id")
-        .to_string();
-    assert_eq!(finished(&router, &job_id).await["status"], "COMPLETED");
-    let og_id = uuid::Uuid::try_parse(&job_id)
-        .expect("a UUID")
-        .simple()
-        .to_string();
-    let deleted = send(
-        &router,
-        Request::delete(format!("/jobs/{og_id}"))
-            .body(Body::empty())
-            .expect("delete"),
-    )
-    .await;
-    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
-
-    super::sweep(&state);
-    let mut left = std::fs::read_dir(&files)
-        .expect("files")
-        .map(|entry| {
-            entry
-                .expect("entry")
-                .file_name()
-                .into_string()
-                .expect("name")
-        })
-        .collect::<Vec<_>>();
-    left.sort();
-    assert_eq!(left, vec![format!("{kept}.csv"), format!("{kept}.json")]);
-    let jobs = std::fs::read_dir(state.jobs().dir().join("precisely/jobs"))
-        .expect("jobs")
-        .count();
-    assert_eq!(jobs, 0);
-    let gone = get(&router, &format!("/compat/precisely/v2/bulk/jobs/{job_id}")).await;
-    assert_eq!(gone.status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        gone.json(),
-        errors("INVALID_REQUEST", "Invalid Job Id (DIS-LI-1051)")
-    );
 }
 
 /// The standardized result verify gives for 100 King Street West, with

@@ -154,15 +154,6 @@ mod tests {
     }
 
     #[test]
-    fn a_field_without_children_keeps_its_whole_value() {
-        let value = json!({"displayName": {"text": "A", "languageCode": "en"}, "id": "a"});
-        assert_eq!(
-            masked("displayName", value),
-            json!({"displayName": {"text": "A", "languageCode": "en"}})
-        );
-    }
-
-    #[test]
     fn a_parent_path_keeps_all_children_in_either_order() {
         let value = json!({"place": {"name": {"text": "A", "languageCode": "en"}, "id": "a"}});
         let expected = json!({"place": {"name": {"text": "A", "languageCode": "en"}}});

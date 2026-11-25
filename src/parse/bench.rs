@@ -775,13 +775,7 @@ pub fn align_predictions(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("og-parse-bench-{name}-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("temp dir");
-        dir
-    }
+    use crate::test_support::TempDir;
 
     #[test]
     fn a_row_is_covered_when_the_dictionaries_hold_each_of_its_names() {
@@ -863,7 +857,7 @@ mod tests {
 
     #[test]
     fn every_system_is_scored_per_country_and_variant_on_the_same_rows() {
-        let root = temp_dir("bench");
+        let root = TempDir::new("parse-bench-bench");
         let gold = root.join("gold");
         fs::create_dir_all(&gold).expect("dir");
         fs::write(
@@ -911,12 +905,11 @@ mod tests {
         assert!(markdown.contains("| all | messy | 3 |"), "{markdown}");
         assert!(markdown.contains("### Per-label F1 (%)"), "{markdown}");
         assert!(markdown.contains("Worst rows for og-legacy"), "{markdown}");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_baseline_missing_a_variant_is_an_error_not_a_partial_score() {
-        let root = temp_dir("missing");
+        let root = TempDir::new("parse-bench-missing");
         fs::create_dir_all(root.join("gold")).expect("dir");
         fs::write(root.join("gold/us.tsv"), "en\tus\tmain/street\n").expect("gold");
         store_predictions(
@@ -934,12 +927,11 @@ mod tests {
         let error = run_parse_bench(&options(root.join("gold"), root.join("predictions"), 0))
             .expect_err("missing");
         assert!(error.to_string().contains("us.messy.tsv"), "{error:#}");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn stale_predictions_are_an_error_not_a_score() {
-        let root = temp_dir("stale");
+        let root = TempDir::new("parse-bench-stale");
         fs::create_dir_all(root.join("gold")).expect("dir");
         fs::write(root.join("gold/us.tsv"), "en\tus\tmain/street\n").expect("gold");
         let base = root.join("predictions/base");
@@ -952,12 +944,11 @@ mod tests {
         let error = run_parse_bench(&options(root.join("gold"), root.join("predictions"), 0))
             .expect_err("stale");
         assert!(error.to_string().contains("regenerate"), "{error:#}");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn fixtures_normalize_queries_export_and_answers_align_back() {
-        let root = temp_dir("pipeline");
+        let root = TempDir::new("parse-bench-pipeline");
         let raw = root.join("raw");
         fs::create_dir_all(&raw).expect("dir");
         fs::write(
@@ -1019,12 +1010,11 @@ mod tests {
         })
         .expect("report");
         assert_eq!(report.groups.len(), 3);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn a_row_the_baseline_failed_on_is_kept_and_scored_wrong() {
-        let root = temp_dir("failed");
+        let root = TempDir::new("parse-bench-failed");
         fs::create_dir_all(root.join("gold")).expect("dir");
         fs::write(
             root.join("gold/us.tsv"),
@@ -1064,6 +1054,5 @@ mod tests {
         assert_eq!(base.rows, 2);
         assert_eq!(base.rows_correct, 1);
         assert_eq!(base.rows_misaligned, 1);
-        let _ = fs::remove_dir_all(root);
     }
 }

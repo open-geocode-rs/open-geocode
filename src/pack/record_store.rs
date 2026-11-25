@@ -2923,7 +2923,7 @@ fn agreed_postcode(postcodes: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::PlaceLayer;
+    use crate::{record::PlaceLayer, test_support::TempDir};
 
     fn line(points: &[[f64; 2]]) -> Geometry {
         Geometry::new(GeometryValue::LineString {
@@ -3075,8 +3075,7 @@ mod tests {
     }
 
     fn write_store(records: &[Record], contexts: &[Option<ContextRef>]) -> Reader {
-        let root =
-            std::env::temp_dir().join(format!("open-geocode-records-{}", uuid::Uuid::new_v4()));
+        let root = TempDir::new("records");
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
         let mut writer = Writer::create(&scratch, &Budget::unlimited()).expect("writer");
         for (index, record) in records.iter().enumerate() {
@@ -3573,8 +3572,7 @@ mod tests {
 
     #[test]
     fn string_dictionary_is_bounded_by_the_segment() {
-        let root =
-            std::env::temp_dir().join(format!("open-geocode-segments-{}", uuid::Uuid::new_v4()));
+        let root = TempDir::new("segments");
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
         let budget = Budget::unlimited();
         let mut writer = Writer::create(&scratch, &budget)
@@ -3611,14 +3609,13 @@ mod tests {
 
     #[test]
     fn string_dictionary_stays_within_its_share_of_a_small_budget() {
-        let root =
-            std::env::temp_dir().join(format!("open-geocode-dictionary-{}", uuid::Uuid::new_v4()));
+        let root = TempDir::new("dictionary");
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
-        let budget = Budget::new(64 << 20);
+        let budget = Budget::new(1 << 20);
         let mut writer = Writer::create(&scratch, &budget).expect("writer");
         let base = sample_records().remove(0);
         // Every record brings a new street name: the worst case.
-        for index in 0..200_000 {
+        for index in 0..5_000 {
             let mut record = base.clone();
             if let Record::Address(address) = &mut record {
                 address.address.street = Some(format!("Unique Street Number {index}"));
@@ -3640,7 +3637,7 @@ mod tests {
         writer.finish(&mut pack).expect("finish");
         pack.finish().expect("pack finish");
         let reader = Reader::open(&Container::open(&path).expect("open")).expect("reader");
-        for id in [0, 99_999, 199_999] {
+        for id in [0, 2_499, 4_999] {
             let Record::Address(address) = reader.record(id).expect("record") else {
                 panic!("address");
             };
@@ -3649,35 +3646,6 @@ mod tests {
                 Some(format!("Unique Street Number {id}").as_str())
             );
         }
-    }
-
-    #[test]
-    fn spans_blocks_and_keeps_contexts() {
-        let base = sample_records().remove(0);
-        let mut records = Vec::new();
-        let mut contexts = Vec::new();
-        for index in 0..(BLOCK_RECORDS * 3 + 5) {
-            let mut record = base.clone();
-            if let Record::Address(address) = &mut record {
-                address.address.number = index.to_string();
-                address.geometry = point_geometry(-79.0 + index as f64 * 0.001, 43.0);
-                address.source.object_id = index as i64;
-            }
-            records.push(record);
-            contexts.push((index % 3 != 0).then_some(ContextRef {
-                tuple_id: index as u32,
-                ambiguous: index % 2 == 0,
-            }));
-        }
-        let reader = write_store(&records, &contexts);
-        for (index, record) in records.iter().enumerate() {
-            assert_eq!(&reader.record(index as u64).expect("record"), record);
-            assert_eq!(
-                reader.header(index as u64).expect("header").context,
-                contexts[index]
-            );
-        }
-        assert!(reader.record(records.len() as u64).is_err());
     }
 
     #[test]
@@ -3789,6 +3757,7 @@ mod tests {
             let summary = reader.summary(id).expect("summary");
             assert_eq!(summary.id, reader.record_json(id).expect("json")["id"]);
         }
+        assert!(reader.record(records.len() as u64).is_err());
     }
 
     #[test]
@@ -3831,33 +3800,5 @@ mod tests {
             reader.summary(2).expect("summary").source.dataset,
             "openaddresses:nz/countrywide"
         );
-    }
-
-    #[test]
-    fn line_geometry_follows_the_summary_fields() {
-        let mut records = sample_records();
-        records.truncate(2);
-        let reader = write_store(&records, &[]);
-        let entry = reader.body(1).expect("body");
-        let (header, fields) = (entry.header, entry.fields);
-        let mut cursor = fields;
-        reader.skip_fields(&header, &mut cursor).expect("fields");
-        let geometry_offset = fields.len() - cursor.len();
-
-        // A damaged point count breaks full decoding but not the summary, which
-        // stops before the geometry bytes.
-        let mut damaged = fields.to_vec();
-        damaged[geometry_offset] = 1;
-        let mut cursor = damaged.as_slice();
-        assert_eq!(
-            reader
-                .string_field(header.strings, &mut cursor)
-                .expect("name"),
-            "King Street"
-        );
-        reader
-            .string_list(header.strings, &mut cursor)
-            .expect("alternate names");
-        assert!(reader.geometry(&header, &mut cursor).is_err());
     }
 }

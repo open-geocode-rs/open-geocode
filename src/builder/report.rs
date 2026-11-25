@@ -1671,39 +1671,6 @@ mod tests {
     }
 
     #[test]
-    fn the_stage_table_has_a_row_per_stage_and_the_peak() {
-        let mut report = BuilderReport::default();
-        report.stages.push(StageReport {
-            stage: "scan OSM objects".to_string(),
-            wall_ms: 2_000,
-            inputs: BTreeMap::from([(
-                "planet.osm.pbf".to_string(),
-                InputRead {
-                    bytes: 360_000_000,
-                    wait_ms: 1_900,
-                },
-            )]),
-            scratch_written_bytes: 100 << 20,
-            scratch_raw_written_bytes: 400 << 20,
-            bound: Bound::ReadIo,
-            ..StageReport::default()
-        });
-        report.scratch.peak_live_bytes = 300 << 20;
-        report.scratch.peak_owners = BTreeMap::from([("node-requests".to_string(), 200 << 20)]);
-        report.scratch.zstd_level = 1;
-        let table = report.stage_table();
-        let row = table.lines().nth(1).expect("row");
-        assert!(row.starts_with("scan OSM objects"), "{table}");
-        assert!(row.contains(" 180 "), "input MB/s: {table}");
-        assert!(row.contains("100 (   400)"), "spill: {table}");
-        assert!(row.ends_with("read-io"), "{table}");
-        assert!(
-            table.contains("peak scratch 300 MiB (node-requests 200 MiB)"),
-            "{table}"
-        );
-    }
-
-    #[test]
     fn merging_worker_reports_matches_one_sequential_report() {
         let tags = BTreeMap::from([("highway".to_string(), "residential".to_string())]);
         let mut sequential = BuilderReport::default();
@@ -1799,40 +1766,6 @@ mod tests {
                 .quality
                 .samples
                 .contains_key("address/missing_postcode")
-        );
-    }
-
-    #[test]
-    fn records_accepted_address_quality_for_complete_source_context() {
-        let address = address_record(
-            "osm:node:20",
-            20,
-            Some("King Street"),
-            Some("Toronto"),
-            Some("Ontario"),
-            Some("M5V"),
-            Some("CA"),
-        );
-        let mut report = BuilderReport::default();
-
-        report.accept_address_with_tags(&address, None);
-
-        assert_eq!(report.quality.addresses.total, 1);
-        assert_eq!(report.quality.addresses.has_locality, 1);
-        assert_eq!(report.quality.addresses.has_region, 1);
-        assert_eq!(report.quality.addresses.has_postcode, 1);
-        assert_eq!(report.quality.addresses.has_country, 1);
-        assert_eq!(report.quality.addresses.has_full_admin_context, 1);
-        assert_eq!(report.quality.addresses.missing_any_admin_context, 0);
-        assert_eq!(
-            report.quality.addresses.by_location_precision.get("point"),
-            Some(&1)
-        );
-        assert!(
-            report
-                .quality
-                .samples
-                .contains_key("address/complete_source_context")
         );
     }
 

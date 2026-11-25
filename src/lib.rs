@@ -21,6 +21,8 @@ pub mod response;
 pub mod reverse;
 pub mod search;
 mod stop;
+#[cfg(test)]
+mod test_support;
 mod util;
 
 pub(crate) use self::address_template::lines as address_lines;

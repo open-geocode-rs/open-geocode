@@ -45,19 +45,23 @@ mod tests {
 
     #[test]
     fn an_offset_follows_daylight_saving_time() {
-        let summer = at("Europe/Berlin", "2026-07-01T12:00:00Z").expect("a zone");
-        let winter = at("Europe/Berlin", "2026-01-15T12:00:00Z").expect("a zone");
+        let offset =
+            |name, instant| at(name, instant).map(|offset| (offset.text(), offset.minutes()));
         assert_eq!(
-            (summer.text(), summer.minutes()),
-            ("+02:00".to_string(), 120)
+            offset("Europe/Berlin", "2026-07-01T12:00:00Z"),
+            Some(("+02:00".to_string(), 120))
         );
         assert_eq!(
-            (winter.text(), winter.minutes()),
-            ("+01:00".to_string(), 60)
+            offset("Europe/Berlin", "2026-01-15T12:00:00Z"),
+            Some(("+01:00".to_string(), 60))
         );
         assert_eq!(
-            at("America/Chicago", "2026-07-01T12:00:00Z").map(Offset::text),
-            Some("-05:00".to_string())
+            offset("America/Chicago", "2026-07-01T12:00:00Z"),
+            Some(("-05:00".to_string(), -300))
+        );
+        assert_eq!(
+            offset("America/Chicago", "2026-01-15T12:00:00Z"),
+            Some(("-06:00".to_string(), -360))
         );
     }
 
@@ -68,8 +72,9 @@ mod tests {
             Some("+05:45".to_string())
         );
         assert_eq!(
-            at("America/St_Johns", "2026-01-15T12:00:00Z").map(Offset::minutes),
-            Some(-210)
+            at("America/St_Johns", "2026-01-15T12:00:00Z")
+                .map(|offset| (offset.text(), offset.minutes())),
+            Some(("-03:30".to_string(), -210))
         );
         assert_eq!(at("Mars/Olympus_Mons", "2026-07-01T12:00:00Z"), None);
     }

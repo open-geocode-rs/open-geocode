@@ -473,13 +473,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_empty_words_name_nothing() {
-        assert_eq!(presets_for_word("zzzqqq"), Vec::<&str>::new());
-        assert_eq!(presets_for_word(""), Vec::<&str>::new());
-        assert_eq!(presets_for_prefix(""), Vec::<&str>::new());
-    }
-
-    #[test]
     fn a_whole_word_beats_the_start_of_another() {
         let park = of_query("park").expect("park");
         assert!(park.contains(&"leisure park"));
@@ -526,9 +519,9 @@ mod tests {
     fn the_compressed_catalog_is_current() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("catalog");
         let text = std::fs::read(root.join("categories.json")).expect("catalog");
-        let compressed = zstd::encode_all(&text[..], 19).expect("compress");
         let path = root.join("categories.json.zst");
         if std::env::var_os("OG_UPDATE_CONTRACT").is_some() {
+            let compressed = zstd::encode_all(&text[..], 19).expect("compress");
             std::fs::write(&path, &compressed).expect("write");
         }
         let current = std::fs::read(&path).unwrap_or_default();

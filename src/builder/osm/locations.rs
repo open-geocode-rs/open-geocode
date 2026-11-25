@@ -986,6 +986,7 @@ pub(crate) fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     fn ranked(ids: &[i64]) -> NodeSet {
         let set = NodeSet::new(&Budget::unlimited());
@@ -1034,8 +1035,8 @@ mod tests {
 
     #[test]
     fn mapped_slots_read_back_what_was_written() {
-        let dir = std::env::temp_dir().join(format!("og-locations-{}", uuid::Uuid::new_v4()));
-        let scratch = Scratch::create(&dir).expect("scratch");
+        let dir = TempDir::new("locations");
+        let scratch = Scratch::create(dir.join("scratch")).expect("scratch");
         // A budget of nothing sends the coordinates to the file.
         let mut slots = Slots::new(3, true, &Budget::new(0), &scratch).expect("slots");
         assert!(matches!(slots, Slots::Mapped(_)));
@@ -1070,53 +1071,5 @@ mod tests {
         assert!(path.exists());
         drop(slots);
         assert!(!path.exists());
-    }
-
-    /// Not a test of behavior: prints what the store costs per needed node
-    /// and per id, and how fast it marks and finds, on synthetic ids shaped
-    /// like a large extract's (runs of nearby ids spread over the whole id
-    /// space) and a city's (runs within a few ranges).
-    #[test]
-    #[ignore = "micro-benchmark; run with --ignored --nocapture"]
-    fn costs_per_node_and_per_id() {
-        for (name, needed, span, run) in [
-            ("spread", 20_000_000i64, 14_300_000_000i64, 20),
-            ("city", 1_000_000, 200_000_000, 200),
-        ] {
-            let mut ids = Vec::with_capacity(needed as usize);
-            let mut state = 0x9e37_79b9_7f4a_7c15u64;
-            while (ids.len() as i64) < needed {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                let start = (state % span as u64) as i64;
-                ids.extend((0..run).map(|step| start + step * 3));
-            }
-            let memory = Budget::unlimited();
-            let started = std::time::Instant::now();
-            let set = NodeSet::new(&memory);
-            ids.par_chunks(4096)
-                .for_each(|chunk| set.mark(chunk).expect("mark"));
-            let marked = started.elapsed();
-            let mut set = set;
-            let distinct = set.len();
-            set.rank();
-            let started = std::time::Instant::now();
-            let found = ids.par_iter().filter(|id| set.slot(**id).is_some()).count();
-            let looked_up = started.elapsed();
-            assert_eq!(found, ids.len());
-            let bytes = set.bytes();
-            println!(
-                "{name}: {distinct} needed nodes over {span} ids: set {} MiB = {:.3} B per id \
-                 spanned, {:.2} B per needed node plus {LOCATION_BYTES} B of coordinates; \
-                 marked {:.1} M ids/s, found {:.1} M ids/s on {} threads",
-                bytes >> 20,
-                bytes as f64 / span as f64,
-                bytes as f64 / distinct as f64,
-                ids.len() as f64 / marked.as_secs_f64() / 1e6,
-                ids.len() as f64 / looked_up.as_secs_f64() / 1e6,
-                rayon::current_num_threads(),
-            );
-        }
     }
 }

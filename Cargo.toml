@@ -206,6 +206,7 @@ tower = { version = "0.5", features = ["util"] }
 # Holds a batch result's `response` as the bytes it was sent as, so the
 # contract tests compare it with its `GET` byte for byte.
 serde_json = { version = "1.0", features = ["raw_value"] }
+fs4 = "0.13.1"
 
 # The profile that 'dist' will build with
 [profile.dist]

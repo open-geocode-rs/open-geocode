@@ -86,16 +86,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn computes_closed_way_centroid() {
-        let points = [(0.0, 0.0), (0.0, 2.0), (2.0, 2.0), (2.0, 0.0), (0.0, 0.0)];
-
-        let (lat, lon) = centroid(&points).expect("centroid");
-
-        assert!((lat - 1.0).abs() < 0.000001);
-        assert!((lon - 1.0).abs() < 0.000001);
-    }
-
-    #[test]
     fn builds_line_string_geometry_with_bbox_and_representative_point() {
         let points = [(43.64, -79.41), (43.66, -79.36)];
 

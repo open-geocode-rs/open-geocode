@@ -629,6 +629,8 @@ fn nanos_to_ms(nanos: u128) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use crate::{
         context::AdminContextTuple,
         pack::{RecordContext, Writer},
@@ -636,15 +638,21 @@ mod tests {
             AddressComponents, AddressRecord, LocationPrecision, ObjectType, PlaceLayer,
             PlaceRecord, PoiRecord, SourceProvenance, point_geometry,
         },
+        test_support::TempDir,
     };
 
     use super::*;
 
-    #[test]
-    fn samples_unique_pois_and_scores_hits_at_one_and_five() {
-        let temp_dir = temp_pack_path("bench-poi-fixture");
-        let _ = fs::remove_dir_all(&temp_dir);
-        let mut writer = Writer::create(&temp_dir).expect("writer");
+    static BENCH_PACK: LazyLock<TempDir> = LazyLock::new(|| {
+        let dir = TempDir::new("bench-pack");
+        let mut writer = Writer::create(&dir).expect("writer");
+        write_toronto_pois(&mut writer);
+        write_wellington_address(&mut writer);
+        writer.finish().expect("finish");
+        dir
+    });
+
+    fn write_toronto_pois(writer: &mut Writer) {
         let mut area = |layer, name: &str, object_id| {
             writer
                 .write(
@@ -721,8 +729,11 @@ mod tests {
             };
             writer.write(&poi.into(), context).expect("POI");
         }
-        writer.finish().expect("finish");
-        let reader = Reader::open(&temp_dir).expect("reader");
+    }
+
+    #[test]
+    fn samples_unique_pois_and_scores_hits_at_one_and_five() {
+        let reader = Reader::open(&*BENCH_PACK).expect("reader");
         let riverdale = reader
             .find_by_source_id("osm:node:13")
             .expect("lookup")
@@ -735,7 +746,7 @@ mod tests {
 
         let sample = |seed| {
             sample_poi_fixture(&PoiFixtureOptions {
-                pack: temp_dir.clone(),
+                pack: BENCH_PACK.to_path_buf(),
                 count: 10,
                 seed,
             })
@@ -773,14 +784,15 @@ mod tests {
                 osm_id: 13,
             }),
         });
-        let fixture_path = temp_dir.join("poi.json");
+        let fixture_dir = TempDir::new("bench-poi-fixture");
+        let fixture_path = fixture_dir.join("poi.json");
         fs::write(
             &fixture_path,
             serde_json::to_vec(&fixture).expect("fixture json"),
         )
         .expect("write fixture");
         let report = benchmark_pack(&PackBenchmarkOptions {
-            pack: temp_dir.clone(),
+            pack: BENCH_PACK.to_path_buf(),
             queries: Some(fixture_path),
             iterations: 1,
             warmup: 0,
@@ -793,25 +805,19 @@ mod tests {
         );
         assert_eq!(report.queries.search.cases[3].expected_rank, None);
         assert!(report.queries.autocomplete.accuracy.is_none());
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn reports_pack_metrics_without_query_fixture() {
-        let temp_dir = temp_pack_path("bench-metrics");
-        let _ = fs::remove_dir_all(&temp_dir);
-        write_test_pack(&temp_dir);
-
         let report = benchmark_pack(&PackBenchmarkOptions {
-            pack: temp_dir.clone(),
+            pack: BENCH_PACK.to_path_buf(),
             queries: None,
             iterations: 2,
             warmup: 1,
         })
         .expect("benchmark");
 
-        assert_eq!(report.pack.manifest.record_count, 1);
+        assert_eq!(report.pack.manifest.record_count, 11);
         assert!(report.pack.bytes.total > 0);
         assert!(report.pack.bytes.records > 0);
         assert!(report.pack.bytes.text_index > 0);
@@ -822,29 +828,24 @@ mod tests {
         );
         assert!(report.open.pack_reader_ms >= 0.0);
         assert_eq!(report.queries.search.case_count, 0);
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
     fn benchmarks_query_fixture_cases() {
-        let temp_dir = temp_pack_path("bench-queries");
-        let _ = fs::remove_dir_all(&temp_dir);
-        write_test_pack(&temp_dir);
-
-        let fixture_path = temp_dir.join("queries.json");
+        let fixture_dir = TempDir::new("bench-queries");
+        let fixture_path = fixture_dir.join("queries.json");
         fs::write(
             &fixture_path,
             r#"{
-              "search": [{"name": "king", "q": "King Street Toronto", "limit": 5}],
-              "autocomplete": [{"name": "prefix", "q": "kin", "limit": 5}],
-              "reverse": [{"name": "point", "lon": -79.4, "lat": 43.6}]
+              "search": [{"name": "king", "q": "Queen Street Wellington", "limit": 5}],
+              "autocomplete": [{"name": "prefix", "q": "que", "limit": 5}],
+              "reverse": [{"name": "point", "lon": 174.776, "lat": -41.288}]
             }"#,
         )
         .expect("write fixture");
 
         let report = benchmark_pack(&PackBenchmarkOptions {
-            pack: temp_dir.clone(),
+            pack: BENCH_PACK.to_path_buf(),
             queries: Some(fixture_path),
             iterations: 2,
             warmup: 1,
@@ -858,12 +859,9 @@ mod tests {
         assert_eq!(report.queries.autocomplete.cases[0].hit_count, 1);
         assert!(report.queries.reverse.cases[0].result_present);
         assert!(report.queries.search.latency.is_some());
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
-    fn write_test_pack(path: &Path) {
-        let mut writer = Writer::create(path).expect("writer");
+    fn write_wellington_address(writer: &mut Writer) {
         writer
             .write(
                 &AddressRecord {
@@ -875,15 +873,15 @@ mod tests {
                         block_number_len: None,
                         areas: Vec::new(),
                         number: "10".to_string(),
-                        street: Some("King Street".to_string()),
+                        street: Some("Queen Street".to_string()),
                         place: None,
                         unit: None,
-                        locality: Some("Toronto".to_string()),
-                        region: Some("Ontario".to_string()),
-                        postcode: Some("M5V 1A1".to_string()),
-                        country: Some("CA".to_string()),
+                        locality: Some("Wellington".to_string()),
+                        region: Some("Wellington".to_string()),
+                        postcode: Some("6011".to_string()),
+                        country: Some("NZ".to_string()),
                     },
-                    geometry: point_geometry(-79.4, 43.6),
+                    geometry: point_geometry(174.776, -41.288),
                     location_precision: LocationPrecision::Point,
                     source: SourceProvenance::osm(ObjectType::Node, 1),
                 }
@@ -891,10 +889,5 @@ mod tests {
                 None,
             )
             .expect("write address");
-        writer.finish().expect("finish");
-    }
-
-    fn temp_pack_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("open-geocode-{name}-{}", std::process::id()))
     }
 }

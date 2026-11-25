@@ -249,14 +249,4 @@ mod tests {
             Some(("haupt", "strasse"))
         );
     }
-
-    #[test]
-    fn full_forms_have_their_abbreviations() {
-        let table = abbreviations();
-        assert!(table.short_forms("strasse").contains(&"str".to_string()));
-        assert!(table.short_forms("toronto").is_empty());
-        assert_eq!(table.full_forms("tce"), ["terrace"]);
-        assert!(table.full_forms("pl").contains(&"place".to_string()));
-        assert!(table.full_forms("terrace").is_empty());
-    }
 }

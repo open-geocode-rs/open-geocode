@@ -542,19 +542,6 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_relation_keeps_its_label() {
-        round_trip(&[GeometryItem::Relation(BoundaryRelationStub {
-            object_id: 237_385,
-            members: vec![BoundaryRelationMember {
-                way_id: 500,
-                role: BoundaryMemberRole::Outer,
-            }],
-            label: Some(29_546_940),
-            tags: BTreeMap::from([("name".to_string(), "Seattle".to_string())]),
-        })]);
-    }
-
-    #[test]
     fn saved_geometry_reads_back_bit_for_bit() {
         let vertex = |node_id, lat_e7: i32, lon_e7: i32| Vertex {
             node_id,
@@ -574,8 +561,17 @@ mod tests {
                         role: BoundaryMemberRole::Inner,
                     },
                 ],
-                label: None,
+                label: Some(29_546_940),
                 tags: BTreeMap::from([("name".to_string(), "Toronto".to_string())]),
+            }),
+            GeometryItem::Relation(BoundaryRelationStub {
+                object_id: 901,
+                members: vec![BoundaryRelationMember {
+                    way_id: 502,
+                    role: BoundaryMemberRole::Outer,
+                }],
+                label: None,
+                tags: BTreeMap::new(),
             }),
             GeometryItem::Feature(605),
             GeometryItem::Way(BoundaryWay {
@@ -604,32 +600,20 @@ mod tests {
     }
 
     #[test]
-    fn steps_run_in_order_input_by_input() {
+    fn steps_run_every_pass_input_by_input_and_end_sealed() {
+        let input = |index, pass| Step::Input { index, pass };
         let steps = Step::all(2);
-        assert!(steps.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(
-            steps[..5],
+            steps[..8],
             [
-                Step::Input {
-                    index: 0,
-                    pass: Pass::Scan
-                },
-                Step::Input {
-                    index: 0,
-                    pass: Pass::Members
-                },
-                Step::Input {
-                    index: 0,
-                    pass: Pass::Nodes
-                },
-                Step::Input {
-                    index: 0,
-                    pass: Pass::Ways
-                },
-                Step::Input {
-                    index: 1,
-                    pass: Pass::Scan
-                },
+                input(0, Pass::Scan),
+                input(0, Pass::Members),
+                input(0, Pass::Nodes),
+                input(0, Pass::Ways),
+                input(1, Pass::Scan),
+                input(1, Pass::Members),
+                input(1, Pass::Nodes),
+                input(1, Pass::Ways),
             ]
         );
         assert_eq!(steps.last(), Some(&Step::Sealed));

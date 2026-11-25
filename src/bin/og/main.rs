@@ -14,6 +14,9 @@ mod home;
 mod job;
 mod net;
 mod regions;
+#[cfg(test)]
+#[path = "../../test_support.rs"]
+mod test_support;
 mod ui;
 
 use std::{
@@ -479,29 +482,89 @@ fn print_scrollback(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
     })
 }
 
-/// Checks the interface against a Pack in `OG_HOME`. Both tests are
-/// `#[ignore]`d: they need that Pack and bind a port.
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::path::Path;
 
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{App, Home};
+    use crate::test_support::TempDir;
+
+    fn write_pack(dir: &Path) {
+        use open_geocode::pack::Writer;
+        use open_geocode::record::{
+            AddressComponents, AddressRecord, LocationPrecision, ObjectType, PlaceLayer,
+            PlaceRecord, Record, SourceProvenance, point_geometry,
+        };
+        let mut writer = Writer::create(dir).unwrap();
+        for (name, id, lon, lat) in [
+            ("Andorra la Vella", 1, 1.5218, 42.5063),
+            ("Escaldes", 2, 1.5341, 42.5097),
+        ] {
+            let town = PlaceRecord {
+                alt_names: Vec::new(),
+                name: name.to_string(),
+                place_type: "town".to_string(),
+                geometry: point_geometry(lon, lat),
+                source: SourceProvenance::osm(ObjectType::Node, id),
+                prominence: Default::default(),
+                wikidata: None,
+            };
+            writer
+                .write(&Record::Place(PlaceLayer::Locality, town), None)
+                .unwrap();
+        }
+        let house = AddressRecord {
+            building: None,
+            access: Vec::new(),
+            disputed: false,
+            street_postcodes: Vec::new(),
+            address: AddressComponents {
+                block_number_len: None,
+                areas: Vec::new(),
+                number: "70".to_string(),
+                street: Some("Carrer Prat de la Creu".to_string()),
+                place: None,
+                unit: None,
+                locality: Some("Andorra la Vella".to_string()),
+                region: None,
+                postcode: None,
+                country: None,
+            },
+            geometry: point_geometry(1.5235, 42.5078),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, 3),
+        };
+        writer.write(&house.into(), None).unwrap();
+        writer.finish().unwrap();
+    }
 
     /// The query shell's GeoJSON is the HTTP API's answer, value for value.
     #[test]
-    #[ignore = "needs the Andorra Pack in OG_HOME"]
     fn the_shell_answers_what_the_api_answers() {
-        let home = Home::locate().unwrap();
-        let pack = home.packs_dir().join("andorra");
-        let bind: std::net::SocketAddr = "127.0.0.1:8098".parse().unwrap();
+        let dir = TempDir::new("og-shell");
+        let pack = dir.join("pack");
+        write_pack(&pack);
+        let free_address = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|free| free.local_addr())
+            .unwrap();
         let served = pack.clone();
-        std::thread::spawn(move || super::serve_pack(served, bind));
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::spawn(move || super::serve_pack(served, free_address));
+        let ready = std::time::Instant::now();
+        while ureq::get(&format!("http://{free_address}/readyz"))
+            .call()
+            .is_err()
+        {
+            assert!(
+                ready.elapsed() < std::time::Duration::from_secs(30),
+                "the server never got ready"
+            );
+            std::thread::yield_now();
+        }
         let engine = crate::engine::Engine::open(&pack).unwrap();
         let get = |path: &str| -> serde_json::Value {
-            let text = ureq::get(&format!("http://{bind}{path}"))
+            let text = ureq::get(&format!("http://{free_address}{path}"))
                 .call()
                 .unwrap()
                 .body_mut()
@@ -540,8 +603,6 @@ mod tests {
                 "reverse {lat},{lon}"
             );
         }
-        let dir = std::env::temp_dir().join(format!("og-pasted-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
         let address = "carrer prat de la creu 70, andorra la vella";
         std::fs::write(dir.join("in.csv"), format!("address\n\"{address}\"\n")).unwrap();
         open_geocode::batch::run_batch_geocode(&open_geocode::batch::GeocodeOptions {
@@ -558,51 +619,69 @@ mod tests {
             written.contains(&format!("{:.7},{:.7}", hit.lat, hit.lon)),
             "{written}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn generations(pack: &Path) -> usize {
+        std::fs::read_dir(pack.join("generations"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
     }
 
     /// Quitting during a build leaves no unfinished Pack generation behind
     /// but one a later build can resume.
     #[test]
-    #[ignore = "needs the Andorra extract in OG_HOME"]
     fn quitting_mid_build_cleans_up() {
-        let home = Home::locate().unwrap();
-        let region = crate::regions::tree().get("andorra").unwrap();
-        let pack = home.packs_dir().join("andorra-stopped");
-        let mut app = App::new(Home::locate().unwrap());
-        app.job = Some(crate::job::BuildJob::start(
-            crate::job::BuildRequest {
-                inputs: vec![crate::job::BuildInput {
-                    region,
-                    extract: home.extract_path(region),
-                    download: false,
-                }],
-                pack: pack.clone(),
-                memory_budget_bytes: None,
-                scratch_budget_bytes: None,
-                force: false,
-                leftover: open_geocode::builder::Leftover::Refuse,
-                openaddresses: false,
-                tiger: false,
-            },
+        let dir = TempDir::new("og-quit");
+        let home = Home {
+            root: dir.join("home"),
+        };
+        let region = crate::regions::tree().get("monaco").unwrap();
+        let pack = dir.join("pack");
+        let mut app = App::new(Home {
+            root: home.root.clone(),
+        });
+        let request = crate::job::BuildRequest {
+            inputs: vec![crate::job::BuildInput {
+                region,
+                extract: Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("fixtures/smoke/monaco.osm.pbf"),
+                download: false,
+            }],
+            pack: pack.clone(),
+            memory_budget_bytes: None,
+            scratch_budget_bytes: None,
+            force: false,
+            leftover: open_geocode::builder::Leftover::Refuse,
+            openaddresses: false,
+            tiger: false,
+        };
+        let progress = crate::job::Progress::of(&request);
+        let build_held_at_first_stage = progress.steps.lock().unwrap();
+        let mut job = crate::job::BuildJob::spawn(
+            request,
             std::sync::Arc::new(home),
-        ));
-        std::thread::sleep(Duration::from_millis(300));
+            std::sync::Arc::clone(&progress),
+        );
+        while generations(&pack) == 0 {
+            if job.is_finished() {
+                let ended = job.take().map(|built| built.map(|_| ()));
+                panic!("the build ended before it made a generation: {ended:?}");
+            }
+            std::thread::yield_now();
+        }
+        app.job = Some(job);
         app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.quit);
+        drop(build_held_at_first_stage);
         drop(app);
-        let generations = std::fs::read_dir(pack.join("generations"))
-            .map(|entries| entries.count())
-            .unwrap_or(0);
         let stopped = open_geocode::builder::resume::find(&pack).unwrap();
         assert!(
             stopped
                 .iter()
                 .all(open_geocode::builder::resume::Found::resumable)
-                && generations == stopped.len(),
+                && generations(&pack) == stopped.len(),
             "an unfinished generation was left in {}",
             pack.display()
         );
-        let _ = std::fs::remove_dir_all(&pack);
     }
 }

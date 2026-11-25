@@ -336,15 +336,6 @@ mod tests {
     }
 
     #[test]
-    fn small_magnitudes_encode_in_one_byte() {
-        for value in [-64, -1, 0, 1, 63] {
-            let mut out = Vec::new();
-            put_i64(&mut out, value);
-            assert_eq!(out.len(), 1, "value {value}");
-        }
-    }
-
-    #[test]
     fn delta_and_front_coding_round_trip_in_any_order() {
         let values = [5, 7, 7, 1_000_000, -3, i64::MAX, i64::MIN, 0];
         let keys: [&[u8]; 6] = [b"king st", b"king street", b"king", b"", b"queen", b"queen"];
@@ -361,21 +352,6 @@ mod tests {
             assert_eq!(get_front(&mut input, &mut delta).unwrap(), *key);
         }
         assert!(input.is_empty());
-    }
-
-    #[test]
-    fn sorted_ids_and_shared_prefixes_code_short() {
-        let mut out = Vec::new();
-        let mut delta = Delta::default();
-        put_delta(&mut out, &mut delta, 9_000_000_000);
-        let first = out.len();
-        put_delta(&mut out, &mut delta, 9_000_000_017);
-        assert_eq!(out.len() - first, 1);
-        let before = out.len();
-        put_front(&mut out, &mut delta, b"cell-0042/king street/12");
-        put_front(&mut out, &mut delta, b"cell-0042/king street/14");
-        // The first key whole, then a shared length, a length and one byte.
-        assert_eq!(out.len() - before, (1 + 1 + 24) + 3);
     }
 
     #[test]

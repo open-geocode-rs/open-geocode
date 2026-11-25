@@ -163,6 +163,7 @@ impl<T> std::fmt::Debug for BookFile<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Number(u64);
@@ -192,10 +193,8 @@ mod tests {
 
     #[test]
     fn reads_items_back_by_position_and_in_order() {
-        let scratch = Scratch::create(
-            std::env::temp_dir().join(format!("open-geocode-book-{}", uuid::Uuid::new_v4())),
-        )
-        .expect("scratch");
+        let dir = TempDir::new("book");
+        let scratch = Scratch::create(dir.join("scratch")).expect("scratch");
         let mut book = Book::create(&scratch, "book").expect("book");
         let count = CHUNK_ITEMS as u64 * 3 + 5;
         for value in 0..count {

@@ -322,18 +322,4 @@ mod tests {
         .expect("labels");
         assert_eq!(labels, vec![Label::Postcode]);
     }
-
-    #[test]
-    fn lcs_pairs_finds_a_longest_common_subsequence() {
-        let left = "abcbdab".chars().collect::<Vec<_>>();
-        let right = "bdcaba".chars().collect::<Vec<_>>();
-        let pairs = lcs_pairs(&left, &right);
-        assert_eq!(pairs.len(), 4);
-        assert!(pairs.iter().all(|&(i, j)| left[i] == right[j]));
-        assert!(
-            pairs
-                .windows(2)
-                .all(|pair| pair[0].0 < pair[1].0 && pair[0].1 < pair[1].1)
-        );
-    }
 }

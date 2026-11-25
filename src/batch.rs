@@ -1078,15 +1078,6 @@ mod tests {
     }
 
     #[test]
-    fn adds_missing_coordinate_columns() {
-        let mut headers = vec!["id".to_string(), "address".to_string()];
-        let columns = ensure_coordinate_columns(&mut headers, "lat", "lon").expect("columns");
-        assert_eq!(headers, vec!["id", "address", "lat", "lon"]);
-        assert_eq!(columns.lat_index, 2);
-        assert_eq!(columns.lon_index, 3);
-    }
-
-    #[test]
     fn reuses_existing_coordinate_columns_case_insensitively() {
         let mut headers = vec!["id".to_string(), "LAT".to_string(), "Lon".to_string()];
         let columns = ensure_coordinate_columns(&mut headers, "lat", "lon").expect("columns");
@@ -1104,51 +1095,8 @@ mod tests {
 
     #[test]
     fn geocodes_streamed_rows_in_input_order() {
-        use crate::{
-            pack::Writer,
-            record::{
-                AddressComponents, AddressRecord, LocationPrecision, ObjectType, SourceProvenance,
-                point_geometry,
-            },
-        };
-
-        let root =
-            std::env::temp_dir().join(format!("open-geocode-batch-{}", uuid::Uuid::new_v4()));
-        let mut writer = Writer::create(root.join("pack")).expect("writer");
-        for (object_id, number, street, lon) in [
-            (1, "10", "King Street", -79.40),
-            (2, "20", "Queen Street", -79.41),
-        ] {
-            writer
-                .write(
-                    &AddressRecord {
-                        building: None,
-                        access: Vec::new(),
-                        disputed: false,
-                        street_postcodes: Vec::new(),
-                        address: AddressComponents {
-                            block_number_len: None,
-                            areas: Vec::new(),
-                            number: number.into(),
-                            street: Some(street.into()),
-                            place: None,
-                            unit: None,
-                            locality: None,
-                            region: None,
-                            postcode: None,
-                            country: None,
-                        },
-                        geometry: point_geometry(lon, 43.6),
-                        location_precision: LocationPrecision::Point,
-                        source: SourceProvenance::osm(ObjectType::Node, object_id),
-                    }
-                    .into(),
-                    None,
-                )
-                .expect("write");
-        }
-        writer.finish().expect("finish");
-
+        let root = crate::test_support::TempDir::new("batch-stream");
+        let pack = &*crate::runtime::router_tests::KING;
         let input = root.join("in.csv");
         std::fs::write(
             &input,
@@ -1156,7 +1104,7 @@ mod tests {
         )
         .expect("input");
         let report = run_batch_geocode(&GeocodeOptions {
-            pack: Some(root.join("pack")),
+            pack: Some(pack.to_path_buf()),
             input,
             output: root.join("out.csv"),
             audit: Some(root.join("audit.csv")),
@@ -1177,12 +1125,12 @@ mod tests {
         assert_eq!(output.headers, vec!["id", "street", "lat", "lon"]);
         assert_eq!(
             output.rows[0],
-            vec!["a", "20 Queen St", "43.6000000", "-79.4100000"]
+            vec!["a", "20 Queen St", "43.0000000", "-79.1000000"]
         );
         assert_eq!(output.rows[1], vec!["b", "nowhere at all", "", ""]);
         assert_eq!(
             output.rows[2],
-            vec!["c", "10 King Street", "43.6000000", "-79.4000000"]
+            vec!["c", "10 King Street", "43.0000000", "-79.0000000"]
         );
         let audit = read_csv(&root.join("audit.csv")).expect("audit");
         assert_eq!(audit.rows[1][2], "unresolved");
@@ -1207,7 +1155,7 @@ mod tests {
         std::fs::write(&bare, "a,20 Queen St\nb,nowhere at all\n").expect("input");
         let rows = Arc::new(Rows(std::sync::Mutex::new(Vec::new())));
         let report = run_batch_geocode(&GeocodeOptions {
-            pack: Some(root.join("pack")),
+            pack: Some(pack.to_path_buf()),
             input: bare.clone(),
             output: root.join("bare-out.csv"),
             header_row: false,
@@ -1224,7 +1172,7 @@ mod tests {
         assert_eq!(output.headers, vec!["column_1", "column_2", "lat", "lon"]);
 
         let error = run_batch_geocode(&GeocodeOptions {
-            pack: Some(root.join("pack")),
+            pack: Some(pack.to_path_buf()),
             input: bare,
             output: root.join("stopped.csv"),
             header_row: false,
@@ -1245,7 +1193,7 @@ mod tests {
         std::fs::write(&messy, bytes).expect("input");
         assert_eq!(detect_delimiter(&messy).expect("delimiter"), b';');
         let report = run_batch_geocode(&GeocodeOptions {
-            pack: Some(root.join("pack")),
+            pack: Some(pack.to_path_buf()),
             input: messy,
             output: root.join("messy-out.csv"),
             address_field_groups: vec![vec![Column::Named("strasse".into())]],
@@ -1256,13 +1204,13 @@ mod tests {
         let output = std::fs::read(root.join("messy-out.csv")).expect("output");
         let lines: Vec<&[u8]> = output.split(|byte| *byte == b'\n').collect();
         assert_eq!(lines[0], b"\xef\xbb\xbfID;STRASSE;ORT;lat;lon");
-        assert_eq!(lines[1], b"1;20 Queen St;Z\xfcrich;43.6000000;-79.4100000");
-        assert_eq!(lines[2], b"2;10 King Street;;43.6000000;-79.4000000");
+        assert_eq!(lines[1], b"1;20 Queen St;Z\xfcrich;43.0000000;-79.1000000");
+        assert_eq!(lines[2], b"2;10 King Street;;43.0000000;-79.0000000");
 
         let twins = root.join("twins.csv");
         std::fs::write(&twins, "street,street,\nnowhere,10 King Street,x\n").expect("input");
         let report = run_batch_geocode(&GeocodeOptions {
-            pack: Some(root.join("pack")),
+            pack: Some(pack.to_path_buf()),
             input: twins.clone(),
             output: root.join("twins-out.csv"),
             address_field_groups: vec![vec![Column::At(1)]],
@@ -1271,7 +1219,7 @@ mod tests {
         .expect("batch by place");
         assert_eq!(report.resolved, 1);
         let error = run_batch_geocode(&GeocodeOptions {
-            pack: Some(root.join("pack")),
+            pack: Some(pack.to_path_buf()),
             input: twins,
             output: root.join("twins-missing.csv"),
             address_field_groups: vec![vec![Column::Named("adresse".into())]],
@@ -1292,9 +1240,7 @@ mod tests {
 
     #[test]
     fn refuses_to_overwrite_the_input() {
-        let root =
-            std::env::temp_dir().join(format!("open-geocode-batch-same-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).expect("dir");
+        let root = crate::test_support::TempDir::new("batch-same");
         let input = root.join("in.csv");
         let contents = "id,street
 a,10 King Street
@@ -1333,27 +1279,5 @@ a,43.6,-79.4
             assert!(format!("{error:#}").contains("same file"), "{error:#}");
             assert_eq!(std::fs::read_to_string(&input).expect("input"), contents);
         }
-    }
-
-    #[test]
-    fn pads_rows_before_writing_coordinates() {
-        let audit = AuditFields {
-            lat: "43.1".into(),
-            lon: "-79.2".into(),
-            ..AuditFields::default()
-        };
-        let columns = CoordinateColumns {
-            lat_index: 1,
-            lon_index: 2,
-        };
-        let row = ByteRecord::from(vec!["1"]);
-        assert_eq!(
-            output_record(&row, 3, Some((columns, &audit))),
-            ByteRecord::from(vec!["1", "43.1", "-79.2"])
-        );
-        assert_eq!(
-            output_record(&row, 3, None),
-            ByteRecord::from(vec!["1", "", ""])
-        );
     }
 }

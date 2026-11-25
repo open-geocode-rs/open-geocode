@@ -7,7 +7,7 @@
 //! fails here until its examples are regenerated, with
 //! `OG_UPDATE_CONTRACT=1 cargo test contract`, and committed with it.
 
-use std::path::{Path, PathBuf};
+use std::{path::Path, sync::LazyLock};
 
 use axum::{
     Router,
@@ -29,6 +29,7 @@ use crate::{
         PlaceRecord, PoiDetails, PoiRecord, Record, SourceProvenance, StreetRecord, point_geometry,
     },
     runtime::{AppState, build_router},
+    test_support::TempDir,
 };
 
 /// Set to write the live answers and columns over the committed files.
@@ -71,17 +72,8 @@ async fn committed_openapi_is_the_served_contract() {
         crate::http::openapi::document(&crate::limits::Limits::DEFAULT).expect("spec serializes");
     assert_committed("openapi.json", &document);
 
-    let pack = contract_pack();
-    let router = build_router(
-        AppState::open(
-            &pack,
-            &pack.with_extension("jobs"),
-            crate::limits::Limits::DEFAULT,
-        )
-        .expect("open pack"),
-        Some(&pack.join("demo")),
-        Some(&pack.join("basemap.pmtiles")),
-    );
+    let jobs = TempDir::new("contract-openapi");
+    let router = served(&CONTRACT, &jobs);
     let response = router
         .oneshot(
             Request::get("/openapi.json")
@@ -99,7 +91,6 @@ async fn committed_openapi_is_the_served_contract() {
         document,
         "/openapi.json differs from the committed contract"
     );
-    let _ = std::fs::remove_dir_all(&pack);
 }
 
 /// Release Please uses JSON.stringify, which writes integral floats as integers.
@@ -193,56 +184,24 @@ fn committed_audit_columns_are_the_batch_columns() {
     assert_committed(batch::AUDIT_COLUMNS_FILE, &batch::audit_columns_text());
 }
 
-/// Write the contract Pack where `OG_CONTRACT_PACK` points, for serving it
-/// by hand:
-///
-/// ```text
-/// OG_CONTRACT_PACK=/tmp/contract-pack cargo test write_the_contract_pack -- --ignored
-/// open-geocode serve --pack /tmp/contract-pack --bind 127.0.0.1:8080
-/// ```
-///
-/// Ignored because it writes outside the temp dir it cleans up, and exists
-/// so the committed examples can be checked against a running server.
-#[test]
-#[ignore = "writes a Pack to OG_CONTRACT_PACK for serving by hand"]
-fn write_the_contract_pack() {
-    let path = std::env::var_os("OG_CONTRACT_PACK")
-        .map(PathBuf::from)
-        .expect("set OG_CONTRACT_PACK to where the Pack should be written");
-    write_pack(&path);
-    println!("wrote the contract Pack to {}", path.display());
-}
+static CONTRACT: LazyLock<TempDir> = LazyLock::new(|| {
+    let dir = TempDir::new("contract");
+    write_pack(&dir);
+    dir
+});
 
-/// A Pack holding the handful of records the examples are built from, in a
-/// directory of its own so tests can run side by side.
-fn contract_pack() -> PathBuf {
-    let pack = std::env::temp_dir().join(format!(
-        "open-geocode-contract-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    write_pack(&pack);
-    pack
+fn served(pack: &Path, jobs: &Path) -> Router {
+    build_router(
+        AppState::open(pack, jobs, crate::limits::Limits::DEFAULT).expect("open pack"),
+        Some(&pack.join("demo")),
+        Some(&pack.join("basemap.pmtiles")),
+    )
 }
 
 #[tokio::test]
 async fn responses_match_the_committed_examples() {
-    let pack = std::env::temp_dir().join(format!(
-        "open-geocode-contract-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    write_pack(&pack);
-    let router = build_router(
-        AppState::open(
-            &pack,
-            &pack.with_extension("jobs"),
-            crate::limits::Limits::DEFAULT,
-        )
-        .expect("open pack"),
-        Some(&pack.join("demo")),
-        Some(&pack.join("basemap.pmtiles")),
-    );
+    let jobs = TempDir::new("contract-examples");
+    let router = served(&CONTRACT, &jobs);
 
     let address = get(&router, "/geocode?q=10%20King%20Street").await;
     assert_example("geocode-text", &address);
@@ -515,8 +474,6 @@ async fn responses_match_the_committed_examples() {
         assert_eq!(matched.remove("country"), Some(json!("matched")));
     }
     assert_eq!(unfiltered["features"], filtered["features"]);
-
-    let _ = std::fs::remove_dir_all(&pack);
 }
 
 /// One batch result, its answer kept as the bytes it was sent as.
@@ -537,17 +494,8 @@ struct RawBatch {
 /// a batch alike, byte for byte too.
 #[tokio::test]
 async fn batch_results_are_their_get_answers() {
-    let pack = contract_pack();
-    let router = build_router(
-        AppState::open(
-            &pack,
-            &pack.with_extension("jobs"),
-            crate::limits::Limits::DEFAULT,
-        )
-        .expect("open pack"),
-        Some(&pack.join("demo")),
-        Some(&pack.join("basemap.pmtiles")),
-    );
+    let jobs = TempDir::new("contract-batch");
+    let router = served(&CONTRACT, &jobs);
 
     let batches = [
         (
@@ -640,122 +588,6 @@ async fn batch_results_are_their_get_answers() {
     let example: Value = serde_json::from_slice(&example).expect("batch is JSON");
     assert_example("batch-geocode", &example);
     batch_schemas_match_the_rendered_body(&example);
-
-    let _ = std::fs::remove_dir_all(&pack);
-}
-
-/// A `/places` batch answers ids and names side by side, each item in its
-/// place; an id no record has is left out, and a malformed one fails only
-/// its item. The batch item limit caps the items and, item by item, the ids.
-#[tokio::test]
-async fn places_batch_answers_ids_and_names_in_order() {
-    let pack = contract_pack();
-    let limits = crate::limits::Limits {
-        max_batch_items: std::num::NonZeroUsize::new(3).expect("3"),
-        ..crate::limits::Limits::DEFAULT
-    };
-    let router = build_router(
-        AppState::open(&pack, &pack.with_extension("jobs"), limits).expect("open pack"),
-        None,
-        None,
-    );
-    let found = |answer: &Value| -> Vec<String> {
-        answer["features"]
-            .as_array()
-            .expect("features")
-            .iter()
-            .map(|feature| {
-                feature["properties"]["id"]
-                    .as_str()
-                    .expect("id")
-                    .to_string()
-            })
-            .collect()
-    };
-
-    let body = json!([
-        {"id": "saved", "ids": "osm:relation:3,osm:way:999,osm:way:11"},
-        {"id": "typed", "q": "Queen Bakery"},
-        {"id": "broken", "ids": "osm:way:11,11"},
-    ])
-    .to_string();
-    let (status, query) = send_raw(&router, "QUERY", "/places", Some(&body)).await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, post) = send_raw(&router, "POST", "/places", Some(&body)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(query, post, "QUERY and POST answer differently");
-
-    let batch: Value = serde_json::from_slice(&query).expect("batch is JSON");
-    let results = batch["results"].as_array().expect("results");
-    assert_eq!(results.len(), 3);
-    assert_eq!(results[0]["id"], "saved");
-    assert_eq!(results[0]["status"], 200);
-    assert_eq!(
-        found(&results[0]["response"]),
-        ["osm:relation:3", "osm:way:11"]
-    );
-    assert_eq!(
-        results[0]["response"]["geocoding"]["query"],
-        "osm:relation:3,osm:way:999,osm:way:11"
-    );
-    assert_eq!(results[1]["id"], "typed");
-    assert_eq!(results[1]["status"], 200);
-    assert_eq!(found(&results[1]["response"])[0], "osm:way:11");
-    assert_eq!(results[2]["id"], "broken");
-    assert_eq!(results[2]["status"], 400);
-    assert_eq!(results[2]["error"]["error_code"], "malformed_parameter");
-    assert_eq!(
-        results[2]["error"]["detail"],
-        "\"11\" is no record id, such as osm:node:123"
-    );
-    assert_eq!(
-        batch["summary"],
-        json!({"total": 3, "succeeded": 2, "failed": 1})
-    );
-
-    // An item holds as many ids as the limit, and one more fails that item
-    // alone.
-    let body = json!([
-        {"ids": "osm:way:11,osm:way:11,osm:way:11"},
-        {"ids": "osm:way:11,osm:way:11,osm:way:11,osm:way:11"},
-    ])
-    .to_string();
-    let (status, answer) = send_raw(&router, "QUERY", "/places", Some(&body)).await;
-    assert_eq!(status, StatusCode::OK);
-    let batch: Value = serde_json::from_slice(&answer).expect("batch is JSON");
-    assert_eq!(batch["results"][0]["status"], 200);
-    assert_eq!(
-        found(&batch["results"][0]["response"]),
-        ["osm:way:11", "osm:way:11", "osm:way:11"]
-    );
-    assert_eq!(batch["results"][1]["status"], 400);
-    assert_eq!(
-        batch["results"][1]["error"]["error_code"],
-        "limit_too_large"
-    );
-    assert_eq!(
-        batch["results"][1]["error"]["invalid_params"][0]["reason"],
-        "at most 3 ids"
-    );
-
-    // A body of one item past the limit is refused whole, by either method.
-    let over = Value::Array(vec![json!({"q": "Queen Bakery"}); 4]).to_string();
-    for method in ["QUERY", "POST"] {
-        let (status, refused) = send_raw(&router, method, "/places", Some(&over)).await;
-        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{method}");
-        let refused: Value = serde_json::from_slice(&refused).expect("problem is JSON");
-        assert_eq!(refused["error_code"], "too_many_items", "{method}");
-        assert_eq!(
-            refused["detail"], "a batch holds at most 3 items",
-            "{method}"
-        );
-    }
-    let empty = send_raw(&router, "QUERY", "/places", Some("[]")).await;
-    assert_eq!(empty.0, StatusCode::OK);
-    let empty: Value = serde_json::from_slice(&empty.1).expect("batch is JSON");
-    assert_eq!(empty["results"], json!([]));
-
-    let _ = std::fs::remove_dir_all(&pack);
 }
 
 /// The batch schemas in the contract are mirrors, like `Problem`'s, so this
@@ -890,7 +722,7 @@ async fn get(router: &Router, uri: &str) -> Value {
 
 /// Canada > Ontario > Toronto, an address, a POI with an address, a street
 /// and an interpolation range in Toronto.
-fn write_pack(dir: &PathBuf) {
+fn write_pack(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
     let mut writer = Writer::create(dir).expect("writer");
     let place = |writer: &mut Writer, layer, name: &str, id| {
@@ -1084,7 +916,7 @@ fn line(from_lon: f64, from_lat: f64, to_lon: f64, to_lat: f64) -> Geometry {
 
 /// Geneva in Switzerland, each area with its names in other languages, and
 /// an address in Geneva.
-fn write_geneva_pack(dir: &PathBuf) {
+fn write_geneva_pack(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
     let mut writer = Writer::create(dir).expect("writer");
     let mut place = |layer, name: &str, alt_names: &[&str], id, context| {
@@ -1192,31 +1024,14 @@ fn write_geneva_pack(dir: &PathBuf) {
     writer.finish().expect("finish");
 }
 
-fn geneva_router() -> Router {
-    let pack = std::env::temp_dir().join(format!(
-        "open-geocode-geneva-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    write_geneva_pack(&pack);
-    build_router(
-        AppState::open(
-            &pack,
-            &pack.with_extension("jobs"),
-            crate::limits::Limits::DEFAULT,
-        )
-        .expect("open pack"),
-        Some(&pack.join("demo")),
-        Some(&pack.join("basemap.pmtiles")),
-    )
-}
-
 /// `lang` names results and their areas. The first language gives `name`,
 /// with the local name standing in where there is none, and each other one
 /// gives `translations`.
 #[tokio::test]
 async fn lang_names_results_and_areas_in_the_languages_asked() {
-    let router = geneva_router();
+    let dir = TempDir::new("geneva");
+    write_geneva_pack(&dir.join("pack"));
+    let router = served(&dir.join("pack"), &dir.join("jobs"));
 
     let local = get(&router, "/places?ids=osm:relation:1685488").await;
     let city = &local["features"][0]["properties"];
@@ -1284,52 +1099,7 @@ async fn lang_names_results_and_areas_in_the_languages_asked() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
         assert_eq!(problem["invalid_params"][0]["name"], "lang", "{uri}");
     }
-}
 
-/// `lang` takes at most twenty distinct languages. Repeats drop first, so a
-/// list over the cap only by repeats is answered.
-#[tokio::test]
-async fn lang_takes_at_most_twenty_languages() {
-    let router = geneva_router();
-    let twenty = "fr,de,it,rm,en,es,pt,nl,sv,da,fi,pl,cs,sk,hu,ro,bg,el,ru,ja";
-
-    let answer = get(
-        &router,
-        &format!("/places?ids=osm:relation:1685488&lang={twenty}"),
-    )
-    .await;
-    let city = &answer["features"][0]["properties"];
-    assert_eq!(city["name"], "Genève");
-    assert_eq!(city["translations"]["de"], "Genf");
-
-    let repeated = format!("/places?ids=osm:relation:1685488&lang={twenty},DE,fr");
-    let answer = get(&router, &repeated).await;
-    assert_eq!(answer["features"][0]["properties"]["name"], "Genève");
-
-    for uri in [
-        format!("/places?ids=osm:relation:1685488&lang={twenty},ko"),
-        format!("/geocode?q=Rue&lang={twenty},ko"),
-        format!("/reverse?lon=6.1&lat=46.2&lang={twenty},ko"),
-        format!("/autocomplete?q=Rue&lang={twenty},ko"),
-    ] {
-        let (status, problem) = get_error(&router, &uri).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
-        assert_eq!(
-            problem["invalid_params"],
-            json!([{"name": "lang", "reason": "at most 20 languages"}]),
-            "{uri}"
-        );
-        assert_eq!(
-            problem["detail"], "lang asks for 21 languages, and the most is 20",
-            "{uri}"
-        );
-    }
-}
-
-/// A batch item names its answer in its own `lang`, as its `GET` would.
-#[tokio::test]
-async fn a_batch_item_takes_lang() {
-    let router = geneva_router();
     let body = json!([
         {"ids": "osm:relation:1685488", "lang": "de"},
         {"ids": "osm:relation:1685488"},

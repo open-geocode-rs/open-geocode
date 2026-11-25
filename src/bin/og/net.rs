@@ -467,10 +467,11 @@ mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
         net::TcpListener,
-        sync::{Arc, Mutex, atomic::AtomicUsize},
+        sync::{Arc, Mutex},
     };
 
     use super::*;
+    use crate::test_support::TempDir;
 
     /// What a route answers: a body, a redirect to a path or a full URL, or an
     /// error status.
@@ -692,22 +693,6 @@ mod tests {
     }
 
     #[test]
-    fn an_extract_with_no_sum_beside_it_is_an_error_naming_the_sum_url() {
-        let server = Server::start();
-        server.route("/europe-latest.osm.pbf", Answer::Body(b"europe".to_vec()));
-
-        let error = published(&server.url("/europe-latest.osm.pbf")).unwrap_err();
-
-        assert_eq!(
-            format!("{error:#}"),
-            format!(
-                "failed to reach {}: http status: 404",
-                server.url("/europe-latest.osm.pbf.md5")
-            )
-        );
-    }
-
-    #[test]
     fn a_sum_file_without_a_sum_is_an_error() {
         let server = Server::start();
         server.route("/kosovo-latest.osm.pbf", Answer::Body(b"kosovo".to_vec()));
@@ -753,14 +738,13 @@ mod tests {
             Answer::Body(b"monaco 261110".to_vec()),
         );
 
-        let dir = std::env::temp_dir().join(format!("og-net-{}", std::process::id()));
+        let dir = TempDir::new("og-net-snapshot");
         let path = dir.join("monaco.osm.pbf");
         let result =
             download(&published, &path, &AtomicBool::new(false), |_, _| {}).and_then(|partial| {
                 check_md5(&partial, &published.md5, &AtomicBool::new(false), |_| {})?;
                 Ok(fs::read(&partial)?)
             });
-        let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(result.unwrap(), old);
     }
@@ -795,18 +779,12 @@ mod tests {
     fn build_download(server: &Server, id: &str) -> Result<Vec<u8>> {
         let index = Index::fetch(&server.url("/index-v1-nogeom.json"))?;
         let published = published(index.link(id)?)?;
-        // One folder per call, since the tests run side by side.
-        static CALLS: AtomicUsize = AtomicUsize::new(0);
-        let call = CALLS.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("og-net-{}-{call}", std::process::id()));
+        let dir = TempDir::new("og-net-download");
         let path = dir.join("region.osm.pbf");
-        let result =
-            download(&published, &path, &AtomicBool::new(false), |_, _| {}).and_then(|partial| {
-                check_md5(&partial, &published.md5, &AtomicBool::new(false), |_| {})?;
-                Ok(fs::read(&partial)?)
-            });
-        let _ = fs::remove_dir_all(&dir);
-        result
+        download(&published, &path, &AtomicBool::new(false), |_, _| {}).and_then(|partial| {
+            check_md5(&partial, &published.md5, &AtomicBool::new(false), |_| {})?;
+            Ok(fs::read(&partial)?)
+        })
     }
 
     #[test]

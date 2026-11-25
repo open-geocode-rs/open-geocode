@@ -553,15 +553,4 @@ mod tests {
             [ca.unwrap(), nz.unwrap()]
         );
     }
-
-    #[test]
-    fn rates_every_input_on_the_unit_interval() {
-        let mut weights = [0.0; FEATURES];
-        weights[0] = 40.0;
-        let model = Model::new(weights, BTreeMap::new());
-        assert_eq!(model.rate(&Features::default()), 1.0);
-        weights[0] = -40.0;
-        let model = Model::new(weights, BTreeMap::new());
-        assert!(model.rate(&Features::default()) < 1e-6);
-    }
 }

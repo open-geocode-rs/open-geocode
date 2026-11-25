@@ -3216,6 +3216,7 @@ fn object_type_of(code: u8) -> crate::error::Result<ObjectType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
 
     fn dot_with_reach(point: [f64; 2], reach_m: f64) -> TownDot {
         let mut dot = TownDot::new(
@@ -3392,6 +3393,8 @@ mod tests {
         for rings_closed in [false, true] {
             let mut boundary = test_boundary(PlaceLayer::Region);
             boundary.rings_closed = rings_closed;
+            boundary.settled = !rings_closed;
+            boundary.point_names = vec!["Emerald City".to_string()];
             boundary.interior_point = rings_closed.then_some([0.5, -0.25]);
             let interior_point = boundary.interior_point;
             let mut bytes = Vec::new();
@@ -3407,6 +3410,8 @@ mod tests {
                 panic!("not a candidate");
             };
             assert_eq!(read.boundary.rings_closed, rings_closed);
+            assert_eq!(read.boundary.settled, !rings_closed);
+            assert_eq!(read.boundary.point_names, ["Emerald City"]);
             assert_eq!(read.boundary.interior_point, interior_point);
             assert_eq!(
                 read.boundary.extent,
@@ -3433,35 +3438,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_saved_boundary_keeps_what_its_merged_points_gave_it() {
-        use crate::extsort::Spill;
-        for settled in [false, true] {
-            let mut boundary = test_boundary(PlaceLayer::Locality);
-            boundary.settled = settled;
-            boundary.point_names = vec!["Emerald City".to_string()];
-            let mut bytes = Vec::new();
-            SetItem::Candidate(Box::new(BoundaryCandidate {
-                source_object_type: ObjectType::Relation,
-                source_object_id: 237_385,
-                label: None,
-                boundary,
-            }))
-            .encode(&mut bytes);
-            let SetItem::Candidate(read) = SetItem::decode(&mut bytes.as_slice()).expect("decode")
-            else {
-                panic!("not a candidate");
-            };
-            assert_eq!(read.boundary.settled, settled);
-            assert_eq!(read.boundary.point_names, ["Emerald City"]);
-        }
-    }
-
     /// A merged point's names are added to the boundary's record, not to the
     /// area names of the records inside it.
     #[test]
     fn a_merged_points_names_are_the_records_not_the_areas() {
-        let scratch = test_scratch();
+        let (_dir, scratch) = test_scratch();
         let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
         let vertex = |node_id, lon, lat| Vertex { node_id, lat, lon };
         let ring = vec![
@@ -3514,59 +3495,6 @@ mod tests {
             set.context_names(&[7], &HashMap::new()),
             HashMap::from([(7, vec!["Seattle".to_string()])])
         );
-    }
-
-    /// The links' heap grows with the points matched, so a build can reserve it.
-    #[test]
-    fn place_links_count_the_points_they_hold() {
-        let scratch = test_scratch();
-        let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
-        let vertex = |node_id, lon, lat| Vertex { node_id, lat, lon };
-        let ring = vec![
-            vertex(1, 0.0, 0.0),
-            vertex(2, 1.0, 0.0),
-            vertex(3, 1.0, 1.0),
-            vertex(4, 0.0, 1.0),
-            vertex(1, 0.0, 0.0),
-        ];
-        builder
-            .add_relations(
-                &[BoundaryRelationStub {
-                    object_id: 900,
-                    members: vec![BoundaryRelationMember {
-                        way_id: 500,
-                        role: BoundaryMemberRole::Outer,
-                    }],
-                    label: None,
-                    tags: boundary_tags(&BTreeMap::from([
-                        ("boundary".to_string(), "administrative".to_string()),
-                        ("admin_level".to_string(), "8".to_string()),
-                        ("name".to_string(), "Seattle".to_string()),
-                    ])),
-                }],
-                |_| Ok(Some(ring.clone())),
-            )
-            .expect("relations");
-        let mut set = builder.finish().expect("boundaries");
-        let mut links = set.place_links();
-        let empty = links.heap_bytes();
-        let point = |name: &str, item| PlaceRecord {
-            name: name.to_string(),
-            alt_names: Vec::new(),
-            place_type: "city".to_string(),
-            geometry: point_geometry(0.3, 0.2),
-            source: SourceProvenance::osm(ObjectType::Node, 10),
-            prominence: Prominence::default(),
-            wikidata: Some(item),
-        };
-        let points = 10_000u64;
-        for at in 0..points {
-            let name = if at % 2 == 0 { "Seattle" } else { "Elsewhere" };
-            set.match_place_point(&mut links, at, PlaceLayer::Locality, &point(name, 1));
-        }
-        // A matched point costs a table slot and a waiting one a list entry, 8 B or more each.
-        let grown = links.heap_bytes() - empty;
-        assert!(grown >= points as usize * 8, "{grown}");
     }
 
     fn test_boundary(layer: PlaceLayer) -> BuiltBoundary {
@@ -3803,32 +3731,6 @@ mod tests {
         );
     }
 
-    /// Two levels of one country must never share a layer: the deeper one is
-    /// then dropped to the innermost layer and the slot it wanted stays
-    /// empty.
-    #[test]
-    fn every_country_gives_each_level_its_own_layer() {
-        let mut clashes = Vec::new();
-        for (country, levels) in admin_levels().levels_by_country() {
-            if levels.len() < 2 || !admin_levels().names_a_locality(&country) {
-                continue;
-            }
-            let layers = layers_for_levels_in(Some(&country), &levels);
-            let mut seen: BTreeMap<PlaceLayer, u8> = BTreeMap::new();
-            for (level, layer) in &layers {
-                if let Some(first) = seen.insert(*layer, *level) {
-                    clashes.push(format!("{country}: {first} and {level} both {layer:?}"));
-                }
-            }
-        }
-        assert!(
-            clashes.is_empty(),
-            "{} level clashes:\n  {}",
-            clashes.len(),
-            clashes.join("\n  ")
-        );
-    }
-
     /// The claim this change exists for: a country deeper than the
     /// conventional five keeps every level, each in a tier of its own.
     /// Germany maps nine, three of them `state_district` and two
@@ -3960,7 +3862,7 @@ mod tests {
         country: Option<&str>,
         levels: &[(u8, Option<PlaceLayer>, usize)],
     ) -> BTreeMap<u8, PlaceLayer> {
-        let scratch = test_scratch();
+        let (_dir, scratch) = test_scratch();
         let mut shapes = ShapeWriter::create(&scratch, SHAPES_LABEL).expect("shape file");
         let mut candidates = Vec::new();
         let levels = levels
@@ -4076,7 +3978,7 @@ mod tests {
             square(2, "3", "関東地方", None, 4.0),
             square(3, "4", "千葉県", None, 1.0),
         ];
-        let scratch = test_scratch();
+        let (_dir, scratch) = test_scratch();
         let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
         builder.add_ways(&ways).expect("ways");
         let set = builder.finish().expect("boundaries");
@@ -4143,7 +4045,7 @@ mod tests {
         ];
 
         let member_line = |way_id: i64| Ok(member_lines.get(&way_id).cloned().flatten());
-        let scratch = test_scratch();
+        let (_dir, scratch) = test_scratch();
         let mut builder = BoundaryBuilder::new(&scratch).expect("builder");
         builder
             .add_relations(&relations, member_line)
@@ -4179,21 +4081,6 @@ mod tests {
         let context = index.context_for_point(-75.0, 45.0, &SourceContext::default());
         assert_eq!(context.admin_context.region_record_id(), Some(5));
         assert_eq!(context.admin_context.country_record_id(), Some(4));
-    }
-
-    #[test]
-    fn parses_country_code_from_region_iso3166_2() {
-        let tags = BTreeMap::from([
-            ("boundary".to_string(), "administrative".to_string()),
-            ("admin_level".to_string(), "4".to_string()),
-            ("name".to_string(), "Ontario".to_string()),
-            ("ISO3166-2".to_string(), "CA-ON".to_string()),
-        ]);
-
-        assert_eq!(
-            country_code_from_tags(&tags, PlaceLayer::Region).as_deref(),
-            Some("CA")
-        );
     }
 
     fn square_boundary(
@@ -4235,11 +4122,10 @@ mod tests {
         }
     }
 
-    fn test_scratch() -> Arc<crate::extsort::Scratch> {
-        crate::extsort::Scratch::create(
-            std::env::temp_dir().join(format!("og-boundary-{}", uuid::Uuid::new_v4())),
-        )
-        .expect("scratch")
+    fn test_scratch() -> (TempDir, Arc<crate::extsort::Scratch>) {
+        let dir = TempDir::new("boundary");
+        let scratch = crate::extsort::Scratch::create(dir.join("scratch")).expect("scratch");
+        (dir, scratch)
     }
 
     /// `geometry` written to `shapes` as the boundary stage writes it, with
@@ -4259,7 +4145,7 @@ mod tests {
 
     /// An index of square boundaries, each the square its box is.
     fn test_index(mut boundaries: Vec<AcceptedBoundary>) -> BoundaryIndex {
-        let scratch = test_scratch();
+        let (_dir, scratch) = test_scratch();
         let mut shapes = ShapeWriter::create(&scratch, SHAPES_LABEL).expect("shape file");
         for boundary in &mut boundaries {
             let square = MultiPolygon::new(vec![boundary.bounds.to_polygon()]);

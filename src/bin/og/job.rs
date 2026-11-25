@@ -160,8 +160,8 @@ pub(crate) struct BuildJob {
     handle: Option<JoinHandle<Result<Built>>>,
 }
 
-impl BuildJob {
-    pub(crate) fn start(request: BuildRequest, home: Arc<Home>) -> Self {
+impl Progress {
+    pub(crate) fn of(request: &BuildRequest) -> Arc<Self> {
         let mut steps = Vec::new();
         // One download and checksum pair per input that needs fetching, each
         // named after its region so a build of several says which it is on.
@@ -201,7 +201,17 @@ impl BuildJob {
             });
         }
         steps.extend(BuildStage::ALL.into_iter().map(build_step));
-        let progress = Progress::new(steps);
+        Self::new(steps)
+    }
+}
+
+impl BuildJob {
+    pub(crate) fn start(request: BuildRequest, home: Arc<Home>) -> Self {
+        let progress = Progress::of(&request);
+        Self::spawn(request, home, progress)
+    }
+
+    pub(crate) fn spawn(request: BuildRequest, home: Arc<Home>, progress: Arc<Progress>) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let pack = request.pack.clone();
         let extracts = request

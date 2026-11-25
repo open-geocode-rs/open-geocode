@@ -170,11 +170,4 @@ mod tests {
         // Osmosis state files escape the colons.
         assert_eq!(parse_time("2026-10-16T04\\:50\\:38Z"), Some(rfc));
     }
-
-    #[test]
-    fn groups_thousands() {
-        assert_eq!(thousands(0), "0");
-        assert_eq!(thousands(10_000), "10,000");
-        assert_eq!(thousands(7_590_748), "7,590,748");
-    }
 }

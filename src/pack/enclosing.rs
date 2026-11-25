@@ -200,7 +200,7 @@ impl AreaTags {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::temp::TempPath;
+    use crate::test_support::TempDir;
 
     /// A Pack file holding what `add` puts in it, opened as a Pack opens it.
     fn open(
@@ -208,7 +208,8 @@ mod tests {
         tuples: u64,
         records: u64,
     ) -> Result<Option<Reader>> {
-        let path = TempPath::new("enclosing");
+        let dir = TempDir::new("enclosing");
+        let path = dir.join("pack");
         let mut pack = Writer::create(&path).expect("pack");
         add(&mut pack)?;
         pack.finish().expect("finish");

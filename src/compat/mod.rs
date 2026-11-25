@@ -1083,7 +1083,22 @@ pub(crate) fn postal_lines(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use super::*;
+    use crate::test_support::TempDir;
+
+    static STATED_NAMES: LazyLock<TempDir> = LazyLock::new(|| {
+        let dir = TempDir::new("compat-stated-names");
+        crate::runtime::router_tests::write_stated_names_pack(&dir.join("pack"));
+        dir
+    });
+
+    static DEFAULTS: LazyLock<TempDir> = LazyLock::new(|| {
+        let dir = TempDir::new("compat-defaults");
+        write_defaults_pack(&dir.join("pack"));
+        dir
+    });
 
     #[test]
     fn an_area_is_named_without_the_word_for_its_kind() {
@@ -1205,11 +1220,10 @@ mod tests {
     /// once is named in the language of the place, on every vendor.
     #[tokio::test]
     async fn a_country_named_in_several_languages_takes_the_places_own() {
-        use crate::runtime::router_tests::{state_for, temp_path, write_stated_names_pack};
+        use crate::runtime::router_tests::state_for;
         use axum::body::Body;
         use tower::ServiceExt;
-        let pack = temp_path("vendor-joined-names");
-        write_stated_names_pack(&pack);
+        let pack = STATED_NAMES.join("pack");
         let router = runtime::build_router(state_for(&pack, true), None, None);
         let get = |uri: &str| {
             let router = router.clone();
@@ -1248,11 +1262,10 @@ mod tests {
     /// none.
     #[tokio::test]
     async fn a_local_name_is_in_the_language_its_place_speaks() {
-        use crate::runtime::router_tests::{state_for, temp_path, write_stated_names_pack};
+        use crate::runtime::router_tests::state_for;
         use axum::body::Body;
         use tower::ServiceExt;
-        let pack = temp_path("vendor-local-language");
-        write_stated_names_pack(&pack);
+        let pack = STATED_NAMES.join("pack");
         let router = runtime::build_router(state_for(&pack, true), None, None);
         let get = |uri: String| {
             let router = router.clone();
@@ -1316,7 +1329,6 @@ mod tests {
             let answer = get(format!("/compat/google/v4/geocode/address?{swiss}{asked}")).await;
             assert_eq!(of(&languages(&answer), "route"), None, "{answer}");
         }
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// A country and a state named alike in English and Jamaican Patois,
@@ -1330,7 +1342,6 @@ mod tests {
                 PlaceRecord, Record, SourceProvenance, point_geometry,
             },
         };
-        let _ = std::fs::remove_dir_all(dir);
         let mut writer = Writer::create(dir).expect("writer");
         let mut area = |layer, name: &str, id: i64| {
             let record = Record::Place(
@@ -1473,7 +1484,70 @@ mod tests {
         });
         writer.write(&rivoli.into(), in_paris).expect("paris house");
         writer.write(&front.into(), context).expect("front door");
+        write_nested_areas(&mut writer);
         writer.finish().expect("finish");
+    }
+
+    fn write_nested_areas(writer: &mut crate::pack::Writer) {
+        use crate::{
+            pack::RecordContext,
+            record::{
+                ObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance, point_geometry,
+            },
+        };
+        let mut area = |layer,
+                        name: &str,
+                        alt: &[&str],
+                        id: i64,
+                        at: [f64; 2],
+                        within: &[(PlaceLayer, u64)]| {
+            let record = Record::Place(
+                layer,
+                PlaceRecord {
+                    alt_names: alt.iter().map(|name| name.to_string()).collect(),
+                    name: name.to_string(),
+                    place_type: "admin_level:8".to_string(),
+                    geometry: point_geometry(at[0], at[1]),
+                    source: SourceProvenance::osm(ObjectType::Relation, id),
+                    prominence: Default::default(),
+                    wikidata: None,
+                },
+            );
+            let context = (!within.is_empty()).then(|| RecordContext {
+                admin_context: crate::context::AdminContextTuple::from_tiers(
+                    within.iter().copied(),
+                ),
+                flags: 0,
+                zone: None,
+                enclosing: Vec::new(),
+            });
+            writer.write(&record, context).expect("area")
+        };
+        let county = area(
+            PlaceLayer::District,
+            "Providence County",
+            &["Providence"],
+            101,
+            [-71.5, 41.8],
+            &[],
+        );
+        area(
+            PlaceLayer::Locality,
+            "Providence",
+            &[],
+            102,
+            [-71.41, 41.82],
+            &[(PlaceLayer::District, county)],
+        );
+        area(
+            PlaceLayer::Locality,
+            "Köln",
+            &["Cologne"],
+            103,
+            [6.96, 50.94],
+            &[],
+        );
+        area(PlaceLayer::Locality, "Cologne", &[], 104, [10.4, 45.6], &[]);
     }
 
     /// Where a place's areas are named alike in several languages, the
@@ -1481,11 +1555,10 @@ mod tests {
     /// county's plate code is HERE's county code.
     #[tokio::test]
     async fn a_default_language_picks_among_alike_names_and_a_plate_code_is_the_county_code() {
-        use crate::runtime::router_tests::{state_for, temp_path};
+        use crate::runtime::router_tests::state_for;
         use axum::body::Body;
         use tower::ServiceExt;
-        let pack = temp_path("vendor-default-language");
-        write_defaults_pack(&pack);
+        let pack = DEFAULTS.join("pack");
         let router = runtime::build_router(state_for(&pack, true), None, None);
         let get = |uri: &str| {
             let router = router.clone();
@@ -1521,7 +1594,6 @@ mod tests {
             None,
             "{paris}"
         );
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// An address drawn as a named building names it as Google's premise,
@@ -1529,11 +1601,10 @@ mod tests {
     /// when the point is the address's own main entrance.
     #[tokio::test]
     async fn a_building_is_the_premise_and_a_door_is_a_door() {
-        use crate::runtime::router_tests::{state_for, temp_path};
+        use crate::runtime::router_tests::state_for;
         use axum::body::Body;
         use tower::ServiceExt;
-        let pack = temp_path("vendor-premise");
-        write_defaults_pack(&pack);
+        let pack = DEFAULTS.join("pack");
         let router = runtime::build_router(state_for(&pack, true), None, None);
         let call = |request: axum::http::Request<Body>| {
             let router = router.clone();
@@ -1592,7 +1663,6 @@ mod tests {
                 "{answer}"
             );
         }
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// A town inside a county of the same name answers alone, as the
@@ -1600,72 +1670,10 @@ mod tests {
     /// matches whole both answer, one by another of its names.
     #[tokio::test]
     async fn the_narrowest_of_nested_areas_answers_and_unrelated_ones_stay() {
-        use crate::{
-            pack::{RecordContext, Writer},
-            record::{
-                ObjectType, PlaceLayer, PlaceRecord, Record, SourceProvenance, point_geometry,
-            },
-            runtime::router_tests::{state_for, temp_path},
-        };
+        use crate::runtime::router_tests::state_for;
         use axum::body::Body;
         use tower::ServiceExt;
-        let pack = temp_path("vendor-nested-areas");
-        let _ = std::fs::remove_dir_all(&pack);
-        let mut writer = Writer::create(&pack).expect("writer");
-        let mut area = |layer,
-                        name: &str,
-                        alt: &[&str],
-                        id: i64,
-                        at: [f64; 2],
-                        within: &[(PlaceLayer, u64)]| {
-            let record = Record::Place(
-                layer,
-                PlaceRecord {
-                    alt_names: alt.iter().map(|name| name.to_string()).collect(),
-                    name: name.to_string(),
-                    place_type: "admin_level:8".to_string(),
-                    geometry: point_geometry(at[0], at[1]),
-                    source: SourceProvenance::osm(ObjectType::Relation, id),
-                    prominence: Default::default(),
-                    wikidata: None,
-                },
-            );
-            let context = (!within.is_empty()).then(|| RecordContext {
-                admin_context: crate::context::AdminContextTuple::from_tiers(
-                    within.iter().copied(),
-                ),
-                flags: 0,
-                zone: None,
-                enclosing: Vec::new(),
-            });
-            writer.write(&record, context).expect("area")
-        };
-        let county = area(
-            PlaceLayer::District,
-            "Providence County",
-            &["Providence"],
-            1,
-            [-71.5, 41.8],
-            &[],
-        );
-        area(
-            PlaceLayer::Locality,
-            "Providence",
-            &[],
-            2,
-            [-71.41, 41.82],
-            &[(PlaceLayer::District, county)],
-        );
-        area(
-            PlaceLayer::Locality,
-            "Köln",
-            &["Cologne"],
-            3,
-            [6.96, 50.94],
-            &[],
-        );
-        area(PlaceLayer::Locality, "Cologne", &[], 4, [10.4, 45.6], &[]);
-        writer.finish().expect("finish");
+        let pack = DEFAULTS.join("pack");
         let router = runtime::build_router(state_for(&pack, true), None, None);
         let titles = |q: &str| {
             let router = router.clone();
@@ -1690,7 +1698,6 @@ mod tests {
         };
         assert_eq!(titles("Providence").await, ["Providence"]);
         assert_eq!(titles("Cologne").await, ["Cologne", "Köln"]);
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// Every vendor names a house's town and country as og's answer in the
@@ -1698,11 +1705,10 @@ mod tests {
     /// areas.
     #[tokio::test]
     async fn every_vendor_names_a_stated_town_in_the_language_asked() {
-        use crate::runtime::router_tests::{state_for, temp_path, write_stated_names_pack};
+        use crate::runtime::router_tests::state_for;
         use axum::body::Body;
         use tower::ServiceExt;
-        let pack = temp_path("vendor-stated-names");
-        write_stated_names_pack(&pack);
+        let pack = STATED_NAMES.join("pack");
         let router = runtime::build_router(state_for(&pack, true), None, None);
         let call = |request: axum::http::Request<Body>| {
             let router = router.clone();
@@ -1779,7 +1785,6 @@ mod tests {
             assert_eq!(address["city"]["longName"], town, "{precisely}");
             assert_eq!(address["country"]["name"], country, "{precisely}");
         }
-        let _ = std::fs::remove_dir_all(&pack);
     }
 
     #[test]

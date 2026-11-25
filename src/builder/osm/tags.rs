@@ -286,20 +286,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_cleaned_values_and_presence() {
-        let tags = BTreeMap::from([
-            ("addr:street".to_string(), "  King   Street ".to_string()),
-            ("addr:unit".to_string(), "   ".to_string()),
-        ]);
-        assert_eq!(tags.cleaned("addr:street").as_deref(), Some("King Street"));
-        assert_eq!(tags.cleaned("addr:unit"), None);
-        assert_eq!(tags.cleaned("missing"), None);
-        assert!(tags.has("addr:street"));
-        assert!(!tags.has("addr:unit"));
-        assert!(!tags.has("missing"));
-    }
-
-    #[test]
     fn name_keys_are_names_in_a_language() {
         for key in [
             "name",

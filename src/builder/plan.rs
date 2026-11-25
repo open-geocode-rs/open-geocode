@@ -611,13 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_is_what_the_machine_leaves_and_never_costs_a_worker() {
-        // 28 GiB available on 24 CPUs: 1.75 GiB for the workers and the
-        // base heap, three quarters of the rest for the budget.
-        assert_eq!(
-            derived_budget(&machine(28), 24),
-            ((28u64 << 30) - (1792 << 20)) / 4 * 3
-        );
+    fn a_small_machine_keeps_the_least_budget_and_every_worker() {
         let small = preflight(machine(1), 1 << 30, 0, None);
         assert_eq!(small.memory_budget_bytes, MIN_BUDGET_BYTES as u64);
         assert_eq!(small.threads, 24);

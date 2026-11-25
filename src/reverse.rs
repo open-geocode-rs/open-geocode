@@ -991,11 +991,8 @@ fn same_text(left: &str, right: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+pub(crate) mod tests {
+    use std::sync::LazyLock;
 
     use geojson::{Geometry, GeometryValue};
 
@@ -1006,115 +1003,69 @@ mod tests {
             InterpolationRange, LocationPrecision, ObjectType, PlaceLayer, PlaceRecord, PoiRecord,
             SourceProvenance, StreetRecord, point_geometry,
         },
+        test_support::TempDir,
     };
 
     use super::*;
 
-    #[test]
-    fn reverse_prefers_explicit_address() {
-        let temp_dir = temp_pack_dir("explicit");
-        let mut writer = Writer::create(&temp_dir).expect("writer");
-        writer.write(&street_record().into(), None).expect("street");
-        writer
-            .write(&address_record().into(), None)
-            .expect("address");
-        writer.finish().expect("finish");
-
-        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
-        let response = geocoder
-            .reverse(GeocodeOptions::at(-79.0, 43.0))
-            .expect("reverse");
-        let result = response.result.expect("result");
-
-        assert_eq!(result.match_kind, MatchKind::ExplicitAddress);
-        assert_eq!(result.primary_record_id, Some(1));
-        assert_eq!(result.evidence.explicit_address_record_id, Some(1));
-
-        let _ = fs::remove_dir_all(temp_dir);
+    pub(crate) struct ReverseSpots {
+        pub(crate) dir: TempDir,
+        interpolation: RecordId,
+        street: RecordId,
+        boundary_locality: RecordId,
+        layer_locality: RecordId,
     }
 
-    #[test]
-    fn reverse_uses_a_zip_corroborated_by_a_separate_zip_plus_four() {
-        let temp_dir = temp_pack_dir("postal-conflict");
-        let mut writer = Writer::create(&temp_dir).expect("writer");
+    const EXPLICIT: f64 = -79.0;
+    const INTERPOLATION: f64 = -69.0;
+    const STREET: f64 = -59.0;
+    const BOUNDARY: f64 = -49.0;
+    const POI: f64 = -39.0;
+    const LAYER: f64 = -29.0;
+    pub(crate) const BUENOS_AIRES: [f64; 2] = [-58.38, -34.6];
+
+    pub(crate) static REVERSE_SPOTS: LazyLock<ReverseSpots> = LazyLock::new(|| {
+        let dir = TempDir::new("reverse-spots");
+        let mut writer = Writer::create(&dir).expect("writer");
+
+        writer
+            .write(&street_record(EXPLICIT, 1030).into(), None)
+            .expect("street");
+        writer
+            .write(&address_record(EXPLICIT, 1010).into(), None)
+            .expect("address");
+
         for (id, longitude, number, zip) in [
             (100, -77.0, "10", "20001"),
             (101, -77.00002, "11", "20001-1111"),
             (102, -77.00003, "10", "20002"),
             (103, -77.00010, "10", "20002-4214"),
         ] {
-            let mut record = address_record();
+            let mut record = address_record(longitude, id);
             record.address.number = number.into();
             record.address.locality = Some("Washington".into());
             record.address.region = Some("DC".into());
             record.address.country = Some("US".into());
             record.address.postcode = Some(zip.into());
             record.geometry = point_geometry(longitude, 38.9);
-            record.source = SourceProvenance::osm(ObjectType::Node, id);
             writer.write(&record.into(), None).expect("address");
         }
-        writer.finish().expect("finish");
-        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
-        let result = geocoder
-            .reverse(GeocodeOptions::at(-77.0, 38.9))
-            .expect("reverse")
-            .result
-            .expect("result");
-        assert_eq!(result.id.as_deref(), Some("osm:node:102"));
-        assert_eq!(result.context.postcode.as_deref(), Some("20002"));
-        let _ = fs::remove_dir_all(temp_dir);
-    }
 
-    #[test]
-    fn reverse_estimates_address_from_interpolation() {
-        let temp_dir = temp_pack_dir("interpolation");
-        let mut writer = Writer::create(&temp_dir).expect("writer");
-        writer
-            .write(&interpolation_record().into(), None)
+        let interpolation = writer
+            .write(&interpolation_record(INTERPOLATION, 2020).into(), None)
             .expect("interpolation");
-        writer.finish().expect("finish");
 
-        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
-        let response = geocoder
-            .reverse(GeocodeOptions::at(-79.00001, 43.0005))
-            .expect("reverse");
-        let result = response.result.expect("result");
+        let street = writer
+            .write(&street_record(STREET, 3030).into(), None)
+            .expect("street");
 
-        assert_eq!(result.match_kind, MatchKind::EstimatedAddress);
-        assert!(result.label.starts_with("50 Queen Street"));
-        assert_eq!(result.evidence.interpolation_record_id, Some(0));
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn reverse_falls_back_to_street() {
-        let temp_dir = temp_pack_dir("street");
-        let mut writer = Writer::create(&temp_dir).expect("writer");
-        writer.write(&street_record().into(), None).expect("street");
-        writer.finish().expect("finish");
-
-        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
-        let response = geocoder
-            .reverse(GeocodeOptions::at(-79.00001, 43.0005))
-            .expect("reverse");
-        let result = response.result.expect("result");
-
-        assert_eq!(result.match_kind, MatchKind::NearestStreet);
-        assert!(result.label.starts_with("Queen Street"));
-        assert_eq!(result.evidence.street_record_id, Some(0));
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn reverse_prefers_materialized_boundary_context_over_source_locality() {
-        let temp_dir = temp_pack_dir("boundary-context");
-        let mut writer = Writer::create(&temp_dir).expect("writer");
-        let locality_id = writer
-            .write(&Record::Place(PlaceLayer::Locality, place_record()), None)
+        let boundary_locality = writer
+            .write(
+                &Record::Place(PlaceLayer::Locality, place_record(BOUNDARY, 4099)),
+                None,
+            )
             .expect("place");
-        let mut address = address_record();
+        let mut address = address_record(BOUNDARY, 4010);
         address.address.locality = Some("North York".to_string());
         writer
             .write(
@@ -1122,43 +1073,17 @@ mod tests {
                 Some(RecordContext {
                     admin_context: AdminContextTuple::from_tiers([(
                         PlaceLayer::Locality,
-                        locality_id,
+                        boundary_locality,
                     )]),
                     flags: 0,
                     ..Default::default()
                 }),
             )
             .expect("address");
-        writer.finish().expect("finish");
 
-        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
-        let response = geocoder
-            .reverse(GeocodeOptions::at(-79.0, 43.0))
-            .expect("reverse");
-        let result = response.result.expect("result");
-
-        assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
-        assert_eq!(result.evidence.context_record_ids, vec![locality_id]);
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    fn temp_pack_dir(label: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "open-geocode-reverse-{label}-{}-{nanos}",
-            std::process::id()
-        ))
-    }
-
-    #[test]
-    fn reverse_answers_with_the_address_beside_a_poi_not_the_poi() {
-        let temp_dir = temp_pack_dir("poi");
-        let mut writer = Writer::create(&temp_dir).expect("writer");
-        writer.write(&street_record().into(), None).expect("street");
+        writer
+            .write(&street_record(POI, 5030).into(), None)
+            .expect("street");
         // An unaddressed POI on top of the query point is not an address.
         writer
             .write(
@@ -1167,9 +1092,9 @@ mod tests {
                     name: "Corner Bench Park".to_string(),
                     category: "leisure:park".to_string(),
                     address: None,
-                    geometry: point_geometry(-79.0, 43.0),
+                    geometry: point_geometry(POI, 43.0),
                     location_precision: LocationPrecision::Point,
-                    source: SourceProvenance::osm(ObjectType::Node, 40),
+                    source: SourceProvenance::osm(ObjectType::Node, 5040),
                     prominence: Default::default(),
                     wikidata: None,
                     brand: None,
@@ -1186,10 +1111,10 @@ mod tests {
                     alt_names: Vec::new(),
                     name: "Queen Bakery".to_string(),
                     category: "shop:bakery".to_string(),
-                    address: Some(address_record().address),
-                    geometry: point_geometry(-79.0, 43.00005),
+                    address: Some(address_record(POI, 5010).address),
+                    geometry: point_geometry(POI, 43.00005),
                     location_precision: LocationPrecision::Centroid,
-                    source: SourceProvenance::osm(ObjectType::Way, 41),
+                    source: SourceProvenance::osm(ObjectType::Way, 5041),
                     prominence: Default::default(),
                     wikidata: None,
                     brand: None,
@@ -1200,47 +1125,31 @@ mod tests {
                 None,
             )
             .expect("bakery");
-        let mut address = address_record();
-        address.geometry = point_geometry(-79.0, 43.00005);
+        let mut address = address_record(POI, 5010);
+        address.geometry = point_geometry(POI, 43.00005);
         address.location_precision = LocationPrecision::Centroid;
-        address.source = SourceProvenance::osm(ObjectType::Way, 41);
+        address.source = SourceProvenance::osm(ObjectType::Way, 5041);
         writer.write(&address.into(), None).expect("address");
-        writer.finish().expect("finish");
 
-        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
-        let result = geocoder
-            .reverse(GeocodeOptions::at(-79.0, 43.0))
-            .expect("reverse")
-            .result
-            .expect("result");
-
-        assert_eq!(result.match_kind, MatchKind::ExplicitAddress);
-        assert_eq!(result.id.as_deref(), Some("osm:way:41"));
-        assert_eq!(result.layer.as_deref(), Some("address"));
-        assert_eq!(result.label, "10 Queen Street, Toronto, Ontario, Canada");
-        assert_eq!(result.evidence.explicit_address_record_id, Some(3));
-
-        let _ = fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn a_layer_answers_with_its_nearest_record_and_lists_no_other_area() {
-        let temp_dir = temp_pack_dir("layer");
-        let mut writer = Writer::create(&temp_dir).expect("writer");
-        let locality_id = writer
-            .write(&Record::Place(PlaceLayer::Locality, place_record()), None)
+        let layer_locality = writer
+            .write(
+                &Record::Place(PlaceLayer::Locality, place_record(LAYER, 6099)),
+                None,
+            )
             .expect("place");
-        writer.write(&street_record().into(), None).expect("street");
+        writer
+            .write(&street_record(LAYER, 6030).into(), None)
+            .expect("street");
         writer
             .write(
                 &PoiRecord {
                     alt_names: Vec::new(),
                     name: "Queen Bakery".to_string(),
                     category: "shop:bakery".to_string(),
-                    address: Some(address_record().address),
-                    geometry: point_geometry(-79.0, 43.0),
+                    address: Some(address_record(LAYER, 6010).address),
+                    geometry: point_geometry(LAYER, 43.0),
                     location_precision: LocationPrecision::Point,
-                    source: SourceProvenance::osm(ObjectType::Node, 41),
+                    source: SourceProvenance::osm(ObjectType::Node, 6041),
                     prominence: Default::default(),
                     wikidata: None,
                     brand: None,
@@ -1251,17 +1160,127 @@ mod tests {
                 None,
             )
             .expect("bakery");
-        let mut address = address_record();
-        address.geometry = point_geometry(-79.0, 43.00005);
+        let mut address = address_record(LAYER, 6010);
+        address.geometry = point_geometry(LAYER, 43.00005);
         writer.write(&address.into(), None).expect("address");
-        writer.finish().expect("finish");
 
-        let geocoder = PackReverseGeocoder::open(&temp_dir).expect("geocoder");
+        let [lon, lat] = BUENOS_AIRES;
+        let mut imported = address_record(lon, 7);
+        imported.address = AddressComponents {
+            block_number_len: None,
+            areas: Vec::new(),
+            number: "1".to_string(),
+            street: Some("Avenida de Mayo".to_string()),
+            place: None,
+            unit: None,
+            locality: None,
+            region: None,
+            postcode: None,
+            country: None,
+        };
+        imported.geometry = point_geometry(lon, lat);
+        imported.source = SourceProvenance::imported("openaddresses:ar/c/city_of_buenos_aires", 7);
+        writer.write(&imported.into(), None).expect("address");
+
+        writer.finish().expect("finish");
+        ReverseSpots {
+            dir,
+            interpolation,
+            street,
+            boundary_locality,
+            layer_locality,
+        }
+    });
+
+    fn geocoder() -> PackReverseGeocoder {
+        PackReverseGeocoder::open(&REVERSE_SPOTS.dir).expect("geocoder")
+    }
+
+    #[test]
+    fn reverse_prefers_explicit_address() {
+        let response = geocoder()
+            .reverse(GeocodeOptions::at(EXPLICIT, 43.0))
+            .expect("reverse");
+        let result = response.result.expect("result");
+
+        assert_eq!(result.match_kind, MatchKind::ExplicitAddress);
+        assert_eq!(result.id.as_deref(), Some("osm:node:1010"));
+    }
+
+    #[test]
+    fn reverse_uses_a_zip_corroborated_by_a_separate_zip_plus_four() {
+        let result = geocoder()
+            .reverse(GeocodeOptions::at(-77.0, 38.9))
+            .expect("reverse")
+            .result
+            .expect("result");
+        assert_eq!(result.id.as_deref(), Some("osm:node:102"));
+        assert_eq!(result.context.postcode.as_deref(), Some("20002"));
+    }
+
+    #[test]
+    fn reverse_estimates_address_from_interpolation() {
+        let response = geocoder()
+            .reverse(GeocodeOptions::at(INTERPOLATION - 0.00001, 43.0005))
+            .expect("reverse");
+        let result = response.result.expect("result");
+
+        assert_eq!(result.match_kind, MatchKind::EstimatedAddress);
+        assert!(result.label.starts_with("50 Queen Street"));
+        assert_eq!(
+            result.evidence.interpolation_record_id,
+            Some(REVERSE_SPOTS.interpolation)
+        );
+    }
+
+    #[test]
+    fn reverse_falls_back_to_street() {
+        let response = geocoder()
+            .reverse(GeocodeOptions::at(STREET - 0.00001, 43.0005))
+            .expect("reverse");
+        let result = response.result.expect("result");
+
+        assert_eq!(result.match_kind, MatchKind::NearestStreet);
+        assert!(result.label.starts_with("Queen Street"));
+        assert_eq!(result.evidence.street_record_id, Some(REVERSE_SPOTS.street));
+    }
+
+    #[test]
+    fn reverse_prefers_materialized_boundary_context_over_source_locality() {
+        let response = geocoder()
+            .reverse(GeocodeOptions::at(BOUNDARY, 43.0))
+            .expect("reverse");
+        let result = response.result.expect("result");
+
+        assert_eq!(result.context.locality.as_deref(), Some("Toronto"));
+        assert_eq!(
+            result.evidence.context_record_ids,
+            vec![REVERSE_SPOTS.boundary_locality]
+        );
+    }
+
+    #[test]
+    fn reverse_answers_with_the_address_beside_a_poi_not_the_poi() {
+        let result = geocoder()
+            .reverse(GeocodeOptions::at(POI, 43.0))
+            .expect("reverse")
+            .result
+            .expect("result");
+
+        assert_eq!(result.match_kind, MatchKind::ExplicitAddress);
+        assert_eq!(result.id.as_deref(), Some("osm:way:5041"));
+        assert_eq!(result.layer.as_deref(), Some("address"));
+        assert_eq!(result.label, "10 Queen Street, Toronto, Ontario, Canada");
+    }
+
+    #[test]
+    fn a_layer_answers_with_its_nearest_record_and_lists_no_other_area() {
+        let geocoder = geocoder();
         let at = |layer| {
             geocoder
                 .reverse(GeocodeOptions {
                     layer: Some(layer),
-                    ..GeocodeOptions::at(-79.0, 43.0)
+                    ..GeocodeOptions::at(LAYER, 43.0)
                 })
                 .expect("reverse")
                 .result
@@ -1269,29 +1288,30 @@ mod tests {
 
         let street = at(Layer::Street).expect("street");
         assert_eq!(street.match_kind, MatchKind::NearestStreet);
-        assert_eq!(street.id.as_deref(), Some("osm:way:30"));
+        assert_eq!(street.id.as_deref(), Some("osm:way:6030"));
         assert!(street.evidence.context_record_ids.is_empty());
 
         let address = at(Layer::Address).expect("address");
-        assert_eq!(address.id.as_deref(), Some("osm:node:10"));
+        assert_eq!(address.id.as_deref(), Some("osm:node:6010"));
         assert_eq!(address.layer.as_deref(), Some("address"));
 
         let poi = at(Layer::Poi).expect("poi");
         assert_eq!(poi.match_kind, MatchKind::Poi);
-        assert_eq!(poi.id.as_deref(), Some("osm:node:41"));
+        assert_eq!(poi.id.as_deref(), Some("osm:node:6041"));
         assert!(poi.label.starts_with("Queen Bakery, "), "{}", poi.label);
 
         let locality = at(Layer::Locality).expect("locality");
-        assert_eq!(locality.primary_record_id, Some(locality_id));
+        assert_eq!(
+            locality.primary_record_id,
+            Some(REVERSE_SPOTS.layer_locality)
+        );
         assert_eq!(locality.layer.as_deref(), Some("locality"));
 
         assert!(at(Layer::Interpolation).is_none());
         assert!(at(Layer::Country).is_none());
-
-        let _ = fs::remove_dir_all(temp_dir);
     }
 
-    fn address_record() -> AddressRecord {
+    fn address_record(lon: f64, id: i64) -> AddressRecord {
         AddressRecord {
             building: None,
             access: Vec::new(),
@@ -1309,25 +1329,25 @@ mod tests {
                 postcode: None,
                 country: Some("Canada".to_string()),
             },
-            geometry: point_geometry(-79.0, 43.0),
+            geometry: point_geometry(lon, 43.0),
             location_precision: LocationPrecision::Point,
-            source: SourceProvenance::osm(ObjectType::Node, 10),
+            source: SourceProvenance::osm(ObjectType::Node, id),
         }
     }
 
-    fn place_record() -> PlaceRecord {
+    fn place_record(lon: f64, id: i64) -> PlaceRecord {
         PlaceRecord {
             alt_names: Vec::new(),
             name: "Toronto".to_string(),
             place_type: "admin_level:8".to_string(),
-            geometry: point_geometry(-79.0, 43.0),
-            source: SourceProvenance::osm(ObjectType::Relation, 99),
+            geometry: point_geometry(lon, 43.0),
+            source: SourceProvenance::osm(ObjectType::Relation, id),
             prominence: Default::default(),
             wikidata: None,
         }
     }
 
-    fn interpolation_record() -> crate::record::InterpolationRecord {
+    fn interpolation_record(lon: f64, id: i64) -> crate::record::InterpolationRecord {
         crate::record::InterpolationRecord {
             address: InterpolationAddressComponents {
                 street: Some("Queen Street".to_string()),
@@ -1344,28 +1364,28 @@ mod tests {
                 step: 2,
             },
             anchor_node_ids: [2, 98],
-            geometry: line_geometry(),
-            representative_point: [-79.0, 43.0005],
-            source: SourceProvenance::osm(ObjectType::Way, 20),
+            geometry: line_geometry(lon),
+            representative_point: [lon, 43.0005],
+            source: SourceProvenance::osm(ObjectType::Way, id),
         }
     }
 
-    fn street_record() -> StreetRecord {
+    fn street_record(lon: f64, id: i64) -> StreetRecord {
         StreetRecord {
             other_ways: Vec::new(),
             road_class: crate::record::RoadClass::Residential,
             alt_names: Vec::new(),
             locality: None,
             name: "Queen Street".to_string(),
-            geometry: line_geometry(),
-            representative_point: [-79.0, 43.0005],
-            source: SourceProvenance::osm(ObjectType::Way, 30),
+            geometry: line_geometry(lon),
+            representative_point: [lon, 43.0005],
+            source: SourceProvenance::osm(ObjectType::Way, id),
         }
     }
 
-    fn line_geometry() -> Geometry {
+    fn line_geometry(lon: f64) -> Geometry {
         Geometry::new(GeometryValue::LineString {
-            coordinates: vec![vec![-79.0, 43.0].into(), vec![-79.0, 43.001].into()],
+            coordinates: vec![vec![lon, 43.0].into(), vec![lon, 43.001].into()],
         })
     }
 }

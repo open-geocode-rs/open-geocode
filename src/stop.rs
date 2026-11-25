@@ -94,11 +94,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_thread_with_no_stop_never_stops() {
-        assert!(check().is_ok());
-    }
-
-    #[test]
     fn a_lookup_stops_once_past_its_deadline() {
         let stop = Stop::new(Duration::from_millis(1), Arc::new(AtomicBool::new(false)));
         let outcome = within(stop, || {

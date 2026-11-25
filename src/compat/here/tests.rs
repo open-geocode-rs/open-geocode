@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::Path, sync::LazyLock, time::Duration};
 
 use axum::{
     Router,
@@ -21,19 +21,16 @@ use crate::{
         PlaceRecord, PoiDetails, PoiRecord, Record, SourceProvenance, StreetRecord, point_geometry,
     },
     runtime::{AppState, build_router},
+    test_support::TempDir,
 };
 
-/// A Pack in its own temporary directory, removed with its jobs when the
-/// test ends, failed or not.
-#[derive(Debug)]
-pub(super) struct TestPack(PathBuf);
+static PACK: LazyLock<TempDir> = LazyLock::new(|| {
+    let dir = TempDir::new("compat-here");
+    write_pack(&dir.join("pack"));
+    dir
+});
 
-impl Drop for TestPack {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-        let _ = std::fs::remove_dir_all(self.0.with_extension("jobs"));
-    }
-}
+pub(super) struct TestPack(TempDir);
 
 impl TestPack {
     pub(super) fn router(&self) -> Router {
@@ -43,8 +40,12 @@ impl TestPack {
     /// A server on the Pack. Each keeps its jobs in the one directory, so
     /// two see the same jobs.
     pub(super) fn state(&self, limits: Limits) -> AppState {
-        AppState::open(&self.0, &self.0.with_extension("jobs"), limits).expect("open pack")
+        AppState::open(&PACK.join("pack"), &self.0, limits).expect("open pack")
     }
+}
+
+pub(super) fn pack(name: &str) -> TestPack {
+    TestPack(TempDir::new(&format!("compat-here-{name}")))
 }
 
 /// The vendor id og issues for an address of the fixture: its og id, its
@@ -70,15 +71,8 @@ fn line(from: [f64; 2], to: [f64; 2]) -> geojson::Geometry {
 /// region and areas, a POI with two phone numbers, a website, weekly hours
 /// and an entrance, a street and an interpolation range. Calibrated, every confidence
 /// one half.
-pub(super) fn pack(name: &str) -> TestPack {
-    let dir = std::env::temp_dir().join(format!(
-        "open-geocode-compat-here-{name}-{}",
-        std::process::id()
-    ));
-    let pack = TestPack(dir.clone());
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(dir.with_extension("jobs"));
-    let mut writer = Writer::create(&dir).expect("writer");
+fn write_pack(dir: &Path) {
+    let mut writer = Writer::create(dir).expect("writer");
     let mut place = |layer, name: &str, id| {
         writer
             .write(
@@ -279,11 +273,10 @@ pub(super) fn pack(name: &str) -> TestPack {
         )
         .expect("interpolation");
     writer.finish().expect("finish");
-    let reader = crate::pack::Reader::open(&dir).expect("pack");
+    let reader = crate::pack::Reader::open(dir).expect("pack");
     Model::new([0.0; FEATURES], Default::default())
         .save(&reader)
         .expect("confidence model");
-    pack
 }
 
 pub(super) struct Reply {
@@ -1671,21 +1664,24 @@ pub(super) async fn finished_job(router: &Router, input: &str) -> String {
     id
 }
 
-/// Polls a batch job until it ends, and answers its details.
+async fn wait_until_the_og_job_ends(router: &Router, run: &str) {
+    get(router, &format!("/jobs/{run}/results")).await;
+}
+
 async fn finished(router: &Router, id: &str) -> Value {
-    for _ in 0..400 {
-        let details = get(router, &format!("/compat/here/v7/batch/jobs/{id}"))
-            .await
-            .json();
-        if !matches!(
+    let run = id.strip_prefix("JOB-").expect("JOB- id").replace('-', "");
+    wait_until_the_og_job_ends(router, &run).await;
+    let details = get(router, &format!("/compat/here/v7/batch/jobs/{id}"))
+        .await
+        .json();
+    assert!(
+        !matches!(
             details["status"].as_str(),
             Some("inProgress" | "queued" | "pending")
-        ) {
-            return details;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("job {id} did not end");
+        ),
+        "{details}"
+    );
+    details
 }
 
 /// A file's lines, the header first and the rest sorted. A job writes its
@@ -1869,37 +1865,117 @@ async fn a_geocode_batch_runs_on_og_jobs() {
     assert_eq!(listed.json()["count"], 0);
 }
 
-/// A stop answers the job stopped, as HERE does, or completed when its last
-/// record was already written. It never answers the job still in progress,
-/// however soon after the start it comes.
+fn hold_every_batch_thread(state: &AppState) -> std::sync::mpsc::Sender<()> {
+    let threads = state.batch_pool().current_num_threads();
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Arc::new(std::sync::Mutex::new(gate));
+    let (held, all_held) = std::sync::mpsc::channel();
+    for _ in 0..threads {
+        let (gate, held) = (std::sync::Arc::clone(&gate), held.clone());
+        state.batch_pool().spawn(move || {
+            held.send(()).expect("held");
+            let _ = gate.lock().expect("gate").recv();
+        });
+    }
+    for _ in 0..threads {
+        all_held.recv().expect("a held thread");
+    }
+    release
+}
+
 #[tokio::test]
 async fn a_stopped_batch_answers_stopped_never_in_progress() {
     let pack = pack("batch-stop");
-    let router = pack.router();
-    let input = std::iter::once("recId|q".to_string())
-        .chain((0..2000).map(|row| format!("r{row}|{row} King Street")))
-        .collect::<Vec<_>>()
-        .join("\n");
-    for _ in 0..20 {
-        let created = send(
-            &router,
-            "POST",
-            &format!("/compat/here/v7/batch/jobs?serviceHrn={GEOCODE_HRN}"),
-            Some(("text/plain", input.as_str())),
-        )
-        .await;
-        assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
-        let id = created.json()["id"].as_str().expect("id").to_string();
-        let stopped = send(
-            &router,
-            "PUT",
-            &format!("/compat/here/v7/batch/jobs/{id}/stop"),
-            None,
-        )
-        .await;
-        let status = stopped.json()["status"].clone();
-        assert!(status == "stopped" || status == "completed", "{status}");
-    }
+    let state = pack.state(Limits::DEFAULT);
+    let router = build_router(state.clone(), None, None);
+    let release = hold_every_batch_thread(&state);
+    let created = send(
+        &router,
+        "POST",
+        &format!("/compat/here/v7/batch/jobs?serviceHrn={GEOCODE_HRN}"),
+        Some((
+            "text/plain",
+            "recId|q\nr1|10 King Street\nr2|20 Queen Street\n",
+        )),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
+    let id = created.json()["id"].as_str().expect("id").to_string();
+    let uri = format!("/compat/here/v7/batch/jobs/{id}/stop");
+    let mut stop = std::pin::pin!(send(&router, "PUT", &uri, None));
+    let record = super::batch::store_dir(&state).join(format!("{id}.json"));
+    let stop_recorded_so_run_cancelled = || {
+        serde_json::from_slice::<Value>(&std::fs::read(&record).expect("record"))
+            .expect("record JSON")["stopped"]
+            == true
+    };
+    std::future::poll_fn(|context| match stop.as_mut().poll(context) {
+        std::task::Poll::Ready(reply) => panic!("the stop answered first: {}", reply.text()),
+        std::task::Poll::Pending if stop_recorded_so_run_cancelled() => std::task::Poll::Ready(()),
+        std::task::Poll::Pending => std::task::Poll::Pending,
+    })
+    .await;
+    drop(release);
+    let stopped = stop.await;
+    assert_eq!(stopped.status, StatusCode::OK, "{}", stopped.text());
+    assert_eq!(stopped.json()["status"], "stopped");
+}
+
+#[tokio::test]
+async fn a_start_whose_record_fails_to_save_leaves_no_run_and_starts_again() {
+    let pack = pack("batch-start-save-fails");
+    let state = pack.state(Limits::DEFAULT);
+    let router = build_router(state.clone(), None, None);
+    let created = send(
+        &router,
+        "POST",
+        "/compat/here/v7/batch/jobs?startJob=false",
+        Some(("text/plain", "recId|q\nr1|10 King Street\n")),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
+    let id = created.json()["id"].as_str().expect("id").to_string();
+    let run = id.strip_prefix("JOB-").expect("JOB- id").replace('-', "");
+    let job = format!("/compat/here/v7/batch/jobs/{id}");
+
+    let partial_record_path_taken_by_a_directory =
+        super::batch::store_dir(&state).join(format!("{id}.json.partial"));
+    std::fs::create_dir(&partial_record_path_taken_by_a_directory).expect("block the record");
+    let failed = send(&router, "PUT", &format!("{job}/start"), None).await;
+    assert_eq!(
+        failed.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        failed.text()
+    );
+    assert_eq!(
+        failed.json(),
+        json!({
+            "title": "Internal Server Error",
+            "status": 500,
+            "code": "E6005000",
+            "cause": "The server failed to run the job",
+            "action": "Try again later",
+            "correlationId": "rid-1",
+        })
+    );
+    let orphan = get(&router, &format!("/jobs/{run}")).await;
+    assert_eq!(orphan.status, StatusCode::NOT_FOUND, "{}", orphan.text());
+    assert_eq!(get(&router, &job).await.json()["status"], "submitted");
+
+    std::fs::remove_dir(&partial_record_path_taken_by_a_directory).expect("unblock the record");
+    let started = send(&router, "PUT", &format!("{job}/start"), None).await;
+    assert_eq!(started.status, StatusCode::OK, "{}", started.text());
+    assert_eq!(started.json()["status"], "queued");
+    let details = finished(&router, &id).await;
+    assert_eq!(details["status"], "completed");
+    assert_eq!(
+        details["records"],
+        json!({
+            "total": 1, "valid": 1, "invalid": 0, "processed": 1,
+            "pending": 0, "succeeded": 1, "failed": 0,
+        })
+    );
 }
 
 #[tokio::test]
@@ -2249,15 +2325,11 @@ async fn batch_errors_take_the_batch_shape() {
 
 /// A server that answers every request 200 and keeps the request lines,
 /// as a webhook endpoint does.
-async fn hook_receiver() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let kept = std::sync::Arc::clone(&calls);
+async fn hook_receiver() -> (String, tokio::sync::watch::Receiver<Vec<String>>) {
+    let (kept, calls) = tokio::sync::watch::channel(Vec::new());
     let app = Router::new().fallback(move |uri: axum::http::Uri| {
-        let kept = std::sync::Arc::clone(&kept);
-        async move {
-            kept.lock().expect("calls").push(uri.to_string());
-            StatusCode::OK
-        }
+        kept.send_modify(|calls| calls.push(uri.to_string()));
+        async { StatusCode::OK }
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -2268,21 +2340,24 @@ async fn hook_receiver() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>
 }
 
 /// Waits for the receiver to have taken `count` calls.
-async fn calls_taken(calls: &std::sync::Mutex<Vec<String>>, count: usize) -> Vec<String> {
-    for _ in 0..400 {
-        let taken = calls.lock().expect("calls").clone();
-        if taken.len() >= count {
-            return taken;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("the webhook took {count} calls")
+async fn calls_taken(
+    calls: &mut tokio::sync::watch::Receiver<Vec<String>>,
+    count: usize,
+) -> Vec<String> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        calls.wait_for(|taken| taken.len() >= count),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the webhook took {count} calls"))
+    .expect("the webhook runs")
+    .clone()
 }
 
 #[tokio::test]
 async fn notifications_are_kept_and_called_when_a_job_ends() {
     let pack = pack("batch-notify");
-    let (hook, calls) = hook_receiver().await;
+    let (hook, mut calls) = hook_receiver().await;
     let allowed = || {
         pack.state(Limits::DEFAULT)
             .with_hook_hosts(vec![hook.trim_start_matches("http://").to_string()])
@@ -2332,7 +2407,7 @@ async fn notifications_are_kept_and_called_when_a_job_ends() {
     let reply = get(&router, &format!("{path}/test")).await;
     assert_eq!(reply.status, StatusCode::NO_CONTENT, "{}", reply.text());
     assert_eq!(
-        calls_taken(&calls, 1).await,
+        calls_taken(&mut calls, 1).await,
         [
             "/done?id=JOB-00000000-0000-0000-0000-000000000000&name=test&status=completed&ok=0&failed=0&total=0"
         ]
@@ -2359,7 +2434,7 @@ async fn notifications_are_kept_and_called_when_a_job_ends() {
     let details = finished(&router, &job).await;
     assert_eq!(details["notificationIds"], json!([id]));
     assert_eq!(
-        calls_taken(&calls, 2).await[1],
+        calls_taken(&mut calls, 2).await[1],
         format!("/done?id={job}&name=night%20run&status=completed&ok=2&failed=0&total=2")
     );
 

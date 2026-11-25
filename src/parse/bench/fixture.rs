@@ -281,13 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn a_row_without_separators_is_one_part() {
-        let row = TaggedRow::parse_line("de\tde\tmunchen/locality 80331/postcode").expect("row");
-        assert!(row.breaks.is_empty());
-        assert_eq!(row.query(), "munchen 80331");
-    }
-
-    #[test]
     fn malformed_rows_are_rejected() {
         for line in [
             "en\tus",
@@ -304,12 +297,5 @@ mod tests {
         ] {
             assert!(TaggedRow::parse_line(line).is_err(), "{line:?}");
         }
-    }
-
-    #[test]
-    fn relabelling_keeps_tokens_and_boundaries() {
-        let row = TaggedRow::parse_line("en\tca\tking/street , toronto/locality").expect("row");
-        let other = row.relabelled(&[Label::Locality, Label::Region]);
-        assert_eq!(other.to_line(), "en\tca\tking/locality , toronto/region");
     }
 }

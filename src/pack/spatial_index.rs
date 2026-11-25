@@ -1371,6 +1371,7 @@ mod tests {
             ObjectType, PostcodeRecord, SourceProvenance, StreetRecord, point_geometry,
         },
         records,
+        test_support::TempDir,
     };
     use geojson::GeometryValue;
 
@@ -1452,7 +1453,7 @@ mod tests {
             .map(|id| poi(-79.0 + id as f64 * 1e-5, 43.0, id, "amenity:cafe"))
             .collect::<Vec<_>>();
         records.push(poi(-79.01, 43.0, 900, "amenity:pharmacy"));
-        let (reader, _) = build(&records);
+        let (_root, reader, _) = build(&records);
         let pharmacy = |record_id, _, _| {
             reader
                 .records
@@ -1474,9 +1475,8 @@ mod tests {
     }
 
     /// Build a Pack holding only records and the spatial index.
-    fn build(records: &[Record]) -> (Reader, Commit) {
-        let root =
-            std::env::temp_dir().join(format!("open-geocode-spatial-{}", uuid::Uuid::new_v4()));
+    fn build(records: &[Record]) -> (TempDir, Reader, Commit) {
+        let root = TempDir::new("spatial");
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
         let mut writer = records::Writer::create(&scratch, &crate::memory::Budget::unlimited())
             .expect("records");
@@ -1492,15 +1492,13 @@ mod tests {
         pack.finish().expect("pack finish");
         let container = Container::open(&path).expect("open");
         let records = records::Reader::open(&container).expect("records reader");
-        (
-            Reader::open(&container, records).expect("spatial reader"),
-            commit,
-        )
+        let reader = Reader::open(&container, records).expect("spatial reader");
+        (root, reader, commit)
     }
 
     #[test]
     fn county_coverage_checks_points_inside_the_outline() {
-        let (reader, _) = build(&[address(-79.0, 43.0, 7)]);
+        let (_root, reader, _) = build(&[address(-79.0, 43.0, 7)]);
         let triangle = |vertices| geo::Polygon::new(geo::LineString::from_iter(vertices), vec![]);
         assert!(
             reader
@@ -1524,7 +1522,7 @@ mod tests {
                 id,
             ));
         }
-        let (reader, commit) = build(&records);
+        let (_root, reader, commit) = build(&records);
         assert_eq!(commit.point_count, 1_001);
         assert_eq!(commit.block_count, 1_001_u64.div_ceil(BLOCK_RECORDS));
 
@@ -1576,33 +1574,30 @@ mod tests {
     fn early_stopping_scan_matches_the_full_scan() {
         // Points scattered over ~60 km, denser near the centre.
         let points = scattered(5_000);
-        let postcodes = points
+        let records = points
             .iter()
             .enumerate()
-            .map(|(index, [lon, lat])| {
-                Record::Postcode(PostcodeRecord {
-                    postcode: format!("P{index}"),
-                    country: None,
-                    geometry: point_geometry(*lon, *lat),
-                    source: DerivedSourceProvenance::osm_address_records(1),
-                })
+            .flat_map(|(index, [lon, lat])| {
+                [
+                    Record::Postcode(PostcodeRecord {
+                        postcode: format!("P{index}"),
+                        country: None,
+                        geometry: point_geometry(*lon, *lat),
+                        source: DerivedSourceProvenance::osm_address_records(1),
+                    }),
+                    address(*lon, *lat, index as i64),
+                ]
             })
             .collect::<Vec<_>>();
-        let addresses = points
-            .iter()
-            .enumerate()
-            .map(|(index, [lon, lat])| address(*lon, *lat, index as i64))
-            .collect::<Vec<_>>();
-        let (postcodes, _) = build(&postcodes);
-        let (addresses, _) = build(&addresses);
+        let (_root, reader, _) = build(&records);
         let distances =
             |hits: &[PointCandidate]| hits.iter().map(|hit| hit.distance_m).collect::<Vec<_>>();
         for (lon, lat) in [(-79.4, 43.7), (-79.6, 43.9), (-79.1, 43.5), (-78.0, 43.0)] {
             for limit in [1, 16, 100] {
-                let early = postcodes
+                let early = reader
                     .context_candidates(lon, lat, 50_000.0, limit)
                     .expect("early");
-                let mut full = postcodes
+                let mut full = reader
                     .context_candidates(lon, lat, 50_000.0, 0)
                     .expect("full");
                 full.truncate(limit);
@@ -1612,10 +1607,10 @@ mod tests {
                     "{lon},{lat} limit {limit}"
                 );
 
-                let early = addresses
+                let early = reader
                     .point_candidates(lon, lat, Layer::Address, 50_000.0, limit)
                     .expect("early");
-                let mut full = addresses
+                let mut full = reader
                     .point_candidates(lon, lat, Layer::Address, 50_000.0, 0)
                     .expect("full");
                 full.truncate(limit);
@@ -1630,7 +1625,8 @@ mod tests {
 
     #[test]
     fn finds_points_across_the_antimeridian() {
-        let (reader, _) = build(&[address(179.99995, -44.0, 1), address(-179.99995, -44.0, 2)]);
+        let (_root, reader, _) =
+            build(&[address(179.99995, -44.0, 1), address(-179.99995, -44.0, 2)]);
         let hits = reader
             .point_candidates(-179.99999, -44.0, Layer::Address, 50.0, 0)
             .expect("hits");
@@ -1642,7 +1638,7 @@ mod tests {
 
     #[test]
     fn indexes_context_points_apart_from_addresses() {
-        let (reader, commit) = build(&[
+        let (_root, reader, commit) = build(&[
             address(-79.4, 43.6, 1),
             Record::Postcode(PostcodeRecord {
                 postcode: "M5V".to_string(),
@@ -1680,7 +1676,7 @@ mod tests {
                 source: SourceProvenance::osm(ObjectType::Way, object_id),
             })
         };
-        let (reader, commit) = build(&[street(1, -79.0), street(2, -78.99)]);
+        let (_root, reader, commit) = build(&[street(1, -79.0), street(2, -78.99)]);
         assert_eq!(commit.line_count, 2);
         let hits = reader
             .segment_candidates(-79.00001, 43.00075, Layer::Street, 5.0, 1)
@@ -1722,7 +1718,7 @@ mod tests {
             representative_point: [-79.0, 43.0005],
             source: SourceProvenance::osm(ObjectType::Way, 1),
         });
-        let (reader, commit) = build(&[street]);
+        let (_root, reader, commit) = build(&[street]);
         assert_eq!(commit.line_count, 1);
         let hits = reader
             .segment_candidates(-78.99001, 43.0005, Layer::Street, 5.0, 1)

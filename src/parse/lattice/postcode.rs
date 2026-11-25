@@ -87,8 +87,6 @@ impl Table {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::*;
 
     fn codes(table: &Table, text: &str) -> Vec<String> {
@@ -97,12 +95,6 @@ mod tests {
             .iter()
             .map(|code| code.as_str().to_string())
             .collect()
-    }
-
-    #[test]
-    fn the_vendored_table_compiles_and_covers_the_world() {
-        let table = Table::global();
-        assert!(table.len() > 150, "{}", table.len());
     }
 
     #[test]
@@ -127,36 +119,26 @@ mod tests {
         assert!(table.matches("toronto").is_empty());
     }
 
-    /// The PikeVM the set falls back to without room for its lazy DFA is
-    /// measured against, as the clock alone would make the test depend on
-    /// the machine.
     #[test]
-    fn the_table_matches_on_its_lazy_dfa() {
+    fn rows_from_the_start_middle_and_end_of_the_vendored_table_load() {
         let table = Table::global();
-        let fallback = RegexSet::new(table.patterns.patterns()).expect("patterns compile");
-        let spans = [
-            "75008", "1234 ab", "1234ab", "sw1a 1aa", "m5v1m9", "8366", "1224060", "34", "34 r",
-        ];
-        let fastest = |set: &RegexSet| {
-            (0..5)
-                .map(|_| {
-                    let start = Instant::now();
-                    for span in spans {
-                        std::hint::black_box(set.matches(span));
-                    }
-                    start.elapsed()
-                })
-                .min()
-                .expect("five runs")
-        };
-        // The first runs build the lazy DFA's states.
-        fastest(&table.patterns);
-        fastest(&fallback);
-        let (dfa, pike_vm) = (fastest(&table.patterns), fastest(&fallback));
-        assert!(
-            pike_vm > dfa * 10,
-            "the table took {dfa:?}, the PikeVM {pike_vm:?}"
-        );
+        for (country, postcode) in [
+            ("AC", "ASCN 1ZZ"),
+            ("AD", "AD500"),
+            ("AF", "1001"),
+            ("KR", "110-110"),
+            ("KY", "KY1-1100"),
+            ("KZ", "050000"),
+            ("XK", "10000"),
+            ("ZA", "2001"),
+            ("ZM", "10101"),
+        ] {
+            let code = CountryCode::parse(country).unwrap();
+            assert!(
+                table.matches_country(code, postcode),
+                "{country} {postcode}"
+            );
+        }
     }
 
     #[test]

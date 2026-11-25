@@ -61,6 +61,46 @@ pub(crate) fn relation(
     }
 }
 
+pub(crate) fn renumbered(blocks: Vec<Vec<TestElement>>, by: i64) -> Vec<Vec<TestElement>> {
+    let raise = |ids: &mut Vec<(i64, &'static str)>| ids.iter_mut().for_each(|(id, _)| *id += by);
+    blocks
+        .into_iter()
+        .map(|block| {
+            block
+                .into_iter()
+                .map(|mut element| {
+                    match &mut element {
+                        TestElement::Node { id, .. } => *id += by,
+                        TestElement::Way { id, refs, .. } => {
+                            *id += by;
+                            refs.iter_mut().for_each(|node| *node += by);
+                        }
+                        TestElement::Relation {
+                            id, members, nodes, ..
+                        } => {
+                            *id += by;
+                            raise(members);
+                            raise(nodes);
+                        }
+                    }
+                    element
+                })
+                .collect()
+        })
+        .collect()
+}
+
+pub(crate) fn moved(blocks: Vec<Vec<TestElement>>, north: f64, east: f64) -> Vec<Vec<TestElement>> {
+    let mut blocks = blocks;
+    for element in blocks.iter_mut().flatten() {
+        if let TestElement::Node { lat, lon, .. } = element {
+            *lat += north;
+            *lon += east;
+        }
+    }
+    blocks
+}
+
 pub(crate) fn write_pbf(path: &Path, blocks: &[Vec<TestElement>]) {
     let mut file = Vec::new();
     let mut header = Vec::new();
