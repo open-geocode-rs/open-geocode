@@ -1,37 +1,54 @@
 use std::{
-    fs,
+    fs::{self, File},
     ops::Deref,
     path::{Path, PathBuf},
     sync::LazyLock,
-    time::{Duration, SystemTime},
 };
 
-/// A killed run leaves its root behind. No run lasts six hours.
-const STALE_ROOT_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+const ROOT_PREFIX: &str = "open-geocode-tests-";
+const LOCK_FILE: &str = "lock";
 
-static ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
-    let parent = std::env::temp_dir().join("open-geocode-tests");
-    sweep_stale_roots(&parent);
-    let root = parent.join(format!("{}-{}", std::process::id(), uuid::Uuid::new_v4()));
-    fs::create_dir_all(&root).expect("create the test root");
-    root
+struct Root {
+    path: PathBuf,
+    _lock: File,
+}
+
+// Statics never drop. A later run's sweep frees this root once the lock dies with us.
+static ROOT: LazyLock<Root> = LazyLock::new(|| {
+    let temp = std::env::temp_dir();
+    sweep_dead_roots(&temp);
+    let path = temp.join(format!(
+        "{ROOT_PREFIX}{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir(&path).expect("create the test root");
+    let staged = path.join(format!("{LOCK_FILE}.new"));
+    let lock = File::create(&staged).expect("create the test root lock");
+    lock.try_lock().expect("lock the test root");
+    // A sweep opens only the final name, so it never sees the lock unheld.
+    fs::rename(&staged, path.join(LOCK_FILE)).expect("publish the test root lock");
+    Root { path, _lock: lock }
 });
 
-fn sweep_stale_roots(parent: &Path) {
-    let Ok(entries) = fs::read_dir(parent) else {
+fn sweep_dead_roots(temp: &Path) {
+    let Ok(entries) = fs::read_dir(temp) else {
         return;
     };
-    let now = SystemTime::now();
     for entry in entries.flatten() {
-        let stale = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > STALE_ROOT_AGE);
-        if stale {
-            let _ = fs::remove_dir_all(entry.path());
+        if !entry.file_name().to_string_lossy().starts_with(ROOT_PREFIX) {
+            continue;
         }
+        let root = entry.path();
+        let Ok(lock) = File::open(root.join(LOCK_FILE)) else {
+            continue;
+        };
+        if lock.try_lock().is_err() {
+            continue;
+        }
+        // Windows refuses to remove a directory holding an open file.
+        drop(lock);
+        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -39,7 +56,7 @@ pub(crate) struct TempDir(PathBuf);
 
 impl TempDir {
     pub(crate) fn new(name: &str) -> Self {
-        let path = ROOT.join(format!("{name}-{}", uuid::Uuid::new_v4()));
+        let path = ROOT.path.join(format!("{name}-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create a test directory");
         Self(path)
     }
