@@ -1913,6 +1913,63 @@ async fn a_stopped_batch_answers_stopped_never_in_progress() {
 }
 
 #[tokio::test]
+async fn a_start_whose_record_fails_to_save_leaves_no_run_and_starts_again() {
+    let pack = pack("batch-start-save-fails");
+    let state = pack.state(Limits::DEFAULT);
+    let router = build_router(state.clone(), None, None);
+    let created = send(
+        &router,
+        "POST",
+        "/compat/here/v7/batch/jobs?startJob=false",
+        Some(("text/plain", "recId|q\nr1|10 King Street\n")),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
+    let id = created.json()["id"].as_str().expect("id").to_string();
+    let run = id.strip_prefix("JOB-").expect("JOB- id").replace('-', "");
+    let job = format!("/compat/here/v7/batch/jobs/{id}");
+
+    // A directory where the record's new copy is written fails the save as a full disk would.
+    let blocked = super::batch::store_dir(&state).join(format!("{id}.json.partial"));
+    std::fs::create_dir(&blocked).expect("block the record");
+    let failed = send(&router, "PUT", &format!("{job}/start"), None).await;
+    assert_eq!(
+        failed.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        failed.text()
+    );
+    assert_eq!(
+        failed.json(),
+        json!({
+            "title": "Internal Server Error",
+            "status": 500,
+            "code": "E6005000",
+            "cause": "The server failed to run the job",
+            "action": "Try again later",
+            "correlationId": "rid-1",
+        })
+    );
+    let orphan = get(&router, &format!("/jobs/{run}")).await;
+    assert_eq!(orphan.status, StatusCode::NOT_FOUND, "{}", orphan.text());
+    assert_eq!(get(&router, &job).await.json()["status"], "submitted");
+
+    std::fs::remove_dir(&blocked).expect("unblock the record");
+    let started = send(&router, "PUT", &format!("{job}/start"), None).await;
+    assert_eq!(started.status, StatusCode::OK, "{}", started.text());
+    assert_eq!(started.json()["status"], "queued");
+    let details = finished(&router, &id).await;
+    assert_eq!(details["status"], "completed");
+    assert_eq!(
+        details["records"],
+        json!({
+            "total": 1, "valid": 1, "invalid": 0, "processed": 1,
+            "pending": 0, "succeeded": 1, "failed": 0,
+        })
+    );
+}
+
+#[tokio::test]
 async fn a_revgeocode_batch_waits_for_its_start() {
     let pack = pack("batch-revgeocode");
     let router = pack.router();
