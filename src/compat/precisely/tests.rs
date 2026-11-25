@@ -1688,7 +1688,7 @@ async fn uploads_and_jobs_expire_with_og_jobs() {
     let router = build_router(state.clone(), None, None);
     let kept = upload(&router, "addressid|address|country\n1|99 Nowhere Lane|CA\n").await;
     let expired = upload(&router, "addressid|address|country\n2|7 Stale Lane|CA\n").await;
-    // Expiry reads the system clock and the API hides expired files unswept, so age the record and read the disk.
+    // Expiry has no input but the wall clock against a retention of at least an hour, so the record is aged on disk.
     let record = mentions(&fixture.jobs, &format!("\"fileId\":\"{expired}\""));
     let [record] = record.as_slice() else {
         panic!("one record for {expired}, found {record:?}");
