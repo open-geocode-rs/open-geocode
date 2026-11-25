@@ -160,8 +160,9 @@ enum PackCommand {
         /// 512 MiB and 64 MiB per worker thread. Larger inputs spill to
         /// scratch files on disk instead of using more memory. The check
         /// before the build stops it when the budget and that overhead do not
-        /// fit the memory available. Defaults to three quarters of what this
-        /// process can use, less the overhead.
+        /// fit the memory free beyond what the process already holds outside
+        /// its heap, such as cached input and scratch pages. Defaults to three
+        /// quarters of what this process can use, less the overhead.
         #[arg(
             long,
             value_parser = clap::value_parser!(u64).range(MIN_MEMORY_BUDGET_MB..=MAX_MEMORY_BUDGET_MB),
