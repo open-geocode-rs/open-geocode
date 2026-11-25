@@ -339,6 +339,10 @@ pub struct StageReport {
     pub peak_scratch_bytes: u64,
     pub peak_rss_bytes: u64,
     pub peak_budget_bytes: u64,
+    /// Most bytes the heap held at once, as the global allocator counts
+    /// them; 0 when it does not count.
+    #[serde(default)]
+    pub peak_heap_bytes: u64,
     pub shares: BoundShares,
     pub bound: Bound,
 }
@@ -353,7 +357,7 @@ impl BuilderReport {
     pub fn stage_table(&self) -> String {
         let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20);
         let mut table = format!(
-            "{:<28} {:>8} {:>6} {:>9} {:>17} {:>17} {:>9} {:>8} {:>8}  {}\n",
+            "{:<28} {:>8} {:>6} {:>9} {:>17} {:>17} {:>9} {:>8} {:>8} {:>8}  {}\n",
             "stage",
             "wall s",
             "cores",
@@ -362,6 +366,7 @@ impl BuilderReport {
             "spill r MiB (raw)",
             "scratch",
             "RSS",
+            "heap",
             "budget",
             "bound"
         );
@@ -373,7 +378,7 @@ impl BuilderReport {
                 0.0
             };
             table.push_str(&format!(
-                "{:<28} {:>8.1} {:>6.1} {:>9.0} {:>8.0} ({:>6.0}) {:>8.0} ({:>6.0}) {:>8.0}M {:>7.0}M {:>7.0}M  {}\n",
+                "{:<28} {:>8.1} {:>6.1} {:>9.0} {:>8.0} ({:>6.0}) {:>8.0} ({:>6.0}) {:>8.0}M {:>7.0}M {:>7.0}M {:>7.0}M  {}\n",
                 stage.stage,
                 secs,
                 stage.shares.cores,
@@ -384,6 +389,7 @@ impl BuilderReport {
                 mib(stage.scratch_raw_read_bytes),
                 mib(stage.peak_scratch_bytes),
                 mib(stage.peak_rss_bytes),
+                mib(stage.peak_heap_bytes),
                 mib(stage.peak_budget_bytes),
                 stage.bound.as_str(),
             ));
