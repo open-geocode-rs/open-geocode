@@ -20,7 +20,7 @@ body:
     id: pack
     attributes:
       label: Pack
-      description: Region or planet, and how it was built. Name every flag behind any number you state. That means the input .osm.pbf and its date, whether OpenAddresses was included (--openaddresses or --openaddresses-zip), --qrank, --memory-budget-mb, threads (RAYON_NUM_THREADS) and the og commit.
+      description: Region or planet, and how it was built. Give each flag behind any number you state with its value, and state flags not used as absent, for example `--memory-budget-mb 8192`, `--qrank` absent. That means the input .osm.pbf and its date, whether OpenAddresses was included (--openaddresses or --openaddresses-zip), --qrank, --memory-budget-mb, threads (RAYON_NUM_THREADS) and the og commit.
       placeholder: "France, OSM + BAN"
     validations:
       required: true
