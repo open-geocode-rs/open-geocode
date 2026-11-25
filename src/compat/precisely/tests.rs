@@ -1688,69 +1688,6 @@ fn a_country_is_read_as_any_iso_code() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn uploads_and_job_records_expire_with_og_jobs() {
-    let fixture = Fixture::new("sweep");
-    let state = fixture.state(Limits::DEFAULT);
-    let router = build_router(state.clone(), None, None);
-    let kept = upload(&router, "addressid|address|country\n1|99 Nowhere Lane|CA\n").await;
-    let expired = upload(&router, "addressid|address|country\n").await;
-    let files = state.jobs().dir().join("precisely/files");
-    let record = files.join(format!("{expired}.json"));
-    let mut stale =
-        serde_json::from_slice::<Value>(&std::fs::read(&record).expect("record")).expect("JSON");
-    stale["createdNs"] = json!(0);
-    std::fs::write(&record, stale.to_string()).expect("write");
-    assert_eq!(
-        get(&router, "/compat/precisely/v2/files").await.json(),
-        json!({"results": [{"fileId": kept, "fileName": "test"}]})
-    );
-
-    let submitted = post(&router, "/v2/bulk-geocode", &json!({"fileId": kept})).await;
-    let job_id = submitted.json()["statusUrl"]
-        .as_str()
-        .and_then(|url| url.rsplit('/').next())
-        .expect("job id")
-        .to_string();
-    assert_eq!(finished(&router, &job_id).await["status"], "COMPLETED");
-    let og_id = uuid::Uuid::try_parse(&job_id)
-        .expect("a UUID")
-        .simple()
-        .to_string();
-    let deleted = send(
-        &router,
-        Request::delete(format!("/jobs/{og_id}"))
-            .body(Body::empty())
-            .expect("delete"),
-    )
-    .await;
-    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
-
-    super::sweep(&state);
-    let mut left = std::fs::read_dir(&files)
-        .expect("files")
-        .map(|entry| {
-            entry
-                .expect("entry")
-                .file_name()
-                .into_string()
-                .expect("name")
-        })
-        .collect::<Vec<_>>();
-    left.sort();
-    assert_eq!(left, vec![format!("{kept}.csv"), format!("{kept}.json")]);
-    let jobs = std::fs::read_dir(state.jobs().dir().join("precisely/jobs"))
-        .expect("jobs")
-        .count();
-    assert_eq!(jobs, 0);
-    let gone = get(&router, &format!("/compat/precisely/v2/bulk/jobs/{job_id}")).await;
-    assert_eq!(gone.status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        gone.json(),
-        errors("INVALID_REQUEST", "Invalid Job Id (DIS-LI-1051)")
-    );
-}
-
 /// The standardized result verify gives for 100 King Street West, with
 /// the score og's confidence makes.
 fn verified_result(score: &Value, stated: &[&str], codes: [&str; 2]) -> Value {

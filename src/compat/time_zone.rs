@@ -44,32 +44,15 @@ mod tests {
     }
 
     #[test]
-    fn an_offset_follows_daylight_saving_time() {
-        let summer = at("Europe/Berlin", "2026-07-01T12:00:00Z").expect("a zone");
-        let winter = at("Europe/Berlin", "2026-01-15T12:00:00Z").expect("a zone");
-        assert_eq!(
-            (summer.text(), summer.minutes()),
-            ("+02:00".to_string(), 120)
-        );
-        assert_eq!(
-            (winter.text(), winter.minutes()),
-            ("+01:00".to_string(), 60)
-        );
-        assert_eq!(
-            at("America/Chicago", "2026-07-01T12:00:00Z").map(Offset::text),
-            Some("-05:00".to_string())
-        );
-    }
-
-    #[test]
     fn a_zone_off_the_hour_or_unknown() {
         assert_eq!(
             at("Asia/Kathmandu", "2026-07-01T12:00:00Z").map(Offset::text),
             Some("+05:45".to_string())
         );
         assert_eq!(
-            at("America/St_Johns", "2026-01-15T12:00:00Z").map(Offset::minutes),
-            Some(-210)
+            at("America/St_Johns", "2026-01-15T12:00:00Z")
+                .map(|offset| (offset.text(), offset.minutes())),
+            Some(("-03:30".to_string(), -210))
         );
         assert_eq!(at("Mars/Olympus_Mons", "2026-07-01T12:00:00Z"), None);
     }

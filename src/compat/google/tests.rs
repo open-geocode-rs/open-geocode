@@ -343,19 +343,6 @@ fn bakery_hours() -> Value {
 }
 
 #[tokio::test]
-async fn search_text_answers_every_field_without_a_mask() {
-    let fixture = fixture();
-    let reply = post(
-        &fixture.router,
-        SEARCH_TEXT,
-        json!({"textQuery": "Queen Bakery"}),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::OK);
-    assert_eq!(reply.body, json!({"places": [bakery_place()]}));
-}
-
-#[tokio::test]
 async fn search_text_answers_an_address_before_the_places_at_it() {
     let fixture = fixture();
     let reply = post_with(
@@ -444,8 +431,18 @@ async fn search_text_reads_the_mask_from_header_then_dollar_fields_then_fields()
         json!({"places": [{"location": {"latitude": 43.0, "longitude": -79.005}}]})
     );
 
-    let star = post_with(router, SEARCH_TEXT, &[("X-Goog-FieldMask", "*")], body).await;
+    let star = post_with(
+        router,
+        SEARCH_TEXT,
+        &[("X-Goog-FieldMask", "*")],
+        body.clone(),
+    )
+    .await;
     assert_eq!(star.body, json!({"places": [bakery_place()]}));
+
+    let bare = post(router, SEARCH_TEXT, body).await;
+    assert_eq!(bare.status, StatusCode::OK);
+    assert_eq!(bare.body, json!({"places": [bakery_place()]}));
 }
 
 #[tokio::test]

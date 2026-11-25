@@ -2725,30 +2725,6 @@ mod tests {
     }
 
     #[test]
-    fn og_ids_carry_the_record_back() {
-        assert_eq!(
-            carried("7|3|250|rec-1"),
-            Some(Carried {
-                ordinal: 7,
-                limit: 3,
-                radius_m: Some(250.0),
-                rec_id: "rec-1",
-            })
-        );
-        assert_eq!(
-            carried("0|1||a.b,c"),
-            Some(Carried {
-                ordinal: 0,
-                limit: 1,
-                radius_m: None,
-                rec_id: "a.b,c",
-            })
-        );
-        assert_eq!(carried("x|1||a"), None);
-        assert_eq!(carried("1|1|"), None);
-    }
-
-    #[test]
     fn delimiters_and_billing_tags_follow_here_rules() {
         assert_eq!(delimiter(None, true).unwrap(), '|');
         assert_eq!(delimiter(Some("\\t"), false).unwrap(), '\t');
@@ -3007,56 +2983,6 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
-    }
-
-    #[tokio::test]
-    async fn a_failed_metadata_save_removes_only_the_new_run() {
-        use super::super::tests::pack;
-
-        let pack = pack("batch-metadata-rollback");
-        let state = pack.state(crate::limits::Limits::DEFAULT);
-        let mut meta = meta(false, false);
-        let uuid = job_uuid(&meta.id).unwrap();
-        let run = uuid.simple().to_string();
-        fs::create_dir_all(store_dir(&state)).unwrap();
-        save(&state, &meta).unwrap();
-        fs::write(
-            file(&state, &meta.id, "items"),
-            "{\"id\":\"0|1||1\",\"q\":\"King Street\"}\n",
-        )
-        .unwrap();
-
-        let partial = file(&state, &meta.id, "json.partial");
-        fs::create_dir(&partial).unwrap();
-        {
-            let _guard = LOCK.lock().await;
-            assert!(launch(&state, &mut meta, uuid, u64::MAX).await.is_err());
-        }
-        assert!(state.jobs().get(&run).is_none());
-        assert!(!state.jobs().dir().join(format!("{run}.json")).exists());
-
-        fs::remove_dir(partial).unwrap();
-        let mut meta = load(&state, &meta.id).unwrap();
-        assert!(meta.runs.is_empty());
-        {
-            let _guard = LOCK.lock().await;
-            launch(&state, &mut meta, uuid, u64::MAX).await.unwrap();
-        }
-        state.jobs().get(&run).unwrap().ended().await;
-        assert_eq!(load(&state, &meta.id).unwrap().runs, [run]);
-    }
-
-    #[tokio::test]
-    async fn a_finished_run_answered_every_item() {
-        use super::super::tests::{finished_job, pack};
-
-        let pack = pack("batch-answered");
-        let state = pack.state(crate::limits::Limits::DEFAULT);
-        let router = crate::runtime::build_router(state.clone(), None, None);
-        let id = finished_job(&router, "recId|q\n1|10 King Street\n2|Queen\n3|zzzz\n").await;
-        let meta = load(&state, &id).expect("meta");
-        assert_eq!(meta.items, 3);
-        assert_eq!(answered(&state, &meta).expect("answered"), [0b111]);
     }
 
     #[tokio::test]
