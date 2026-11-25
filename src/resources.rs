@@ -434,9 +434,7 @@ mod platform {
     /// The tightest cgroup memory limit over this process's cgroup and its
     /// ancestors, and what is left under it: v2 `memory.max` less
     /// `memory.current`, or v1 `memory.limit_in_bytes` less
-    /// `memory.usage_in_bytes`, each less the inactive file pages
-    /// `memory.stat` counts in it. `groups` and `mountinfo` are
-    /// `/proc/self/cgroup` and `/proc/self/mountinfo`; `read` reads a file.
+    /// `memory.usage_in_bytes`.
     #[cfg(target_os = "linux")]
     pub(super) fn cgroup_memory_from(
         groups: &str,
@@ -555,8 +553,6 @@ mod platform {
         }
     }
 
-    /// A mountinfo path, whose space, tab, newline and backslash the kernel
-    /// writes as three octal digits after a backslash.
     #[cfg(target_os = "linux")]
     fn unescape(field: &str) -> PathBuf {
         use std::os::unix::ffi::OsStringExt;

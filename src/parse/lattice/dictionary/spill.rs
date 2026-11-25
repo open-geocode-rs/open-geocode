@@ -384,7 +384,6 @@ fn spooled(spool: &SpoolFile<Named>) -> Result<impl Iterator<Item = Result<(Stri
         .map(|named| named.map(|named| (named.name, named.entry))))
 }
 
-/// `sorted` and `held`, both in key order, with the counts of a word in both added.
 fn with_held<'a>(
     sorted: impl Iterator<Item = Result<(String, Entry)>> + 'a,
     held: &'a BTreeMap<String, Entry>,

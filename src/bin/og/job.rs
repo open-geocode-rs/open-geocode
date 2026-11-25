@@ -490,9 +490,6 @@ fn run(
     };
     let plan = plan_osm_build(&options)?;
     *progress.plan.lock().expect("plan lock") = Some(plan.clone());
-    // The process's global pool is the batch runs', sized to every CPU the
-    // first time one runs. The build gets a pool of its own, sized by the
-    // plan.
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(plan.threads)
         .build()

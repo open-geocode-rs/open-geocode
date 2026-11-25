@@ -32,9 +32,6 @@ const CELL_TAG: u8 = b'C';
 const PLACE_TAG: u8 = b'P';
 const STREET_TAG: u8 = b'Z';
 const CHUNKS_PER_THREAD: u32 = 2;
-/// Documents keyed together. Neighbouring documents share most places and
-/// cells, so a chunk's entries are deduplicated before they join the sorter:
-/// every name of every area of every address would not fit in memory.
 const CHUNK_DOCUMENTS: u32 = 4096;
 const META_FILE: &str = "meta.json";
 const STREET_FILE: &str = "streets.fst";

@@ -684,7 +684,6 @@ async fn main() -> Result<()> {
                 ..BuildOsmOptions::default()
             };
             let plan = plan_osm_build(&options)?;
-            // One pool serves every stage of the build, sized by the plan.
             rayon::ThreadPoolBuilder::new()
                 .num_threads(plan.threads)
                 .build_global()

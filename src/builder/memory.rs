@@ -9,14 +9,6 @@
 //! that cannot spill leave, as DataFusion's `FairSpillPool` does: a sorter
 //! open alone may take the whole pool, and four take a quarter each.
 //!
-//! The limit is the build plan's ([`crate::builder::plan`]), derived from
-//! the memory the process can use unless `--memory-budget-mb` sets it. The pool also
-//! refuses to grow once the heap itself, counted by the global allocator
-//! ([`crate::alloc`]), would pass the budget and the heap the build holds
-//! outside it by design ([`Budget::limit_heap`]), or a ceiling below the
-//! memory that was available. Memory nobody reserved (the parser's
-//! dictionaries, maps, Tantivy's own) then makes the tracked buffers spill
-//! instead of the heap growing past the budget.
 //! The build report records the peaks.
 
 use std::sync::{

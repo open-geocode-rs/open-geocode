@@ -28,8 +28,6 @@ pub(super) struct Abbreviations {
     full: FxHashMap<String, Vec<String>>,
     /// A full form to its variants ("straße" to "str", "strasse").
     short: FxHashMap<String, Vec<String>>,
-    /// The forms of the street types of languages that glue them onto the
-    /// name, each with the other forms of its phrase.
     glued: FxHashMap<String, Vec<String>>,
 }
 

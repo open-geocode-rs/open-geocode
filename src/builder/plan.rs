@@ -16,9 +16,8 @@
 //!
 //! Every cost is per item, not per PBF byte: a PBF byte of Germany holds four
 //! times the node references of a byte of Canada, so no ratio of input bytes
-//! fits both. Only the estimate before the scan reads counts from bytes: at
-//! the densest input measured, so it errs towards needing more, but never
-//! past what the planet holds.
+//! fits both. Only the estimate before the scan reads counts from bytes, at
+//! the densest input measured, so it errs towards needing more.
 
 use std::path::{Path, PathBuf};
 
@@ -62,7 +61,6 @@ const HOUSE_SPILL_BYTES: f64 = 50.0;
 const PACK_BYTES_PER_RECORD: f64 = 102.0;
 const PACK_BYTES_PER_IMPORTED_ROW: f64 = 25.0;
 
-/// A worker's batch of PBF blobs and its own allocator pages.
 pub const WORKER_BYTES: u64 = 64 << 20;
 /// Four extracts of 2 to 12 GB held at most 760 MiB beyond their budget with 6 workers (2026-11).
 pub const BASE_UNTRACKED_BYTES: u64 = 512 << 20;
