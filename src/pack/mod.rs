@@ -451,6 +451,7 @@ struct AreaZones {
 #[derive(Debug)]
 pub struct Writer {
     scratch: Arc<Scratch>,
+    failed: bool,
     memory: Arc<Budget>,
     sorter_bytes: usize,
     records: records::Writer,
@@ -587,6 +588,7 @@ impl Writer {
             spatial: spatial_index::Writer::new(&scratch)?,
             dictionaries: Builder::new(&scratch, &options.memory, options.sorter_bytes),
             scratch,
+            failed: false,
             memory: Arc::clone(&options.memory),
             sorter_bytes: options.sorter_bytes,
             generation,
@@ -688,6 +690,7 @@ impl Writer {
     }
 
     pub fn commit(&mut self, batch: PreparedBatch) -> Result<()> {
+        self.check_usable()?;
         let first = self.records.record_count();
         if batch.first != first {
             return Err(Error::Inconsistent(format!(
@@ -695,6 +698,21 @@ impl Writer {
                 batch.first
             )));
         }
+        let result = self.commit_batch(batch, first);
+        self.failed = result.is_err();
+        result
+    }
+
+    fn check_usable(&self) -> Result<()> {
+        if self.failed {
+            return Err(Error::Inconsistent(
+                "a batch failed partway, so this writer holds a partial Pack; discard it and start a new writer".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit_batch(&mut self, batch: PreparedBatch, first: u64) -> Result<()> {
         let mut placed = Vec::with_capacity(batch.records.len());
         let mut names = Vec::with_capacity(batch.records.len());
         let mut documents = Vec::with_capacity(batch.records.len());
@@ -770,6 +788,7 @@ impl Writer {
     }
 
     pub fn into_sealing(self) -> Result<Sealing> {
+        self.check_usable()?;
         let Self {
             generation,
             scratch,
@@ -2121,6 +2140,36 @@ mod tests {
         );
         writer.finish().expect("finish");
         assert_eq!(first_hit(&root, "king").as_deref(), Some("osm:node:1"));
+    }
+
+    #[test]
+    fn a_writer_whose_batch_failed_partway_refuses_every_later_call() {
+        let dir = TempDir::new("failed-batch");
+        let mut writer = Writer::create_with(
+            dir.join("pack"),
+            &WriterOptions {
+                sorter_bytes: 1,
+                ..WriterOptions::default()
+            },
+        )
+        .expect("writer");
+        writer.scratch().set_budget(Some(1));
+        let batch: Vec<_> = (0..2000)
+            .map(|number| {
+                (
+                    address_record(number, "10", &format!("King {number} Street")),
+                    None,
+                )
+            })
+            .collect();
+        assert!(writer.write_batch(&batch).is_err());
+        writer.scratch().set_budget(None);
+        let message = writer
+            .write_batch(&batch)
+            .expect_err("a failed writer is refused")
+            .to_string();
+        assert!(message.contains("partial Pack"), "{message}");
+        assert!(writer.finish().is_err());
     }
 
     #[test]
