@@ -1998,6 +1998,19 @@ impl<'a> Run<'a> {
         report
     }
 
+    fn record_scratch(&mut self, scratch: &Scratch) {
+        let report = &mut self.build.report;
+        report.scratch.spilled_bytes = scratch.spilled_bytes();
+        report.scratch.budget_bytes = scratch.budget();
+        report.scratch.peak_live_bytes = scratch.peak_bytes();
+        report.scratch.peak_owners = scratch.peak_owners();
+        report.scratch.zstd_level = scratch.level();
+        report.scratch.spills = scratch.traffic();
+        self.checkpoints.peak_retained_bytes = scratch.peak_retained_bytes();
+        self.checkpoints.voided = scratch.voided();
+    }
+
+    /// Train the parser on the sealed Pack and publish it.
     fn finish(mut self) -> Result<BuilderReport> {
         let phase = Instant::now();
         let (mut sealed, mut stats) = self.sealed.take().ok_or_else(|| missing("the Pack"))?;
@@ -2030,15 +2043,7 @@ impl<'a> Run<'a> {
         let scratch = Arc::clone(&self.scratch);
         self.sample_saved = None;
         scratch.complete();
-        let report = &mut self.build.report;
-        report.scratch.spilled_bytes = scratch.spilled_bytes();
-        report.scratch.budget_bytes = scratch.budget();
-        report.scratch.peak_live_bytes = scratch.peak_bytes();
-        report.scratch.peak_owners = scratch.peak_owners();
-        report.scratch.zstd_level = scratch.level();
-        report.scratch.spills = scratch.traffic();
-        self.checkpoints.peak_retained_bytes = scratch.peak_retained_bytes();
-        self.checkpoints.voided = scratch.voided();
+        self.record_scratch(&scratch);
         self.progress.finish(BuildStage::Parser);
         let parser_training_ms = phase.elapsed().as_millis();
         self.progress.start(BuildStage::StructuredIndex, None)?;
@@ -2100,6 +2105,7 @@ impl<'a> Run<'a> {
         }
         stats.bytes = sealed.bytes();
         self.progress.finish(BuildStage::StructuredIndex);
+        self.record_scratch(&scratch);
         let mut report = self.report();
         report.checkpoints = self.checkpoints.clone();
         self.progress.check()?;
