@@ -24,7 +24,7 @@ use std::{
 };
 
 use memmap2::{Mmap, MmapMut};
-use ph::fmph::GOFunction;
+use ph::fmph::{GOBuildConf, GOFunction};
 use rayon::prelude::*;
 
 use crate::{
@@ -200,24 +200,27 @@ fn build(
     let keys = finished(keys)?;
     let firsts = finished(firsts)?;
     let more = finished(more)?;
-    let keys_map = mapped(&keys)?;
-    let all_keys = keys_map.as_deref().unwrap_or_default().as_chunks::<8>().0;
-    let function = GOFunction::from_slice(all_keys);
     let mut values = ScratchFile::create(scratch, LABEL, "places-ids.values")?;
     io::copy(&mut io::repeat(0).take(places * width as u64), &mut values)?;
-    let mut values_map = mapped_mut(&values)?;
-    let slots = values_map.as_deref_mut().unwrap_or_default();
-    let mut blocks_in = BufReader::new(File::open(firsts.path())?);
-    let mut block = [0u8; 8];
-    for key in all_keys {
-        blocks_in.read_exact(&mut block[..width])?;
-        let slot = function
-            .get(key)
-            .ok_or_else(|| Error::Inconsistent("a catalogued id has no slot".into()))?
-            as usize;
-        slots[slot * width..(slot + 1) * width].copy_from_slice(&block[..width]);
-    }
-    drop(values_map);
+    let function = {
+        let keys_map = mapped(&keys)?;
+        let all_keys = keys_map.as_deref().unwrap_or_default().as_chunks::<8>().0;
+        let function = perfect_hash(all_keys);
+        let mut values_map = mapped_mut(&values)?;
+        let slots = values_map.as_deref_mut().unwrap_or_default();
+        let mut blocks_in = BufReader::new(File::open(firsts.path())?);
+        let mut block = [0u8; 8];
+        for key in all_keys {
+            blocks_in.read_exact(&mut block[..width])?;
+            let slot = function
+                .get(key)
+                .ok_or_else(|| Error::Inconsistent("a catalogued id has no slot".into()))?
+                as usize;
+            slots[slot * width..(slot + 1) * width].copy_from_slice(&block[..width]);
+        }
+        function
+    };
+    drop((keys, firsts));
     let mut section = BufWriter::new(ScratchFile::create(scratch, LABEL, "places-ids.section")?);
     section.write_all(&[width as u8])?;
     section.write_all(&places.to_le_bytes())?;
@@ -226,6 +229,10 @@ fn build(
     io::copy(&mut File::open(more.path())?, &mut section)?;
     function.write(&mut section)?;
     finished(section)
+}
+
+fn perfect_hash(keys: &[[u8; 8]]) -> GOFunction {
+    GOFunction::from_slice_with_conf(keys, GOBuildConf::with_ct(Default::default(), 0))
 }
 
 fn finished(writer: BufWriter<ScratchFile>) -> Result<ScratchFile> {
@@ -405,6 +412,17 @@ mod tests {
         for malformed in ["7", "osm:node", "osm:node:x", "osm:node:-1", "osm:area:1"] {
             assert!(parse(malformed).is_err(), "{malformed}");
         }
+    }
+
+    #[test]
+    fn the_hash_built_without_a_key_cache_is_the_one_built_with_it() {
+        let keys: Vec<[u8; 8]> = (0..5000u64).map(|id| (id * 7 + 1).to_le_bytes()).collect();
+        let (mut plain, mut uncached) = (Vec::new(), Vec::new());
+        GOFunction::from_slice(&keys[..])
+            .write(&mut plain)
+            .expect("write");
+        perfect_hash(&keys).write(&mut uncached).expect("write");
+        assert_eq!(plain, uncached);
     }
 
     static IDS_PACK: LazyLock<TempDir> = LazyLock::new(|| {
