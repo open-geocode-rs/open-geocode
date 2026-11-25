@@ -1,4 +1,4 @@
-use std::{num::NonZeroUsize, path::PathBuf};
+use std::{num::NonZeroUsize, sync::LazyLock};
 
 use axum::{
     Router,
@@ -22,16 +22,23 @@ use crate::{
         PostcodeRecord, Record, SourceProvenance, point_geometry,
     },
     runtime::{AppState, build_router},
+    test_support::TempDir,
 };
 
-/// A Pack directory removed when the test ends, pass or fail.
-struct Pack(PathBuf);
+static PACK: LazyLock<TempDir> = LazyLock::new(|| {
+    let dir = TempDir::new("compat-mapbox");
+    let pack = dir.join("pack");
+    let mut writer = Writer::create(&pack).expect("writer");
+    write_toronto(&mut writer);
+    write_block_address(&mut writer);
+    writer.finish().expect("finish");
+    dir
+});
 
-impl Drop for Pack {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-        let _ = std::fs::remove_dir_all(self.0.with_extension("jobs"));
-    }
+struct Pack(TempDir);
+
+fn write_pack() -> Pack {
+    Pack(TempDir::new("compat-mapbox-jobs"))
 }
 
 /// An address with a unit, a cafe of a chain and an interpolation range in
@@ -46,13 +53,7 @@ fn address_vendor_id(og_id: &str) -> String {
     encode_parts(og_id, Some(Layer::Address), label)
 }
 
-fn write_pack() -> Pack {
-    let dir = std::env::temp_dir().join(format!(
-        "open-geocode-compat-mapbox-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let mut writer = Writer::create(&dir).expect("writer");
+fn write_toronto(writer: &mut Writer) {
     // Each area lies in the areas written before it, as a build gives it.
     let place = |writer: &mut Writer, layer, name: &str, id, lon, within: &[(PlaceLayer, u64)]| {
         writer
@@ -78,19 +79,12 @@ fn write_pack() -> Pack {
             )
             .expect("place")
     };
-    let country = place(&mut writer, PlaceLayer::Country, "Canada", 1, -80.0, &[]);
+    let country = place(writer, PlaceLayer::Country, "Canada", 1, -80.0, &[]);
     let in_country = [(PlaceLayer::Country, country)];
-    let region = place(
-        &mut writer,
-        PlaceLayer::Region,
-        "Ontario",
-        2,
-        -79.5,
-        &in_country,
-    );
+    let region = place(writer, PlaceLayer::Region, "Ontario", 2, -79.5, &in_country);
     let in_region = [in_country[0], (PlaceLayer::Region, region)];
     let locality = place(
-        &mut writer,
+        writer,
         PlaceLayer::Locality,
         "Toronto",
         3,
@@ -103,7 +97,7 @@ fn write_pack() -> Pack {
         [-793_000_000, 429_000_000, -789_000_000, 431_000_000],
     )]);
     let neighbourhood = place(
-        &mut writer,
+        writer,
         PlaceLayer::Neighbourhood,
         "Downtown",
         4,
@@ -258,13 +252,11 @@ fn write_pack() -> Pack {
             context,
         )
         .expect("interpolation");
-    writer.finish().expect("finish");
-    Pack(dir)
 }
 
 fn router_with(pack: &Pack, limits: Limits) -> Router {
     build_router(
-        AppState::open(&pack.0, &pack.0.with_extension("jobs"), limits).expect("open pack"),
+        AppState::open(&PACK.join("pack"), &pack.0, limits).expect("open pack"),
         None,
         None,
     )
@@ -1251,13 +1243,7 @@ async fn search_box_forward_keeps_places_with_one_lookup_slot() {
     assert_eq!(body["features"][0]["properties"]["name"], "Queen Cafe");
 }
 
-#[tokio::test]
-async fn search_box_forward_keeps_a_verified_block_address_without_country() {
-    let pack = Pack(std::env::temp_dir().join(format!(
-        "open-geocode-compat-mapbox-jp-{}",
-        uuid::Uuid::new_v4()
-    )));
-    let mut writer = Writer::create(&pack.0).expect("writer");
+fn write_block_address(writer: &mut Writer) {
     writer
         .write(
             &AddressRecord {
@@ -1285,8 +1271,11 @@ async fn search_box_forward_keeps_a_verified_block_address_without_country() {
             None,
         )
         .expect("address");
-    writer.finish().expect("finish");
+}
 
+#[tokio::test]
+async fn search_box_forward_keeps_a_verified_block_address_without_country() {
+    let pack = write_pack();
     let router = router(&pack);
     let base = "/compat/mapbox/search/searchbox/v1/forward";
     for (query, matches) in [

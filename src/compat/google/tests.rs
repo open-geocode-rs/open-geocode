@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::{path::Path, sync::LazyLock};
 
 use axum::{
     Router,
@@ -18,19 +18,24 @@ use crate::{
         PlaceLayer, PlaceRecord, PoiDetails, PoiRecord, Record, SourceProvenance, point_geometry,
     },
     runtime::{AppState, build_router},
+    test_support::TempDir,
 };
 
-/// Removes the Pack when a test ends, even on a failed assertion.
-struct Fixture {
-    pack: PathBuf,
-    router: Router,
-}
+static TORONTO: LazyLock<TempDir> = LazyLock::new(|| {
+    let dir = TempDir::new("compat-google");
+    write_pack(&dir.join("pack"));
+    dir
+});
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.pack);
-        let _ = std::fs::remove_dir_all(self.pack.with_extension("jobs"));
-    }
+static US: LazyLock<TempDir> = LazyLock::new(|| {
+    let dir = TempDir::new("compat-google-us");
+    write_us_pack(&dir.join("pack"));
+    dir
+});
+
+struct Fixture {
+    _jobs: TempDir,
+    router: Router,
 }
 
 /// The vendor id og issues for an address of the fixture: its og id, its
@@ -43,16 +48,21 @@ fn address_vendor_id(og_id: &str) -> String {
     encode_parts(og_id, Some(Layer::Address), label)
 }
 
+fn fixture_over(pack: &Path) -> Fixture {
+    let jobs = TempDir::new("compat-google-jobs");
+    let state = AppState::open(pack, &jobs, Limits::DEFAULT).expect("pack");
+    Fixture {
+        _jobs: jobs,
+        router: build_router(state, None, None),
+    }
+}
+
 fn fixture() -> Fixture {
-    let pack = std::env::temp_dir().join(format!(
-        "open-geocode-compat-google-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    write_pack(&pack);
-    let state = AppState::open(&pack, &pack.with_extension("jobs"), Limits::DEFAULT).expect("pack");
-    let router = build_router(state, None, None);
-    Fixture { pack, router }
+    fixture_over(&TORONTO.join("pack"))
+}
+
+fn us_fixture() -> Fixture {
+    fixture_over(&US.join("pack"))
 }
 
 /// Canada > Ontario > Golden Horseshoe > York > Toronto > Old Toronto >
@@ -1979,13 +1989,8 @@ async fn filters_og_holds_no_data_for_keep_no_place_and_the_rest_apply() {
 /// United States > California > Santa Clara County > Mountain View, holding
 /// 1600 Amphitheatre Parkway as its county source writes it, the county
 /// standing in for the town, and the place at that address.
-fn us_fixture() -> Fixture {
-    let pack = std::env::temp_dir().join(format!(
-        "open-geocode-compat-google-us-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let mut writer = Writer::create(&pack).expect("writer");
+fn write_us_pack(pack: &Path) {
+    let mut writer = Writer::create(pack).expect("writer");
     let (lon, lat) = (-122.0846, 37.4218);
     let mut place = |layer, name: &str, id| {
         writer
@@ -2124,10 +2129,8 @@ fn us_fixture() -> Fixture {
             context,
         )
         .expect("poi");
+    write_landmarks(&mut writer);
     writer.finish().expect("finish");
-    let state = AppState::open(&pack, &pack.with_extension("jobs"), Limits::DEFAULT).expect("pack");
-    let router = build_router(state, None, None);
-    Fixture { pack, router }
 }
 
 #[tokio::test]
@@ -2326,13 +2329,7 @@ async fn a_house_mapped_as_an_outline_is_a_rooftop() {
 
 /// Four places near 43 N 79 W: the one asked for, a well known mall whose
 /// outline holds it, a corner shop nearer, and a shop 490 m off.
-fn landmark_fixture() -> Fixture {
-    let pack = std::env::temp_dir().join(format!(
-        "open-geocode-compat-google-landmarks-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let mut writer = Writer::create(&pack).expect("writer");
+fn write_landmarks(writer: &mut Writer) {
     let mut poi = |name: &str, category: &str, lon: f64, id, prominence| {
         writer
             .write(
@@ -2387,17 +2384,13 @@ fn landmark_fixture() -> Fixture {
         mall,
         [-790_030_000, 429_990_000, -789_990_000, 430_010_000],
     )]);
-    writer.finish().expect("finish");
-    let state = AppState::open(&pack, &pack.with_extension("jobs"), Limits::DEFAULT).expect("pack");
-    let router = build_router(state, None, None);
-    Fixture { pack, router }
 }
 
 /// A place's landmarks are the best known places within a short walk, the
 /// nearer first among equals, each saying whether the place lies inside it.
 #[tokio::test]
 async fn a_place_is_described_by_its_best_known_neighbours() {
-    let fixture = landmark_fixture();
+    let fixture = us_fixture();
     let router = &fixture.router;
     let cafe = encode_parts("osm:way:21", Some(Layer::Poi), "");
     let reply = get_with(
@@ -2448,7 +2441,7 @@ async fn a_place_is_described_by_its_best_known_neighbours() {
 /// An extent alone cannot establish that a landmark contains the destination.
 #[tokio::test]
 async fn a_destination_does_not_infer_containment_from_an_extent() {
-    let fixture = landmark_fixture();
+    let fixture = us_fixture();
     let router = &fixture.router;
     let cafe = encode_parts("osm:way:21", Some(Layer::Poi), "");
     let reply = post(

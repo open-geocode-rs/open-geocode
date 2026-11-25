@@ -1,10 +1,6 @@
 //! `/compat/precisely` driven through og's router on a small Pack.
 
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{collections::BTreeSet, path::Path, sync::LazyLock, time::Duration};
 
 use axum::{
     Router,
@@ -28,30 +24,24 @@ use crate::{
         PlaceRecord, PoiRecord, PostcodeRecord, Record, SourceProvenance, point_geometry,
     },
     runtime::{AppState, build_router},
+    test_support::TempDir,
 };
 
-/// A Pack and its job directory, removed when the test ends, failed or not.
-struct Fixture {
-    pack: PathBuf,
-}
+static PACK: LazyLock<TempDir> = LazyLock::new(|| {
+    let dir = TempDir::new("compat-precisely");
+    write_pack(&dir.join("pack"));
+    dir
+});
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.pack);
-        let _ = std::fs::remove_dir_all(self.pack.with_extension("jobs"));
-    }
+struct Fixture {
+    jobs: TempDir,
 }
 
 impl Fixture {
     fn new(name: &str) -> Self {
-        let pack = std::env::temp_dir().join(format!(
-            "open-geocode-precisely-{name}-{}",
-            std::process::id()
-        ));
-        let fixture = Self { pack };
-        let _ = std::fs::remove_dir_all(fixture.pack.with_extension("jobs"));
-        write_pack(&fixture.pack);
-        fixture
+        Self {
+            jobs: TempDir::new(&format!("compat-precisely-{name}")),
+        }
     }
 
     fn router(&self) -> Router {
@@ -63,7 +53,7 @@ impl Fixture {
     }
 
     fn state(&self, limits: Limits) -> AppState {
-        AppState::open(&self.pack, &self.pack.with_extension("jobs"), limits).expect("state")
+        AppState::open(&PACK.join("pack"), &self.jobs, limits).expect("state")
     }
 }
 
@@ -80,7 +70,6 @@ fn address_vendor_id(og_id: &str) -> String {
 }
 
 fn write_pack(dir: &Path) {
-    let _ = std::fs::remove_dir_all(dir);
     let mut writer = Writer::create(dir).expect("writer");
     let mut place = |layer, name: &str, id| {
         writer

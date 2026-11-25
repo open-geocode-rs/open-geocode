@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::Path, sync::LazyLock, time::Duration};
 
 use axum::{
     Router,
@@ -21,19 +21,16 @@ use crate::{
         PlaceRecord, PoiDetails, PoiRecord, Record, SourceProvenance, StreetRecord, point_geometry,
     },
     runtime::{AppState, build_router},
+    test_support::TempDir,
 };
 
-/// A Pack in its own temporary directory, removed with its jobs when the
-/// test ends, failed or not.
-#[derive(Debug)]
-pub(super) struct TestPack(PathBuf);
+static PACK: LazyLock<TempDir> = LazyLock::new(|| {
+    let dir = TempDir::new("compat-here");
+    write_pack(&dir.join("pack"));
+    dir
+});
 
-impl Drop for TestPack {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-        let _ = std::fs::remove_dir_all(self.0.with_extension("jobs"));
-    }
-}
+pub(super) struct TestPack(TempDir);
 
 impl TestPack {
     pub(super) fn router(&self) -> Router {
@@ -43,8 +40,12 @@ impl TestPack {
     /// A server on the Pack. Each keeps its jobs in the one directory, so
     /// two see the same jobs.
     pub(super) fn state(&self, limits: Limits) -> AppState {
-        AppState::open(&self.0, &self.0.with_extension("jobs"), limits).expect("open pack")
+        AppState::open(&PACK.join("pack"), &self.0, limits).expect("open pack")
     }
+}
+
+pub(super) fn pack(name: &str) -> TestPack {
+    TestPack(TempDir::new(&format!("compat-here-{name}")))
 }
 
 /// The vendor id og issues for an address of the fixture: its og id, its
@@ -70,15 +71,8 @@ fn line(from: [f64; 2], to: [f64; 2]) -> geojson::Geometry {
 /// region and areas, a POI with two phone numbers, a website, weekly hours
 /// and an entrance, a street and an interpolation range. Calibrated, every confidence
 /// one half.
-pub(super) fn pack(name: &str) -> TestPack {
-    let dir = std::env::temp_dir().join(format!(
-        "open-geocode-compat-here-{name}-{}",
-        std::process::id()
-    ));
-    let pack = TestPack(dir.clone());
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(dir.with_extension("jobs"));
-    let mut writer = Writer::create(&dir).expect("writer");
+fn write_pack(dir: &Path) {
+    let mut writer = Writer::create(dir).expect("writer");
     let mut place = |layer, name: &str, id| {
         writer
             .write(
@@ -279,11 +273,10 @@ pub(super) fn pack(name: &str) -> TestPack {
         )
         .expect("interpolation");
     writer.finish().expect("finish");
-    let reader = crate::pack::Reader::open(&dir).expect("pack");
+    let reader = crate::pack::Reader::open(dir).expect("pack");
     Model::new([0.0; FEATURES], Default::default())
         .save(&reader)
         .expect("confidence model");
-    pack
 }
 
 pub(super) struct Reply {
@@ -1875,31 +1868,48 @@ async fn a_geocode_batch_runs_on_og_jobs() {
 #[tokio::test]
 async fn a_stopped_batch_answers_stopped_never_in_progress() {
     let pack = pack("batch-stop");
-    let router = pack.router();
-    let input = std::iter::once("recId|q".to_string())
-        .chain((0..2000).map(|row| format!("r{row}|{row} King Street")))
-        .collect::<Vec<_>>()
-        .join("\n");
-    for _ in 0..20 {
-        let created = send(
-            &router,
-            "POST",
-            &format!("/compat/here/v7/batch/jobs?serviceHrn={GEOCODE_HRN}"),
-            Some(("text/plain", input.as_str())),
-        )
-        .await;
-        assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
-        let id = created.json()["id"].as_str().expect("id").to_string();
-        let stopped = send(
+    let state = pack.state(Limits::DEFAULT);
+    let router = build_router(state.clone(), None, None);
+    // Every pool thread held, so the job answers no record before the stop.
+    let threads = state.batch_pool().current_num_threads();
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Arc::new(std::sync::Mutex::new(gate));
+    let (held, all_held) = std::sync::mpsc::channel();
+    for _ in 0..threads {
+        let (gate, held) = (std::sync::Arc::clone(&gate), held.clone());
+        state.batch_pool().spawn(move || {
+            held.send(()).expect("held");
+            let _ = gate.lock().expect("gate").recv();
+        });
+    }
+    for _ in 0..threads {
+        all_held.recv().expect("a held thread");
+    }
+    let created = send(
+        &router,
+        "POST",
+        &format!("/compat/here/v7/batch/jobs?serviceHrn={GEOCODE_HRN}"),
+        Some((
+            "text/plain",
+            "recId|q\nr1|10 King Street\nr2|20 Queen Street\n",
+        )),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
+    let id = created.json()["id"].as_str().expect("id").to_string();
+    let stop = tokio::spawn(async move {
+        send(
             &router,
             "PUT",
             &format!("/compat/here/v7/batch/jobs/{id}/stop"),
             None,
         )
-        .await;
-        let status = stopped.json()["status"].clone();
-        assert!(status == "stopped" || status == "completed", "{status}");
-    }
+        .await
+    });
+    tokio::task::yield_now().await;
+    drop(release);
+    let status = stop.await.expect("stop").json()["status"].clone();
+    assert!(status == "stopped" || status == "completed", "{status}");
 }
 
 #[tokio::test]

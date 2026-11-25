@@ -2844,8 +2844,7 @@ mod tests {
 
     #[test]
     fn a_resumed_run_reads_only_what_no_run_answered() {
-        let dir = std::env::temp_dir().join(format!("og-here-feed-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = crate::test_support::TempDir::new("here-feed");
         let path = dir.join("items");
         let lines = (0..70).map(|ordinal| format!("{{\"id\":\"{ordinal}\"}}\n"));
         fs::write(&path, lines.collect::<String>()).expect("items");
@@ -2857,7 +2856,6 @@ mod tests {
         while let Some(chunk) = receiver.blocking_recv() {
             fed.extend_from_slice(&chunk.expect("chunk"));
         }
-        let _ = fs::remove_dir_all(&dir);
         let fed = String::from_utf8(fed).expect("UTF-8");
         let ids = fed
             .lines()
