@@ -30,7 +30,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
-    sync::OnceLock,
+    sync::{LazyLock, OnceLock},
 };
 
 use crate::error::{Error, Result};
@@ -1159,32 +1159,29 @@ impl Builder {
         );
         fields[Field::StreetBare.index()] = bare;
         fields[Field::StreetTail.index()] = tail;
-        let mut units = vocabulary(UNIT_WORDS);
-        units.extend(vocabulary(LIBPOSTAL_UNIT_TYPES));
-        units.extend(vocabulary(LIBPOSTAL_STAIRCASES));
-        units.extend(vocabulary(LIBPOSTAL_ENTRANCES));
+        let mut units = VOCABULARY.units.clone();
         for (word, entry) in &fields[Field::Unit.index()] {
             if entry.count >= MIN_UNIT_WORD_VALUES {
                 units.entry(word.clone()).or_insert(*entry).count = entry.count;
             }
         }
         fields[Field::Unit.index()] = with_glued_forms(units);
-        for (field, list) in [
-            (Field::PoBox, LIBPOSTAL_PO_BOXES),
-            (Field::Level, LIBPOSTAL_LEVEL_TYPES),
-            (Field::Building, LIBPOSTAL_BUILDING_TYPES),
-            (Field::Directional, LIBPOSTAL_DIRECTIONALS),
-            (Field::Near, LIBPOSTAL_NEAR),
-            (Field::Category, LIBPOSTAL_CATEGORIES),
-        ] {
-            fields[field.index()] = match field {
-                Field::PoBox | Field::Level => with_glued_forms(vocabulary(list)),
-                _ => vocabulary(list),
-            };
-        }
         // Every word of every name but a POI's: a venue's name is any word
         // at all, and would make typos of street names known words.
-        let mut words = BTreeMap::<String, Entry>::new();
+        let mut words = VOCABULARY
+            .pre_override_list_word_counts
+            .iter()
+            .map(|(word, count)| {
+                (
+                    word.clone(),
+                    Entry {
+                        count: *count,
+                        country: None,
+                        levels: 0,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         for (field, entries) in Field::ALL.into_iter().zip(&fields) {
             if field == Field::Poi {
                 continue;
@@ -1203,15 +1200,22 @@ impl Builder {
             }
         }
         fields[Field::Word.index()] = words;
-        for (field, phrase) in vocabulary_overrides() {
-            fields[field.index()].remove(&phrase);
+        for (field, phrase) in &VOCABULARY.overrides {
+            fields[field.index()].remove(phrase);
         }
         for field in Field::ALL {
-            pack.add(
-                field.section(),
-                DICTIONARY_VERSION,
-                &build_fst(&fields[field.index()])?,
-            )?;
+            match VOCABULARY
+                .list_fields
+                .iter()
+                .find(|(listed, _)| *listed == field)
+            {
+                Some((_, fst)) => pack.add(field.section(), DICTIONARY_VERSION, fst)?,
+                None => pack.add(
+                    field.section(),
+                    DICTIONARY_VERSION,
+                    &build_fst(&fields[field.index()])?,
+                )?,
+            }
         }
         // Which places a name names is only known where the Pack holds every
         // place of a level: countries, regions, districts and cities are all
@@ -1399,20 +1403,7 @@ fn admin_types() -> &'static [(String, Attach)] {
 /// unit value of the Pack's own records, which the unit dictionary also
 /// holds.
 pub fn designates_unit(key: &str) -> bool {
-    static DESIGNATORS: OnceLock<BTreeMap<String, Entry>> = OnceLock::new();
-    DESIGNATORS
-        .get_or_init(|| {
-            let mut designators = vocabulary(UNIT_WORDS);
-            for list in [
-                LIBPOSTAL_UNIT_TYPES,
-                LIBPOSTAL_STAIRCASES,
-                LIBPOSTAL_ENTRANCES,
-            ] {
-                designators.extend(vocabulary(list));
-            }
-            designators
-        })
-        .contains_key(key)
+    VOCABULARY.units.contains_key(key)
 }
 
 /// Whether `key` is a word of an admin area's type ("丁目", "chome", "kreis").
@@ -1532,8 +1523,7 @@ fn street_types(streets: &BTreeMap<String, Entry>) -> BTreeMap<String, Entry> {
         }
     }
     let threshold = ((streets.len() as f64 * STREET_TYPE_SHARE) as u64).max(MIN_STREET_TYPE_NAMES);
-    let mut types = vocabulary(STREET_TYPE_WORDS);
-    types.extend(vocabulary(LIBPOSTAL_STREET_TYPES));
+    let mut types = VOCABULARY.street_types.clone();
     for (word, count) in ends {
         if count >= threshold && !word.chars().any(|character| character.is_numeric()) {
             types
@@ -1615,6 +1605,67 @@ fn with_glued_forms(mut entries: BTreeMap<String, Entry>) -> BTreeMap<String, En
     }
     entries
 }
+
+const LIST_FIELDS: [(Field, &str); 6] = [
+    (Field::PoBox, LIBPOSTAL_PO_BOXES),
+    (Field::Level, LIBPOSTAL_LEVEL_TYPES),
+    (Field::Building, LIBPOSTAL_BUILDING_TYPES),
+    (Field::Directional, LIBPOSTAL_DIRECTIONALS),
+    (Field::Near, LIBPOSTAL_NEAR),
+    (Field::Category, LIBPOSTAL_CATEGORIES),
+];
+
+struct Vocabulary {
+    units: BTreeMap<String, Entry>,
+    street_types: BTreeMap<String, Entry>,
+    list_fields: Vec<(Field, Vec<u8>)>,
+    pre_override_list_word_counts: BTreeMap<String, u64>,
+    overrides: Vec<(Field, String)>,
+}
+
+static VOCABULARY: LazyLock<Vocabulary> = LazyLock::new(|| {
+    let mut units = vocabulary(UNIT_WORDS);
+    for list in [
+        LIBPOSTAL_UNIT_TYPES,
+        LIBPOSTAL_STAIRCASES,
+        LIBPOSTAL_ENTRANCES,
+    ] {
+        units.extend(vocabulary(list));
+    }
+    let mut street_types = vocabulary(STREET_TYPE_WORDS);
+    street_types.extend(vocabulary(LIBPOSTAL_STREET_TYPES));
+    let overrides = vocabulary_overrides();
+    let mut pre_override_list_word_counts = BTreeMap::<String, u64>::new();
+    let list_fields = LIST_FIELDS
+        .into_iter()
+        .map(|(field, list)| {
+            let mut entries = match field {
+                Field::PoBox | Field::Level => with_glued_forms(vocabulary(list)),
+                _ => vocabulary(list),
+            };
+            for name in entries.keys() {
+                for word in name.split_whitespace() {
+                    *pre_override_list_word_counts
+                        .entry(word.to_string())
+                        .or_default() += 1;
+                }
+            }
+            for (overridden, phrase) in &overrides {
+                if *overridden == field {
+                    entries.remove(phrase);
+                }
+            }
+            (field, build_fst(&entries).expect("in-memory FST"))
+        })
+        .collect();
+    Vocabulary {
+        units,
+        street_types,
+        list_fields,
+        pre_override_list_word_counts,
+        overrides,
+    }
+});
 
 pub(super) fn vocabulary(list: &str) -> BTreeMap<String, Entry> {
     list.lines()
