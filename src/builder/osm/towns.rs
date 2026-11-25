@@ -1,6 +1,3 @@
-//! How far a town mapped only as a point reaches, as far as the addresses
-//! that name it and at least half way to the nearest other town point.
-
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicU64, Ordering as Atomic},
@@ -16,18 +13,10 @@ use crate::{
 
 use super::{boundary::TownDot, checkpoint::NamedPoint};
 
-/// Votes measured side by side.
 const VOTE_BATCH: usize = 1 << 16;
 
 type Peer = GeomWithData<[f64; 2], usize>;
 
-/// Sets the reach of each town point in `dots`, in whole metres, whose names, as
-/// [`dictionary_key`] spells them, are `names`. A town reaches as far as
-/// the farthest address that names it and lies nearer to it than to any
-/// other town point of its kind or a bigger one. An address past the half
-/// way line to such a town is that town's, or names a town of this name by
-/// mistake. Every town reaches at least half way to the nearest other town
-/// point, so a town no address names still holds the houses nearest it.
 pub(super) fn measure_reach(
     dots: &mut [TownDot],
     names: &[Vec<String>],
@@ -48,7 +37,6 @@ pub(super) fn measure_reach(
             .map(|(index, dot)| Peer::new(dot.point, index))
             .collect(),
     );
-    // A tree of the towns of each kind and every bigger kind, by rank.
     let mut ranks = dots
         .iter()
         .map(|dot| dot.settlement.rank)
@@ -104,7 +92,6 @@ pub(super) fn measure_reach(
         if nearer_than(peers, vote.point, metres, |other| other != town) {
             return;
         }
-        // Positive floats order as their bits do.
         reach[town].fetch_max(metres.to_bits(), Atomic::Relaxed);
     };
     let mut batch = Vec::with_capacity(VOTE_BATCH);
@@ -122,7 +109,6 @@ pub(super) fn measure_reach(
     Ok(())
 }
 
-/// Metres to the nearest point of `tree` that `accept` takes.
 fn nearest_m(
     tree: &RTree<Peer>,
     [lon, lat]: [f64; 2],
@@ -145,7 +131,6 @@ fn nearest_m(
     best
 }
 
-/// Whether a point of `tree` that `accept` takes lies nearer than `metres`.
 fn nearer_than(
     tree: &RTree<Peer>,
     [lon, lat]: [f64; 2],
@@ -161,9 +146,6 @@ fn nearer_than(
         })
 }
 
-/// The most degrees, in plain lon and lat, a point within `metres` of a
-/// point at `lat` can lie away. A degree of longitude is shortest at the
-/// pole-ward edge of the circle.
 fn degrees_within(lat: f64, metres: f64) -> f64 {
     let lat_span = metres / METRES_PER_DEGREE;
     let edge = (lat.abs() + lat_span).min(89.9).to_radians();
@@ -200,7 +182,6 @@ mod tests {
             .collect()
     }
 
-    /// A tenth of a degree of latitude, in metres.
     const TENTH: f64 = METRES_PER_DEGREE / 10.0;
 
     #[test]
@@ -217,7 +198,6 @@ mod tests {
     fn a_town_reaches_its_farthest_address() {
         let mut dots = vec![dot(1, [0.0, 0.0], 16), dot(2, [0.0, 0.2], 20)];
         let names = keys(&dots);
-        // Past the hamlet's half way line, as a smaller town cuts no city short.
         let votes = [vote("Town 1", [0.0, 0.15]), vote("Town 1", [0.0, -0.05])];
         measure_reach(&mut dots, &names, votes.into_iter()).unwrap();
         assert!(

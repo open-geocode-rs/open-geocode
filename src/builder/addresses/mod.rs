@@ -1,20 +1,3 @@
-//! Address points from outside OSM, such as OpenAddresses, added to a build.
-//!
-//! A build asks its [`AddressSource`] for files once it knows which countries
-//! the Pack covers, then reads each one into the same street groups as the
-//! OSM addresses. An imported address that repeats an OSM one (same street,
-//! number and unit, close by) is dropped: the Pack keeps one record per house,
-//! and marks it disputed when the two disagree on where it is.
-//!
-//! Two layouts are read, either one gzipped or not, from a file of their own
-//! or from an entry of a zip archive (the collection OpenAddresses publishes):
-//!
-//! - OpenAddresses GeoJSON, one feature per line, with the properties
-//!   `number`, `street`, `unit`, `city`, `district`, `region` and `postcode`.
-//! - CSV with a header row naming `LON`, `LAT`, `NUMBER` and `STREET`, and
-//!   optionally `UNIT`, `CITY`, `DISTRICT`, `REGION` and `POSTCODE`, in any
-//!   case and order: the OpenAddresses CSV layout.
-
 pub mod openaddresses;
 
 use std::{
@@ -35,7 +18,6 @@ use crate::{
     },
 };
 
-/// What a Pack covers, from the boundaries it has.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Coverage {
     /// Countries covered whole, ISO 3166-1 alpha-2 in upper case: `NZ`.
@@ -45,30 +27,20 @@ pub struct Coverage {
     pub subdivisions: BTreeSet<String>,
 }
 
-/// Where a build finds addresses to add to the input's own.
 pub trait AddressSource: Send + Sync + fmt::Debug {
-    /// The files to read for a Pack covering `coverage`, and the data sets
-    /// left out. Called once, after the boundaries are built; it may
-    /// download.
     fn pick(&self, coverage: &Coverage) -> Result<Picked>;
 }
 
-/// What an [`AddressSource`] gives a build: the files to read, and each data
-/// set it left out with the reason, for the build to warn of.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Picked {
     pub files: Vec<AddressFile>,
     pub left_out: Vec<String>,
 }
 
-/// One file of address points and the dataset its records name as their
-/// source, such as `openaddresses:nz/countrywide`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AddressFile {
     pub dataset: String,
     pub path: PathBuf,
-    /// The file's name inside `path` when `path` is a zip archive, read from
-    /// the archive without unpacking it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
     /// The ISO 3166 code of the country (`JP`) or region (`CA-ON`) the
@@ -78,16 +50,9 @@ pub struct AddressFile {
     pub area: Option<String>,
 }
 
-/// Rows of a file with an [`AddressFile::area`] read before any is taken. A
-/// file most of whose first rows lie outside its area is a broken source,
-/// such as one with longitude and latitude swapped, and none of its rows is
-/// taken: the few its error lands inside the area are as wrong as the rest.
-/// The first rows tell, since a source is broken throughout or not at all.
 pub const SAMPLE_ROWS: usize = 1_000;
 
 impl AddressFile {
-    /// Bytes read to import the file: the entry's compressed bytes inside an
-    /// archive, else the file's.
     pub fn bytes(&self) -> Result<u64> {
         match &self.entry {
             Some(entry) => Ok(zip_entry(&self.path, entry)?.compressed_bytes),
@@ -101,7 +66,6 @@ impl AddressFile {
         }
     }
 
-    /// The file as a report names it: `archive.zip!entry` for an entry.
     pub fn describe(&self) -> String {
         match &self.entry {
             Some(entry) => format!("{}!{entry}", self.path.display()),
@@ -110,14 +74,12 @@ impl AddressFile {
     }
 }
 
-/// Where an entry's data lies in a zip archive, and how it is stored.
 struct ZipEntry {
     data_start: u64,
     compressed_bytes: u64,
     deflated: bool,
 }
 
-/// Find `entry` in the archive's central directory.
 fn zip_entry(path: &Path, entry: &str) -> Result<ZipEntry> {
     let file = File::open(path).map_err(|source| Error::IoPath {
         action: "failed to open",
@@ -149,7 +111,6 @@ fn zip_entry(path: &Path, entry: &str) -> Result<ZipEntry> {
     })
 }
 
-/// Fixed files, whatever the Pack covers: the `--addresses` a build is given.
 #[derive(Debug, Clone, Default)]
 pub struct AddressFiles(pub Vec<AddressFile>);
 
@@ -162,7 +123,6 @@ impl AddressSource for AddressFiles {
     }
 }
 
-/// Several sources, read in order.
 #[derive(Debug, Clone, Default)]
 pub struct AddressSources(pub Vec<std::sync::Arc<dyn AddressSource>>);
 
@@ -178,24 +138,15 @@ impl AddressSource for AddressSources {
     }
 }
 
-/// What one imported file added to the build.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImportReport {
     pub dataset: String,
     pub path: String,
     pub bytes: u64,
     pub rows: u64,
-    /// Rows that became address records, before duplicates were dropped.
     pub accepted: u64,
-    /// Rows left out, by reason.
     pub rejected: BTreeMap<String, u64>,
-    /// Accepted rows dropped for repeating an address the Pack already has,
-    /// an OSM one or one an earlier row or file stated, close to where it
-    /// lies.
     pub duplicates: u64,
-    /// Accepted rows dropped for naming a house the Pack already has, but
-    /// farther from it than sources placing one house disagree. The house
-    /// kept is marked disputed.
     pub disputes: u64,
 }
 
@@ -222,7 +173,6 @@ struct Properties {
     postcode: Option<String>,
 }
 
-/// One row as read, before it is checked.
 #[derive(Debug, Default)]
 struct Row {
     lon: Option<f64>,
@@ -252,7 +202,6 @@ pub fn read_file_prepared<P: Send>(
     read_rows(file, usize::MAX, prepare, accept)
 }
 
-/// The points of the addresses the first `rows` rows of `file` state.
 pub fn first_points(file: &AddressFile, rows: usize) -> Result<Vec<[f64; 2]>> {
     let mut points = Vec::new();
     read_rows(
@@ -267,14 +216,10 @@ pub fn first_points(file: &AddressFile, rows: usize) -> Result<Vec<[f64; 2]>> {
     Ok(points)
 }
 
-/// Rows read and handed to the pool at once.
 const ROW_BATCH: usize = 1 << 14;
 
-/// A row as the reading thread hands it on. A GeoJSON line is parsed on the
-/// pool, a CSV record by the reader that splits it.
 enum Unparsed {
     Line(Vec<u8>),
-    /// Boxed, as a split row is several times a line's size.
     Row(Box<std::result::Result<Row, &'static str>>),
 }
 
@@ -296,8 +241,6 @@ fn read_rows<P: Send>(
     };
     let describe = file.describe();
     let rows: Box<dyn Iterator<Item = Result<Unparsed>> + Send> = match layout(named)? {
-        // Split as bytes: one row of another encoding is that row's
-        // rejection, not the end of the build.
         Layout::GeoJson => Box::new(input.split(b'\n').take(limit).filter_map(
             move |line| match line {
                 Ok(line) if line.trim_ascii().is_empty() => None,
@@ -361,9 +304,6 @@ fn read_rows<P: Send>(
     };
     let dataset = file.dataset.as_str();
     let prepare = &prepare;
-    // Inflating and splitting a file is one stream, but each row parses and
-    // checks on its own. One thread reads the next batch while the pool
-    // readies this one, and rows are taken in file order.
     std::thread::scope(|scope| {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let reader = scope.spawn(move || -> Result<()> {
@@ -375,8 +315,6 @@ fn read_rows<P: Send>(
                 }
             }
         });
-        // Dropping the receiver on an error here stops the reader at its
-        // next batch.
         let mut row_number = 0i64;
         for batch in receiver {
             let first = row_number + 1;
@@ -456,9 +394,6 @@ fn layout(path: &Path) -> Result<Layout> {
     }
 }
 
-/// The text of `entry` in the zip archive at `path`, inflated as it is read.
-/// The entry is read from its own offset in the archive, so a collection of
-/// thousands of files is read one entry at a time and never unpacked.
 fn open_entry(path: &Path, entry: &str) -> Result<Box<dyn BufRead + Send>> {
     use std::io::{Seek, SeekFrom};
     let ZipEntry {
@@ -484,7 +419,6 @@ fn open_entry(path: &Path, entry: &str) -> Result<Box<dyn BufRead + Send>> {
     })
 }
 
-/// The file's text, gunzipped when it starts with the gzip magic.
 fn open(path: &Path) -> Result<Box<dyn BufRead + Send>> {
     let failed = |source| Error::IoPath {
         action: "failed to open",

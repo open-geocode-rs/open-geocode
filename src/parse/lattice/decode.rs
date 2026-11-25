@@ -1,12 +1,3 @@
-//! Semi-Markov Viterbi decoding of a lattice, n-best.
-//!
-//! A path covers the query with segments, each a lattice span with one
-//! label. Its score is the sum of its edges' scores and of the transitions
-//! between consecutive labels, from a start state before the first segment
-//! to an end state after the last. Two segmentations that give every token
-//! the same label are one labelling, so each decoding cell keeps the best
-//! path per label sequence and the n best are n different labellings.
-
 use crate::error::{Error, Result};
 
 use super::{CountryCode, Tokens, Units, weights::Weights};
@@ -15,25 +6,20 @@ use crate::{
     util::codec::{get_string, get_u8, get_u32, get_u64, put_str, put_u64},
 };
 
-/// Labels, then the start and end states of the transition table.
 pub(super) const LABELS: usize = Label::ALL.len();
 pub(super) const START: usize = LABELS;
 pub(super) const END: usize = LABELS + 1;
 pub(super) const STATES: usize = LABELS + 2;
 
-/// A run of tokens with the features of every edge over it.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Span {
     pub start: usize,
     pub end: usize,
     pub features: Vec<u32>,
-    /// Features that hold only when the query is decoded as that country:
-    /// its postcode pattern matched, or a dictionary hit is in it.
     pub country_features: Vec<(CountryCode, u32)>,
 }
 
 impl Span {
-    /// The feature ids of the span decoded as `country`.
     pub(super) fn features_in(
         &self,
         country: Option<CountryCode>,
@@ -47,22 +33,14 @@ impl Span {
     }
 }
 
-/// The spans over the units of one query, and the countries worth decoding
-/// it for.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Lattice {
-    /// How many units the query has.
     pub len: usize,
     pub units: Units,
     pub spans: Vec<Span>,
     pub candidates: Vec<CountryCode>,
-    /// The spans that are names of areas the Pack knows, as `(start, end,
-    /// the record ids of the areas)`.
     pub places: Vec<(usize, usize, Vec<u32>)>,
-    /// The names spans are a typo of, as `(start, end, the label the name
-    /// is read as, the name's key)`.
     pub corrections: Vec<(usize, usize, Label, String)>,
-    /// Span indices by the token they end before.
     by_end: Vec<Vec<usize>>,
 }
 
@@ -84,7 +62,6 @@ impl Lattice {
         }
     }
 
-    /// The areas the span `start..end` names, when the Pack knows them.
     pub(super) fn place(&self, start: usize, end: usize) -> Option<&[u32]> {
         self.places
             .iter()
@@ -92,7 +69,6 @@ impl Lattice {
             .map(|place| place.2.as_slice())
     }
 
-    /// Bytes the lattice holds, its heap data included.
     pub(super) fn resident_bytes(&self) -> usize {
         use std::mem::size_of;
         let tokens = &self.units.tokens;
@@ -130,7 +106,6 @@ impl Lattice {
                 .sum::<usize>()
     }
 
-    /// Write the lattice for [`Self::decode`], which reads back an equal one.
     pub(super) fn encode(&self, out: &mut Vec<u8>) {
         let units = &self.units;
         put_u64(out, units.len() as u64);
@@ -210,7 +185,6 @@ impl Lattice {
             units.token_of.push(count(input)?);
         }
         let span_count = count(input)?;
-        // A corrupt count must not reserve more than the input could hold.
         let mut spans = Vec::with_capacity(span_count.min(input.len()));
         for _ in 0..span_count {
             let start = count(input)?;
@@ -259,14 +233,12 @@ impl Lattice {
     }
 }
 
-/// One labelled span of a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Segment {
     pub span: usize,
     pub label: Label,
 }
 
-/// A labelling of the whole query.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Path {
     pub segments: Vec<Segment>,
@@ -275,7 +247,6 @@ pub(super) struct Path {
 }
 
 impl Path {
-    /// The units and label of every segment, in order.
     pub(super) fn segments(&self, lattice: &Lattice) -> Vec<(usize, usize, Label)> {
         self.segments
             .iter()
@@ -286,7 +257,6 @@ impl Path {
             .collect()
     }
 
-    /// The label of every unit.
     pub(super) fn labels(&self, lattice: &Lattice) -> Vec<Label> {
         let mut labels = Vec::with_capacity(lattice.len);
         for segment in &self.segments {
@@ -297,11 +267,6 @@ impl Path {
     }
 }
 
-/// The countries a lattice is decoded as: every candidate country, or the
-/// global fallback alone when the query points to none. A query whose
-/// dictionary hits and postcode matches point to a country is read with
-/// that country's evidence and transitions, never against a global reading
-/// that leaves its evidence out.
 pub(super) fn countries(lattice: &Lattice) -> Vec<Option<CountryCode>> {
     if lattice.candidates.is_empty() {
         vec![None]
@@ -310,9 +275,6 @@ pub(super) fn countries(lattice: &Lattice) -> Vec<Option<CountryCode>> {
     }
 }
 
-/// The best `n` labellings over the countries of [`countries`], each
-/// labelling once, under the country that scores it best. With `allows`,
-/// only those that give each span a label it allows.
 pub(super) fn best(
     lattice: &Lattice,
     weights: &Weights,
@@ -337,8 +299,6 @@ pub(super) fn best(
     paths
 }
 
-/// The best `k` labellings decoded as `country` that give every token its
-/// gold label.
 #[cfg(test)]
 pub(super) fn decode_gold(
     lattice: &Lattice,
@@ -352,11 +312,8 @@ pub(super) fn decode_gold(
     decode(lattice, weights, country, k, Some(&allows))
 }
 
-/// Which labels a span may take.
 pub(super) type Allows<'a> = &'a dyn Fn(&Span, Label) -> bool;
 
-/// The best labelling over the countries of [`countries`] that gives each
-/// span only a label `allows` lets it have, `None` when none does.
 pub(super) fn best_allowed(
     lattice: &Lattice,
     weights: &Weights,
@@ -370,8 +327,6 @@ pub(super) fn best_allowed(
     paths.into_iter().next()
 }
 
-/// The best `k` labellings decoded as `country`, or, with `allows`, the
-/// best that give each span only a label it allows.
 pub(super) fn decode(
     lattice: &Lattice,
     weights: &Weights,
@@ -453,7 +408,6 @@ pub(super) fn decode(
         .collect()
 }
 
-/// Best first; equal scores keep their order.
 pub(super) fn sort_paths(paths: &mut [Path]) {
     paths.sort_by(|left, right| right.score.total_cmp(&left.score));
 }
@@ -461,7 +415,6 @@ pub(super) fn sort_paths(paths: &mut [Path]) {
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     score: f32,
-    /// Of the label of every token so far, to keep one path per labelling.
     hash: u64,
     back: Option<Back>,
 }
@@ -476,7 +429,6 @@ struct Back {
 const HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 const HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// Extends a labelling hash by one label for each token of a segment.
 struct HashExtension {
     label: u64,
     tokens: usize,
@@ -498,7 +450,6 @@ impl HashExtension {
     }
 }
 
-/// Keep the `k` best entries of a cell, one per labelling.
 fn insert(cell: &mut Vec<Entry>, candidate: Entry, k: usize) {
     if let Some(same) = cell.iter_mut().find(|entry| entry.hash == candidate.hash) {
         if candidate.score > same.score {

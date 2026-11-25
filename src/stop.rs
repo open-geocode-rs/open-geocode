@@ -1,14 +1,3 @@
-//! When the lookup running on this thread must stop: past its deadline, or
-//! cancelled because nobody waits for its answer any more.
-//!
-//! A lookup runs on a blocking thread, which nothing can interrupt from
-//! outside: dropping the future that waits for it drops only the answer, and
-//! the thread works on. So the lookup calls [`check`] between its steps and
-//! stops itself.
-//!
-//! The stop is per thread, because every step of a lookup runs on the thread
-//! that started it. Work handed to another thread does not see it.
-
 use std::{
     cell::RefCell,
     sync::{
@@ -20,7 +9,6 @@ use std::{
 
 use crate::error::{Error, Result};
 
-/// When a lookup must stop. The default never does.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Stop {
     deadline: Option<(Instant, Duration)>,
@@ -28,8 +16,6 @@ pub(crate) struct Stop {
 }
 
 impl Stop {
-    /// Stop `timeout` from now, or once `cancel` is set, whichever comes
-    /// first.
     pub(crate) fn new(timeout: Duration, cancel: Arc<AtomicBool>) -> Self {
         Self {
             deadline: Some((Instant::now() + timeout, timeout)),
@@ -56,9 +42,6 @@ thread_local! {
     static CURRENT: RefCell<Stop> = RefCell::new(Stop::default());
 }
 
-/// Run `work` on this thread under `stop`, then put back the stop it
-/// replaced, also when `work` panics: a batch catches an item's panic and
-/// runs the next item on the same thread.
 pub(crate) fn within<T>(stop: Stop, work: impl FnOnce() -> T) -> T {
     struct Restore(Option<Stop>);
     impl Drop for Restore {
@@ -72,7 +55,6 @@ pub(crate) fn within<T>(stop: Stop, work: impl FnOnce() -> T) -> T {
     work()
 }
 
-/// Fails once the lookup on this thread is past its deadline or cancelled.
 pub(crate) fn check() -> Result<()> {
     CURRENT.with_borrow(Stop::reached)
 }

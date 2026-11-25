@@ -1,9 +1,3 @@
-//! One answer for one house.
-//!
-//! A house can be in a Pack more than once: OSM maps it as an address point
-//! and as its building's outline, or several mappers each placed a point
-//! for it. Suggestions and vendor lookups keep the most precise copy.
-
 use crate::{
     api::{Accuracy, Address, Common, ForwardFeature, ReverseFeature},
     builder::osm::DISPUTED_HOUSE_RADIUS_M,
@@ -13,11 +7,8 @@ use crate::{
     util::geo::haversine_m,
 };
 
-/// A native answer: one record at one point.
 pub(crate) trait Answer {
-    /// The house it is, when it is one.
     fn house(&self) -> Option<House>;
-    /// The building it is drawn as.
     fn building(&mut self) -> &mut Option<Building>;
 }
 
@@ -41,19 +32,12 @@ impl Answer for ReverseFeature {
     }
 }
 
-/// The copy kept for a house takes the building another copy of it is drawn
-/// as, when it is drawn as none. A point at a building's door and the
-/// building's outline are one house, and the outline names the building.
 fn take_building(kept: &mut Option<Building>, other: &mut Option<Building>) {
     if kept.is_none() {
         *kept = other.take();
     }
 }
 
-/// Keeps one answer per house, in the place of its best-ranked copy. Of the
-/// copies, the most precise point wins, and of equally precise ones the one
-/// that states most of its address, then the best-ranked. It keeps the
-/// building any copy is drawn as ([`take_building`]).
 pub(crate) fn one_per_house<A: Answer>(answers: &mut Vec<A>) {
     let mut kept: Vec<(A, Option<House>)> = Vec::with_capacity(answers.len());
     for answer in std::mem::take(answers) {
@@ -83,7 +67,6 @@ pub(crate) fn one_per_house<A: Answer>(answers: &mut Vec<A>) {
     *answers = kept.into_iter().map(|(answer, _)| answer).collect();
 }
 
-/// Fetch more candidates only when copies filled the window.
 pub(crate) fn ask_again(
     asked: usize,
     ask: usize,
@@ -95,8 +78,6 @@ pub(crate) fn ask_again(
     (kept < asked && held >= ask && more > ask).then_some(more)
 }
 
-/// What tells one house from another: its street, number and unit as search
-/// spells them, where it is, and the postcode and town it states.
 pub(crate) struct House {
     key: (String, String, Option<String>),
     point: [f64; 2],
@@ -107,8 +88,6 @@ pub(crate) struct House {
 }
 
 impl House {
-    /// The house a record is, when it is an address with a street and a
-    /// number.
     fn of(common: &Common, point: [f64; 2]) -> Option<Self> {
         if common.layer != Layer::Address {
             return None;
@@ -139,15 +118,6 @@ impl House {
         })
     }
 
-    /// Whether both are one house, as og's build decides it for the rows
-    /// it imports. Sources place one house apart, at its door, its parcel or
-    /// its building's middle, which on a large building or lot is a few
-    /// hundred metres. So two copies of its street, number and unit within
-    /// [`DISPUTED_HOUSE_RADIUS_M`] are one house, unless they state where
-    /// they are differently. A postcode is written one way, so two that
-    /// differ are two houses. A town has names in several languages, `Wien`
-    /// and `Vienna`, so it tells houses apart only where one states no
-    /// postcode.
     fn is_same(&self, other: &Self) -> bool {
         fn differ(left: Option<&String>, right: Option<&String>) -> bool {
             left.zip(right).is_some_and(|(left, right)| left != right)
@@ -162,7 +132,6 @@ impl House {
                 <= DISPUTED_HOUSE_RADIUS_M
     }
 
-    /// Whether this copy should answer for the house in place of `held`.
     fn outranks(&self, held: &Self) -> bool {
         (self.accuracy, std::cmp::Reverse(self.stated))
             < (held.accuracy, std::cmp::Reverse(held.stated))
@@ -191,8 +160,6 @@ mod tests {
         }
     }
 
-    /// A copy of `42 Heinestraße`, or of the number `address` states, placed
-    /// `east` metres east of the first.
     fn copy(id: &'static str, accuracy: Accuracy, east: f64, address: Address) -> Copy {
         let metres_per_degree = 111_320.0 * 48.218_f64.to_radians().cos();
         Copy {
@@ -251,8 +218,6 @@ mod tests {
         assert_eq!(kept(vec![outline, other, point, bare]), ["point", "other"]);
     }
 
-    /// The point kept for a house names the building its outline copy is
-    /// drawn as, whichever came first.
     #[test]
     fn the_copy_kept_takes_the_building_another_copy_is_drawn_as() {
         let named = || {

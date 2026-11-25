@@ -22,8 +22,6 @@ use crate::{
     search::{AddressGeocodeOptions, TextSearcher},
 };
 
-/// The audit columns' file name in `contract/`, which the contract tests
-/// keep equal to [`audit_columns`].
 pub const AUDIT_COLUMNS_FILE: &str = "batch-audit-columns.txt";
 
 /// A column of the input: by its header name, matched without regard to
@@ -40,14 +38,8 @@ pub struct GeocodeOptions {
     pub pack: Option<PathBuf>,
     pub input: PathBuf,
     pub output: PathBuf,
-    /// Where to write the audit CSV; none is written without one.
     pub audit: Option<PathBuf>,
-    /// Whether the input's first row names its columns. Without one, the
-    /// columns are named `column_1`, `column_2` and so on, and the output
-    /// starts with those names.
     pub header_row: bool,
-    /// Groups of columns, each joined into one query; tried in order until
-    /// one resolves.
     pub address_field_groups: Vec<Vec<Column>>,
     pub locality_field: Option<Column>,
     pub region_field: Option<Column>,
@@ -60,7 +52,6 @@ pub struct GeocodeOptions {
     pub lat_column: String,
     pub lon_column: String,
     pub join: Option<CoordinateJoinOptions>,
-    /// Told about every row as it is geocoded.
     pub observer: Option<Arc<dyn Observer>>,
     /// Set to stop the run: it then fails with [`Cancelled`] and writes
     /// no output.
@@ -107,16 +98,11 @@ impl Default for GeocodeOptions {
     }
 }
 
-/// One geocoded row, as a [`Observer`] is told about it.
 #[derive(Debug)]
 pub struct Row<'a> {
-    /// The row's place in the input, from 0, header excluded.
     pub index: usize,
-    /// The address text searched, or the candidates tried, joined by ` | `.
     pub query: &'a str,
-    /// What the row resolved to.
     pub feature: Option<&'a ForwardFeature>,
-    /// How long the row took to geocode.
     pub elapsed: Duration,
 }
 
@@ -127,7 +113,6 @@ pub trait Observer: Send + Sync {
     fn row(&self, row: &Row);
 }
 
-/// The error a batch run returns when it was asked to stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cancelled;
 
@@ -150,14 +135,10 @@ pub struct CoordinateJoinOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GeocodeReport {
     pub rows: usize,
-    /// Rows given coordinates, the fallbacks among them.
     pub resolved: usize,
-    /// Rows whose address matched nothing, given the finest area they name.
     pub fallback: usize,
 }
 
-/// What the audit CSV appends to an input row: how the row went, then the
-/// columns of the feature it resolved to ([`api::flat_columns`]).
 #[derive(Debug, Clone, Default)]
 struct AuditFields {
     status: String,
@@ -165,7 +146,6 @@ struct AuditFields {
     reason: String,
     lat: String,
     lon: String,
-    /// One value per [`api::flat_columns`] column, empty when unresolved.
     result: Vec<String>,
 }
 
@@ -188,7 +168,6 @@ struct JoinedCoordinate {
     audit_fields: HashMap<String, String>,
 }
 
-/// The input columns a run reads, by place.
 struct Fields {
     groups: Vec<Vec<usize>>,
     locality: Option<usize>,
@@ -197,9 +176,6 @@ struct Fields {
 }
 
 impl Fields {
-    /// The places of the columns `options` names, among `headers`. A column
-    /// the input does not have is an error, not a column that is always
-    /// empty.
     fn resolve(options: &GeocodeOptions, headers: &[String]) -> Result<Self> {
         let lookup = header_lookup(headers);
         let place = |column: &Column| -> Result<usize> {
@@ -233,7 +209,6 @@ impl Fields {
 
 const AUDIT_PREFIX: &str = "geocode_";
 
-/// The columns the audit CSV appends to the input's, in order.
 pub fn audit_columns() -> Vec<String> {
     let mut columns = vec![
         format!("{AUDIT_PREFIX}status"),
@@ -248,15 +223,12 @@ pub fn audit_columns() -> Vec<String> {
     columns
 }
 
-/// [`audit_columns`] one per line, as `contract/` records them.
 pub fn audit_columns_text() -> String {
     let mut text = audit_columns().join("\n");
     text.push('\n');
     text
 }
 
-/// Rows read, geocoded and written per chunk. Chunks keep memory flat for
-/// inputs of any size.
 const BATCH_CHUNK_ROWS: usize = 50_000;
 
 /// Geocode a CSV in streaming chunks. Within a chunk, rows are looked up in
@@ -273,7 +245,6 @@ pub fn run_batch_geocode(options: &GeocodeOptions) -> Result<GeocodeReport> {
         ));
     }
     ensure_distinct_paths(&options.input, &options.output, options.audit.as_deref())?;
-    // A typo that matched no country would read as rows no Pack answers.
     if let Some(code) = options
         .countries
         .iter()
@@ -335,8 +306,6 @@ pub fn run_batch_geocode(options: &GeocodeOptions) -> Result<GeocodeReport> {
         }
     };
 
-    // The output starts as the input does, so a program that reads the
-    // mark as UTF-8 reads both alike.
     let mark = starts_with_byte_order_mark(&options.input)?;
     let mut output = create_csv(&options.output, &output_header, delimiter, mark)?;
     let mut audit = options
@@ -384,9 +353,7 @@ pub fn run_batch_geocode(options: &GeocodeOptions) -> Result<GeocodeReport> {
     Ok(report)
 }
 
-/// Field separators a delimited file may use, most common first.
 const DELIMITERS: [u8; 4] = *b",;\t|";
-/// Bytes read from the start of a file to find its separator.
 const SNIFF_BYTES: usize = 64 << 10;
 
 /// The field separator of a delimited text file: of `,` `;` tab and `|`,
@@ -402,8 +369,6 @@ pub fn detect_delimiter(path: &Path) -> Result<u8> {
         })?
         .take(SNIFF_BYTES as u64)
         .read_to_end(&mut sample)?;
-    // A line cut short by the sample's end would count against every
-    // separator alike; leave it out.
     if sample.len() == SNIFF_BYTES
         && let Some(end) = sample.iter().rposition(|byte| *byte == b'\n')
     {
@@ -412,7 +377,6 @@ pub fn detect_delimiter(path: &Path) -> Result<u8> {
     Ok(delimiter_of(&sample))
 }
 
-/// The field separator of delimited text, as [`detect_delimiter`] finds it.
 pub fn delimiter_of(sample: &[u8]) -> u8 {
     let mut best = (b',', 0);
     for delimiter in DELIMITERS {
@@ -437,8 +401,6 @@ pub fn delimiter_of(sample: &[u8]) -> u8 {
     best.0
 }
 
-/// A reader of a delimited file, every row as data, quirks tolerated:
-/// rows of different widths, and bytes that are not UTF-8.
 pub fn open_delimited(path: &Path, delimiter: u8) -> Result<csv::Reader<File>> {
     ReaderBuilder::new()
         .flexible(true)
@@ -448,10 +410,8 @@ pub fn open_delimited(path: &Path, delimiter: u8) -> Result<csv::Reader<File>> {
         .map_err(Error::from)
 }
 
-/// The byte order mark some files start with. Reading leaves it out.
 const BYTE_ORDER_MARK: &[u8] = "\u{feff}".as_bytes();
 
-/// Whether a file starts with [`BYTE_ORDER_MARK`].
 fn starts_with_byte_order_mark(path: &Path) -> Result<bool> {
     let mut start = Vec::with_capacity(BYTE_ORDER_MARK.len());
     File::open(path)
@@ -471,13 +431,10 @@ pub fn text(cell: &[u8]) -> Cow<'_, str> {
     String::from_utf8_lossy(cell)
 }
 
-/// A row's cells as [`text`].
 pub fn cells(record: &ByteRecord) -> Vec<String> {
     record.iter().map(|cell| text(cell).into_owned()).collect()
 }
 
-/// Names for the columns of a CSV without a header row: `column_1`,
-/// `column_2` and so on, as many as the widest of its first rows has.
 pub fn unnamed_columns(path: &Path) -> Result<Vec<String>> {
     let width = open_delimited(path, detect_delimiter(path)?)?
         .byte_records()
@@ -584,7 +541,6 @@ where
     Ok(results.into_iter().map(|(_, result)| result).collect())
 }
 
-/// Group key: rows in the same postcode and place are geocoded together.
 fn locality_key(row: &ByteRecord, fields: &Fields) -> [String; 4] {
     let field = |index: Option<usize>| {
         field_value(row, index)
@@ -604,7 +560,6 @@ fn locality_key(row: &ByteRecord, fields: &Fields) -> [String; 4] {
     ]
 }
 
-/// `--address-fields` values: each a comma-separated group of column names.
 pub fn parse_field_groups(values: &[String]) -> Result<Vec<Vec<Column>>> {
     values
         .iter()
@@ -637,8 +592,6 @@ fn geocode_row(
     let postcode = field_value(row, fields.postcode);
 
     let mut tried_queries = Vec::new();
-    // The first area a group falls back to answers only when no group
-    // matches the address itself.
     let mut fallback = None;
     for group in &fields.groups {
         let Some(address) = compose_query(row, group) else {
@@ -754,8 +707,6 @@ fn create_csv(
     })
 }
 
-/// A CSV written beside its destination and moved into place only once it is
-/// complete, so a failed run never leaves a truncated file behind.
 struct PendingCsv {
     writer: csv::Writer<File>,
     temporary: PathBuf,
@@ -788,8 +739,6 @@ impl Drop for PendingCsv {
     }
 }
 
-/// Refuse output paths that name the input or each other, however they are
-/// spelled.
 fn ensure_distinct_paths(input: &Path, output: &Path, audit: Option<&Path>) -> Result<()> {
     let resolve = |path: &Path| -> Result<PathBuf> {
         if path.exists() {
@@ -913,8 +862,6 @@ fn ensure_coordinate_columns(
     })
 }
 
-/// An input row as the output writes it: its own cells, as many as the
-/// output has columns, with the coordinates written in when it resolved.
 fn output_record(
     row: &ByteRecord,
     width: usize,
@@ -932,14 +879,12 @@ fn output_record(
     record
 }
 
-/// The text of a cell, trimmed, or `None` when there is none.
 fn field_value(row: &ByteRecord, index: Option<usize>) -> Option<String> {
     let value = text(row.get(index?)?);
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
 }
 
-/// The cells of `columns` with their whitespace collapsed, joined by `, `.
 fn compose_query(row: &ByteRecord, columns: &[usize]) -> Option<String> {
     let parts = columns
         .iter()
@@ -954,8 +899,6 @@ fn compose_query(row: &ByteRecord, columns: &[usize]) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-/// An input row as the audit writes it: its own cells, as many as the input
-/// has columns, then the audit's.
 fn audit_record(width: usize, row: &ByteRecord, audit: &AuditFields) -> ByteRecord {
     let mut record = output_record(row, width, None);
     record.push_field(audit.status.as_bytes());
@@ -974,8 +917,6 @@ fn column_values(feature: Option<&api::ForwardFeature>) -> Vec<String> {
         .collect()
 }
 
-/// A joined row's audit: the joined file's own audit columns where it has
-/// them (it may be an earlier run's audit CSV), and its coordinates.
 fn audit_from_joined(joined: &JoinedCoordinate) -> AuditFields {
     let column = |name: &str| {
         joined
@@ -1012,8 +953,6 @@ fn format_coordinate(value: f64) -> String {
 mod tests {
     use super::*;
 
-    /// Every item runs once, and the results come back in input order
-    /// whatever order the items ran in.
     #[test]
     fn engine_answers_every_item_once_in_input_order() {
         let items = ["b2", "a1", "b1", "a2"];
@@ -1184,9 +1123,6 @@ mod tests {
         assert!(matches!(error, Error::Cancelled));
         assert!(!root.join("stopped.csv").exists());
 
-        // A file as offices export it: a byte order mark, semicolons, a
-        // Latin-1 byte, a short row. It is read as it is and written back
-        // with its own separator and its own bytes.
         let messy = root.join("messy.csv");
         let mut bytes = b"\xef\xbb\xbfID;STRASSE;ORT\n".to_vec();
         bytes.extend_from_slice(b"1;20 Queen St;Z\xfcrich\n2;10 King Street\n");
@@ -1268,7 +1204,6 @@ a,43.6,-79.4
             }),
             ..GeocodeOptions::default()
         };
-        // The same file spelled differently must be caught too.
         let same = root.join(".").join("in.csv");
         for (output, audit) in [
             (same.clone(), root.join("audit.csv")),

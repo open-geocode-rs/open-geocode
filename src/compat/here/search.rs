@@ -1,7 +1,3 @@
-//! Geocoding and Search v7: `/v1/geocode`, `/v1/revgeocode`,
-//! `/v1/multi-revgeocode`, `/v1/autosuggest`, `/v1/autocomplete`,
-//! `/v1/discover`, `/v1/browse` and `/v1/lookup`.
-
 use axum::{
     body::Bytes,
     extract::{OriginalUri, RawQuery, State},
@@ -28,7 +24,6 @@ use super::{
     media_type, respond,
 };
 
-/// The most suggestions og's `/autocomplete` gives in one answer.
 const MAX_AUTOCOMPLETE_LIMIT: usize = 20;
 
 const GEOCODE_TYPES: [&str; 7] = [
@@ -55,7 +50,6 @@ pub(super) struct Items {
     pub(super) items: Vec<Item>,
 }
 
-/// An autosuggest or discover answer, paged when the request set `offset`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Page {
@@ -146,7 +140,6 @@ impl Qualified {
         Ok(qualified)
     }
 
-    /// Each field given, by HERE's name of it.
     fn fields(&self) -> impl Iterator<Item = (&'static str, &str)> {
         [
             ("country", &self.country),
@@ -162,8 +155,6 @@ impl Qualified {
         .filter_map(|(name, value)| value.as_deref().map(|value| (name, value)))
     }
 
-    /// The country as an og filter, when it is given as a code. A country
-    /// given by name is searched as text instead.
     fn country_code(&self) -> Option<&'static str> {
         let country = self.country.as_deref()?.trim();
         match country.len() {
@@ -174,7 +165,6 @@ impl Qualified {
     }
 }
 
-/// A forward geocode as HERE asks it, free text, qualified or both.
 #[derive(Debug, Default)]
 pub(super) struct Geocode {
     pub(super) q: Option<String>,
@@ -193,12 +183,6 @@ impl Geocode {
                 .is_some_and(|code| !self.countries.contains(&code))
     }
 
-    /// og's `/geocode` parameters, or `None` when nothing is asked, with blank
-    /// text and no qualified part.
-    ///
-    /// A street with no free text is og's structured geocode, the address
-    /// fields apart. Anything else is one text. og's structured form has no
-    /// field for a district or a county, and text loses none of them.
     pub(super) fn og_fields(&self) -> Option<Vec<(&'static str, String)>> {
         let qq = &self.qualified;
         let q = self.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
@@ -308,8 +292,6 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
         qualified,
         countries,
         at,
-        // A `types` filter drops some of what og finds, so og is asked for
-        // all it may give.
         limit: if types.is_some() {
             MAX_SEARCH_LIMIT
         } else if params
@@ -375,9 +357,6 @@ async fn geocode_answer(state: &AppState, query: Option<&str>) -> Result<Items, 
     Ok(Items { items })
 }
 
-/// How og reads `q`, each run of words of one label a part, by HERE's name
-/// of the part, and each `qq` field a part of its own, where it stands in
-/// the field. A word og reads as none of these is left out.
 fn parsing(state: &AppState, q: Option<&str>, qualified: &Qualified) -> Parsing {
     use crate::parse::types::Label;
     let mut parsing = Parsing::new();
@@ -441,8 +420,6 @@ fn parsing(state: &AppState, q: Option<&str>, qualified: &Qualified) -> Parsing 
     parsing
 }
 
-// A uniquely identified house can correct the stated postcode when the
-// alternative is falling back to its street.
 fn prefer_postcode_correction(collection: &mut ForwardCollection) {
     if !collection.features.first().is_some_and(|first| {
         first.properties.common.layer == Layer::Street
@@ -487,25 +464,17 @@ fn prefer_postcode_correction(collection: &mut ForwardCollection) {
     }
 }
 
-/// A reverse geocode as HERE asks it.
 #[derive(Debug)]
 pub(super) struct Reverse {
     pub(super) center: LatLng,
-    /// `in=circle`'s radius, a hard filter on the distance.
     pub(super) radius_m: Option<f64>,
-    /// og's layers when HERE's `types` or `bearing` asks for kinds og keeps
-    /// apart. Empty for an answer of any kind.
     pub(super) layers: &'static [&'static str],
     pub(super) types: Option<Vec<String>>,
     pub(super) limit: usize,
-    /// og's `lang`, from HERE's `lang`.
     pub(super) lang: Option<String>,
-    /// Whether `show=tz` asks for each item's time zone.
     pub(super) time_zone: bool,
 }
 
-/// Whether `show` asks for `value`, one of the enrichments HERE adds to
-/// each item only when asked.
 pub(super) fn shows(params: &Params, value: &str) -> bool {
     params
         .get("show")
@@ -520,7 +489,6 @@ pub(super) fn og_lang(params: &Params) -> Option<String> {
     first_language(params.get("lang")?)
 }
 
-/// The first code of a HERE `lang` list.
 pub(super) fn first_language(list: &str) -> Option<String> {
     list.split(',')
         .map(str::trim)
@@ -544,14 +512,11 @@ impl Reverse {
                 "With 'bearing', the only accepted value is 'street'",
             ));
         }
-        // og has no heading to match, but HERE's bearing answers streets
-        // only, and that og can do.
         let layers: &'static [&'static str] = match (bearing, types.as_deref()) {
             (Some(_), _) => &["street"],
             (None, Some([kind])) => match kind.as_str() {
                 "street" => &["street"],
                 "houseNumber" => &["address"],
-                // HERE's address results are houses and streets.
                 "address" => &["address", "street"],
                 "place" => &["poi"],
                 "city" => &["locality"],
@@ -574,8 +539,6 @@ impl Reverse {
         })
     }
 
-    /// og's reverse parameters, for the nearest of `layer` or, with none,
-    /// for the point's answer.
     pub(super) fn og_fields(&self, layer: Option<&str>) -> Vec<(&'static str, String)> {
         let mut fields = vec![
             ("lon", self.center.lng.to_string()),
@@ -590,7 +553,6 @@ impl Reverse {
         ];
         if let Some(layer) = layer {
             fields.push(("layer", layer.to_string()));
-            // og answers the nearest of one kind as many times as asked.
             fields.push(("limit", self.limit.to_string()));
         }
         if let Some(lang) = &self.lang {
@@ -600,8 +562,6 @@ impl Reverse {
     }
 }
 
-/// og's reverse answer as HERE's items. An area og finds the point in has
-/// no distance; it lies at the point, inside any circle.
 pub(super) fn reverse_items(
     features: &[Feature],
     radius_m: Option<f64>,
@@ -627,7 +587,6 @@ pub(super) fn reverse_items(
         .collect()
 }
 
-/// The point to reverse geocode, from exactly one of `at` or `in=circle`.
 fn location(at: Option<&str>, area: Option<&str>) -> Result<(LatLng, Option<f64>), Gs7Error> {
     match (at, area) {
         (Some(at), None) => Ok((LatLng::parse("at", at)?, None)),
@@ -665,7 +624,6 @@ pub(super) async fn revgeocode(
     respond(&request_id, answer.await.map(|items| Items { items }))
 }
 
-/// The answer of each og layer HERE's types ask for, nearest first.
 async fn reverse_lookup(state: &AppState, request: &Reverse) -> Result<Vec<Item>, Gs7Error> {
     let mut features = Vec::new();
     if request.layers.is_empty() {
@@ -692,7 +650,6 @@ async fn reverse_lookup(state: &AppState, request: &Reverse) -> Result<Vec<Item>
     ))
 }
 
-/// One answer of a multi reverse geocode, its items or why it has none.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum MultiResult {
@@ -710,7 +667,6 @@ struct MultiError {
     title: String,
 }
 
-/// Sub-requests one call may carry.
 const MAX_MULTI: usize = 100;
 
 pub(super) async fn multi_revgeocode(
@@ -803,8 +759,6 @@ fn sub_request_id(params: &Params, line: &str) -> Result<String, Gs7Error> {
     }
 }
 
-/// Where autosuggest and discover search, from `at`, `in=circle` or
-/// `in=bbox`, and `in=countryCode` beside `at`.
 #[derive(Debug, Default)]
 struct Near {
     center: Option<LatLng>,
@@ -839,8 +793,6 @@ impl Near {
             }
             Some(Area::Circle { center, radius_m }) => {
                 near.center = Some(*center);
-                // The circle's bounding box narrows og's search; the
-                // distance check on the answer makes it the circle.
                 near.fields.push(("bbox", circle_bbox(*center, *radius_m)));
             }
             Some(Area::Bbox([west, south, east, north])) => {
@@ -889,8 +841,6 @@ fn missing_location() -> Gs7Error {
     .action("Provide one of 'at', 'in=circle' or 'in=bbox'; 'in=countryCode' needs 'at' beside it")
 }
 
-/// The box around a circle, in og's `min_lon,min_lat,max_lon,max_lat`,
-/// clamped to the globe. og's box cannot cross the antimeridian.
 fn circle_bbox(center: LatLng, radius_m: f64) -> String {
     let angular = radius_m / EARTH_RADIUS_M;
     let lat_span = angular.to_degrees();
@@ -914,8 +864,6 @@ fn circle_bbox(center: LatLng, radius_m: f64) -> String {
     format!("{min_lon},{min_lat},{max_lon},{max_lat}")
 }
 
-/// `offset` paging over what og answered. Answers the page, and the paging
-/// fields HERE sends only when `offset` was asked.
 fn page(items: Vec<Item>, offset: Option<usize>, limit: usize, query_terms: bool) -> Page {
     let start = offset.unwrap_or(0);
     let total = items.len();
@@ -937,10 +885,6 @@ fn page(items: Vec<Item>, offset: Option<usize>, limit: usize, query_terms: bool
     }
 }
 
-/// How many results og is asked for. That is a page past `offset`, and one
-/// more to tell whether another page follows, up to the most og gives to one
-/// query. A page past those is cut short or empty, as HERE answers a page
-/// past the results it has.
 fn fetch(offset: Option<usize>, limit: usize, max: usize) -> usize {
     match offset {
         Some(offset) => offset + limit + 1,
@@ -953,7 +897,6 @@ fn fetch(offset: Option<usize>, limit: usize, max: usize) -> usize {
 /// when `route` names no width.
 const MAX_ROUTE_WIDTH_M: u32 = 50_000;
 const DEFAULT_ROUTE_WIDTH_M: u32 = 1_000;
-/// The most points a route may have.
 const MAX_ROUTE_POINTS: usize = 2_000;
 
 /// `route`, a flexible polyline to search along with an optional width,
@@ -1006,7 +949,6 @@ fn corridor(params: &Params, body: &Bytes) -> Result<Option<Corridor>, Gs7Error>
         .ok_or_else(|| illegal("A route must hold at least two points"))
 }
 
-/// og's fields that narrow a search to the box around a route.
 fn route_fields(corridor: Option<&Corridor>) -> Option<(&'static str, String)> {
     corridor.map(|corridor| {
         let [west, south, east, north] = corridor.bbox();
@@ -1086,10 +1028,6 @@ pub(super) async fn autosuggest(
     respond(&request_id, answer.await)
 }
 
-/// The searches HERE offers ahead of the places: a `categoryQuery` for each
-/// category whose name the typed word begins, in the language asked, and a
-/// `chainQuery` for a chain the query names whole, whose name is its own in
-/// every language. Each runs as og's own `/discover`.
 fn query_items(
     state: &AppState,
     headers: &HeaderMap,
@@ -1166,9 +1104,6 @@ pub(super) async fn autocomplete(
         if q.trim().is_empty() {
             return Ok(Items { items: Vec::new() });
         }
-        // og suggests places and addresses in one list; HERE's autocomplete
-        // is addresses alone, so og is asked for all it gives and the places
-        // are dropped.
         let mut fields = vec![
             ("q", q.to_string()),
             ("limit", MAX_AUTOCOMPLETE_LIMIT.to_string()),
@@ -1236,8 +1171,6 @@ pub(super) async fn discover(
                 .collect();
             return Ok(page(along(items, corridor.as_ref()), offset, limit, false));
         }
-        // Along a route og is asked for all it gives, since the corridor
-        // drops what lies off it.
         let ask = match corridor {
             Some(_) => MAX_SEARCH_LIMIT,
             None => fetch(offset, limit, MAX_SEARCH_LIMIT),
@@ -1264,14 +1197,6 @@ pub(super) async fn discover(
     respond(&request_id, answer.await)
 }
 
-/// Places around a point, by kind and by name (HERE Browse)
-///
-/// The answer is the places around `at`, nearest first, as far as og looks
-/// around a point. `in=circle` searches that circle instead, and `in=bbox`
-/// that box. `categories` keeps the kinds og has under a HERE id, and `name`
-/// the places whose name holds its words, and `foodTypes` the places
-/// serving them. og's places carry no HERE chain, so asking for one keeps
-/// none. `route` keeps the places along it.
 pub(super) async fn browse(
     State(state): State<AppState>,
     Rid(request_id): Rid,
@@ -1290,8 +1215,6 @@ pub(super) async fn browse(
         let offset = params.int("offset", 0, 99)?;
         let filter = Filter::parse(params.get("categories"))?;
         let name = params.get("name").and_then(search_key);
-        // og's places carry no HERE chain, so a list that keeps only places
-        // of some keeps none og holds. One that only excludes keeps them all.
         if !Listed::parse(params.get("chains")).included.is_empty() {
             return Ok(page(Vec::new(), offset, limit, false));
         }
@@ -1300,8 +1223,6 @@ pub(super) async fn browse(
         if categories.is_empty() {
             return Ok(page(Vec::new(), offset, limit, false));
         }
-        // What the filters drop comes out of og's answer, so og is asked for
-        // all one search gives.
         let mut fields = vec![("limit", MAX_SEARCH_LIMIT.to_string())];
         match area {
             Some(Area::Countries(countries)) => {
@@ -1317,8 +1238,6 @@ pub(super) async fn browse(
             }
             None => fields.push(("focus", at.og_point())),
         }
-        // Along a route the corridor's box is searched in place of the
-        // circle around `at`.
         if let Some(field) = route_fields(corridor.as_ref()) {
             fields.retain(|(name, _)| *name != "radius");
             fields.push(field);
@@ -1348,8 +1267,6 @@ pub(super) async fn browse(
             })
             .collect::<Vec<_>>();
         items = along(items, corridor.as_ref());
-        // A circle or a box is searched from its own middle, and Browse ranks
-        // by the distance from `at`, or along a route.
         items.sort_by_key(|item| item.distance);
         Ok(page(items, offset, limit, false))
     };

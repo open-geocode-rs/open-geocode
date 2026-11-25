@@ -1,11 +1,3 @@
-//! The tagged-address TSV format every gold file and stored prediction
-//! uses: libpostal's training layout, `lang<TAB>country<TAB>fields`, with the
-//! fields separated by single spaces. A field is `token/label`, the token
-//! normalized as the text index normalizes it and the label one of og's eight
-//! names, or a lone `,` marking where the source separated two parts of the
-//! address. A normalized token never holds `,`, `/` or whitespace, so the
-//! format needs no escaping.
-
 use std::{
     fmt::Write as _,
     fs,
@@ -19,11 +11,8 @@ use crate::{
     util::fold::search_key,
 };
 
-/// The field that marks a part boundary.
 pub const SEPARATOR: &str = ",";
 
-/// One tagged address: its tokens in order, and where the source separated
-/// its parts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaggedRow {
     pub lang: String,
@@ -35,8 +24,6 @@ pub struct TaggedRow {
 }
 
 impl TaggedRow {
-    /// The query a parser is given: the tokens joined by spaces, with a comma
-    /// closing each part but the last ("30 w 26th st, new york").
     pub fn query(&self) -> String {
         let mut query = String::new();
         for (index, tagged) in self.tokens.iter().enumerate() {
@@ -55,7 +42,6 @@ impl TaggedRow {
         self.tokens.iter().map(|tagged| tagged.label).collect()
     }
 
-    /// The row with the same tokens and part boundaries and other labels.
     pub fn relabelled(&self, labels: &[Label]) -> Self {
         Self {
             tokens: self
@@ -136,7 +122,6 @@ impl TaggedRow {
     }
 }
 
-/// A fixture file's rows.
 pub fn read_rows(path: &Path) -> Result<Vec<TaggedRow>> {
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -153,16 +138,10 @@ pub fn write_rows(path: &Path, rows: &[TaggedRow]) -> Result<()> {
     write_lines(path, rows.iter().map(TaggedRow::to_line))
 }
 
-/// The fields column of a stored prediction for a row the baseline failed
-/// on. A normalized token never holds `!`, so it is never a real row.
 pub const FAILED: &str = "!failed";
 
-/// A stored baseline prediction for one gold row: the gold tokens with the
-/// baseline's labels, or `None` when the baseline failed on the row, which
-/// scores as wrong on every token.
 pub type Prediction = Option<TaggedRow>;
 
-/// A prediction file's rows, one per gold row.
 pub fn read_predictions(path: &Path) -> Result<Vec<Prediction>> {
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -180,8 +159,6 @@ pub fn read_predictions(path: &Path) -> Result<Vec<Prediction>> {
         .collect()
 }
 
-/// Store a baseline's predictions for `gold`, row for row; a failed row keeps
-/// its gold row's language and country.
 pub fn write_predictions(path: &Path, gold: &[TaggedRow], predicted: &[Prediction]) -> Result<()> {
     ensure!(
         gold.len() == predicted.len(),
@@ -213,17 +190,12 @@ fn write_lines(path: &Path, lines: impl Iterator<Item = String>) -> Result<()> {
     fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
 }
 
-/// One country's gold file, `<dir>/<cc>.tsv`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CountryFile {
-    /// The lowercase country code, the file's stem.
     pub country: String,
     pub path: PathBuf,
 }
 
-/// The gold files of a gold directory, sorted by country: every `<cc>.tsv`
-/// in it, or only those of `countries` when it is not empty, each of which
-/// must exist.
 pub fn country_files(dir: &Path, countries: &[String]) -> Result<Vec<CountryFile>> {
     ensure!(dir.is_dir(), "{} is not a directory", dir.display());
     let mut files = Vec::new();

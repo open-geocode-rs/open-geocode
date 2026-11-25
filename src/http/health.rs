@@ -1,9 +1,3 @@
-//! Health endpoints (ADR 0017 Decision 28).
-//!
-//! `/healthz` answers "the process is alive"; `/readyz` answers "the Pack is
-//! loaded and the Runtime can serve geocoding traffic". Both return empty bodies
-//! so they cannot leak filesystem paths, Pack internals, or diagnostics.
-
 use axum::{extract::State, http::StatusCode};
 
 use crate::runtime::AppState;

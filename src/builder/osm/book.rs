@@ -1,11 +1,3 @@
-//! Items written once, in order, and read back by their position.
-//!
-//! The addresses are written here once they are in street order, and every
-//! sort after that carries their position instead of the address. Items
-//! are stored in chunks, so the file's index costs a few bytes a chunk
-//! rather than a position per item, and an item may be written as what it
-//! adds to the one before it.
-
 use std::sync::Arc;
 
 use crate::{
@@ -14,14 +6,9 @@ use crate::{
     util::codec::{get_u64, put_u64},
 };
 
-/// Items per chunk. A read decodes a whole chunk, and the records that
-/// point at a book come one street at a time, so a chunk holds about a
-/// street's addresses.
 const CHUNK_ITEMS: usize = 64;
 
-/// An item of a book: by default encoded on its own.
 pub(crate) trait Entry: Spill {
-    /// Its encoding after `previous`, the item before it in its chunk.
     fn encode_following(&self, previous: Option<&Self>, out: &mut Vec<u8>) {
         let _ = previous;
         self.encode(out);
@@ -59,7 +46,6 @@ impl<T: Entry> Spill for Chunk<T> {
     }
 }
 
-/// A book being written.
 pub(crate) struct Book<T> {
     spool: IndexedSpool<Chunk<T>>,
     chunk: Vec<T>,
@@ -79,7 +65,6 @@ impl<T: Entry> Book<T> {
         self.len
     }
 
-    /// Write `item`, returning its position.
     pub(crate) fn push(&mut self, item: T) -> Result<u64> {
         self.chunk.push(item);
         self.len += 1;
@@ -99,23 +84,19 @@ impl<T: Entry> Book<T> {
     }
 }
 
-/// A book closed for reading. The file is removed once it is dropped.
 pub(crate) struct BookFile<T> {
     file: IndexedSpoolFile<Chunk<T>>,
 }
 
 impl<T> BookFile<T> {
-    /// The book as a checkpoint names it.
     pub(crate) fn state(&mut self, scratch: &Arc<Scratch>) -> Result<IndexedState> {
         self.file.state(scratch)
     }
 
-    /// The files a checkpoint names for it.
     pub(crate) fn files(&self) -> Vec<std::path::PathBuf> {
         self.file.files()
     }
 
-    /// The book a checkpoint named.
     pub(crate) fn restore(scratch: &Arc<Scratch>, state: &IndexedState) -> Result<Self> {
         Ok(Self {
             file: IndexedSpoolFile::restore(scratch, state)?,
@@ -124,13 +105,10 @@ impl<T> BookFile<T> {
 }
 
 impl<T: Entry> BookFile<T> {
-    /// The chunk that holds position `at`.
     pub(crate) fn chunk_of(at: u64) -> usize {
         (at / CHUNK_ITEMS as u64) as usize
     }
 
-    /// Every item of chunk `index`, the first at position
-    /// `index * CHUNK_ITEMS`.
     pub(crate) fn chunk(&self, index: usize) -> Result<Vec<T>> {
         if index >= self.file.len() {
             return Err(Error::Decode("book position is past its end"));
@@ -138,14 +116,12 @@ impl<T: Entry> BookFile<T> {
         Ok(self.file.get(index)?.0)
     }
 
-    /// The item at `at` among the items of its chunk.
     pub(crate) fn pick(items: &[T], at: u64) -> Result<&T> {
         items
             .get((at % CHUNK_ITEMS as u64) as usize)
             .ok_or(Error::Decode("book position is past its chunk"))
     }
 
-    /// Every item, in the order they were written.
     pub(crate) fn items(&self) -> impl Iterator<Item = Result<T>> + '_ {
         (0..self.file.len()).flat_map(move |index| match self.chunk(index) {
             Ok(items) => items.into_iter().map(Ok).collect::<Vec<_>>(),
@@ -178,7 +154,6 @@ mod tests {
         }
     }
 
-    /// Each written as its difference from the one before.
     impl Entry for Number {
         fn encode_following(&self, previous: Option<&Self>, out: &mut Vec<u8>) {
             put_u64(out, self.0 - previous.map_or(0, |previous| previous.0));

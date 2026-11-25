@@ -1,16 +1,3 @@
-//! What a build reports while it runs, and how it is stopped.
-//!
-//! The builder names each stage as it starts, says how much work the stage
-//! has when that is known, and counts the work as it is done. A
-//! [`BuildObserver`] turns that into whatever its caller shows: bars on a
-//! terminal, lines in a log, or the screens of the interactive interface.
-//!
-//! A [`Meter`] measures what each stage costs: wall and CPU time, bytes read
-//! from each input, scratch written and read by owner, and the peaks of
-//! scratch, RAM and the memory budget. From the shares of time each
-//! resource was busy it names the one that bound the stage ([`Bound`]),
-//! live every second and in the build report at the end.
-
 use std::{
     collections::BTreeMap,
     fmt,
@@ -32,49 +19,28 @@ use crate::{
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
-/// How often a running stage is measured for live progress.
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 
-/// The stages of a build, in the order they run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuildStage {
-    /// Pass 1: classify every OSM object. Measured in bytes of the input.
     Scan,
-    /// Pass 2: read the ways boundary relations are made of. Measured in
-    /// blocks of the input.
     BoundaryMembers,
-    /// Pass 3: store the coordinates of the nodes ways need. Measured in
-    /// blocks of the input.
     NodeJoin,
-    /// Pass 4: read the kept ways again and turn them into records. Measured
-    /// in blocks of the input.
     AssembleWays,
-    /// Build the admin boundary polygons. No measure.
     Boundaries,
-    /// Read address files from outside OSM, such as OpenAddresses, fetching
-    /// them first when the source downloads. Measured in bytes of the files.
     ImportAddresses,
-    /// Write places and boundaries. Measured in records.
     ContextRecords,
-    /// Write addresses, POIs, interpolations, streets and postcodes. Measured
-    /// in records.
     Records,
-    /// Finish the text and spatial indexes and write the Pack file. No
-    /// measure.
     Indexes,
-    /// Train the address parser on the Pack. No measure.
     Parser,
-    /// Key the Pack's streets and places for the structured index. No measure.
     StructuredIndex,
 }
 
-/// What a stage's work is counted in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageUnit {
     Bytes,
     Blocks,
     Records,
-    /// The stage has no measure: only its time is known.
     None,
 }
 
@@ -93,7 +59,6 @@ impl BuildStage {
         BuildStage::StructuredIndex,
     ];
 
-    /// What the stage's work is counted in, as the build report names it.
     pub const fn unit_name(self) -> &'static str {
         match self.unit() {
             StageUnit::Bytes => "bytes",
@@ -114,7 +79,6 @@ impl BuildStage {
         }
     }
 
-    /// One line naming the stage, for logs and terminal bars.
     pub const fn description(self) -> &'static str {
         match self {
             Self::Scan => "scan OSM objects",
@@ -131,7 +95,6 @@ impl BuildStage {
         }
     }
 
-    /// The stage's place in the build, from 1.
     pub fn number(self) -> usize {
         Self::ALL
             .iter()
@@ -144,48 +107,35 @@ impl BuildStage {
 /// is started, advanced any number of times, then finished, and stages never
 /// overlap. A stage the input does not need is started and finished at once.
 pub trait BuildObserver: Send + Sync {
-    /// A stage starts. `total` is its work in the stage's unit when known up
-    /// front.
     fn started(&self, stage: BuildStage, total: Option<u64>);
-    /// `units` more of the running stage's work is done.
     fn advanced(&self, units: u64);
     fn finished(&self, stage: BuildStage);
-    /// Something the build should be told about but goes on despite, such
-    /// as the pre-flight check finding memory or disk short of what it needs.
     fn warned(&self, message: &str);
     /// What the running stage costs so far, about every second while it
     /// runs and once when it ends.
     fn measured(&self, live: &LiveStage) {
         let _ = live;
     }
-    /// The build goes on from the checkpoint a stopped one left, before
-    /// any stage starts.
     fn resumed(&self, resume: &ResumeReport) {
         let _ = resume;
     }
 }
 
-/// The running stage's throughput and what bounds it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveStage {
     pub stage: BuildStage,
     pub elapsed: Duration,
     pub threads: usize,
-    /// The stage's work per second, in its unit.
     pub units_per_sec: f64,
-    /// Input bytes read per second.
     pub input_bytes_per_sec: f64,
-    /// Scratch bytes written per second, as on disk.
     pub scratch_bytes_per_sec: f64,
     pub live_scratch_bytes: u64,
     pub shares: BoundShares,
     pub bound: Bound,
-    /// The stage has ended: this is its final measure.
     pub finished: bool,
 }
 
 impl LiveStage {
-    /// One line for a log or a progress bar.
     pub fn summary(&self) -> String {
         let mut parts = vec![format!("{:.1}/{} cores", self.shares.cores, self.threads)];
         if self.input_bytes_per_sec > 0.0 {
@@ -206,7 +156,6 @@ impl LiveStage {
     }
 }
 
-/// The error a build returns when it was asked to stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildCancelled;
 
@@ -218,8 +167,6 @@ impl fmt::Display for BuildCancelled {
 
 impl std::error::Error for BuildCancelled {}
 
-/// The observer and the stop flag, as the passes of a build share them,
-/// and the meter that measures each stage.
 #[derive(Clone)]
 pub(crate) struct Progress {
     observer: Arc<dyn BuildObserver>,
@@ -236,8 +183,6 @@ impl Progress {
         }
     }
 
-    /// Measure each stage against `scratch` and `budget`, sampling the
-    /// running one every second for the observer.
     pub(crate) fn metered(mut self, scratch: &Arc<Scratch>, budget: &Arc<Budget>) -> Self {
         let meter = Arc::new(Meter {
             scratch: Arc::clone(scratch),
@@ -256,7 +201,6 @@ impl Progress {
         self
     }
 
-    /// Starts a stage, unless the build was asked to stop.
     pub(crate) fn start(&self, stage: BuildStage, total: Option<u64>) -> Result<()> {
         self.check()?;
         if let Some(meter) = &self.meter {
@@ -283,7 +227,6 @@ impl Progress {
         self.observer.finished(stage);
     }
 
-    /// The counter of what is read from `input`.
     pub(crate) fn input(&self, input: &Path) -> Arc<InputCounter> {
         match &self.meter {
             Some(meter) => meter.input(input),
@@ -291,14 +234,12 @@ impl Progress {
         }
     }
 
-    /// What every finished stage cost, in order.
     pub(crate) fn stages(&self) -> Vec<StageReport> {
         self.meter.as_ref().map_or_else(Vec::new, |meter| {
             meter.stages.lock().expect("stages lock").clone()
         })
     }
 
-    /// Fails with [`BuildCancelled`] once the build was asked to stop.
     pub(crate) fn check(&self) -> Result<()> {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(BuildCancelled.into());
@@ -307,7 +248,6 @@ impl Progress {
     }
 }
 
-/// Bytes read from one input and the time spent reading them.
 #[derive(Debug, Default)]
 pub(crate) struct InputCounter {
     bytes: AtomicU64,
@@ -331,7 +271,6 @@ impl InputCounter {
     }
 }
 
-/// Measures what each stage of a build costs.
 pub(crate) struct Meter {
     scratch: Arc<Scratch>,
     budget: Arc<Budget>,
@@ -343,13 +282,11 @@ pub(crate) struct Meter {
     peak_rss: AtomicU64,
 }
 
-/// The counters when a stage started.
 #[derive(Debug, Clone)]
 struct Snapshot {
     stage: BuildStage,
     started: Instant,
     cpu: Duration,
-    /// The thread that started the stage, and its CPU time then.
     driver: Option<(Arc<resources::ThreadClock>, Duration)>,
     inputs: BTreeMap<String, InputRead>,
     traffic: BTreeMap<String, Traffic>,
@@ -404,7 +341,6 @@ impl Meter {
         *self.running.lock().expect("running lock") = Some(start);
     }
 
-    /// The running stage's report so far, and its live view.
     fn report(&self, start: &Snapshot) -> (StageReport, LiveStage) {
         let now = self.snapshot(start.stage);
         self.peak_rss
@@ -511,8 +447,6 @@ impl Meter {
     }
 }
 
-/// Every [`SAMPLE_EVERY`], tell `observer` what the running stage costs so
-/// far, until the meter is dropped.
 fn sample(meter: &Weak<Meter>, observer: &dyn BuildObserver) {
     loop {
         std::thread::sleep(SAMPLE_EVERY);
@@ -525,9 +459,6 @@ fn sample(meter: &Weak<Meter>, observer: &dyn BuildObserver) {
     }
 }
 
-/// Draws one bar per stage on stderr when it is a terminal, and writes a
-/// line per stage with the time since the build began when it is not, so a
-/// build run from a script or a service logs where its time goes.
 #[derive(Debug)]
 pub struct TerminalObserver {
     started: Instant,

@@ -1,21 +1,13 @@
-//! Answers lie inside the places the query names: its country always, and
-//! its postcode and town whenever any candidate does, as the structured index's
-//! places hold them. The rule is the same in both lanes.
-
 use super::*;
 
-/// One place the query names, as the structured index's places of its words.
 #[derive(Debug)]
 struct NamedGroup {
     label: Label,
     places: Vec<Place>,
 }
 
-/// The places a query names that agree with each other (see
-/// [`TextSearcher::named_places`]).
 #[derive(Debug, Default)]
 pub(super) struct NamedPlaces {
-    /// The one country the named places agree on most, when one does.
     country: Option<String>,
     groups: Vec<NamedGroup>,
 }
@@ -29,8 +21,6 @@ impl NamedPlaces {
         self.groups.iter().any(|group| group.label == label)
     }
 
-    /// Whether `point` in `country` (unknown when `None`) lies in the named
-    /// country and in a place of each group `level` keeps.
     fn holds(
         &self,
         structured: &StructuredIndex,
@@ -57,12 +47,6 @@ impl NamedPlaces {
             })
     }
 
-    /// The levels a candidate is held to, strictest first: its postcode
-    /// and town; then, when the query names both, the postcode without the
-    /// town and the town without the postcode, as either may be written as
-    /// the post office names it; then the country alone. A region only
-    /// chooses the country: a region's words also name small places
-    /// ("Württemberg"), so it holds no candidate to it.
     fn levels(&self) -> Vec<Level> {
         let mut levels = vec![Level::All];
         if self.has(Label::Postcode) && self.has(Label::Locality) {
@@ -72,9 +56,6 @@ impl NamedPlaces {
         levels
     }
 
-    /// Keep of `items` those at the strictest level any meets (see
-    /// [`Self::levels`]), each at `point_of` in `country_of`; none when
-    /// none lies even in the named country.
     fn keep<T>(
         &self,
         structured: &StructuredIndex,
@@ -102,7 +83,6 @@ impl NamedPlaces {
 
 #[derive(Debug, Clone, Copy)]
 enum Level {
-    /// The postcode and the town.
     All,
     Postcode,
     Town,
@@ -120,7 +100,6 @@ impl Level {
     }
 }
 
-/// A postcode written as a placeholder, all zeros ("00000" in Hong Kong).
 fn placeholder_postcode(words: &str) -> bool {
     let digits = words.chars().filter(|character| !character.is_whitespace());
     let mut any = false;
@@ -133,7 +112,6 @@ fn placeholder_postcode(words: &str) -> bool {
     any
 }
 
-/// The country a hit lies in, when known, as its code.
 fn hit_country(hit: &TextSearchHit) -> Option<String> {
     if let Some(country) = hit.features.country {
         return Some(country.as_str().to_string());
@@ -147,13 +125,6 @@ fn hit_country(hit: &TextSearchHit) -> Option<String> {
 }
 
 impl TextSearcher {
-    /// The country `pieces` write, as its code, and the pieces that write
-    /// it: the query's last words when they name a country the Pack covers
-    /// ("FR", "FRANCE", "Duitsland"), or the words before a postcode that
-    /// ends it, and no word of them is read as a region ("MA" after
-    /// Boston), a postcode ("4811 AT"), a street, a number or a unit;
-    /// whatever else they are read as, a town among them ("fr" of
-    /// "Saint-Dizier 52100 FR").
     pub(super) fn written_country(&self, pieces: &[Tagged]) -> Option<(String, Range<usize>)> {
         let dictionaries = self.tagger.dictionaries();
         let covered = |country: &CountryCode| dictionaries.country_weight(*country) > 0.0;
@@ -200,22 +171,6 @@ impl TextSearcher {
         None
     }
 
-    /// The places `reading` names, each as the structured index's places of its
-    /// words, held to the country most of them agree on.
-    ///
-    /// The country is the one the query writes (see
-    /// [`Self::written_country`]), whatever else the reading reads its
-    /// words as: a reading of "Saint-Dizier 52100 FR" that takes "fr" for a
-    /// town still names France. Its postcode, towns and regions are the runs of words
-    /// it reads as each that the structured index knows; a placeholder postcode
-    /// ("00000") names nothing. Each country scores one for the stated
-    /// country and one for each named place it holds a place of; when one
-    /// country scores best it is the country, and each named place keeps
-    /// only its places there, so a postcode another country shares
-    /// ("02130" of France and Boston) is read in the country the rest
-    /// agree on, and a stated country the postcode and town both disagree
-    /// with ("Duisburg 47051 France") gives way to them. A named place the
-    /// country holds none of names nothing.
     pub(super) fn named_places(
         &self,
         structured: &StructuredIndex,
@@ -261,7 +216,6 @@ impl TextSearcher {
         if let Some(country) = &stated {
             *votes.entry(country.clone()).or_default() += 1;
         }
-        // A place of records that lie in no country says nothing of one.
         for group in &groups {
             let mut seen = HashSet::new();
             for place in group
@@ -295,10 +249,6 @@ impl TextSearcher {
         NamedPlaces { country, groups }
     }
 
-    /// Keep of `found` the structured stage's candidates inside the places the
-    /// query names, at the strictest level any meets (see
-    /// [`NamedPlaces::levels`]); none when none lies in the named country,
-    /// and the text search answers.
     pub(super) fn structured_named(
         structured: &StructuredIndex,
         named: &NamedPlaces,
@@ -312,10 +262,6 @@ impl TextSearcher {
         );
     }
 
-    /// Keep of the text search's `pool` the candidates inside the places
-    /// the query names, as [`Self::structured_named`] does. When none lies even
-    /// in the named country, the query is answered by the finest area it
-    /// names (see [`Self::fallback`]), never by a hit in another country.
     pub(super) fn pool_named(structured: &StructuredIndex, named: &NamedPlaces, pool: &mut Pool) {
         named.keep(
             structured,

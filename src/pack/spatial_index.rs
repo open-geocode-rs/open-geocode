@@ -1,28 +1,3 @@
-//! Spatial index over the record store.
-//!
-//! Three packed R-trees, each built bottom up from items already in Hilbert
-//! order, as Flatbush packs them: a node's children are the next 16 nodes of
-//! the level below, so the tree stores boxes and no pointers. The trees hold
-//! no coordinates of their own beyond the boxes; points and lines are read
-//! from the record store.
-//!
-//! - `spatial/blocks`: one box per record block, around the block's point
-//!   records. A query decodes the blocks near it whole, which takes
-//!   microseconds for 64 records, and a box per block costs a fraction of a
-//!   byte per record.
-//! - `spatial/lines`: one box per street or interpolation line, with its
-//!   record id. Lines get boxes of their own because one long road would
-//!   stretch a block's box over every query along it.
-//! - `spatial/context`: one box per place and postcode point, with its record
-//!   id, so wide-radius admin lookups pass over the address blocks.
-//!
-//! ```text
-//! spatial/<name>  item_count u64 | id width u8 (0 = the item's index, 4 or 8)
-//!                 | boxes: the items in order, then each level above, root last;
-//!                   min_lon i32, min_lat i32, max_lon i32, max_lat i32
-//!                 | ids, when stored
-//! ```
-
 use std::{
     cmp::{Ordering, Reverse},
     collections::BinaryHeap,
@@ -56,9 +31,6 @@ const CONTEXT: &str = "spatial/context";
 const NODE_SIZE: usize = 16;
 const BOX_BYTES: usize = 16;
 const HEADER_BYTES: usize = 9;
-/// Box distances are flat-earth estimates. Scaled down by this they stay
-/// below the haversine distance of every point inside the box for the radii
-/// queries use, so no candidate is skipped.
 const LOWER_BOUND_SLACK: f64 = 0.99;
 
 type BoundingBox = [i32; 4];
@@ -101,8 +73,6 @@ fn union(left: BoundingBox, right: BoundingBox) -> BoundingBox {
     ]
 }
 
-/// Leaves stream to scratch as they come; only the levels above them, a
-/// sixteenth of the items and less, are held in memory.
 #[derive(Debug)]
 struct TreeWriter {
     name: String,
@@ -112,11 +82,9 @@ struct TreeWriter {
     widest_id: u64,
     parents: Vec<BoundingBox>,
     open: BoundingBox,
-    /// The parents, once a checkpoint wrote them out.
     saved: Option<ScratchFile>,
 }
 
-/// One tree as a checkpoint names it: its files, by name and length.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct TreeState {
     leaves: (String, u64),
@@ -146,8 +114,6 @@ impl TreeWriter {
         })
     }
 
-    /// Flush the leaves and write the parents out, once no box is pushed
-    /// any more.
     fn state(&mut self, scratch: &Arc<Scratch>) -> Result<TreeState> {
         let flushed = |file: &mut BufWriter<ScratchFile>| -> Result<(String, u64)> {
             file.flush()?;
@@ -280,7 +246,6 @@ impl TreeWriter {
     }
 }
 
-/// The spatial index writer as a checkpoint names it, every record added.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriterState {
     blocks: TreeState,
@@ -292,14 +257,11 @@ pub struct WriterState {
     points: u64,
 }
 
-/// Boxes for the spatial index, taken from records as they are written, in
-/// record id order.
 #[derive(Debug)]
 pub struct Writer {
     blocks: TreeWriter,
     lines: TreeWriter,
     context: TreeWriter,
-    /// The block whose box is open, and the box.
     block: u64,
     block_box: BoundingBox,
     record_count: u64,
@@ -333,7 +295,6 @@ impl Writer {
         })
     }
 
-    /// The scratch files the writer streams to.
     pub fn files(&self) -> Vec<PathBuf> {
         [&self.blocks, &self.lines, &self.context]
             .into_iter()
@@ -341,7 +302,6 @@ impl Writer {
             .collect()
     }
 
-    /// The writer a checkpoint left, ready to be copied into the Pack.
     pub fn restore(scratch: &Arc<Scratch>, state: &WriterState) -> Result<Self> {
         Ok(Self {
             blocks: TreeWriter::restore(scratch, "blocks", &state.blocks)?,
@@ -428,7 +388,6 @@ struct Tree {
     bytes: Bytes,
     count: usize,
     id_width: usize,
-    /// First node and node count of each level, leaves first.
     levels: Vec<(usize, usize)>,
     ids_start: usize,
 }
@@ -522,8 +481,6 @@ impl Tree {
         Ok(false)
     }
 
-    /// Items whose boxes lie within `radius_m` of the point, nearest box
-    /// first, each with a lower bound on its distance.
     fn nearest(&self, lon: f64, lat: f64, radius_m: f64) -> Nearest<'_> {
         let mut pending = BinaryHeap::new();
         if let Some(&(root, _)) = self.levels.last() {
@@ -551,7 +508,6 @@ struct Nearest<'a> {
     pending: BinaryHeap<Reverse<Pending>>,
 }
 
-/// A node not yet visited, ordered by its lower bound.
 struct Pending {
     distance_m: f64,
     level: usize,
@@ -582,7 +538,6 @@ impl Ord for Pending {
 }
 
 impl Iterator for Nearest<'_> {
-    /// An item's index and the lower bound on its distance.
     type Item = (usize, f64);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -611,9 +566,6 @@ impl Iterator for Nearest<'_> {
     }
 }
 
-/// A lower bound on the distance from a point to anything in a box, in
-/// metres; infinite for an empty box. Longitude wraps, so a box across the
-/// antimeridian from the point is near it.
 fn lower_bound_m(bbox: &BoundingBox, lon: f64, lat: f64) -> f64 {
     if bbox[0] > bbox[2] {
         return f64::INFINITY;
@@ -627,15 +579,12 @@ fn lower_bound_m(bbox: &BoundingBox, lon: f64, lat: f64) -> f64 {
             .rem_euclid(360.0)
             .min((lon - max_lon).rem_euclid(360.0))
     };
-    // A degree of longitude is shortest at the latitude nearest a pole.
     let poleward = lat.abs().max(min_lat.abs()).max(max_lat.abs()).min(90.0);
     let x = d_lon.to_radians() * poleward.to_radians().cos();
     let y = d_lat.to_radians();
     EARTH_RADIUS_M * x.hypot(y) * LOWER_BOUND_SLACK
 }
 
-/// The `limit` smallest distances seen, to stop a nearest-first scan once no
-/// unread box can hold anything closer.
 struct Closest {
     limit: usize,
     distances: BinaryHeap<OrderedDistance>,
@@ -676,7 +625,6 @@ impl Closest {
         }
     }
 
-    /// Whether nothing at `bound` or beyond can be among the closest.
     fn settled(&self, bound: f64) -> bool {
         self.distances.len() >= self.limit
             && self.limit > 0
@@ -706,9 +654,6 @@ impl std::fmt::Debug for Reader {
     }
 }
 
-/// The segments of a line record, each part's in order, with the length of
-/// the line before and at the end of each, in metres. The parts of a street
-/// of several ways are measured end to end, as one line without the gaps.
 struct LineCache {
     segments: Vec<LineSegment>,
 }
@@ -837,8 +782,6 @@ impl Reader {
         Ok(closest_candidates(candidates, limit))
     }
 
-    /// Explicit address points: address records and POIs that carry an
-    /// address.
     pub fn address_candidates(
         &self,
         lon: f64,
@@ -970,9 +913,6 @@ impl Reader {
         Ok(closest_candidates(candidates, limit))
     }
 
-    /// The `limit` context points within `radius_m` nearest a point that
-    /// `keep` keeps, nearest first. `keep` sees each point's layer and record
-    /// before it counts, so points of other kinds never use up the limit.
     pub fn nearest_context_points(
         &self,
         lon: f64,
@@ -1038,8 +978,6 @@ impl Reader {
         radius_m: f64,
         limit: usize,
     ) -> Result<Vec<SegmentCandidate>> {
-        // One candidate a record, at its nearest stretch: a road of many
-        // stretches is one answer, however many of them lie near.
         let mut candidates = Vec::<SegmentCandidate>::new();
         let mut closest = Closest::new(limit);
         for (item, bound) in self.lines.nearest(lon, lat, radius_m) {
@@ -1080,7 +1018,6 @@ impl Reader {
             let Some(nearest) = nearest else {
                 continue;
             };
-            // A record the index holds as several items keeps its nearest.
             match candidates
                 .iter_mut()
                 .find(|held| held.record_id == record_id)
@@ -1180,10 +1117,6 @@ impl Reader {
         ]))
     }
 
-    /// Point records within `radius_m` that `accepts` keeps, reading the
-    /// blocks nearest first. With a `limit`, the scan stops once no unread
-    /// block can hold a point closer than the `limit` closest so far: a dense
-    /// city centre costs the few blocks around the query.
     fn block_points(
         &self,
         lon: f64,
@@ -1228,9 +1161,6 @@ impl Reader {
     }
 }
 
-/// The degrees of latitude and longitude a radius spans around a point, a
-/// little wide: points outside are farther than the radius, so a scan passes
-/// over them without the trigonometry of a haversine distance.
 struct DegreeWindow {
     lat: f64,
     lon: f64,
@@ -1239,7 +1169,6 @@ struct DegreeWindow {
 impl DegreeWindow {
     fn around(lat: f64, radius_m: f64) -> Self {
         let lat_degrees = (radius_m / EARTH_RADIUS_M).to_degrees() / LOWER_BOUND_SLACK;
-        // Within a degree of a pole every longitude is near: no window.
         let cos = (lat.abs() + lat_degrees).min(90.0).to_radians().cos();
         Self {
             lat: lat_degrees,
@@ -1337,8 +1266,6 @@ fn compare_distance<T: CandidateDistance>(left: &T, right: &T) -> Ordering {
 
 fn closest_candidates<T: CandidateDistance>(mut candidates: Vec<T>, limit: usize) -> Vec<T> {
     if limit > 0 && candidates.len() > limit {
-        // Select indices so equal-distance candidates retain their original order,
-        // including ties at the cutoff. Only the retained candidates are sorted.
         let mut indices: Vec<usize> = (0..candidates.len()).collect();
         indices.select_nth_unstable_by(limit - 1, |&left, &right| {
             compare_distance(&candidates[left], &candidates[right]).then_with(|| left.cmp(&right))
@@ -1384,7 +1311,6 @@ mod tests {
                     layer: Layer::Address,
                     lon: 0.0,
                     lat: 0.0,
-                    // Repeated, unsorted distances exercise ties at the cutoff.
                     distance_m: ((id * 37) % 23) as f64,
                 })
                 .collect();
@@ -1445,8 +1371,6 @@ mod tests {
         })
     }
 
-    /// The walk finds the nearest POI of a kind past others, and gives up
-    /// once it has tested its budget.
     #[test]
     fn walks_to_the_nearest_poi_of_a_category_within_a_budget() {
         let mut records = (0..200)
@@ -1474,7 +1398,6 @@ mod tests {
         );
     }
 
-    /// Build a Pack holding only records and the spatial index.
     fn build(records: &[Record]) -> (TempDir, Reader, Commit) {
         let root = TempDir::new("spatial");
         let scratch = Scratch::create(root.join("scratch")).expect("scratch");
@@ -1572,7 +1495,6 @@ mod tests {
 
     #[test]
     fn early_stopping_scan_matches_the_full_scan() {
-        // Points scattered over ~60 km, denser near the centre.
         let points = scattered(5_000);
         let records = points
             .iter()
@@ -1711,7 +1633,6 @@ mod tests {
             alt_names: Vec::new(),
             locality: None,
             name: "King Street".to_string(),
-            // Two ways of one street, a gap between them.
             geometry: Geometry::new(GeometryValue::MultiLineString {
                 coordinates: vec![part(-79.0), part(-78.99)],
             }),

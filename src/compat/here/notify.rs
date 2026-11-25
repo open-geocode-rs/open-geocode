@@ -1,9 +1,3 @@
-//! Batch notifications (BETA), webhooks called with `GET` when a job ends.
-//!
-//! Each is kept as a file beside the HERE jobs, so it outlives a restart.
-//! og calls whatever URL a client stored. Who may store one is decided at
-//! the gateway in front of og, which holds every other credential too.
-
 use std::{
     fs, io,
     path::PathBuf,
@@ -27,17 +21,13 @@ use super::{
     batch::{BatchError, date_time, store_dir},
 };
 
-/// HERE's most notifications per job.
 pub(super) const MAX_PER_JOB: usize = 5;
 const PREFIX: &str = "NOTIFICATION-";
 /// The one type HERE has. Its docs also spell it `WEB_HOOK`, which is read
 /// as the same.
 const WEB_HOOK: &str = "webHook";
-/// A webhook that answers slower than this is logged as failed. The job it
-/// reports on has ended long before, so nothing waits on it.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Read-modify-write of a notification's file, one at a time.
 static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +35,6 @@ struct Stored {
     id: String,
     url: String,
     created: u64,
-    /// Unix seconds of the last call made, test calls included.
     #[serde(default)]
     last_used: Option<u64>,
 }
@@ -79,7 +68,6 @@ struct GivenConfig {
     url: Option<String>,
 }
 
-/// What a job's notification URL may name, by HERE's property names.
 #[derive(Debug, Clone)]
 pub(super) struct Facts {
     pub(super) id: String,
@@ -94,7 +82,6 @@ pub(super) struct Facts {
 }
 
 impl Facts {
-    /// The made-up job a test call reports on.
     fn dummy() -> Self {
         Self {
             id: "JOB-00000000-0000-0000-0000-000000000000".to_string(),
@@ -124,8 +111,6 @@ impl Facts {
     }
 }
 
-/// The URL with every `${PROPERTY}` replaced by its value, percent-encoded
-/// so a job name with spaces or `&` stays one value.
 fn fill(url: &str, facts: &Facts) -> String {
     let mut url = url.to_string();
     for (name, value) in facts.properties() {
@@ -156,8 +141,6 @@ fn dir(state: &AppState) -> PathBuf {
     store_dir(state).join("notifications")
 }
 
-/// The file of a notification. The id is checked to be the prefix and a
-/// UUID first, so it can never name a path outside the store.
 fn file(state: &AppState, id: &str) -> Option<PathBuf> {
     let uuid = uuid::Uuid::parse_str(id.strip_prefix(PREFIX)?).ok()?;
     (format!("{PREFIX}{uuid}") == id).then(|| dir(state).join(format!("{id}.json")))
@@ -177,7 +160,6 @@ fn save(state: &AppState, stored: &Stored) -> io::Result<()> {
     fs::rename(partial, path)
 }
 
-/// Whether a notification of this id is kept.
 pub(super) fn exists(state: &AppState, id: &str) -> bool {
     load(state, id).is_some()
 }
@@ -202,8 +184,6 @@ fn internal(error: &io::Error) -> BatchError {
     )
 }
 
-/// The URL a body asks for, checked to be an `http` or `https` URL once
-/// its properties are filled in.
 fn read(body: &[u8]) -> Result<String, BatchError> {
     let given: Given = serde_json::from_slice(body).map_err(|error| {
         BatchError::bad_request(
@@ -245,7 +225,6 @@ fn read(body: &[u8]) -> Result<String, BatchError> {
     Ok(url)
 }
 
-/// `url` when its host is one the operator lets jobs call.
 fn on_allowed_host(state: &AppState, url: String) -> Result<String, BatchError> {
     match allowed(state, &fill(&url, &Facts::dummy())) {
         true => Ok(url),
@@ -256,8 +235,6 @@ fn on_allowed_host(state: &AppState, url: String) -> Result<String, BatchError> 
     }
 }
 
-/// Whether `url`'s host is one the operator lets jobs call (see
-/// `serve --hook-host`).
 fn allowed(state: &AppState, url: &str) -> bool {
     url.parse::<Uri>()
         .ok()
@@ -363,8 +340,6 @@ pub(super) async fn delete(
     }
 }
 
-/// Calls the notification once with a made-up job, and answers whether its
-/// endpoint took the call.
 pub(super) async fn test(
     State(state): State<AppState>,
     Rid(request_id): Rid,
@@ -392,8 +367,6 @@ pub(super) async fn test(
     }
 }
 
-/// Calls each notification about a job that ended, off the async runtime.
-/// A failure is logged and never retried; the job's own status is final.
 pub(super) fn deliver(state: &AppState, ids: &[String], facts: &Facts) {
     for id in ids {
         let state = state.clone();
@@ -405,8 +378,6 @@ pub(super) fn deliver(state: &AppState, ids: &[String], facts: &Facts) {
     }
 }
 
-/// One call of notification `id`, logged either way. The URL is not
-/// logged, since a client may keep a secret in its query.
 fn call(state: &AppState, id: &str, facts: &Facts) -> Result<(), String> {
     let url = {
         let _guard = LOCK
@@ -418,12 +389,9 @@ fn call(state: &AppState, id: &str, facts: &Facts) -> Result<(), String> {
             return Err(cause);
         };
         stored.last_used = Some(unix_now());
-        // A failed save only loses `lastUsedTime`; the call still goes out.
         let _ = save(state, &stored);
         fill(&stored.url, facts)
     };
-    // Checked again on each call: the operator may have dropped the host
-    // since the notification was kept.
     if !allowed(state, &url) {
         let cause = "the host is not one this server calls back".to_string();
         log(state, id, facts, None, Some(&cause));

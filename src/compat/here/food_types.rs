@@ -1,16 +1,3 @@
-//! HERE's food types, the cuisines a place's `foodTypes` name, and the
-//! kinds of food OpenStreetMap's `cuisine` tag lists that each one is.
-//!
-//! A `cuisine` value is the food type of the same whole name: its words are
-//! the value's with underscores as spaces, read without regard to case or
-//! to a plural `s` (`ice_cream` is Ice Cream, `burger` is Burgers). A common
-//! value HERE files as a variation of one country's kitchen, or spells
-//! otherwise, is listed in [`NAMED`], each reviewed by hand. A part of a
-//! variation's name alone names nothing: `chicken` is Chicken, not
-//! Japanese-Yakitori/Chicken.
-
-/// Common `cuisine` values and the food type each one is, where no food
-/// type has the value's own name.
 const NAMED: [(&str, &str); 9] = [
     ("sushi", "203-026"),
     ("ramen", "203-060"),
@@ -23,7 +10,6 @@ const NAMED: [(&str, &str); 9] = [
     ("pastry", "800-069"),
 ];
 
-/// Every food type, as HERE's food type system lists them: its id and name.
 const FOOD_TYPES: [(&str, &str); 189] = [
     ("101-000", "American"),
     ("101-001", "American-Californian"),
@@ -216,8 +202,6 @@ const FOOD_TYPES: [(&str, &str); 189] = [
     ("800-087", "Kebab"),
 ];
 
-/// The food types of a place's `cuisine` values, each once, in the order
-/// of the values. A value no food type is named by is left out.
 pub(super) fn of_cuisine(cuisine: &[String]) -> Vec<(&'static str, &'static str)> {
     let mut found = Vec::new();
     for value in cuisine {
@@ -230,9 +214,6 @@ pub(super) fn of_cuisine(cuisine: &[String]) -> Vec<(&'static str, &'static str)
     found
 }
 
-/// Whether a place of these food types is kept by browse's `foodTypes`.
-/// A base food type asked for keeps its variations too (`201-000` keeps
-/// `201-009`), and one to leave out wins over one to keep.
 pub(super) fn admits(
     listed: &super::category::Listed,
     of_place: &[super::category::ItemCategory],
@@ -251,8 +232,6 @@ pub(super) fn admits(
     (listed.included.is_empty() || any(&listed.included)) && !any(&listed.excluded)
 }
 
-/// The food type `value` names: the one of its whole name, else the one
-/// [`NAMED`] gives it.
 fn named(value: &str) -> Option<(&'static str, &'static str)> {
     let value = value.trim().to_lowercase();
     let wanted = words(&value.replace('_', " "));
@@ -269,7 +248,6 @@ fn named(value: &str) -> Option<(&'static str, &'static str)> {
         .copied()
 }
 
-/// The words of a name, in lower case, each without a plural `s`.
 fn words(name: &str) -> Vec<String> {
     name.split_whitespace()
         .map(|word| {
@@ -307,9 +285,6 @@ mod tests {
         assert_eq!(ids(&["chinese", "Chinese"]), ["201-000"], "each once");
     }
 
-    /// A part of a variation's name names nothing of its own: chicken is
-    /// HERE's Chicken, and fish, bakery and northwestern no kitchen of one
-    /// country.
     #[test]
     fn a_part_of_a_variations_name_names_no_variation() {
         assert_eq!(ids(&["chicken"]), ["800-062"]);
@@ -318,8 +293,6 @@ mod tests {
         }
     }
 
-    /// The most used OSM `cuisine` values, each beside the food type it is,
-    /// none where HERE has none of that meaning.
     #[test]
     fn the_most_used_cuisines_are_their_food_types() {
         let expected = [

@@ -1,18 +1,9 @@
-//! A time zone's offset from UTC at the moment a vendor is answered.
-//!
-//! og's Pack names the IANA zone a result lies in. Vendors also write the
-//! zone's offset in effect when they answer, which takes daylight saving
-//! time into account, so it is computed per request from the zone's rules.
-
 use jiff::{Timestamp, tz::TimeZone};
 
-/// A zone's offset from UTC, in seconds east.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Offset(i32);
 
 impl Offset {
-    /// The offset in effect now in the IANA zone `name`, none when og knows
-    /// no such zone.
     pub(crate) fn now(name: &str) -> Option<Self> {
         Self::at(name, Timestamp::now())
     }
@@ -22,12 +13,10 @@ impl Offset {
         Some(Self(zone.to_offset(at).seconds()))
     }
 
-    /// Whole minutes east of UTC.
     pub(crate) fn minutes(self) -> i32 {
         self.0 / 60
     }
 
-    /// `+02:00`, `-05:00`, `+05:45`.
     pub(crate) fn text(self) -> String {
         let sign = if self.0 < 0 { '-' } else { '+' };
         let minutes = self.0.unsigned_abs() / 60;

@@ -1,24 +1,3 @@
-//! The build scratch directory and its disk ledger.
-//!
-//! Every byte og writes to scratch is reserved first: sorter runs, spools,
-//! the Pack writer's section files and, measured at checkpoints since its
-//! writes cannot be hooked, Tantivy's index directory. The ledger counts
-//! what is live by owner and refuses a reservation past the cap, the
-//! smaller of `--scratch-budget-mb` and 90% of what the volume had free, as
-//! DuckDB caps its spill with `max_temp_directory_size`. A refused writer
-//! degrades before it fails: spill blocks are compressed harder, a sorter
-//! merges its older runs at that level, and only then does the build stop,
-//! naming the stage, the live bytes by owner and what would fit.
-//!
-//! A checkpoint pins the files it names ([`Scratch::commit`]). The build
-//! still finishes with them as it goes, but a pinned file it is done with
-//! is retired, not removed: it stays on disk, outside the live bytes, until
-//! a later checkpoint no longer names it, so a build that stops can go on
-//! from the last checkpoint. Retired files give way first when the ledger
-//! runs short; the checkpoint they belong to is given up then, never the
-//! build. A scratch directory holding a checkpoint outlives a build that
-//! fails; one that completes, or never reached a checkpoint, is removed.
-
 use std::{
     collections::{BTreeMap, HashSet},
     fs::{self, File},
@@ -39,87 +18,52 @@ use crate::{
     resources,
 };
 
-/// zstd levels a refused reservation steps through. Level 1 compresses at
-/// several hundred MB/s per core; past 9 the gain is small and the cost
-/// steep.
 const LEVELS: [i32; 4] = [1, 3, 6, 9];
-/// Bytes reserved between two reads of the volume's free space.
 const DISK_PROBE_BYTES: u64 = 256 << 20;
-/// The checkpoint a build goes on from, in the scratch directory.
 pub const MANIFEST_FILE: &str = "resume.json";
-/// Whose bytes the manifest is.
 const CHECKPOINT_LABEL: &str = "checkpoint";
 
-/// Build scratch directory. Removed with everything in it when dropped,
-/// unless it holds a checkpoint the build has not completed.
-///
-/// Scratch files are synced only once a checkpoint names them: a build that
-/// stops before goes on from the checkpoint before, which does not need
-/// them. On Windows they are marked temporary while what was spilled fits
-/// the page cache the build leaves free (see [`Scratch::set_cache_bytes`]):
-/// the lazy writer then keeps them in memory instead of writing them out,
-/// which pays while they fit, but past that it would push the Pack and the
-/// input out of the cache.
 #[derive(Debug)]
 pub struct Scratch {
     path: PathBuf,
     next_file: AtomicU64,
-    /// Spilled bytes up to which new files are marked temporary.
     cache_bytes: AtomicU64,
-    /// Set to stop the build this scratch serves.
     cancel: OnceLock<Arc<AtomicBool>>,
-    /// The most live bytes allowed; `u64::MAX` when only the volume caps it.
     budget: AtomicU64,
     live: AtomicU64,
     peak: AtomicU64,
     stage_peak: AtomicU64,
-    /// Bytes ever written, after compression.
     written: AtomicU64,
     level: AtomicI32,
     owners: Mutex<BTreeMap<String, Arc<Owner>>>,
-    /// Live bytes by owner when the peak was last recorded.
     peak_owners: Mutex<(u64, BTreeMap<String, u64>)>,
     disk: Mutex<DiskProbe>,
-    /// Directories written by code that cannot reserve, measured instead.
     watched: Mutex<Vec<(Arc<Owner>, PathBuf)>>,
     stage: Mutex<&'static str>,
     write_nanos: AtomicU64,
     read_wait_nanos: AtomicU64,
     spill_wait_nanos: AtomicU64,
     pins: Mutex<Pins>,
-    /// Bytes of retired files: on disk, but not live.
     retained: AtomicU64,
     peak_retained: AtomicU64,
 }
 
-/// The files the last checkpoint names, and those of them the build is
-/// done with.
 #[derive(Debug, Default)]
 struct Pins {
-    /// A checkpoint is committed, and neither completed nor given up.
     held: bool,
     files: HashSet<PathBuf>,
     retired: Vec<(PathBuf, u64)>,
-    /// Files an earlier commit synced: no scratch file is written again
-    /// once a checkpoint names it.
     synced: HashSet<PathBuf>,
-    /// The stage whose checkpoint was given up to make room, if one was.
     voided: Option<String>,
 }
 
-/// The volume's free space when last read, which caps the ledger as much as
-/// the budget does.
 #[derive(Debug, Default)]
 struct DiskProbe {
-    /// Free bytes, or `None` when the volume cannot be read.
     free: Option<u64>,
-    /// Live bytes when `free` was read.
     live: u64,
     reserved_since: u64,
 }
 
-/// One owner of scratch disk: a sorter, a spool or a writer file, by label.
-/// Sorters of one label, such as one per input, share an owner.
 #[derive(Debug, Default)]
 pub struct Owner {
     label: String,
@@ -158,8 +102,6 @@ impl Owner {
         self.runs.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A k-way merge ran; `passes` is how often the most merged item has
-    /// now been merged.
     pub(super) fn merged(&self, fan_in: usize, passes: u64) {
         self.merges.fetch_add(1, Ordering::Relaxed);
         self.max_fan_in.fetch_max(fan_in as u64, Ordering::Relaxed);
@@ -185,8 +127,6 @@ impl Owner {
     }
 }
 
-/// What one owner wrote to and read from scratch. Raw bytes are before
-/// compression, the others as on disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Traffic {
     pub items_written: u64,
@@ -195,12 +135,8 @@ pub struct Traffic {
     pub items_read: u64,
     pub raw_read_bytes: u64,
     pub read_bytes: u64,
-    /// Sorted runs and spools written, merged runs included.
     pub runs: u64,
-    /// K-way merges, the last one included.
     pub merges: u64,
-    /// How often the most merged item was merged: 1 for one merge of every
-    /// run, 2 when some were merged first.
     pub merge_passes: u64,
     pub max_fan_in: u64,
     pub live_bytes: u64,
@@ -229,18 +165,13 @@ impl Traffic {
     }
 }
 
-/// Time the build's threads spent on scratch I/O and handing work over.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IoTimes {
-    /// In scratch writes, summed over writing threads.
     pub write: Duration,
-    /// Readers waiting for a block of scratch to be read ahead.
     pub read_wait: Duration,
-    /// Producers waiting for a sorter's previous buffer to be written.
     pub spill_wait: Duration,
 }
 
-/// A reservation the ledger refused, with what the build should be told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shortfall {
     pub message: String,
@@ -337,7 +268,6 @@ impl Scratch {
         }
     }
 
-    /// Cap the live scratch bytes, below what the volume caps them to.
     pub fn set_budget(&self, bytes: Option<u64>) {
         self.budget
             .store(bytes.unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -347,8 +277,6 @@ impl Scratch {
         Some(self.budget.load(Ordering::Relaxed)).filter(|budget| *budget != u64::MAX)
     }
 
-    /// Stop the work that holds this scratch once `cancel` is set: merges,
-    /// and the stages that check [`Scratch::check_cancelled`].
     pub fn cancel_on(&self, cancel: Arc<AtomicBool>) {
         let _ = self.cancel.set(cancel);
     }
@@ -366,13 +294,10 @@ impl Scratch {
         Ok(())
     }
 
-    /// Mark new scratch files temporary while fewer than `bytes` have been
-    /// spilled.
     pub fn set_cache_bytes(&self, bytes: u64) {
         self.cache_bytes.store(bytes, Ordering::Relaxed);
     }
 
-    /// Name the stage that reserves next, for a refusal's message.
     pub fn set_stage(&self, stage: &'static str) {
         *self.stage.lock().expect("stage lock") = stage;
     }
@@ -381,7 +306,6 @@ impl Scratch {
         &self.path
     }
 
-    /// Total bytes written to scratch files so far, as on disk.
     pub fn spilled_bytes(&self) -> u64 {
         self.written.load(Ordering::Relaxed)
     }
@@ -394,12 +318,10 @@ impl Scratch {
         self.peak.load(Ordering::Relaxed)
     }
 
-    /// Live bytes by owner when the peak was reached.
     pub fn peak_owners(&self) -> BTreeMap<String, u64> {
         self.peak_owners.lock().expect("peak lock").1.clone()
     }
 
-    /// Most live bytes since the last [`Scratch::reset_stage_peak`].
     pub fn stage_peak_bytes(&self) -> u64 {
         self.stage_peak.load(Ordering::Relaxed)
     }
@@ -408,13 +330,10 @@ impl Scratch {
         self.stage_peak.store(self.live_bytes(), Ordering::Relaxed);
     }
 
-    /// The zstd level new blocks are compressed at.
     pub fn level(&self) -> i32 {
         self.level.load(Ordering::Relaxed)
     }
 
-    /// Compress harder from now on, if `from` is not already behind the
-    /// level. False once the highest level is reached.
     pub(super) fn raise_level(&self, from: i32) -> bool {
         let Some(next) = LEVELS.iter().copied().find(|level| *level > from) else {
             return false;
@@ -446,7 +365,6 @@ impl Scratch {
             .fetch_add(nanos(time), Ordering::Relaxed);
     }
 
-    /// The owner of everything written under `label`.
     pub fn owner(&self, label: &str) -> Arc<Owner> {
         let mut owners = self.owners.lock().expect("owners lock");
         if let Some(owner) = owners.get(label) {
@@ -460,7 +378,6 @@ impl Scratch {
         owner
     }
 
-    /// What each owner wrote and read so far.
     pub fn traffic(&self) -> BTreeMap<String, Traffic> {
         self.owners
             .lock()
@@ -513,15 +430,11 @@ impl Scratch {
         self.record_peak(live);
     }
 
-    /// Return bytes a deleted file held.
     pub fn release(&self, owner: &Owner, bytes: u64) {
         self.live.fetch_sub(bytes, Ordering::Relaxed);
         owner.live.fetch_sub(bytes, Ordering::Relaxed);
     }
 
-    /// Remove `path`, a file of `bytes` bytes `owner` is done with, or
-    /// retire it while the last checkpoint names it. Its bytes stop being
-    /// live either way.
     pub fn remove(&self, owner: &Owner, path: &Path, bytes: u64) {
         if !self.retire(path, bytes) {
             let _ = fs::remove_file(path);
@@ -529,8 +442,6 @@ impl Scratch {
         self.release(owner, bytes);
     }
 
-    /// Remove `path`, a directory counted by [`Scratch::watch`], or retire
-    /// it while the last checkpoint names it.
     pub fn remove_dir(&self, path: &Path) -> Result<()> {
         if !self.retire(path, directory_bytes(path)) {
             fs::remove_dir_all(path).map_err(|source| Error::IoPath {
@@ -543,7 +454,6 @@ impl Scratch {
         Ok(())
     }
 
-    /// Keep `path` on disk for the last checkpoint, when that names it.
     fn retire(&self, path: &Path, bytes: u64) -> bool {
         let mut pins = self.pins.lock().expect("pins lock");
         if !pins.held || !pins.files.contains(path) {
@@ -555,8 +465,6 @@ impl Scratch {
         true
     }
 
-    /// Remove every retired file to make room, giving up the checkpoint
-    /// that needs them. False when there is none to remove.
     fn reclaim(&self) -> bool {
         let mut pins = self.pins.lock().expect("pins lock");
         if pins.retired.is_empty() {
@@ -622,14 +530,10 @@ impl Scratch {
         Ok(())
     }
 
-    /// Whether the directory holds a checkpoint the build may go on from,
-    /// and so outlives this.
     pub fn resumable(&self) -> bool {
         self.pins.lock().expect("pins lock").held
     }
 
-    /// The build is done with its checkpoints: the directory goes when this
-    /// is dropped.
     pub fn complete(&self) {
         let mut pins = self.pins.lock().expect("pins lock");
         pins.held = false;
@@ -639,28 +543,22 @@ impl Scratch {
         self.release(&owner, owner.live.load(Ordering::Relaxed));
     }
 
-    /// The stage whose checkpoint was given up to make room, if one was.
     pub fn voided(&self) -> Option<String> {
         self.pins.lock().expect("pins lock").voided.clone()
     }
 
-    /// Bytes of retired files on disk now.
     pub fn retained_bytes(&self) -> u64 {
         self.retained.load(Ordering::Relaxed)
     }
 
-    /// Most bytes of retired files held at once.
     pub fn peak_retained_bytes(&self) -> u64 {
         self.peak_retained.load(Ordering::Relaxed)
     }
 
-    /// Where new file names continue from, for a checkpoint to keep.
     pub fn next_file(&self) -> u64 {
         self.next_file.load(Ordering::Relaxed)
     }
 
-    /// What a checkpoint keeps of the ledger, so a build that goes on from
-    /// it reports what every run wrote and read.
     pub fn ledger(&self) -> Ledger {
         Ledger {
             written: self.spilled_bytes(),
@@ -671,7 +569,6 @@ impl Scratch {
         }
     }
 
-    /// Carry on the counts the run before kept in `ledger`.
     pub fn seed(&self, ledger: &Ledger) {
         self.written.fetch_add(ledger.written, Ordering::Relaxed);
         self.peak_retained
@@ -703,10 +600,6 @@ impl Scratch {
         }
     }
 
-    /// The most live bytes allowed now: the budget less what retired files
-    /// hold, or what the volume had free when last read, whichever is less.
-    /// The volume is read again every [`DISK_PROBE_BYTES`], since the Pack
-    /// and other programs fill it too.
     fn cap(&self, bytes: u64) -> u64 {
         let budget = self
             .budget
@@ -732,8 +625,6 @@ impl Scratch {
         {
             return;
         }
-        // Owners are listed again only once the peak has grown by a step,
-        // not on every block.
         let mut peak = self.peak_owners.lock().expect("peak lock");
         if live < peak.0.saturating_add((peak.0 / 64).max(1 << 20)) && peak.0 != 0 {
             return;
@@ -782,8 +673,6 @@ impl Scratch {
         }
     }
 
-    /// Count `path`, a directory written by code that cannot reserve, as
-    /// `label`'s, measured by [`Scratch::measure`].
     pub fn watch(&self, label: &str, path: &Path) {
         let owner = self.owner(label);
         self.watched
@@ -793,7 +682,6 @@ impl Scratch {
         self.measure();
     }
 
-    /// Stop measuring `path`, once it is removed.
     pub fn unwatch(&self, path: &Path) {
         let mut watched = self.watched.lock().expect("watched lock");
         watched.retain(|(owner, watched)| {
@@ -806,9 +694,6 @@ impl Scratch {
         });
     }
 
-    /// Measure the watched directories, one level deep, and the volume's
-    /// free space. Called at checkpoints: a watched directory past the cap
-    /// fails the next reservation.
     pub fn measure(&self) {
         for (owner, path) in self.watched.lock().expect("watched lock").iter() {
             let bytes = directory_bytes(path);
@@ -830,7 +715,6 @@ impl Scratch {
         disk.reserved_since = 0;
     }
 
-    /// Create a scratch file for writing.
     pub(super) fn create_file(&self, path: &Path) -> std::io::Result<File> {
         let mut options = fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -860,7 +744,6 @@ impl Drop for Scratch {
     }
 }
 
-/// What a checkpoint keeps of the ledger's counts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
     pub written: u64,
@@ -878,8 +761,6 @@ fn remove_path(path: &Path) {
     };
 }
 
-/// Flush `path` to the disk: a file, or every file of a directory and of
-/// the directories below it.
 fn sync_path(path: &Path) -> Result<()> {
     let io = |source| Error::IoPath {
         action: "failed to sync scratch file",
@@ -918,7 +799,6 @@ fn mib(bytes: u64) -> u64 {
     bytes.div_ceil(1 << 20)
 }
 
-/// Bytes of the files in `path` and in the directories right below it.
 fn directory_bytes(path: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(path) else {
         return 0;
@@ -941,9 +821,6 @@ fn directory_bytes(path: &Path) -> u64 {
         .sum()
 }
 
-/// A plain scratch file whose every write is reserved, such as a Pack
-/// section streamed before it is copied in. Removed, and its bytes
-/// returned, when dropped.
 #[derive(Debug)]
 pub struct ScratchFile {
     /// Taken before the file is removed: Windows cannot remove an open file.
@@ -955,8 +832,6 @@ pub struct ScratchFile {
 }
 
 impl ScratchFile {
-    /// Create `name` in the scratch directory, its bytes counted as
-    /// `label`'s.
     pub fn create(scratch: &Arc<Scratch>, label: &str, name: &str) -> Result<Self> {
         let path = scratch.path().join(name);
         let file = scratch.create_file(&path).map_err(|source| Error::IoPath {
@@ -973,8 +848,6 @@ impl ScratchFile {
         })
     }
 
-    /// `name`, as a checkpoint left it with `bytes` bytes, to write on
-    /// after them.
     pub fn reopen(scratch: &Arc<Scratch>, label: &str, name: &str, bytes: u64) -> Result<Self> {
         let path = scratch.path().join(name);
         let failed = |source| Error::IoPath {
@@ -993,7 +866,6 @@ impl ScratchFile {
                 detail: "a checkpoint names more bytes than the file holds",
             });
         }
-        // Bytes a failed run wrote after the checkpoint are not the build's.
         file.set_len(bytes).map_err(failed)?;
         io::Seek::seek(&mut file, io::SeekFrom::End(0)).map_err(failed)?;
         let owner = scratch.owner(label);
@@ -1011,12 +883,10 @@ impl ScratchFile {
         &self.path
     }
 
-    /// Whose bytes the file holds.
     pub fn label(&self) -> &str {
         self.owner.label()
     }
 
-    /// The file's name in the scratch directory.
     pub fn name(&self) -> String {
         self.path
             .file_name()
@@ -1029,9 +899,6 @@ impl ScratchFile {
     }
 }
 
-/// Raise `peak` to `value`, reading first: a written block rarely moves a
-/// peak, and `fetch_max` takes the cache line exclusive even when it does
-/// not.
 fn raise(peak: &AtomicU64, value: u64) {
     if peak.load(Ordering::Relaxed) < value {
         peak.fetch_max(value, Ordering::Relaxed);

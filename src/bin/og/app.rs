@@ -1,7 +1,3 @@
-//! Screen state and key handling. Packs are read from the og home, builds
-//! and batch runs are real jobs on their own threads, and the query shell
-//! asks the open Pack on a thread of its own.
-
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -41,7 +37,6 @@ pub(crate) enum Screen {
     Done,
     Query,
     Json,
-    /// Choosing the columns of a file to geocode.
     BatchSetup,
     BatchRun,
     BatchDone,
@@ -51,7 +46,6 @@ pub(crate) enum Screen {
 pub(crate) enum Mode {
     Search,
     Reverse,
-    /// Many addresses at once, pasted as CSV.
     Batch,
 }
 
@@ -74,31 +68,23 @@ impl Mode {
 }
 
 pub(crate) const DONE_ITEMS: [&str; 3] = ["Open query shell", "Serve now", "Quit"];
-/// Rows of the region list, so the box keeps one height while browsing.
 pub(crate) const REGION_ROWS: usize = 13;
-/// Where `og serve` and "Serve now" listen.
 pub(crate) const SERVE_ADDRESS: &str = "127.0.0.1:8080";
 
-/// One row of the region list.
 pub(crate) struct RegionRow {
     pub region: &'static Region,
-    /// Matched character positions of the name, for highlighting.
     pub positions: Vec<usize>,
-    /// The regions above it, shown in search results.
     pub trail: Option<String>,
 }
 
-/// What the server says about the chosen region's extract right now.
 #[derive(Default)]
 pub(crate) struct Live {
     pub remote: Option<net::Remote>,
-    /// When the newest extract's data is from.
     pub data_at: Option<i64>,
     pub error: Option<String>,
     pub done: bool,
 }
 
-/// The extract on disk for the chosen region, and when its data is from.
 pub(crate) struct OnDisk {
     pub path: PathBuf,
     pub bytes: u64,
@@ -108,72 +94,43 @@ pub(crate) struct OnDisk {
 pub(crate) struct App {
     pub screen: Screen,
     pub quit: bool,
-    /// Lines to print above the live area: they stay in terminal history.
     pub scrollback: Vec<Line<'static>>,
-    /// Lines a build or a batch run has put into history, so they can be
-    /// erased when the flow is left.
     pub flow_lines: usize,
-    /// How many lines above the window to erase: asked for here, done by the
-    /// loop that owns the terminal.
     pub erase: Option<usize>,
-    /// Plain lines printed after the interface closes.
     pub farewell: Vec<String>,
-    /// A Pack to serve once the interface closes.
     pub serve: Option<PathBuf>,
     pub flash: Option<(String, Instant)>,
     pub started: Instant,
-    /// Terminal width, for lines printed into history.
     pub width: u16,
     pub home: Arc<Home>,
     pub home_cursor: usize,
-    /// The Packs the home screen lists.
     pub packs: Vec<PackInfo>,
-    /// When the newest data for each Pack's region is from, by Pack
-    /// directory, as the servers answer.
     pub updates: Arc<Mutex<HashMap<PathBuf, i64>>>,
     pub history: Vec<BuildRecord>,
-    /// The Pack the query shell is using.
     pub engine: Option<Arc<Engine>>,
-    /// Asks `engine` off the interface thread.
     asker: Option<Asker>,
     pub active_name: String,
     pub active_dir: PathBuf,
     pub region_query: String,
     pub region_cursor: usize,
     pub region_scroll: usize,
-    /// The regions browsed into, from a continent down. Empty at the top.
     pub region_path: Vec<usize>,
-    /// The region the cursor last settled on: what a build covers when
-    /// nothing is ticked.
     pub region: &'static Region,
-    /// The regions ticked with space, by tree index, in the order they were
-    /// ticked. Empty means "just the one under the cursor", so the one-region
-    /// flow needs no ticking at all.
     pub picked: Vec<usize>,
-    /// The name typed for a Pack of several regions, empty until one is.
     pub pack_name: String,
-    /// Download the extract even though one is on disk: an update.
     pub force_download: bool,
     pub on_disk: Option<OnDisk>,
     pub live: Arc<Mutex<Live>>,
-    /// What the build of the chosen region would run with and need, as the
-    /// builder plans it.
     pub plan: Option<Result<BuildPlan, String>>,
-    /// Build despite the shortfalls the plan finds.
     pub force: bool,
-    /// Add the OpenAddresses points of the countries the Pack covers.
     pub openaddresses: bool,
     pub confirm_cursor: usize,
     pub job: Option<BuildJob>,
-    /// Steps of the running job already printed into history.
     pub printed: usize,
-    /// Warnings of the running job already printed into history.
     warned: usize,
     pub built: Option<Built>,
     pub build_error: Option<String>,
     pub show_logs: bool,
-    /// What og holds on the heap, and the disk free where the Pack is
-    /// written, sampled while a job runs.
     pub heap: Option<u64>,
     pub free_disk: Option<u64>,
     sampled: Instant,
@@ -186,28 +143,20 @@ pub(crate) struct App {
     pub hit_cursor: usize,
     pub json_scroll: usize,
     pub json_all: bool,
-    /// What was pasted or typed in batch mode: CSV text, or a file path.
     pub batch_text: String,
-    /// Whether the batch text changed since it was last read.
     batch_dirty: bool,
     pub batch_rows: Vec<PastedRow>,
     pub batch_note: String,
     pub batch_millis: f64,
-    /// The file being geocoded, once one is opened.
     pub batch: Option<BatchSession>,
-    /// The columns of the preview asked for last.
     preview_for: Option<Vec<bool>>,
     pub batch_button: usize,
-    /// A file named in the batch tab, waiting to be continued with or dropped.
     pub batch_candidate: Option<BatchFile>,
-    /// 0 is Continue, 1 is Cancel.
     pub batch_choice: usize,
     pub batch_error: Option<String>,
     /// One clipboard for the session: on Linux what is copied lives only as
     /// long as the clipboard that copied it.
     clipboard: Option<arboard::Clipboard>,
-    /// Jobs asked to stop that may still be cleaning up. Dropping one waits
-    /// for it, so they are kept until they finish or og exits.
     pub stopping_builds: Vec<BuildJob>,
     pub stopping_runs: Vec<Run>,
 }
@@ -292,12 +241,8 @@ impl App {
         app
     }
 
-    /// Asks each Pack's publisher, in the background, when its newest data
-    /// is from.
     fn check_updates(&self) {
         for pack in &self.packs {
-            // A Pack of several regions is only as fresh as its oldest
-            // input, so it is checked against every publisher it came from.
             let urls: Vec<String> = pack
                 .regions
                 .iter()
@@ -308,8 +253,6 @@ impl App {
             }
             let (updates, dir) = (Arc::clone(&self.updates), pack.dir.clone());
             thread::spawn(move || {
-                // The newest each publisher has, taken together: the Pack is
-                // behind when any one of its regions has newer data.
                 if let Some(at) = urls
                     .iter()
                     .filter_map(|url| net::state_timestamp(url).ok())
@@ -321,14 +264,11 @@ impl App {
         }
     }
 
-    /// When newer data than a Pack's is published, the time it is from.
     pub(crate) fn update_for(&self, pack: &PackInfo) -> Option<i64> {
         let newest = *self.updates.lock().expect("updates lock").get(&pack.dir)?;
         (newest > pack.data_at?).then_some(newest)
     }
 
-    /// Where the build writes. One region names its own Pack; several go
-    /// under the name typed for them, falling back to their slugs joined.
     pub(crate) fn pack_dir(&self) -> PathBuf {
         let regions = self.build_regions();
         match regions.as_slice() {
@@ -346,9 +286,6 @@ impl App {
         }
     }
 
-    /// What the build reads, with the extracts it must fetch first. The one
-    /// place that decides it, so the confirm screen and the build itself
-    /// never disagree.
     pub(crate) fn build_inputs(&self) -> Vec<BuildInput> {
         self.build_regions()
             .into_iter()
@@ -360,20 +297,16 @@ impl App {
             .collect()
     }
 
-    /// Whether the build downloads the extract first.
     pub(crate) fn downloads(&self) -> bool {
         self.force_download || self.on_disk.is_none()
     }
 
-    /// The addresses OpenAddresses adds, at most, when it is turned on.
     pub(crate) fn imported_rows(&self) -> u64 {
         self.openaddresses_data()
             .filter(|_| self.openaddresses)
             .map_or(0, |data| data.rows)
     }
 
-    /// The OpenAddresses data the build's regions hold, as the catalog counts
-    /// it; `None` where it has none.
     pub(crate) fn openaddresses_data(&self) -> Option<regions::OpenAddresses> {
         self.build_regions()
             .iter()
@@ -384,7 +317,6 @@ impl App {
             })
     }
 
-    /// Bytes to download: the live size when the server gave one.
     pub(crate) fn download_bytes(&self) -> u64 {
         let live = self.live.lock().expect("live lock");
         live.remote
@@ -392,9 +324,6 @@ impl App {
             .unwrap_or(self.region.osm.bytes)
     }
 
-    /// The extracts the build reads, in bytes. One region is measured from
-    /// the copy on disk or the size its publisher states; several are
-    /// measured from the catalog, which is what the picker showed.
     pub(crate) fn input_bytes(&self) -> u64 {
         let regions = self.build_regions();
         if regions.len() > 1 {
@@ -406,7 +335,6 @@ impl App {
         }
     }
 
-    /// How long the build takes, scaled from this machine's own builds.
     pub(crate) fn estimate(&self) -> Option<Estimate> {
         home::estimate(
             &self.history,
@@ -419,9 +347,6 @@ impl App {
         home::estimate(&self.history, region.osm.bytes, false)
     }
 
-    /// Plans the build of the chosen region as the builder will: the memory
-    /// budget, the threads, and what memory and disk it needs. Forced, so
-    /// the plan comes back with its shortfalls instead of failing on them.
     fn replan(&mut self) {
         let pack = self.pack_dir();
         self.plan = Some(
@@ -438,8 +363,6 @@ impl App {
         );
     }
 
-    /// What the build lacks: the plan's shortfalls, and room for the
-    /// download where the extract is kept.
     pub(crate) fn shortfalls(&self) -> Vec<String> {
         let Some(Ok(plan)) = &self.plan else {
             return Vec::new();
@@ -469,12 +392,10 @@ impl App {
         shortfalls
     }
 
-    /// Whether the build can start: it was planned, and fits or is forced.
     pub(crate) fn can_build(&self) -> bool {
         matches!(self.plan, Some(Ok(_))) && (self.force || self.shortfalls().is_empty())
     }
 
-    /// The equivalent non-interactive command for this build.
     pub(crate) fn command(&self) -> String {
         let mut command = format!("og build --region {}", self.region.id);
         if self.force_download {
@@ -489,7 +410,6 @@ impl App {
         command
     }
 
-    /// The region whose children the list shows.
     pub(crate) fn region_here(&self) -> &'static Region {
         let tree = regions::tree();
         self.region_path
@@ -497,9 +417,6 @@ impl App {
             .map_or_else(|| tree.root(), |index| tree.at(*index))
     }
 
-    /// The rows of the region list. Browsing shows the region itself first,
-    /// as the first row, then its children. A search shows every region whose
-    /// name or alias matches, with the regions above it.
     pub(crate) fn region_rows(&self) -> Vec<RegionRow> {
         let tree = regions::tree();
         if self.region_browsing() {
@@ -541,13 +458,10 @@ impl App {
         matches.into_iter().map(|(row, _)| row).collect()
     }
 
-    /// Whether the list shows the browsed region's own children.
     pub(crate) fn region_browsing(&self) -> bool {
         self.region_query.trim().is_empty()
     }
 
-    /// Rows the list can show from the current scroll: browsing at the top
-    /// spends one on the line under the region itself.
     pub(crate) fn region_capacity(&self) -> usize {
         if self.region_browsing() && self.region_scroll == 0 {
             REGION_ROWS - 1
@@ -556,8 +470,6 @@ impl App {
         }
     }
 
-    /// The regions a build would cover: the ticked ones, or, when none are
-    /// ticked, the one under the cursor. Always at least one.
     pub(crate) fn build_regions(&self) -> Vec<&'static Region> {
         let tree = regions::tree();
         if self.picked.is_empty() {
@@ -566,17 +478,10 @@ impl App {
         self.picked.iter().map(|index| tree.at(*index)).collect()
     }
 
-    /// Whether this region is ticked.
     pub(crate) fn is_picked(&self, region: &Region) -> bool {
         self.picked.contains(&region.index)
     }
 
-    /// Ticks or unticks the region under the cursor. Picking a region that
-    /// contains, or lies in, one already ticked replaces it: an extract and
-    /// the extract it is part of would index the same places twice, and the
-    /// wider one already covers the narrower.
-    ///
-    /// Returns what to tell the person when a pick displaced others.
     pub(crate) fn toggle_picked(&mut self) -> Option<String> {
         let tree = regions::tree();
         let region = self
@@ -613,7 +518,6 @@ impl App {
         }
     }
 
-    /// Scrolls so the cursor row is on screen.
     fn region_follow(&mut self) {
         if self.region_cursor < self.region_scroll {
             self.region_scroll = self.region_cursor;
@@ -628,7 +532,6 @@ impl App {
         self.region_follow();
     }
 
-    /// Opens a region: the list shows what is below it.
     fn region_open(&mut self, region: &'static Region) {
         self.region_path = regions::tree().ancestors(region);
         self.region_path.push(region.index);
@@ -636,7 +539,6 @@ impl App {
         self.region_reset(0);
     }
 
-    /// Goes up one level, leaving the cursor on the region just left.
     fn region_up(&mut self) {
         let Some(left) = self.region_path.pop() else {
             return;
@@ -649,8 +551,6 @@ impl App {
         self.region_reset(cursor);
     }
 
-    /// Takes a region for the build and moves on to confirming it. The list
-    /// stays on that region for when the user comes back.
     fn region_select(&mut self, region: &'static Region) {
         self.region = region;
         self.picked.clear();
@@ -667,9 +567,6 @@ impl App {
         self.open_confirm();
     }
 
-    /// Opens the confirm step for `self.region`: what is on disk is read
-    /// and the build planned now, what the server has is asked in the
-    /// background.
     fn open_confirm(&mut self) {
         self.on_disk = self.home.extract(self.region).map(|extract| OnDisk {
             data_at: open_geocode::builder::replication_timestamp(&extract.path)
@@ -709,14 +606,11 @@ impl App {
         self.flash = Some((text.into(), Instant::now()));
     }
 
-    /// Puts lines of a flow into history, to be erased when it is left.
     fn push_flow(&mut self, lines: Vec<Line<'static>>) {
         self.flow_lines += lines.len();
         self.scrollback.extend(lines);
     }
 
-    /// Asks for what the flow put into history to be erased, so the next
-    /// screen starts where the flow did and not under its leftovers.
     fn erase_flow(&mut self) {
         if self.flow_lines > 0 {
             self.erase = Some(self.flow_lines);
@@ -804,7 +698,6 @@ impl App {
         }
     }
 
-    /// Takes the open Pack's answer to the newest question, once it is there.
     fn take_reply(&mut self) {
         let Some(reply) = self.asker.as_mut().and_then(Asker::take) else {
             return;
@@ -850,7 +743,6 @@ impl App {
         }
     }
 
-    /// Whether the open Pack is still answering the newest question.
     pub(crate) fn asking(&self) -> bool {
         self.asker.as_ref().is_some_and(Asker::busy)
     }
@@ -879,7 +771,6 @@ impl App {
     }
 
     fn home_key(&mut self, key: KeyEvent) {
-        // The last row builds a new Pack; the rows above it are the Packs.
         let rows = self.packs.len() + 1;
         let on_build = self.home_cursor == self.packs.len();
         match key.code {
@@ -909,8 +800,6 @@ impl App {
             }
             KeyCode::Char('u') if !on_build => {
                 let pack = &self.packs[self.home_cursor];
-                // Updating rebuilds the Pack from every region it covers:
-                // one Pack is one build, so its regions are re-picked whole.
                 let covered = pack.regions.clone();
                 let pack_name = pack.name.clone();
                 match (covered.split_first(), self.update_for(pack)) {
@@ -941,8 +830,6 @@ impl App {
         }
     }
 
-    /// Opens a Pack for the query shell. False, with the reason shown, when
-    /// it cannot be opened.
     fn activate(&mut self, dir: &Path) -> bool {
         if self.engine.is_some() && self.active_dir == dir {
             return true;
@@ -958,7 +845,6 @@ impl App {
                 let engine = Arc::new(engine);
                 self.asker = Some(Asker::new(Arc::clone(&engine)));
                 self.engine = Some(engine);
-                // Rows answered by another Pack are asked again.
                 self.batch_dirty = true;
                 true
             }
@@ -989,17 +875,12 @@ impl App {
                 self.region_cursor = (self.region_cursor + REGION_ROWS).min(count - 1);
                 self.region_follow();
             }
-            // Space ticks a region for a Pack covering several. It comes
-            // before the search box takes the key, which costs nothing: a
-            // search never starts with a space.
             KeyCode::Char(' ') => {
                 if let Some(displaced) = self.toggle_picked() {
                     self.flash(displaced);
                 }
             }
             KeyCode::Enter => {
-                // Ticked regions build together, whatever the cursor is on,
-                // so enter on a parent does not open it into its children.
                 if !self.picked.is_empty() {
                     self.region_query.clear();
                     self.open_confirm();
@@ -1078,12 +959,8 @@ impl App {
 
     fn start_build(&mut self) {
         let pack = self.pack_dir();
-        // Each region reads its own extract, and downloads it when it is
-        // missing — or when this is an update, which refetches them all.
         let inputs = self.build_inputs();
 
-        // A stopped build still removing its unfinished Pack generation, or
-        // holding the download, would race this one.
         if self.stopping_builds.iter().any(|job| {
             inputs
                 .iter()
@@ -1111,8 +988,6 @@ impl App {
                 memory_budget_bytes: None,
                 scratch_budget_bytes: None,
                 force: self.force,
-                // The interface has no flags: building a region again goes
-                // on from where a stopped build of it left off.
                 leftover: Leftover::Resume,
                 openaddresses: self.openaddresses && self.openaddresses_data().is_some(),
                 tiger: false,
@@ -1151,7 +1026,6 @@ impl App {
                 0 => {
                     let dir = self.pack_dir();
                     self.erase_flow();
-                    // The Pack may have been rebuilt where an older one was open.
                     if self.active_dir == dir {
                         self.engine = None;
                         self.asker = None;
@@ -1188,7 +1062,6 @@ impl App {
         self.screen = Screen::Query;
     }
 
-    /// Switches the query shell's tab, and asks what the tab shows.
     fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         if mode == Mode::Batch {
@@ -1198,8 +1071,6 @@ impl App {
         }
     }
 
-    /// Asks the Pack again after the query changed. The answer shown stays
-    /// until the new one is there.
     fn refresh_query(&mut self) {
         let Some(asker) = &mut self.asker else {
             return;
@@ -1338,23 +1209,17 @@ impl App {
         }
     }
 
-    /// Changes the batch text. It is read again once per frame, not once
-    /// per key: a paste sent as keys is thousands of them.
     fn edit_batch(&mut self, edit: impl FnOnce(&mut String)) {
         edit(&mut self.batch_text);
         self.batch_dirty = true;
     }
 
-    /// Forgets the file waiting in the batch tab and clears the box.
     fn drop_batch_file(&mut self) {
         self.batch_candidate = None;
         self.batch_choice = 0;
         self.edit_batch(String::clear);
     }
 
-    /// Reads the batch text again. A single line that names a file makes
-    /// that file the candidate to continue with; anything else is read as
-    /// rows, and the open Pack is asked for every address in it.
     fn refresh_batch(&mut self) {
         self.batch_dirty = false;
         let typed = self.batch_text.trim().trim_matches('"');
@@ -1393,7 +1258,6 @@ impl App {
         }
     }
 
-    /// Text pasted into the terminal as one piece.
     pub(crate) fn on_paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         match self.screen {
@@ -1421,8 +1285,6 @@ impl App {
         self.ask_preview();
     }
 
-    /// Asks what a run would answer for the sample rows with the columns
-    /// picked now, unless that is known.
     fn ask_preview(&mut self) {
         let (Some(session), Some(asker)) = (&self.batch, &mut self.asker) else {
             return;
@@ -1516,7 +1378,6 @@ impl App {
         }
     }
 
-    /// The JSON the GeoJSON screen shows.
     pub(crate) fn json_text(&self) -> String {
         if self.mode == Mode::Batch {
             return self
@@ -1578,11 +1439,6 @@ impl App {
     }
 }
 
-/// Matches a search against a region: every word of the query must occur in
-/// the name or in the regions above it, so `ont canada` finds Ontario. Words
-/// that start a word of the name rank first, then names that start with the
-/// query, then shorter names. Returns the matched positions in the name, by
-/// char.
 fn find(query: &str, name: &str, trail: &str) -> Option<(Vec<usize>, i64)> {
     // Each lowercase char with the place of the char of the name it comes
     // from: lowercasing can make two chars of one (`İ`).
@@ -1613,7 +1469,6 @@ fn find(query: &str, name: &str, trail: &str) -> Option<(Vec<usize>, i64)> {
     Some((positions, score * 1_000 - name.chars().count() as i64))
 }
 
-/// Where `needle` occurs in `text`, preferring the start of a word.
 fn locate(text: &[char], needle: &[char]) -> Option<(usize, bool)> {
     let at = |start: usize| text[start..].starts_with(needle);
     let word_start = |start: usize| start == 0 || !text[start - 1].is_alphanumeric();
@@ -1633,8 +1488,6 @@ mod tests {
 
     #[test]
     fn highlights_the_chars_of_the_name_that_matched() {
-        // `İ` lowercases to two chars; the match after it is still placed
-        // on the name's own chars.
         let (positions, _) = find("stan", "İstanbul", "").expect("a match");
         assert_eq!(positions, [1, 2, 3, 4]);
         let name: Vec<char> = "İstanbul".chars().collect();

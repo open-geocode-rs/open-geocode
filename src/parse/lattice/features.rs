@@ -1,38 +1,9 @@
-//! The features of a lattice span.
-//!
-//! Features say what a span looks like and what the dictionaries know of it,
-//! never which words it holds, so a model learned on one Pack scores queries
-//! of any other: a word's identity is the Pack's business, its role the
-//! model's. Each feature is conjoined with the label of the edge it is on,
-//! so one feature id carries one weight per label.
-//!
-//! The one exception reads a little of a word's letters: the affix blocks
-//! hash the character n-grams (n = 2, 3, 4) a word starts and ends with,
-//! shorter than the word, into [`AFFIX_BUCKETS`] buckets per side and n, so
-//! endings such as "-strasse", "-ville" or "-shi" tell their role on names
-//! no dictionary holds. The word of a span is its one token, or the units of
-//! a script written without spaces glued into one key ("みなとみらい").
-//!
-//! The words themselves are hashed too, each word of a span into
-//! [`WORD_BUCKETS`] buckets, so the model learns the words the Pack it is
-//! trained on writes its streets, venues and places with ("strasse",
-//! "bäckerei", "sebun"). The model stays one per Pack: the words are the
-//! Pack's own, learned when it is built.
-//!
-//! ```text
-//! ids 0 .. NAMED                      the named blocks of BLOCKS, in order
-//! NAMED + (side * 3 + n - 2) * 1024   bucket 0 of the affix block of side
-//!   + bucket                          (0 prefix, 1 suffix) and n (2..=4)
-//! WORDS + bucket                      a word of the span
-//! ```
-
 use super::{
     CountryCode, MAX_SPAN_TOKENS, Tokens,
     decode::Span,
     dictionary::{Dictionaries, Field, Match, level},
 };
 
-/// The feature blocks, in id order, with the names of their features.
 const BLOCKS: &[(&str, &[&str])] = &[
     ("bias", &["bias"]),
     ("span_tokens", &["1", "2", "3", "4", "5"]),
@@ -116,8 +87,6 @@ const BLOCKS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// The kinds of vocabulary phrase, in the order of
-/// [`Field::PHRASES`](super::dictionary::Field::PHRASES).
 const PHRASE_KINDS: [&str; 8] = [
     "unit",
     "po_box",
@@ -275,51 +244,31 @@ const fn offset(block: Block) -> u32 {
     offset as u32
 }
 
-/// Feature ids of the named blocks.
 const NAMED: usize = offset(Block::Grounding) as usize + 4;
-/// The lengths of the hashed affixes.
 const AFFIX_SIZES: [usize; 3] = [2, 3, 4];
-/// Buckets of each affix block: one per side and length.
 pub(super) const AFFIX_BUCKETS: usize = 1_024;
 const AFFIX_BLOCKS: usize = 2 * AFFIX_SIZES.len();
-/// The first id of the word block.
 const WORDS: usize = NAMED + AFFIX_BLOCKS * AFFIX_BUCKETS;
-/// Buckets of the word block.
 pub(super) const WORD_BUCKETS: usize = 1 << 15;
-/// Feature ids, without labels.
 pub(super) const COUNT: usize = WORDS + WORD_BUCKETS;
 
-/// The feature of a one-unit span that lies inside a longer name of `field`
-/// the dictionaries know, at its first unit or after it. A run of
-/// characters labelled one at a time ("千", "代", "田", "区") still sees the
-/// name it is part of.
 pub(super) fn cover(field: Field, begins: bool) -> Option<u32> {
     let index = field_index(field)?;
     Some(id(Block::DictCover, index * 2 + usize::from(!begins)))
 }
 
-/// The id of the first dict_cover feature.
 pub(super) const fn cover_base() -> u32 {
     offset(Block::DictCover)
 }
 
-/// The feature of a chain of `chain.pieces` area names.
 pub(super) fn chain_feature(chain: super::Chain) -> u32 {
     id(Block::Chain, chain.pieces.clamp(2, 4) - 2)
 }
 
-/// The feature of a chain one of whose names is a region.
 pub(super) fn chain_region() -> u32 {
     id(Block::Chain, 3)
 }
 
-/// Say what the Pack does not explain `span` as, of the closed-class
-/// labels. A locality, region or country is a place the Pack knows and a
-/// postcode is a pattern some country uses, so a span is one only when the
-/// Pack explains it: a name of that field, exactly or within a few edits (a
-/// locality also as a chain of area names), or a postcode pattern match.
-/// `grounding` features mark what the Pack does not explain, and their
-/// weights, one per label, say how unlikely each label is there.
 pub(super) fn ground(span: &mut Span) {
     let distance = |field: Field| {
         let index = field_index(field).expect("a name field") as u32;
@@ -359,7 +308,6 @@ fn id(block: Block, index: usize) -> u32 {
     offset(block) + index as u32
 }
 
-/// `block:feature`, for weight dumps and the schema fingerprint.
 pub(super) fn name(id: u32) -> String {
     if let Some(bucket) = (id as usize).checked_sub(WORDS) {
         return if bucket < WORD_BUCKETS {
@@ -392,29 +340,20 @@ pub(super) fn name(id: u32) -> String {
     format!("unknown:{id}")
 }
 
-/// A fingerprint of the feature layout, so weights learned for another
-/// layout are refused rather than misread.
 pub(super) fn schema() -> u64 {
     let names = (0..COUNT as u32).map(name).collect::<Vec<_>>().join("\n");
     xxhash_rust::xxh3::xxh3_64(names.as_bytes())
 }
 
-/// The shape of a token's characters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Shape {
-    /// "670"
     Digits,
-    /// "221b"
     DigitsLetter,
-    /// "g120", "fl36"
     LettersDigits,
-    /// "king"
     Alpha,
-    /// "m5v", "1st"
     Mixed,
 }
 
-/// What one token is, computed once per query.
 #[derive(Debug, Clone)]
 pub(super) struct TokenInfo {
     pub shape: Shape,
@@ -424,17 +363,13 @@ pub(super) struct TokenInfo {
     pub street_type: bool,
     pub unit_word: bool,
     pub street_type_suffix: bool,
-    /// Whether the word is in any dictionary name, so it is not a typo.
     pub known_word: bool,
-    /// Whether the word is of a script written without spaces (see
-    /// [`super::is_unspaced`]).
     pub unspaced: bool,
 }
 
 impl TokenInfo {
     pub(super) fn new(word: &str, dictionaries: &Dictionaries) -> Self {
         let chars = word.chars().count();
-        // A numeral of any script counts as a digit (see [`super::is_numeral`]).
         let digits = word
             .chars()
             .filter(|character| super::is_numeral(*character))
@@ -476,7 +411,6 @@ impl TokenInfo {
         }
     }
 
-    /// Digits, maybe with one letter after them: how house numbers look.
     pub(super) fn is_number(&self) -> bool {
         matches!(self.shape, Shape::Digits | Shape::DigitsLetter)
     }
@@ -486,8 +420,6 @@ impl TokenInfo {
     }
 }
 
-/// Whether the word ends with a street type of at least three letters after
-/// a stem of at least three: "maximilianstr", "bahnhofstrasse".
 fn has_street_type_suffix(word: &str, dictionaries: &Dictionaries) -> bool {
     let boundaries = word
         .char_indices()
@@ -498,10 +430,8 @@ fn has_street_type_suffix(word: &str, dictionaries: &Dictionaries) -> bool {
         .any(|start| dictionaries.contains(Field::StreetType, &word[boundaries[start]..]))
 }
 
-/// The script block of a letter, by its Unicode Script property.
 fn script(character: char) -> usize {
     use unicode_script::{Script, UnicodeScript};
-    // The script table is a binary search, and most letters are these.
     if character.is_ascii_alphabetic() {
         return 0;
     }
@@ -526,7 +456,6 @@ fn frequency_bucket(count: u64) -> usize {
     }
 }
 
-/// The features of one span, collected while the lattice is built.
 pub(super) struct FeatureSet {
     start: usize,
     end: usize,
@@ -535,8 +464,6 @@ pub(super) struct FeatureSet {
 }
 
 impl FeatureSet {
-    /// What every span has: its length, where it sits, its neighbours, and
-    /// for one token its shape.
     pub(super) fn new(tokens: &Tokens, infos: &[TokenInfo], start: usize, end: usize) -> Self {
         let mut set = Self {
             start,
@@ -623,8 +550,6 @@ impl FeatureSet {
         );
     }
 
-    /// The span is a name in `field`, `hit.distance` edits away. `key_chars`
-    /// is the length of the span as one key.
     pub(super) fn dictionary_hit(&mut self, field: Field, hit: &Match, key_chars: usize) {
         let Some(field_index) = field_index(field) else {
             return;
@@ -647,8 +572,6 @@ impl FeatureSet {
             self.country_features
                 .push((country, id(Block::DictInCountry, field_index)));
         }
-        // Which admin level a locality name names: a district and a city
-        // are both in the locality dictionary, and only this tells them apart.
         if field == Field::Locality {
             for (index, bit) in [
                 level::DISTRICT,
@@ -666,9 +589,6 @@ impl FeatureSet {
         }
     }
 
-    /// The prefixes and suffixes of `word`, the span as one word, each of
-    /// [`AFFIX_SIZES`] characters and shorter than the word, hashed into
-    /// their blocks.
     pub(super) fn affixes(&mut self, word: &str) {
         let bounds = word
             .char_indices()
@@ -692,15 +612,10 @@ impl FeatureSet {
         }
     }
 
-    /// The span is a vocabulary phrase of the kinds of `kinds`, one bit per
-    /// field of [`Field::PHRASES`]: "po box", "私書箱", "floor".
     pub(super) fn phrase(&mut self, kinds: u8) {
         self.phrase_bits(Block::Phrase, kinds);
     }
 
-    /// A phrase of the kinds of `before` ends right before the span, and one
-    /// of the kinds of `after` starts right after it: the number of "po box
-    /// 29" follows a PO box phrase.
     pub(super) fn phrase_neighbours(&mut self, before: u8, after: u8) {
         self.phrase_bits(Block::PhraseBefore, before);
         self.phrase_bits(Block::PhraseAfter, after);
@@ -712,8 +627,6 @@ impl FeatureSet {
         }
     }
 
-    /// The span is `pieces` area names glued one after the other, one of
-    /// them a region when `region`.
     pub(super) fn chain(&mut self, pieces: usize, region: bool) {
         self.features
             .push(chain_feature(super::Chain { pieces, region }));
@@ -722,13 +635,10 @@ impl FeatureSet {
         }
     }
 
-    /// The units the span covers.
     pub(super) fn range(&self) -> (usize, usize) {
         (self.start, self.end)
     }
 
-    /// The span is one token that glues a number to a unit, PO box or level
-    /// phrase or an admin type word ("4og", "apt4", "4chome").
     pub(super) fn glued_phrase(&mut self, glued: super::Glued) {
         let index = match glued {
             super::Glued::Unit => 0,
@@ -739,32 +649,24 @@ impl FeatureSet {
         self.push(Block::GluedPhrase, index);
     }
 
-    /// Of the fields whose names the span is, `field` is the one the most
-    /// records use it in: "sachsen" is a state far more than a village.
     pub(super) fn dominant_field(&mut self, field: Field) {
         if let Some(index) = field_index(field) {
             self.push(Block::DictDominant, index);
         }
     }
 
-    /// The span is a street name without its type words (`tail` false) or
-    /// the last name words of one, which the street dictionary does not
-    /// hold as written.
     pub(super) fn street_alias(&mut self, tail: bool) {
         self.push(Block::StreetAlias, usize::from(tail));
     }
 
-    /// The span is one number written in parts: "993.5", "1384 1/2".
     pub(super) fn number_in_parts(&mut self) {
         self.push(Block::Joined, 0);
     }
 
-    /// Some country's postcode pattern matches the span.
     pub(super) fn postcode_any(&mut self) {
         self.push(Block::PostcodeAny, self.end - self.start - 1);
     }
 
-    /// `country`'s postcode pattern matches the span.
     pub(super) fn postcode_in(&mut self, country: CountryCode) {
         self.country_features.push((
             country,
@@ -772,8 +674,6 @@ impl FeatureSet {
         ));
     }
 
-    /// The span's length in units, the last bucket also holding the longer
-    /// spans of a script written without spaces.
     fn length_bucket(&self) -> usize {
         (self.end - self.start).min(MAX_SPAN_TOKENS) - 1
     }
@@ -800,7 +700,6 @@ impl FeatureSet {
     }
 }
 
-/// Feature ids by name, for hand-set weights and tests.
 pub(super) fn by_name(name: &str) -> u32 {
     (0..NAMED as u32)
         .find(|id| self::name(*id) == name)
@@ -847,7 +746,6 @@ mod tests {
                 "{names:?}"
             );
         }
-        // The same ending hashes alike in another word.
         assert_eq!(features("hauptstrasse")[5], names[5]);
         assert_eq!(features("abc").len(), 2, "only affixes shorter than it");
         assert!(features("ab").is_empty());

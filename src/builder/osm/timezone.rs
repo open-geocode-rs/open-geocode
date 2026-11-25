@@ -46,14 +46,11 @@ const SHAPES_LABEL: &str = "timezone-shapes";
 
 #[derive(Debug)]
 struct Zone {
-    /// Its name, by its index in [`Timezones::names`].
     name: u16,
     shape: ShapeRef,
 }
 
-/// The box around a zone, with its index in [`Timezones::zones`].
 type ZoneBox = GeomWithData<Rectangle<[f64; 2]>, u32>;
-/// The box around one ring of a zone, with the zone and the ring.
 type RingBox = GeomWithData<Rectangle<[f64; 2]>, (u32, u32)>;
 
 #[derive(Debug)]
@@ -114,13 +111,10 @@ impl Timezones {
         })
     }
 
-    /// The zone names. A zone is stored as its index here.
     pub(crate) fn names(&self) -> &[String] {
         &self.names
     }
 
-    /// The zone the point lies in. None outside every zone, and where two
-    /// zones cover it.
     pub(crate) fn at(&self, [lon, lat]: [f64; 2]) -> Option<u16> {
         let mut found = None;
         for zone in self.boxes.locate_all_at_point([lon, lat]) {
@@ -136,9 +130,6 @@ impl Timezones {
         found
     }
 
-    /// The one zone the area of `block` lies wholly in, `bounds` being the
-    /// box around it. None for an area that reaches out of every zone by
-    /// more than [`RESOLUTION`], and for one that lies wholly in two.
     pub(crate) fn of_area(&self, block: &[u8], bounds: Rect<f64>) -> Option<u16> {
         let [lon, lat] = interior_point(block)?;
         let reach = AABB::from_corners(
@@ -149,8 +140,6 @@ impl Timezones {
         for found in self.boxes.locate_all_at_point([lon, lat]) {
             let zone = &self.zones[found.data as usize];
             let shape = self.shapes.block(zone.shape)?;
-            // Inside it, its outline never out of it, and no hole or end of
-            // the zone inside the area.
             let holds = covers(shape, lon, lat)
                 && outline_within(block, shape, RESOLUTION)
                 && !self.rings.locate_in_envelope(reach).any(|ring| {
@@ -168,16 +157,12 @@ impl Timezones {
     }
 }
 
-/// Whether ring `ring` of `zone` lies in the area of `block`, off the area's
-/// outline. A ring that runs along the outline is the same border drawn by
-/// the other source, so the ring is judged by its first vertex away from it.
 fn ring_inside(zone: &[u8], ring: u32, block: &[u8]) -> bool {
     ring_vertices(zone, ring as usize)
         .find(|vertex| !near_outline(block, *vertex, RESOLUTION))
         .is_some_and(|[lon, lat]| covers(block, lon, lat))
 }
 
-/// The zones as they are read.
 struct Loading {
     names: Vec<String>,
     zones: Vec<Zone>,
@@ -185,12 +170,10 @@ struct Loading {
     rings: Vec<RingBox>,
     shapes: ShapeWriter,
     block: Vec<u8>,
-    /// What stopped the read that is not the file's fault.
     failed: Option<Error>,
 }
 
 impl Loading {
-    /// `Err` says what is wrong with the feature.
     fn add(&mut self, feature: Feature) -> std::result::Result<(), String> {
         let tzid = feature.properties.tzid;
         if tzid.is_empty() {
@@ -307,7 +290,6 @@ enum Nest {
     Multi(Vec<Vec<Vec<[f64; 2]>>>),
 }
 
-/// One element of a coordinate array, a number or an array a level down.
 enum Element {
     Number(f64),
     Nest(Nest),
@@ -345,8 +327,6 @@ impl<'de> Deserialize<'de> for Element {
                 let Some(first) = seq.next_element::<Element>()? else {
                     return Err(A::Error::custom("a coordinate array is empty"));
                 };
-                // Each arm reads the rest of the array at its first
-                // element's depth.
                 macro_rules! rest {
                     ($first:expr, $depth:path) => {{
                         let mut all = vec![$first];
@@ -396,7 +376,6 @@ impl<'de> Deserialize<'de> for Nest {
     }
 }
 
-/// The feature collection, each feature handed on as it is read.
 struct Collection<'a>(&'a mut Loading);
 
 impl<'de> DeserializeSeed<'de> for Collection<'_> {
@@ -487,8 +466,6 @@ mod tests {
             )
         }
 
-        /// What loading `geojson` fails with, less the path and the advice
-        /// every such error carries.
         fn problem(&self, geojson: &str) -> String {
             let error = self.load(geojson).expect_err("unusable").to_string();
             let path = self.0.join("zones.json");
@@ -522,8 +499,6 @@ mod tests {
         )
     }
 
-    /// West with a hole, East beside it in two parts, and Shared over the
-    /// eastern half of East.
     fn zones() -> String {
         collection(&[
             feature(

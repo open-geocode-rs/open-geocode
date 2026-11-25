@@ -1,7 +1,3 @@
-//! An open Pack and the questions the query shell asks it: search, reverse
-//! and how the parser reads a query. Answers are the Runtime's own GeoJSON,
-//! the same the HTTP API returns.
-
 use std::{path::Path, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result};
@@ -22,7 +18,6 @@ pub(crate) struct Engine {
     tagger: LatticeTagger,
 }
 
-/// One feature of an answer, as a row of the results shows it.
 #[derive(Clone)]
 pub(crate) struct Hit {
     pub layer: String,
@@ -30,18 +25,15 @@ pub(crate) struct Hit {
     pub label: String,
     pub lat: f64,
     pub lon: f64,
-    /// Search's relevance, or reverse's distance in metres.
     pub measure: Measure,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum Measure {
     Score(f32),
-    /// Reverse gives no distance for the areas around the point.
     Distance(Option<f64>),
 }
 
-/// An answer as the HTTP API would give it.
 #[derive(Clone)]
 pub(crate) enum Collection {
     Forward(ForwardCollection),
@@ -49,9 +41,7 @@ pub(crate) enum Collection {
 }
 
 impl Collection {
-    /// Pretty JSON of the whole answer, or of it with only feature `only`.
     pub(crate) fn json(&self, only: Option<usize>) -> String {
-        /// Keep only feature `index`, when one was asked for.
         fn only_one<F: Clone>(features: &[F], only: Option<usize>) -> Vec<F> {
             match only {
                 Some(index) => features.iter().skip(index).take(1).cloned().collect(),
@@ -75,12 +65,9 @@ impl Collection {
 pub(crate) struct Answer {
     pub hits: Vec<Hit>,
     pub collection: Collection,
-    /// How long the engine took, in milliseconds.
     pub millis: f64,
 }
 
-/// A query as the parser reads it: words with one label each, joined while
-/// the label stays the same.
 pub(crate) struct Reading {
     pub parts: Vec<(String, &'static str)>,
 }
@@ -141,8 +128,6 @@ impl Engine {
         })
     }
 
-    /// What a batch run answers for one row's address: its one match, or
-    /// none.
     pub(crate) fn geocode_address(&self, address: &str) -> Result<Answer> {
         let started = Instant::now();
         let address = address.trim().to_string();
@@ -179,7 +164,6 @@ impl Engine {
         })
     }
 
-    /// What `/reverse?lat=&lon=` answers.
     pub(crate) fn reverse(&self, lat: f64, lon: f64) -> Result<Answer> {
         let started = Instant::now();
         let response = self.reverse.reverse(GeocodeOptions::at(lon, lat))?;
@@ -203,7 +187,6 @@ impl Engine {
         })
     }
 
-    /// The parser's best reading of a query.
     pub(crate) fn read(&self, query: &str) -> Reading {
         let mut parts: Vec<(String, &'static str)> = Vec::new();
         if let Some(best) = self.tagger.parse(query).into_iter().next() {
@@ -233,7 +216,6 @@ fn hit(common: &api::Common, geometry: &api::Point, measure: Measure) -> Hit {
     }
 }
 
-/// A unit enum's name as it is serialized: `rooftop`.
 pub(crate) fn name_of(value: &impl Serialize) -> String {
     serde_json::to_value(value)
         .ok()
@@ -241,7 +223,6 @@ pub(crate) fn name_of(value: &impl Serialize) -> String {
         .unwrap_or_default()
 }
 
-/// Reads `lat, lon` from a query.
 pub(crate) fn point(query: &str) -> Option<(f64, f64)> {
     let mut numbers = query
         .split(|c: char| c.is_whitespace() || c == ',')

@@ -47,7 +47,7 @@ Silencing a correctness or safety lint is a bug, so fix the code and remove the 
 
 A comment that stays is one line where it can be, terse, with no hedging or filler.
 
-Why a design was chosen over the alternatives tried, with the evidence, goes in [`GOTCHAS.md`](GOTCHAS.md), never in a comment.
+Why a design was chosen over the alternatives tried, with the evidence, goes in [`DECISIONS.md`](DECISIONS.md), never in a comment.
 Change or delete its entry in the same pull request that changes the code.
 
 ```rust

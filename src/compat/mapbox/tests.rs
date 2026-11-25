@@ -41,10 +41,6 @@ fn write_pack() -> Pack {
     Pack(TempDir::new("compat-mapbox-jobs"))
 }
 
-/// An address with a unit, a cafe of a chain and an interpolation range in
-/// Canada > Ontario > Toronto > Downtown.
-/// The vendor id og issues for an address of the fixture: its og id, its
-/// layer and its label, since the catalogue holds no address.
 fn address_vendor_id(og_id: &str) -> String {
     let label = match og_id {
         "osm:node:10" => "10 King Street, Unit 2, Toronto, M5V 1A1",
@@ -54,7 +50,6 @@ fn address_vendor_id(og_id: &str) -> String {
 }
 
 fn write_toronto(writer: &mut Writer) {
-    // Each area lies in the areas written before it, as a build gives it.
     let place = |writer: &mut Writer, layer, name: &str, id, lon, within: &[(PlaceLayer, u64)]| {
         writer
             .write(
@@ -91,7 +86,6 @@ fn write_toronto(writer: &mut Writer) {
         -79.2,
         &in_region,
     );
-    // Drawn as an outline, so og knows its box.
     writer.set_extents(vec![(
         locality,
         [-793_000_000, 429_000_000, -789_000_000, 431_000_000],
@@ -138,7 +132,6 @@ fn write_toronto(writer: &mut Writer) {
         zone: None,
         enclosing: Vec::new(),
     });
-    // The postcode the addresses state, as a build derives it from them.
     writer
         .write(
             &PostcodeRecord {
@@ -294,12 +287,10 @@ async fn get(router: &Router, uri: &str) -> (StatusCode, Value) {
 const OSM: &str =
     "© OpenStreetMap contributors, ODbL 1.0 (https://www.openstreetmap.org/copyright)";
 
-/// The `mapbox_id` of a context area.
 fn id(og_id: &str) -> String {
     encode_parts(og_id, None, "")
 }
 
-/// The Geocoding context every Toronto record has.
 fn areas() -> Value {
     json!({
         "neighborhood": {"mapbox_id": id("osm:relation:4"), "name": "Downtown"},
@@ -363,8 +354,6 @@ async fn geocoding_forward_answers_an_address_in_mapbox_shape() {
                         ],
                     },
                     "place_formatted": "Toronto, Ontario M5V 1A1, Canada",
-                    // Unstated parts are not in the input, and the country
-                    // og fills in is inferred.
                     "match_code": {
                         "address_number": "matched",
                         "street": "matched",
@@ -522,7 +511,6 @@ async fn every_og_value_lands_in_its_mapbox_slot() {
                 });
             }
             if searchbox {
-                // Mapbox measures distance from `proximity` only.
                 let distance = if reverse {
                     &Value::Null
                 } else {
@@ -730,8 +718,6 @@ async fn geocoding_reverse_lists_the_areas_holding_the_point() {
         types,
         ["address", "neighborhood", "place", "region", "country"]
     );
-    // The town is its own layer, held by the region and country, and holds
-    // none of the smaller areas.
     let held = areas();
     assert_eq!(
         body["features"][2]["properties"]["context"],
@@ -805,7 +791,6 @@ async fn geocoding_structured_input_is_og_structured_geocode() {
         "unmatched"
     );
 
-    // A country og has no data in is a hard filter, as Mapbox's code is.
     let (status, body) = get(
         &router,
         "/compat/mapbox/search/geocode/v6/forward?address_line1=10%20King%20Street&country=NZ",
@@ -814,7 +799,6 @@ async fn geocoding_structured_input_is_og_structured_geocode() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["features"], json!([]));
 
-    // Areas alone are searched as the text they spell.
     let (status, body) = get(
         &router,
         "/compat/mapbox/search/geocode/v6/forward?place=Toronto&types=place",
@@ -1023,7 +1007,6 @@ async fn geocoding_errors_are_mapbox_errors() {
         assert_eq!(got, status, "{uri}");
         assert_eq!(body, json!({"message": message}), "{uri}");
     }
-    // Mapbox documents no 405: a wrong method is an unknown endpoint.
     let (status, body) = send(&router, "POST", &format!("{base}/forward?q=a"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body, json!({"message": "Not Found"}));
@@ -1088,7 +1071,6 @@ async fn search_box_suggest_then_retrieve() {
             "country_code_alpha_3": "CAN",
         },
     });
-    // og's contact and the hours it reads, Monday 0800 to 1800 and so on.
     let open = |day: u8, from: &str, to: &str| json!({"open": {"day": day, "time": from}, "close": {"day": day, "time": to}});
     let metadata = json!({
         "phone": "+1 416-555-0111",
@@ -1324,7 +1306,6 @@ async fn search_box_reverse_keys_context_by_id() {
     );
     assert_eq!(body["features"].as_array().map(Vec::len), Some(1));
 
-    // Without a type the point's areas follow the house, as many as asked.
     let count = |limit: &str| {
         let router = router.clone();
         let uri = format!(
@@ -1391,7 +1372,6 @@ async fn search_box_category_answers_the_places_of_one_kind() {
         assert_eq!(names(&body), [json!("Queen Cafe")], "{uri}");
     }
 
-    // Another kind, a point too far, another country, and the kind excluded.
     for uri in [
         format!("{base}/gas_station?proximity=-79,43"),
         format!("{base}/coffee?proximity=-70,43&radius=1"),
@@ -1560,8 +1540,6 @@ fn attribution_credits_og_sources() {
     );
 }
 
-/// `language` names results in its first language. With more than one, each
-/// layer Mapbox translates lists every language asked, the first too.
 #[tokio::test]
 async fn geocoding_language_names_layers_and_translates_them() {
     let pack = write_pack();
@@ -1599,8 +1577,6 @@ async fn geocoding_language_names_layers_and_translates_them() {
             "translations": both_languages("Kanada", "Canada"),
         })
     );
-    // og has no German name for Ontario and no name in either language for
-    // Toronto or Downtown, so each keeps its local name in that language.
     assert_eq!(context["region"]["name"], "Ontario");
     assert_eq!(
         context["region"]["translations"],
@@ -1614,13 +1590,10 @@ async fn geocoding_language_names_layers_and_translates_them() {
         context["neighborhood"]["translations"],
         both_languages("Downtown", "Downtown")
     );
-    // Mapbox translates only these five layers.
     for layer in ["address", "street", "postcode", "secondary_address"] {
         assert!(context[layer].get("translations").is_none(), "{layer}");
     }
 
-    // A later language og holds no name in reads the local name, not the
-    // first language's.
     let (_, italian) = get(&router, &format!("{forward}&language=de,it")).await;
     assert_eq!(
         italian["features"][0]["properties"]["context"]["country"]["translations"],
@@ -1630,7 +1603,6 @@ async fn geocoding_language_names_layers_and_translates_them() {
         })
     );
 
-    // An area result is its own layer, translated as any other.
     let (_, ontario) = get(
         &router,
         "/compat/mapbox/search/geocode/v6/forward?q=Ontario&types=region&language=fr,de",
@@ -1681,8 +1653,6 @@ async fn geocoding_language_names_layers_and_translates_them() {
     }
 }
 
-/// Search Box names results in the first language it is sent and never
-/// translates.
 #[tokio::test]
 async fn search_box_names_results_in_its_first_language() {
     let pack = write_pack();
@@ -1698,7 +1668,6 @@ async fn search_box_names_results_in_its_first_language() {
     assert!(country.get("translations").is_none());
 }
 
-/// What a filter asks is honoured or refused, never dropped with a 200.
 #[tokio::test]
 async fn filters_are_honoured_or_refused() {
     let pack = write_pack();
@@ -1731,12 +1700,9 @@ async fn filters_are_honoured_or_refused() {
         assert_eq!(body["features"], json!([]), "{uri}");
     }
 
-    // Typed text completes, as Mapbox's default `autocomplete` does.
     let (status, body) = get(&router, &format!("{geocoding}/forward?q=Toro")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(names(&body, "features").first(), Some(&json!("Toronto")));
-    // A whole address stays the geocode, whose match_code says the town
-    // it names is not the one it lies in.
     let (status, body) = get(
         &router,
         &format!("{geocoding}/forward?q=10%20King%20Street,%20Ottawa"),

@@ -1,4 +1,4 @@
-# Gotchas
+# Decisions
 
 Why parts of og are built the way they are, and what was tried before.
 Each entry names the code it governs, says what og does, lists what was rejected and why, and keeps the evidence that decided it.

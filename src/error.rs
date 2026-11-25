@@ -1,25 +1,14 @@
-//! The crate's error type.
-//!
-//! Variants are grouped by what a caller can do about them: fix the request,
-//! rebuild or redownload the Pack, report a build bug, or give up. The groups
-//! are what `http::problem` maps to status codes, so a new variant has to be
-//! classified there before it compiles.
-
 use std::{borrow::Cow, path::PathBuf};
 
-/// Anything the library can fail with.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// A query with nothing in it to search for.
     #[error("search query is empty")]
     EmptyQuery,
 
-    /// A query the index cannot be asked about, after parsing.
     #[error("cannot parse search query {query:?}: it has no words to search")]
     UnparsableQuery { query: String },
 
-    /// A coordinate that is NaN or infinite.
     #[error("coordinate must be finite")]
     CoordinateNotFinite,
 
@@ -27,24 +16,18 @@ pub enum Error {
     #[error("coordinate {value} is out of range")]
     CoordinateOutOfRange { value: f64 },
 
-    /// Options that contradict each other, named as the caller wrote them.
     #[error("{0}")]
     BadOptions(Cow<'static, str>),
 
-    /// A CSV column the options name but the input does not have.
     #[error("{input} has no column {column}")]
     MissingColumn { input: PathBuf, column: String },
 
-    /// The file does not start with the Pack magic.
     #[error("not an open-geocode Pack file")]
     NotAPack,
 
-    /// A Pack written against a different container format.
     #[error("Pack container version {found} is unsupported; rebuild the Pack")]
     UnsupportedVersion { found: u32 },
 
-    /// A part of a Pack (its schema, a section, the parser's weights)
-    /// written in a format this og does not read.
     #[error("the Pack's {part} is format {found} and this og reads {expected}; rebuild the Pack")]
     UnsupportedFormat {
         part: String,
@@ -52,31 +35,24 @@ pub enum Error {
         expected: u32,
     },
 
-    /// A section's bytes do not hash to what the table of contents recorded.
     #[error("Pack section {section} is corrupt: its checksum does not match")]
     ChecksumMismatch { section: String },
 
-    /// The file ends before its table of contents says it should.
     #[error("Pack file is truncated or still being written")]
     Truncated,
 
-    /// A section a reader needs is not in the file.
     #[error("Pack has no {section}")]
     MissingSection { section: &'static str },
 
-    /// Two sections share one name.
     #[error("duplicate Pack section {section}")]
     DuplicateSection { section: String },
 
-    /// A section's recorded extent falls outside the file.
     #[error("Pack section {section} is out of bounds")]
     SectionOutOfBounds { section: String },
 
-    /// The table of contents does not account for every byte.
     #[error("Pack table of contents has trailing bytes")]
     TrailingBytes,
 
-    /// The manifest disagrees with the sections beside it.
     #[error("Pack manifest does not match the build")]
     ManifestMismatch,
 
@@ -85,25 +61,18 @@ pub enum Error {
     #[error("Pack is inconsistent: {0}")]
     Inconsistent(String),
 
-    /// An id past the end of the table it indexes.
     #[error("{what} id {id} is out of range")]
     IdOutOfRange { what: &'static str, id: u64 },
 
-    /// Encoded bytes that do not decode: truncated, over-long, or a tag
-    /// this build does not know.
     #[error("Pack data is malformed: {0}")]
     Decode(&'static str),
 
-    /// Stored geometry that does not decode.
     #[error("stored geometry is invalid: {0}")]
     BadGeometry(String),
 
-    /// A line with more segments than the spatial index can address.
     #[error("line record {id} has too many segments to index")]
     TooManySegments { id: String },
 
-    /// A spill file came back malformed, which means the disk or the
-    /// encoding lied rather than that the input was bad.
     #[error("scratch file {path} is corrupt: {detail}")]
     BadScratch { path: PathBuf, detail: &'static str },
 
@@ -112,15 +81,12 @@ pub enum Error {
     #[error("{0}")]
     OutOfResources(String),
 
-    /// A download the build needs failed.
     #[error("fetching {url} failed: {message}")]
     Fetch { url: String, message: String },
 
-    /// The input extract is not in the layout the build reads.
     #[error("{0}")]
     BadInput(String),
 
-    /// A training or fixture row that does not parse.
     #[error("{0}")]
     BadFixtureRow(String),
 
@@ -128,7 +94,6 @@ pub enum Error {
     #[error("the run was cancelled")]
     Cancelled,
 
-    /// A lookup ran longer than it was given, and stopped.
     #[error("the lookup took longer than {} ms", after.as_millis())]
     TimedOut { after: std::time::Duration },
 
@@ -179,7 +144,6 @@ impl From<std::num::TryFromIntError> for Error {
     }
 }
 
-/// The crate's result type.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {

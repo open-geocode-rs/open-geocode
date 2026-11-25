@@ -1,6 +1,3 @@
-//! `/v1/explain-addresscode`, a code Precisely's APIs return, read back as
-//! words.
-
 use axum::{
     Json,
     extract::{Request, State},
@@ -18,13 +15,10 @@ use super::{
 };
 use crate::{compat::VendorError, runtime::AppState};
 
-/// Codes one request may carry.
 const MAX_CODES: usize = 25;
 
 const GLOBAL_MATCH_CODE: &str = "GlobalMatchCode";
 
-/// Every code type Precisely explains. og issues only the Global Match
-/// Code, so only it is read; the others name tables og does not hold.
 const CODE_TYPES: [&str; 5] = [
     GLOBAL_MATCH_CODE,
     "GlobalLocationCode",
@@ -151,7 +145,6 @@ pub(super) async fn explain_addresscode(
         .into_iter()
         .map(|item| explain(&item, code_type, official))
         .collect::<Vec<_>>();
-    // Every code refused as malformed fails the request, with each reason.
     if responses.iter().all(|response| response.status == INVALID) {
         let errors = responses
             .iter()

@@ -1,15 +1,3 @@
-//! Batch v7, with HERE's job flow outside and og's `/jobs` inside.
-//!
-//! The upload is read as it arrives and written as the og items its records
-//! ask, one JSON line each, so a job never holds its input in memory. Each
-//! start runs those items as an og job, kept and listed at `/jobs/{id}` as
-//! any other. The first runs under the HERE job's own UUID, a resumed one
-//! under a new one. Results and errors are og's results, read back and written as
-//! HERE's files on download.
-//!
-//! An og item's `id` carries what HERE's output needs back and og cannot
-//! honour, as `{ordinal}|{limit}|{radius}|{recId}`. og echoes it untouched.
-
 use std::{
     fs::{self, File},
     io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
@@ -53,23 +41,15 @@ use super::{
 pub(super) const GEOCODE_HRN: &str = "hrn:here:service::olp-here:search-geocode-7";
 pub(super) const REVGEOCODE_HRN: &str = "hrn:here:service::olp-here:search-revgeocode-7";
 
-/// The longest `recId` og can carry back. og's item id holds 128
-/// characters, and the ordinal, limit and radius go first.
 const MAX_REC_ID_CHARS: usize = 100;
 /// HERE's longest record line.
 const MAX_LINE_CHARS: usize = 4096;
-/// Bytes a record line may take before it is cut off as too long, at most
-/// four per character in UTF-8.
 const MAX_LINE_BYTES: u64 = MAX_LINE_CHARS as u64 * 4;
-/// Bytes per chunk when streaming a file out.
 const CHUNK_BYTES: usize = 64 << 10;
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(15 * 60);
 
-/// Read-modify-write of a job's record, one at a time. A start and a stop
-/// arriving together must not both win.
 static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The service a job wraps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Service {
@@ -92,8 +72,6 @@ impl Service {
         }
     }
 
-    /// The CSV columns after `recId|seqNumber|seqLength` when the job names
-    /// none.
     fn default_columns(self) -> &'static [&'static str] {
         match self {
             Self::Geocode => &["position", "addressLabel", "title"],
@@ -118,7 +96,6 @@ impl OutputType {
     }
 }
 
-/// A HERE job as this server keeps it, beside og's own job records.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Meta {
     id: String,
@@ -128,34 +105,23 @@ struct Meta {
     billing_tags: Vec<String>,
     output_type: OutputType,
     output_delimiter: String,
-    /// The CSV columns asked, in HERE's spelling; the default when `None`.
     #[serde(default)]
     output_columns: Option<Vec<String>>,
-    /// JSONL paths to keep; every field when `None`.
     #[serde(default)]
     output_filter: Option<Vec<String>>,
     created: u64,
     #[serde(default)]
     started: Option<u64>,
-    /// Records written for og to look up.
     items: usize,
-    /// Records refused by batch validation, HERE's `invalid`.
     invalid: usize,
-    /// Valid records whose parameters the wrapped service would refuse, failed
-    /// without a lookup.
     rejected: usize,
-    /// og job ids, one per start, oldest first.
     runs: Vec<String>,
     stopped: bool,
     deleted: bool,
-    /// Unix seconds. For a job never started or deleted; a started one
-    /// lives as long as its og jobs.
     expires_at: u64,
     request_id: String,
-    /// The counts and end of a deleted job, whose og jobs are gone with it.
     #[serde(default)]
     frozen: Option<Frozen>,
-    /// Notifications called each time a run of the job ends.
     #[serde(default)]
     notification_ids: Vec<String>,
 }
@@ -166,7 +132,6 @@ struct Frozen {
     ended: Option<u64>,
 }
 
-/// HERE's `JobRecords`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Records {
     total: usize,
@@ -178,8 +143,6 @@ struct Records {
     failed: usize,
 }
 
-/// A job as it stands, with its record, the HERE status its og jobs come to
-/// and their counts.
 #[derive(Debug)]
 struct View {
     meta: Meta,
@@ -202,7 +165,6 @@ impl View {
     }
 }
 
-/// Batch's `ErrorResponse`, and its status.
 #[derive(Debug)]
 pub(super) struct BatchError {
     status: StatusCode,
@@ -336,7 +298,6 @@ fn unix_now() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// Unix seconds as RFC 3339 in UTC, HERE's `date-time`.
 pub(super) fn date_time(seconds: u64) -> String {
     let days = seconds / 86_400;
     let rest = seconds % 86_400;
@@ -349,21 +310,16 @@ pub(super) fn date_time(seconds: u64) -> String {
     )
 }
 
-/// Where HERE jobs are kept, beside og's in a folder og's own scan skips.
 pub(super) fn store_dir(state: &AppState) -> PathBuf {
     state.jobs().dir().join("here")
 }
 
-/// A job's file. The id is checked to be `JOB-` and a UUID first, so it can
-/// never name a path outside the store.
 fn file(state: &AppState, id: &str, extension: &str) -> PathBuf {
     store_dir(state).join(format!("{id}.{extension}"))
 }
 
 fn job_uuid(id: &str) -> Option<uuid::Uuid> {
     let uuid = uuid::Uuid::parse_str(id.strip_prefix("JOB-")?).ok()?;
-    // Only the hyphenated form this server hands out names a job, so one
-    // job has one id.
     (format!("JOB-{uuid}") == id).then_some(uuid)
 }
 
@@ -480,8 +436,6 @@ fn remove_abandoned_staging(state: &AppState) {
     }
 }
 
-/// The job's status as HERE names it, or `None` once it has expired, past
-/// its time or with an og job of it gone. An expired job's files are removed.
 fn view(state: &AppState, meta: Meta) -> Option<View> {
     let mut runs = Vec::with_capacity(meta.runs.len());
     for run in &meta.runs {
@@ -529,7 +483,6 @@ fn view(state: &AppState, meta: Meta) -> Option<View> {
     })
 }
 
-/// HERE's status of a job whose latest og job is in `last`.
 fn here_status(meta: &Meta, last: Option<Status>) -> &'static str {
     match last {
         _ if meta.deleted => "deleted",
@@ -537,8 +490,6 @@ fn here_status(meta: &Meta, last: Option<Status>) -> &'static str {
         Some(Status::Running) => "inProgress",
         Some(Status::Completed) => "completed",
         Some(Status::Cancelled) if meta.stopped => "stopped",
-        // Cancelled by a server shutting down, not by a stop. That is HERE's
-        // failure, which a start resumes.
         Some(Status::Cancelled | Status::Failed) => "failure",
     }
 }
@@ -577,7 +528,6 @@ pub(crate) async fn sweep(state: &AppState) {
     }
 }
 
-/// Every kept job, newest first.
 fn all(state: &AppState) -> Vec<View> {
     let mut views = stored(state)
         .into_iter()
@@ -592,9 +542,6 @@ fn all(state: &AppState) -> Vec<View> {
     views
 }
 
-/// Where this job's links point. They start where clients reach the server
-/// (see [`AppState::origin`]) and keep the request's prefix, so a link works
-/// through whatever path the server is mounted at.
 #[derive(Debug)]
 pub(super) struct Links {
     jobs: String,
@@ -614,7 +561,6 @@ impl Links {
     }
 }
 
-/// HERE's short `JobResponse`, which every action answers with.
 fn job_response(view: &View, links: &Links) -> Value {
     let mut body = json!({
         "id": view.meta.id,
@@ -633,7 +579,6 @@ fn job_response(view: &View, links: &Links) -> Value {
     body
 }
 
-/// HERE's `JobDetailResponse`.
 fn job_details(view: &View, links: &Links) -> Value {
     let mut body = job_response(view, links);
     let href = links.job(&view.meta.id);
@@ -670,7 +615,6 @@ fn job_details(view: &View, links: &Links) -> Value {
     body
 }
 
-/// How the upload is read and the output written, from `POST`'s query.
 #[derive(Debug)]
 struct Plan {
     service: Service,
@@ -758,8 +702,6 @@ impl Plan {
             input_delimiter: delimiter(params.get("inputDelimiter"), false)?,
             output_delimiter,
             input_columns: params.get("inputColumns").map(str::to_string),
-            // The descriptor is written as a result row is, split by the
-            // output delimiter; the filter is a list of comma-separated paths.
             output_columns: list("outputColumns", output_delimiter),
             output_filter: list("outputFilter", ','),
             start,
@@ -867,7 +809,6 @@ fn billing_tags(value: Option<&str>) -> Result<Vec<String>, BatchError> {
     Ok(tags)
 }
 
-/// The upload as a [`Read`], fed chunk by chunk from the request body.
 #[derive(Debug)]
 struct Upload {
     chunks: mpsc::Receiver<io::Result<Bytes>>,
@@ -890,7 +831,6 @@ impl Read for Upload {
     }
 }
 
-/// What the intake found.
 #[derive(Debug, Default)]
 struct Intake {
     items: usize,
@@ -898,7 +838,6 @@ struct Intake {
     rejected: usize,
 }
 
-/// Why an upload as a whole was refused.
 #[derive(Debug)]
 enum Refusal {
     TooLarge,
@@ -906,8 +845,6 @@ enum Refusal {
     Unreadable(io::Error),
 }
 
-/// One column of the input. Its name is lower-cased, since HERE's are not
-/// case-sensitive, and a `name=value` header cell gives it a default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Column {
     name: String,
@@ -953,15 +890,12 @@ fn cells(line: &str, delimiter: char) -> Vec<String> {
     cells
 }
 
-/// How record lines are read.
 #[derive(Debug)]
 enum Layout {
     Delimited(Vec<Column>),
-    /// Each line a URL query string; the delimiter does not apply.
     Query,
 }
 
-/// One input record, its values by lower-cased column name.
 #[derive(Debug, Default)]
 struct Record(Vec<(String, String)>);
 
@@ -975,7 +909,6 @@ impl Record {
     }
 }
 
-/// A record HERE's batch validation refuses, `999` in the error report.
 #[derive(Debug)]
 struct Invalid {
     cause: String,
@@ -991,7 +924,6 @@ impl Invalid {
     }
 }
 
-/// Reads an upload into og items and refused records, a line at a time.
 #[derive(Debug)]
 struct Reader<'a> {
     plan: &'a Plan,
@@ -1062,7 +994,6 @@ impl Reader<'_> {
             let broken = too_long
                 || text.chars().count() > MAX_LINE_CHARS
                 || std::str::from_utf8(&line).is_err();
-            // Only an inline layout consumes a header from the upload.
             record_number += 1;
             if record_number > self.max_items {
                 return Err(Refusal::TooManyRecords(self.max_items));
@@ -1129,8 +1060,6 @@ impl Reader<'_> {
     }
 
     fn invalid(&mut self, rec_id: &str, text: &str, invalid: &Invalid) -> io::Result<()> {
-        /// HERE's message for a line it cannot read, its fields in HERE's
-        /// order, as the errors file quotes it.
         #[derive(serde::Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Message<'a> {
@@ -1153,7 +1082,6 @@ impl Reader<'_> {
         self.reject(rec_id, 999, &message)
     }
 
-    /// A record refused before it runs, its message already as text.
     fn reject(&mut self, rec_id: &str, code: u16, message: &str) -> io::Result<()> {
         write_staged(
             &mut self.rejects,
@@ -1176,7 +1104,6 @@ fn write_staged(
     out.write_all(b"\n")
 }
 
-/// Read past the rest of an overlong line. Returns the bytes skipped.
 fn skip_line(upload: &mut impl BufRead) -> io::Result<u64> {
     let mut skipped = 0u64;
     loop {
@@ -1198,8 +1125,6 @@ fn skip_line(upload: &mut impl BufRead) -> io::Result<u64> {
     }
 }
 
-/// A line's values by column, or `None` for a line its layout cannot read,
-/// with more cells than columns or a query string that does not parse.
 fn read_record(layout: &Layout, text: &str, delimiter: char) -> Option<Record> {
     match layout {
         Layout::Query => {
@@ -1216,7 +1141,6 @@ fn read_record(layout: &Layout, text: &str, delimiter: char) -> Option<Record> {
         }
         Layout::Delimited(columns) => {
             let cells = cells(text, delimiter);
-            // The header can supply defaults for omitted trailing columns.
             let short_of_default = columns
                 .iter()
                 .skip(cells.len())
@@ -1262,8 +1186,6 @@ fn check_rec_id(rec_id: &str) -> Result<(), Invalid> {
     Ok(())
 }
 
-/// A record as og item fields, and what HERE's output needs that og does not
-/// carry.
 #[derive(Debug)]
 struct Translated {
     fields: Vec<(&'static str, String)>,
@@ -1274,8 +1196,6 @@ struct Translated {
 /// A batch record defaults to one result, not the endpoint's 20.
 const BATCH_DEFAULT_LIMIT: usize = 1;
 
-/// The og item a record asks, by the rules its endpoint reads a request
-/// with; a parameter that endpoint would refuse fails the record as its 400.
 fn translate(service: Service, record: &Record) -> Result<Translated, Gs7Error> {
     let limit = match record.get("limit") {
         None => BATCH_DEFAULT_LIMIT,
@@ -1429,8 +1349,6 @@ fn translate(service: Service, record: &Record) -> Result<Translated, Gs7Error> 
     })
 }
 
-/// Pass the request body on a chunk at a time, refusing one that grows past
-/// `max_bytes`.
 async fn forward(
     body: Body,
     max_bytes: u64,
@@ -1587,8 +1505,6 @@ async fn create_job(
     }
     stage.committed = true;
     let mut view = view(state, meta).ok_or_else(BatchError::job_not_found)?;
-    // A created job is submitted, whether its start follows or not; a read
-    // after tells how far it has run.
     view.status = "submitted";
     let links = Links::of(state, headers, uri);
     Ok((StatusCode::CREATED, axum::Json(job_response(&view, &links))).into_response())
@@ -1687,7 +1603,6 @@ fn internal(error: io::Error) -> BatchError {
     BatchError::of(Problem::internal(error.into()))
 }
 
-/// Start an og job over the items no earlier run of this job answered.
 async fn launch(
     state: &AppState,
     meta: &mut Meta,
@@ -1723,7 +1638,6 @@ async fn launch(
     meta.stopped = false;
     if let Err(error) = save_capped(state, meta, remaining) {
         state.jobs().remove(&run);
-        // The first run reuses the job UUID on retry.
         job.ended().await;
         return Err(error);
     }
@@ -1736,10 +1650,7 @@ async fn launch(
     Ok(())
 }
 
-/// Calls the job's notifications once run `run` has ended, unless a later
-/// run took over or the job was deleted meanwhile.
 async fn announce_end(state: &AppState, id: &str, run: &str) {
-    // Taken so a stop's record is saved before the end is read.
     let view = {
         let _guard = LOCK.lock().await;
         load(state, id).and_then(|meta| view(state, meta))
@@ -1768,7 +1679,6 @@ async fn announce_end(state: &AppState, id: &str, run: &str) {
     notify::deliver(state, &view.meta.notification_ids, &facts);
 }
 
-/// The items file, less the lines an earlier run answered, in chunks.
 fn feed(items: File, answered: &[u64], lines: &mpsc::Sender<io::Result<Bytes>>) {
     let mut items = BufReader::new(items);
     let mut chunk = Vec::with_capacity(CHUNK_BYTES);
@@ -1805,7 +1715,6 @@ fn feed(items: File, answered: &[u64], lines: &mpsc::Sender<io::Result<Bytes>>) 
     }
 }
 
-/// One line of an og job's JSONL results.
 #[derive(Debug, Deserialize)]
 struct OgLine {
     #[serde(default)]
@@ -1839,7 +1748,6 @@ struct OgParam {
     name: String,
 }
 
-/// What an og item id carries back.
 #[derive(Debug, PartialEq)]
 struct Carried<'a> {
     ordinal: usize,
@@ -1866,9 +1774,6 @@ fn carried(id: &str) -> Option<Carried<'_>> {
     })
 }
 
-/// Every og line of every run of the job, in the order the runs wrote them,
-/// each passed to `each` with what its id carries and where it starts in its
-/// run's results.
 fn each_line_as_written(
     state: &AppState,
     meta: &Meta,
@@ -1907,17 +1812,12 @@ fn each_line_as_written(
     Ok(())
 }
 
-/// Where a run wrote an og line.
 #[derive(Clone, Copy)]
 struct Written {
     run: usize,
     offset: u64,
 }
 
-/// Every og line of the job, in the order of the records it answers, each
-/// passed to `each` with what its id carries. Runs answer records as they
-/// finish, so a first pass notes where each record's line is, at most one
-/// place per record, and a second reads them in record order.
 fn each_line(
     state: &AppState,
     meta: &Meta,
@@ -1963,7 +1863,6 @@ fn each_line(
     Ok(())
 }
 
-/// A bit per item, set for the ones a run has answered.
 fn answered(state: &AppState, meta: &Meta) -> io::Result<Vec<u64>> {
     let mut answered = vec![0u64; meta.items.div_ceil(64)];
     each_line_as_written(state, meta, |carried, _, _| {
@@ -2008,8 +1907,6 @@ pub(super) async fn start(
             return Ok(current);
         }
         let mut meta = current.meta;
-        // The first run takes the job's own UUID, so the og job is found by
-        // it; a resumed one needs a fresh one.
         let uuid = match (meta.runs.is_empty(), job_uuid(&meta.id)) {
             (true, Some(uuid)) => uuid,
             _ => uuid::Uuid::new_v4(),
@@ -2027,7 +1924,6 @@ pub(super) async fn start(
     }
 }
 
-/// The longest a stop waits for its run to end before it answers.
 const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(super) async fn stop(
@@ -2048,7 +1944,6 @@ pub(super) async fn stop(
         save(&state, &meta).map_err(internal)?;
         if let Some(job) = meta.runs.last().and_then(|run| state.jobs().get(run)) {
             job.cancel();
-            // Await the stop: the final record may already have completed the job.
             let _ = tokio::time::timeout(STOP_WAIT, job.ended()).await;
         }
         view(&state, meta).ok_or_else(BatchError::job_not_found)
@@ -2061,8 +1956,6 @@ pub(super) async fn stop(
     }
 }
 
-/// Delete a job's og jobs and files, keeping its record, which HERE still
-/// shows by id.
 fn delete_job(state: &AppState, view: View) -> io::Result<View> {
     let mut meta = view.meta;
     for run in &meta.runs {
@@ -2106,7 +1999,6 @@ pub(super) async fn delete(
     }
 }
 
-/// The statuses a list or a bulk delete filters by.
 pub(super) const FILTERS: [&str; 8] = [
     "any",
     "submitted",
@@ -2254,7 +2146,6 @@ const COLUMNS: [&str; 46] = [
     "foodTypes",
 ];
 
-/// The always-first columns.
 const STANDARD: [&str; 3] = ["recId", "seqNumber", "seqLength"];
 
 fn output_columns(meta: &Meta) -> Vec<&'static str> {
@@ -2283,7 +2174,6 @@ fn output_columns(meta: &Meta) -> Vec<&'static str> {
     columns
 }
 
-/// An item's value in a CSV column, in HERE's renderings.
 fn cell_of(item: &Item, column: &str) -> String {
     let address = &item.address;
     let text = |value: &Option<String>| value.clone().unwrap_or_default();
@@ -2372,12 +2262,10 @@ fn cell_of(item: &Item, column: &str) -> String {
             .as_ref()
             .map(|scoring| scoring.query_score.to_string())
             .unwrap_or_default(),
-        // A column HERE has and og never fills.
         _ => String::new(),
     }
 }
 
-/// An array cell, its values joined by commas as HERE renders one.
 fn joined(values: impl Iterator<Item = f64>) -> String {
     values
         .map(|value| value.to_string())
@@ -2385,8 +2273,6 @@ fn joined(values: impl Iterator<Item = f64>) -> String {
         .join(",")
 }
 
-/// A cell as written, quoted when it holds the delimiter, a quote or a line
-/// break, its quotes doubled.
 fn quoted(value: &str, delimiter: &str) -> String {
     if value.contains(delimiter) || value.contains(['"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
@@ -2395,7 +2281,6 @@ fn quoted(value: &str, delimiter: &str) -> String {
     }
 }
 
-/// Keep only the paths asked, each `a.b.c`, through arrays to every element.
 fn project(value: &Value, paths: &[Vec<&str>]) -> Value {
     match value {
         Value::Array(items) => {
@@ -2424,10 +2309,8 @@ fn project(value: &Value, paths: &[Vec<&str>]) -> Value {
     }
 }
 
-/// The HERE items one og line answered.
 fn line_items(meta: &Meta, carried: &Carried<'_>, response: &OgResponse) -> Vec<Item> {
     match meta.service {
-        // A column asks for the time zone, so every item carries it.
         Service::Geocode => response
             .features
             .iter()
@@ -2444,7 +2327,6 @@ fn line_items(meta: &Meta, carried: &Carried<'_>, response: &OgResponse) -> Vec<
     }
 }
 
-/// Write the job's results in HERE's format, a record at a time.
 fn write_results(state: &AppState, meta: &Meta, out: &mut impl Write) -> io::Result<()> {
     let delimiter = meta.output_delimiter.as_str();
     let columns = output_columns(meta);
@@ -2514,8 +2396,6 @@ fn write_results(state: &AppState, meta: &Meta, out: &mut impl Write) -> io::Res
     })
 }
 
-/// Write the job's error report, the records refused on upload, then the
-/// lookups og failed.
 fn write_errors(state: &AppState, meta: &Meta, out: &mut impl Write) -> io::Result<()> {
     let delimiter = meta.output_delimiter.as_str();
     writeln!(out, "recId{delimiter}errorCode{delimiter}errorMessage")?;
@@ -2530,8 +2410,6 @@ fn write_errors(state: &AppState, meta: &Meta, out: &mut impl Write) -> io::Resu
                 "{}{delimiter}{}{delimiter}{}",
                 quoted(reject["recId"].as_str().unwrap_or_default(), delimiter),
                 reject["code"],
-                // A job written before the message was kept as text holds
-                // it as an object.
                 reject["message"]
                     .as_str()
                     .map_or_else(|| reject["message"].to_string(), str::to_string),
@@ -2562,7 +2440,6 @@ fn write_errors(state: &AppState, meta: &Meta, out: &mut impl Write) -> io::Resu
     })
 }
 
-/// A file written by `write` on a blocking thread, streamed out as written.
 fn download(
     state: &AppState,
     meta: Meta,
@@ -2596,7 +2473,6 @@ fn download(
         .into_response()
 }
 
-/// A [`Write`] that sends what is written as body chunks.
 #[derive(Debug)]
 struct ChunkWriter {
     chunk: Vec<u8>,

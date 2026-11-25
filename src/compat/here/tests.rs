@@ -37,8 +37,6 @@ impl TestPack {
         build_router(self.state(Limits::DEFAULT), None, None)
     }
 
-    /// A server on the Pack. Each keeps its jobs in the one directory, so
-    /// two see the same jobs.
     pub(super) fn state(&self, limits: Limits) -> AppState {
         AppState::open(&PACK.join("pack"), &self.0, limits).expect("open pack")
     }
@@ -48,8 +46,6 @@ pub(super) fn pack(name: &str) -> TestPack {
     TestPack(TempDir::new(&format!("compat-here-{name}")))
 }
 
-/// The vendor id og issues for an address of the fixture: its og id, its
-/// layer and its label, since the catalogue holds no address.
 fn address_vendor_id(og_id: &str) -> String {
     let label = match og_id {
         "osm:node:10" => "10 King Street, Unit 5, M5V 1A1",
@@ -65,12 +61,6 @@ fn line(from: [f64; 2], to: [f64; 2]) -> geojson::Geometry {
     })
 }
 
-/// Canada > Ontario > Toronto Division > Toronto > Old Toronto >
-/// Entertainment District. Holds an address with only a unit and a postcode
-/// stated and an entrance, one outside every area stating its own town,
-/// region and areas, a POI with two phone numbers, a website, weekly hours
-/// and an entrance, a street and an interpolation range. Calibrated, every confidence
-/// one half.
 fn write_pack(dir: &Path) {
     let mut writer = Writer::create(dir).expect("writer");
     let mut place = |layer, name: &str, id| {
@@ -180,7 +170,6 @@ fn write_pack(dir: &Path) {
         postcode: Some("M5H 2N2".to_string()),
         ..king.clone()
     };
-    // Outside every boundary og knows, its stated parts are all it has.
     writer
         .write(&address(queen, -79.002, 20, Vec::new()), None)
         .expect("address");
@@ -190,8 +179,6 @@ fn write_pack(dir: &Path) {
                 alt_names: Vec::new(),
                 name: "Queen Bakery".to_string(),
                 category: "shop:bakery".to_string(),
-                // States a town and area of its own, beside og's. The
-                // areas og found win HERE's admin tiers.
                 address: Some(AddressComponents {
                     number: "12".to_string(),
                     unit: None,
@@ -204,7 +191,6 @@ fn write_pack(dir: &Path) {
                 source: SourceProvenance::osm(ObjectType::Way, 11),
                 prominence: Default::default(),
                 wikidata: None,
-                // A chain of one bakery, for HERE's chain searches.
                 brand: Some(crate::record::Brand {
                     name: "Queen Bakery".to_string(),
                     wikidata: None,
@@ -220,7 +206,6 @@ fn write_pack(dir: &Path) {
                     access: Entrance::of_tag(Some("yes"), -79.00502, 43.00002)
                         .into_iter()
                         .collect(),
-                    // HERE has a food type for sandwiches, none for coffee.
                     cuisine: vec!["coffee_shop".to_string(), "sandwich".to_string()],
                 }
                 .kept(),
@@ -362,8 +347,6 @@ pub(super) async fn get(router: &Router, uri: &str) -> Reply {
     send(router, "GET", uri, None).await
 }
 
-/// The HERE address of the King Street address, every tier from og's
-/// context, the unit and postcode from the record.
 fn king_address() -> Value {
     json!({
         "label": "10 King Street, Unit 5, Toronto, ON M5V 1A1, Canada",
@@ -452,8 +435,6 @@ fn bakery(distance: Option<i64>) -> Value {
             "name": "Bakery and Baked Goods Store",
             "primary": true,
         }],
-        // Its cuisine names coffee, which HERE has no food type for, and
-        // sandwiches.
         "foodTypes": [{"id": "800-060", "name": "Sandwich", "primary": true}],
     });
     if let Some(distance) = distance {
@@ -462,7 +443,6 @@ fn bakery(distance: Option<i64>) -> Value {
     item
 }
 
-/// The og layer of a HERE address slot an area of the fixture fills.
 fn slot_layer(slot: &str) -> &'static str {
     match slot {
         "district" => "neighbourhood",
@@ -487,7 +467,6 @@ fn area(id: &str, title: &str, kind: (&str, &str, &str), slot: &str) -> Value {
     item
 }
 
-/// An area item that names itself by its own ISO code too.
 fn coded(mut item: Value, slot: &str, code: &str) -> Value {
     item["address"][slot] = code.into();
     item
@@ -595,8 +574,6 @@ async fn geocode_reads_qualified_queries() {
     );
 }
 
-/// A sure match answers alone: the street named in full and its town, not a
-/// house whose town the query names only in part.
 #[tokio::test]
 async fn geocode_answers_the_best_match_alone() {
     let pack = pack("best-match");
@@ -630,7 +607,6 @@ async fn geocode_types_keep_the_kinds_asked() {
             "Queen Street 2-98 even, Toronto",
         )
     );
-    // A range found by its street alone is a street, as no number was asked.
     assert_eq!(items[0]["resultType"], "street");
     assert_eq!(items[0].get("houseNumberType"), None);
 
@@ -644,8 +620,6 @@ async fn geocode_types_keep_the_kinds_asked() {
             "houseNumberType": "PA",
             "address": queen_address(),
             "position": {"lat": 43.0, "lng": -79.002},
-            // "Toronto" is a word of "Toronto City", a partial match, so
-            // the city counts half.
             "scoring": {"queryScore": 0.75, "fieldScore": {"streets": [1.0], "city": 0.5}},
         }]})
     );
@@ -674,7 +648,6 @@ async fn revgeocode_answers_the_nearest_first() {
         json!({"items": [king(json!({"distance": 0}))]})
     );
 
-    // og's areas at the point follow, each in its own address slot.
     let reply = get(
         &router,
         "/compat/here/v1/revgeocode?at=43.0,-79.0&types=area&limit=100",
@@ -693,8 +666,6 @@ async fn revgeocode_answers_the_nearest_first() {
         ]})
     );
 
-    // A circle is a hard filter on the distance. The address 8 m away is
-    // outside 5 m, and the areas hold the point.
     let reply = get(
         &router,
         "/compat/here/v1/revgeocode?in=circle:43.0,-79.0001;r=5&limit=2",
@@ -814,8 +785,6 @@ async fn autosuggest_autocomplete_and_discover() {
         "houseNumberType": "PA",
         "address": queen_address(),
     });
-    // og's marks of "Queen" in each label: the title holds them where it
-    // is the label or starts it.
     let marked = |mut item: Value, at: usize| {
         let mark = json!([{"start": at, "end": at + 5}]);
         item["highlights"] = json!({"title": mark, "address": {"label": mark}});
@@ -888,8 +857,6 @@ async fn autosuggest_autocomplete_and_discover() {
         assert_eq!(reply.status, StatusCode::OK, "{path}");
     }
 
-    // Autocomplete is addresses alone, with no position, titled from the
-    // largest area down, its marks following "Queen" there.
     let mut suggested = queen.clone();
     suggested["title"] = json!("M5H 2N2, Toronto City, 20 Queen Street");
     suggested["highlights"]["title"] = json!([{"start": 26, "end": 31}]);
@@ -902,8 +869,6 @@ async fn autosuggest_autocomplete_and_discover() {
     let reply = get(&router, "/compat/here/v1/autocomplete?q=Queen&limit=20").await;
     assert_eq!(reply.status, StatusCode::OK);
 
-    // Discover is og's place search. A box holds the bakery, one beside it
-    // does not; a circle is the distance from its center.
     let discover = |area: &str| format!("/compat/here/v1/discover?q=Queen+Bakery&in={area}");
     let reply = get(&router, &discover("bbox:-79.01,42.99,-79.0,43.01")).await;
     assert_eq!(reply.json(), json!({"items": [bakery(None)]}));
@@ -941,8 +906,6 @@ async fn browse_answers_the_places_around_a_point_by_kind_and_name() {
     let reply = send(&router, "POST", &format!("{base}?at=43,-79"), None).await;
     assert_eq!(reply.json(), found);
 
-    // Another kind, a kind og has none of, the kind left out, another name,
-    // another country and outside the area.
     for query in [
         "at=43,-79&categories=100-1000-0000",
         "at=43,-79&categories=999-9999-9999",
@@ -958,8 +921,6 @@ async fn browse_answers_the_places_around_a_point_by_kind_and_name() {
         assert_eq!(reply.status, StatusCode::OK, "{query}");
         assert_eq!(reply.json(), json!({"items": []}), "{query}");
     }
-    // og's places carry no chain, so asking for one keeps none, and a page
-    // past og's 50 results is cut short.
     for query in ["at=43,-79&chains=1566", "at=43,-79&limit=20&offset=40"] {
         let reply = get(&router, &format!("{base}?{query}")).await;
         assert_eq!(reply.status, StatusCode::OK, "{query}");
@@ -1051,8 +1012,6 @@ async fn lookup_finds_a_record_the_catalogue_does_not_hold() {
     assert_eq!(reply.json()["id"], range["id"]);
     assert_eq!(reply.json()["title"], range["title"]);
 
-    // An imported row renumbered by a newer release of its data: the
-    // record with the label the id carries.
     let Some(crate::compat::OgRef::Labelled { label, .. }) = decode_id(id) else {
         panic!("{id} carries no label");
     };
@@ -1134,7 +1093,6 @@ async fn errors_take_here_shapes() {
             Some("Unsupported country code: 'XXX'. Provide ISO 3166-1 alpha-3 codes"),
         )
     );
-    // og's own refusal, named by the HERE parameter that became og's.
     let long = "a".repeat(300);
     let reply = get(&router, &format!("/compat/here/v1/geocode?q={long}")).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
@@ -1184,10 +1142,6 @@ async fn errors_take_here_shapes() {
     );
 }
 
-/// Fidelity. Every og value of every answer lands in its HERE slot
-/// unchanged, across each endpoint and every layer the Pack holds, and every
-/// slot og has data for is filled at least once, so a slot that goes empty
-/// fails here.
 #[tokio::test]
 async fn every_og_value_lands_in_its_here_slot() {
     let pack = pack("fidelity");
@@ -1248,8 +1202,6 @@ async fn every_og_value_lands_in_its_here_slot() {
         let features = og["features"].as_array().expect("features");
         assert!(!features.is_empty(), "{native} found nothing");
         assert!(!items.is_empty(), "{here} answered nothing");
-        // Each item is one of og's results, by its id: HERE keeps the best
-        // matches of an address search, so it may answer fewer.
         for item in &items {
             let feature = features
                 .iter()
@@ -1319,8 +1271,6 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
         encode_parts(id, Layer::parse(layer), label),
         "{at}"
     );
-    // A house or street is labelled by its postal lines, the house's own
-    // line first; anything else by og's label.
     let lines = properties["address_lines"]
         .as_array()
         .map(|lines| lines.iter().filter_map(Value::as_str).collect::<Vec<_>>())
@@ -1337,8 +1287,6 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
         }
         _ => properties["label"].clone(),
     };
-    // An `/autocomplete` suggestion has no point, no way in and no box, and
-    // is titled from the largest area down to its own line.
     let suggestion = uri.contains("/v1/autocomplete?");
     let own_line = label.as_str().and_then(|label| label.split(", ").next());
     let title = if layer == "poi" {
@@ -1417,8 +1365,6 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
         area("country").or_else(|| own("country")),
         "{at}"
     );
-    // An area's own code names it where no context area does: `US` on the
-    // country, `US-RI` on the region.
     let own_code = |of: &str| (layer == of).then(|| text(&properties["code"])).flatten();
     assert_eq!(
         slot("countryCode"),
@@ -1435,8 +1381,6 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
             .and_then(|code| code.split_once('-').map(|(_, own)| own.to_string())),
         "{at}"
     );
-    // Contacts and hours are place details, which discover, browse, lookup
-    // and autosuggest carry.
     let details = [
         "/v1/discover",
         "/v1/browse",
@@ -1518,8 +1462,6 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
         let label = properties["highlights"].clone();
         let label = if label.is_null() { json!([]) } else { label };
         assert_eq!(item["highlights"]["address"]["label"], label, "{at}");
-        // A suggestion's title is written anew, and its marks hold the
-        // texts the label's marks hold.
         let texts = |text: &str, marks: &Value| {
             let chars = text.chars().collect::<Vec<_>>();
             let mut texts = marks
@@ -1550,8 +1492,6 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
                 "{at}"
             );
         }
-        // Elsewhere the title holds the marks that lie in it when the label
-        // starts with it.
         let title = item["title"].as_str().unwrap_or_default();
         let length = title.chars().count() as u64;
         let in_title = match item["address"]["label"].as_str().unwrap_or_default().starts_with(title) {
@@ -1571,9 +1511,6 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
         assert_eq!(item.get("highlights"), None, "{at}");
     }
     if uri.contains("/v1/geocode") {
-        // Each stated part as HERE scores a field: 1 matched, 0.5 partial,
-        // left out unmatched; the query score is their mean with 0 for an
-        // unmatched part.
         let score = |part: &Value| match part.as_str() {
             Some("matched") => Some(1.0),
             Some("partial") => Some(0.5),
@@ -1606,8 +1543,6 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
         }
         let street = score(&matched["street"]).filter(|score| *score > 0.0);
         assert_eq!(field["streets"][0].as_f64(), street, "{at} street");
-        // A result og judged on no part takes its calibrated confidence, and
-        // with neither there is no score.
         let query_score = match stated.is_empty() {
             false => Some(stated.iter().copied().sum::<f64>() / stated.len() as f64),
             true => properties["confidence"].as_f64(),
@@ -1618,7 +1553,6 @@ fn assert_fidelity(properties: &Value, coordinates: &Value, item: &Value, uri: &
     }
 }
 
-/// The slots of an item that hold a value, of those M2 fills from og.
 fn slots_filled(item: &Value) -> Vec<&'static str> {
     let present = |value: &Value| match value {
         Value::Null => false,
@@ -1648,8 +1582,6 @@ fn slots_filled(item: &Value) -> Vec<&'static str> {
     .collect()
 }
 
-/// Creates a geocode job of `input` and waits for it to end. Answers its
-/// id.
 pub(super) async fn finished_job(router: &Router, input: &str) -> String {
     let created = send(
         router,
@@ -1684,8 +1616,6 @@ async fn finished(router: &Router, id: &str) -> Value {
     details
 }
 
-/// A file's lines, the header first and the rest sorted. A job writes its
-/// records in the order they finish.
 fn sorted_lines(text: &str) -> Vec<String> {
     let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
     lines[1..].sort();
@@ -2087,8 +2017,6 @@ async fn batch_input_takes_query_lines_and_gzip() {
 
     let pack = pack("batch-forms");
     let router = pack.router();
-    // og's geocode is an address search. The bakery's name finds the street
-    // it shares a word with.
     let lines = "q=10%20King%20Street&in=countryCode:CAN&recId=g1\nq=Queen%20Bakery&recId=g2\n";
     let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     gzip.write_all(lines.as_bytes()).expect("gzip");
@@ -2117,10 +2045,6 @@ async fn batch_input_takes_query_lines_and_gzip() {
     assert_eq!(errors.status, StatusCode::NO_CONTENT);
 }
 
-/// A record HERE cannot read, short of a column with no default, is an
-/// error of its input line, numbered among the records. A record whose
-/// `show` names a value the endpoint does not list is refused as the
-/// endpoint refuses it, and so is the live request.
 #[tokio::test]
 async fn a_short_line_and_an_unknown_show_are_the_errors_here_writes() {
     let pack = pack("batch-errors-here");
@@ -2308,7 +2232,6 @@ async fn batch_errors_take_the_batch_shape() {
     .await;
     assert_eq!(reply.json()["total"], 1);
 
-    // The batch API documents no 405: another method is its 404.
     let reply = send(&router, "PATCH", "/compat/here/v7/batch/jobs", None).await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
     assert_eq!(reply.json()["code"], "E6004040");
@@ -2323,8 +2246,6 @@ async fn batch_errors_take_the_batch_shape() {
     );
 }
 
-/// A server that answers every request 200 and keeps the request lines,
-/// as a webhook endpoint does.
 async fn hook_receiver() -> (String, tokio::sync::watch::Receiver<Vec<String>>) {
     let (kept, calls) = tokio::sync::watch::channel(Vec::new());
     let app = Router::new().fallback(move |uri: axum::http::Uri| {
@@ -2339,7 +2260,6 @@ async fn hook_receiver() -> (String, tokio::sync::watch::Receiver<Vec<String>>) 
     (format!("http://{address}"), calls)
 }
 
-/// Waits for the receiver to have taken `count` calls.
 async fn calls_taken(
     calls: &mut tokio::sync::watch::Receiver<Vec<String>>,
     count: usize,
@@ -2536,8 +2456,6 @@ async fn a_start_with_no_free_slot_is_too_many_jobs() {
     let listed = get(&router, "/compat/here/v7/batch/jobs").await.json();
     assert_eq!(listed["count"], 0);
 
-    // Refused a start, a submitted job stays submitted, and starts once a
-    // slot frees.
     let uri = "/compat/here/v7/batch/jobs?startJob=false";
     let created = send(&router, "POST", uri, input).await.json();
     let id = created["id"].as_str().expect("id").to_string();
@@ -2603,8 +2521,6 @@ async fn a_job_whose_og_job_is_gone_is_gone() {
     assert_eq!(reply.json()["code"], "E6004041");
 }
 
-/// HERE's `lang` names the address in its first language, read without its
-/// region, and an area og holds no name in that language keeps its own.
 #[tokio::test]
 async fn lang_names_the_address_in_its_first_language() {
     let pack = pack("lang");
@@ -2624,7 +2540,6 @@ async fn lang_names_the_address_in_its_first_language() {
     let local = address(get(&router, "/compat/here/v1/geocode?q=10+King+Street").await);
     assert_eq!(local["countryName"], "Canada");
 
-    // A script is a language of its own, so the code goes to og whole.
     for (lang, name) in [
         ("sr", "Канада"),
         ("sr-Latn", "Kanada"),
@@ -2654,8 +2569,6 @@ async fn lang_names_the_address_in_its_first_language() {
     assert_eq!(looked_up.json()["address"]["countryName"], "Kanada");
 }
 
-/// A batch record's `lang` column names its result as the endpoint's `lang`
-/// would.
 #[tokio::test]
 async fn a_batch_record_takes_its_lang_column() {
     let pack = pack("batch-lang");
@@ -2688,8 +2601,6 @@ async fn a_batch_record_takes_its_lang_column() {
     );
 }
 
-/// A live answer converts from og's types and a batch job's from og's
-/// JSON on disk; both must read the same.
 #[tokio::test]
 async fn a_feature_reads_alike_from_og_and_from_its_json() {
     use super::item::Feature;
@@ -2727,10 +2638,6 @@ async fn a_feature_reads_alike_from_og_and_from_its_json() {
     assert!(checked > 5, "{checked}");
 }
 
-/// A route og cannot search along is refused, in the query string as in
-/// the body, rather than answered as a search around nothing.
-/// A query that is a position answers the address nearest it, at its
-/// distance from `at`.
 #[tokio::test]
 async fn discover_answers_the_address_nearest_a_position_query() {
     let pack = pack("position");
@@ -2749,8 +2656,6 @@ async fn discover_answers_the_address_nearest_a_position_query() {
     }
 }
 
-/// `show=parsing` tells how og read the query, part by part, where each
-/// part stands, and each `qq` field as a part of its own.
 #[tokio::test]
 async fn geocode_shows_how_it_read_the_query() {
     let pack = pack("parsing");
@@ -2788,9 +2693,6 @@ async fn geocode_shows_how_it_read_the_query() {
     assert!(plain.json()["items"][0].get("parsing").is_none());
 }
 
-/// Autosuggest offers the searches a typed word begins, a category by the
-/// start of a word of its name and a chain the query names whole, ahead of
-/// the places, each run by og's own discover, in English only.
 #[tokio::test]
 async fn autosuggest_offers_category_and_chain_searches() {
     let pack = pack("query-items");
@@ -2840,7 +2742,6 @@ async fn autosuggest_offers_category_and_chain_searches() {
             .iter()
             .all(|item| item["resultType"] != "categoryQuery")
     );
-    // In German, og's German name of the kind, and a chain's own name.
     let german = get(
         &router,
         "/compat/here/v1/autosuggest?q=b%C3%A4ck&at=43,-79&lang=de",
@@ -2873,7 +2774,6 @@ async fn autosuggest_offers_category_and_chain_searches() {
 async fn a_search_along_a_route_keeps_what_lies_by_it() {
     let pack = pack("route");
     let router = pack.router();
-    // 55 m north of Queen Bakery, from 407 m west of it to 407 m east.
     let near = "BFkxumIv0niPAw-B";
     let far = "BFg4xsI__ooPw-BA";
     for path in ["discover", "autosuggest", "browse"] {
@@ -2882,7 +2782,6 @@ async fn a_search_along_a_route_keeps_what_lies_by_it() {
         } else {
             "&q=queen%20bakery"
         };
-        // The places, which a route filters; a search offered is no place.
         let titles = |reply: &Reply| {
             reply.json()["items"]
                 .as_array()

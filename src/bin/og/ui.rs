@@ -1,6 +1,3 @@
-//! Drawing. Each screen is a short stack of lines inside the inline viewport;
-//! finished steps leave the viewport as plain lines in terminal history.
-
 use std::borrow::Cow;
 
 use open_geocode::{builder::BuildPlan, record::Layer};
@@ -31,17 +28,12 @@ const ERR: Color = Color::Rgb(238, 106, 106);
 const PINK: Color = Color::Rgb(226, 136, 214);
 const VIOLET: Color = Color::Rgb(160, 140, 255);
 
-/// Gradient ends of the stage bar and the overall bar.
 const BAR: [(u8, u8, u8); 2] = [(70, 130, 255), (92, 220, 255)];
-/// Full bars of finished stages, muted so the running one stands out.
 const DONE_BAR: Color = Color::Rgb(74, 140, 104);
-/// The shimmer on the running stage's title sweeps from the first colour to
-/// the second.
 const SHIMMER: [(u8, u8, u8); 2] = [(112, 150, 205), (240, 248, 255)];
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Rows of JSON the GeoJSON box shows at once.
 pub(crate) const JSON_ROWS: usize = 14;
 
 fn span(text: impl Into<Cow<'static, str>>, color: Color) -> Span<'static> {
@@ -71,7 +63,6 @@ fn panel(title: &str) -> Block<'static> {
         ]))
 }
 
-/// Text width in terminal cells; everything drawn here is one cell a char.
 fn width(text: &str) -> usize {
     text.chars().count()
 }
@@ -80,7 +71,6 @@ fn pad(text: &str, cells: usize) -> String {
     format!("{text}{}", " ".repeat(cells.saturating_sub(width(text))))
 }
 
-/// Cuts text to a number of cells, ending it with an ellipsis.
 fn cut(text: &str, cells: usize) -> String {
     if width(text) > cells {
         let keep: String = text.chars().take(cells.saturating_sub(1)).collect();
@@ -94,7 +84,6 @@ fn spinner(app: &App) -> &'static str {
     SPINNER[(app.started.elapsed().as_millis() / 80) as usize % SPINNER.len()]
 }
 
-/// The header printed once on start. It stays in terminal history.
 pub(crate) fn logo() -> Vec<Line<'static>> {
     let o = Style::new().fg(DIM);
     let g = Style::new().add_modifier(Modifier::BOLD);
@@ -138,8 +127,6 @@ fn choice(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The wizard's answers so far, one line each. `live` adds what the
-/// confirm screen can still change, which terminal history leaves out.
 fn answers(app: &App, count: usize, live: bool) -> Vec<Line<'static>> {
     let mut region = vec![
         plain(app.region.label.clone()),
@@ -166,8 +153,6 @@ fn answers(app: &App, count: usize, live: bool) -> Vec<Line<'static>> {
     lines.into_iter().take(count).collect()
 }
 
-/// The datasets the build reads: OpenStreetMap, and OpenAddresses when it is
-/// turned on, with what the confirm screen offers about it when `live`.
 fn sources(app: &App, live: bool) -> Vec<Span<'static>> {
     let osm = regions::dataset_name(app.region.dataset()).to_string();
     let Some(data) = app.openaddresses_data() else {
@@ -196,10 +181,7 @@ fn sources(app: &App, live: bool) -> Vec<Span<'static>> {
     spans
 }
 
-/// What a started build leaves in terminal history.
 pub(crate) fn choices(app: &App) -> Vec<Line<'static>> {
-    // History lines start at the terminal's edge; the live window is one
-    // column in.
     answers(app, 3, false)
         .into_iter()
         .map(|line| {
@@ -210,12 +192,10 @@ pub(crate) fn choices(app: &App) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Width of the content: the terminal minus its margins, at most 96.
 pub(crate) fn content_width(terminal: u16) -> usize {
     terminal.saturating_sub(2).min(96) as usize
 }
 
-/// The line that opens a build in terminal history.
 pub(crate) fn build_header(app: &App) -> Vec<Line<'static>> {
     vec![
         Line::raw(""),
@@ -227,13 +207,10 @@ pub(crate) fn build_header(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
-/// A finished step as it goes into terminal history, with a blank line
-/// after it so the steps do not run together.
 pub(crate) fn step_done(step: &Step, inner: usize) -> Vec<Line<'static>> {
     vec![finished_line(step, inner), Line::raw("")]
 }
 
-/// A build's warning as it goes into terminal history.
 pub(crate) fn warning_line(warning: &str, inner: usize) -> Vec<Line<'static>> {
     vec![
         Line::from(vec![
@@ -275,14 +252,10 @@ pub(crate) fn done_summary(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
-/// Rows of the window every screen is drawn into. The window never changes
-/// size: a short screen leaves blank rows, and the key hints stay on the last
-/// row.
 pub(crate) const HEIGHT: u16 = 20;
 
 pub(crate) fn draw(frame: &mut Frame, app: &App) {
     let full = frame.area();
-    // The last two rows belong to the rule and the key hints.
     let area = Rect {
         x: full.x + 1,
         width: full.width.saturating_sub(2).min(96),
@@ -629,9 +602,6 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
             span(format!("  {}", cut(&names, inner.saturating_sub(28))), DIM),
             span(format!("  {}", format::bytes(app.input_bytes())), DIM),
         ];
-        // The sum of each region's own estimate. Building them together
-        // saves the setup and the parser training a second build repeats,
-        // so the real time lands a little under this.
         if let Some(secs) = secs {
             summary.push(span(format!("  about {}", format::about(secs)), DIM));
         }
@@ -679,9 +649,6 @@ fn region(frame: &mut Frame, area: Rect, app: &App) {
     footer(frame, app, &hints);
 }
 
-/// One line of the region list: the name, what is around it, the size of
-/// its extract, and how long its build takes when this machine has built
-/// before.
 fn region_row(
     app: &App,
     row: &RegionRow,
@@ -701,8 +668,6 @@ fn region_row(
         (true, false) => region.label.clone(),
         (false, _) => region.name.clone(),
     };
-    // The gutter holds the cursor marker, or, once anything is ticked, each
-    // region's tick. Both are three cells wide, so no row reflows.
     let picking = !app.picked.is_empty();
     let ticked = app.is_picked(region);
     let mut spans = vec![match (picking, selected, ticked) {
@@ -794,8 +759,6 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
         .nth(2)
         .unwrap_or_default()
         .to_string();
-    // A Pack of several regions downloads the ones not already on disk, so
-    // the single-region download detail below does not describe it.
     let mut download = if several {
         let fetched: Vec<&BuildInput> = inputs.iter().filter(|input| input.download).collect();
         let bytes: u64 = fetched.iter().map(|input| input.region.osm.bytes).sum();
@@ -873,8 +836,6 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
         field("Output", vec![plain(app.pack_dir().display().to_string())]),
     ]);
     if several {
-        // Every region the one Pack covers: one text index over all of them,
-        // so a search spans them without naming a country.
         let names = picked
             .iter()
             .map(|region| region.name.clone())
@@ -966,9 +927,6 @@ fn confirm(frame: &mut Frame, area: Rect, app: &App) {
     footer(frame, app, &hints);
 }
 
-/// What the build plan sizes and needs: the memory budget and threads it
-/// chose from what the machine has, and the memory and disk the input
-/// needs against what is free.
 fn plan_lines(plan: &BuildPlan) -> Vec<Line<'static>> {
     let found = &plan.resources;
     let free = |free: Option<u64>| {
@@ -1023,7 +981,6 @@ fn plan_lines(plan: &BuildPlan) -> Vec<Line<'static>> {
     ]
 }
 
-/// A region's name from its id, for lines that name a past build.
 fn region_name(id: &str) -> String {
     regions::tree()
         .get(id)
@@ -1039,26 +996,18 @@ fn lerp(ends: [(u8, u8, u8); 2], t: f64) -> Color {
     )
 }
 
-// A stage line is laid out as Ollama lays out a layer, with cargo's verb in
-// front: the verb, what it works on, the percent, a bar, then size, speed and
-// time in columns of fixed width, so nothing moves as the numbers change.
 const VERB_WIDTH: usize = 11;
 const NAME_WIDTH: usize = 16;
 const SIZE_WIDTH: usize = 15;
 const SPEED_WIDTH: usize = 11;
 const TIME_WIDTH: usize = 8;
-/// Everything on a line but the bar: the gutter, verb, name, percent and the
-/// caps and gap around the bar, then the three right-hand columns.
 const LINE_FIXED: usize =
     3 + VERB_WIDTH + 1 + NAME_WIDTH + 2 + 5 + 2 + 2 + SIZE_WIDTH + SPEED_WIDTH + TIME_WIDTH;
 
-/// Cells of the bar: what the width leaves after the other columns.
 fn bar_cells(inner: usize) -> usize {
     inner.saturating_sub(LINE_FIXED).clamp(8, 24)
 }
 
-/// A bar between thin caps. The filled part runs along a gradient, or is one
-/// colour when `solid` is given; its last cell is cut in eighths.
 fn bar_spans(cells: usize, ratio: f64, solid: Option<Color>) -> Vec<Span<'static>> {
     const EIGHTHS: [&str; 7] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉"];
     let exact = ratio.clamp(0.0, 1.0) * cells as f64;
@@ -1079,7 +1028,6 @@ fn bar_spans(cells: usize, ratio: f64, solid: Option<Color>) -> Vec<Span<'static
     spans
 }
 
-/// A title whose letters brighten in a band that sweeps along it.
 fn shimmer(text: &str, millis: u128) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     let head = ((millis / 70) as usize % (chars.len() + 10)) as f64 - 5.0;
@@ -1098,7 +1046,6 @@ fn shimmer(text: &str, millis: u128) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// An amount of a step's work: `752 MB`, `48.2M ways`.
 fn amount(unit: Unit, value: u64) -> String {
     match unit {
         Unit::Bytes => format::bytes(value),
@@ -1109,8 +1056,6 @@ fn amount(unit: Unit, value: u64) -> String {
 
 fn finished_line(step: &Step, inner: usize) -> Line<'static> {
     let cells = bar_cells(inner);
-    // History lines start at the terminal's edge; the live window sits one
-    // column in, so the line carries that margin to stay in line with it.
     let mut spans = vec![
         plain("    "),
         Span::styled(
@@ -1123,7 +1068,6 @@ fn finished_line(step: &Step, inner: usize) -> Line<'static> {
     ];
     match (step.unit, step.total) {
         (Unit::None, _) | (_, None) => {
-            // A step with no measure has no bar: only its time is known.
             spans.push(plain(
                 " ".repeat(5 + cells + 2 + 2 + SIZE_WIDTH + SPEED_WIDTH),
             ));
@@ -1152,8 +1096,6 @@ fn finished_line(step: &Step, inner: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The running step: what it does, how far it is, and the rate it goes at,
-/// all measured.
 fn running_line(app: &App, step: &Step, done: u64, inner: usize) -> Line<'static> {
     let cells = bar_cells(inner);
     let elapsed = step.started.map_or(0.0, |at| at.elapsed().as_secs_f64());
@@ -1243,7 +1185,6 @@ fn build(frame: &mut Frame, area: Rect, app: &App) {
         steps.len(),
         format::duration(progress.started.elapsed().as_secs_f64()),
     );
-    // What is left, from this machine's own builds, once the build runs.
     let build_started = steps
         .iter()
         .rev()
@@ -1604,7 +1545,6 @@ fn query(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// `0.8 ms`, `12 ms`.
 fn milliseconds(millis: f64) -> String {
     if millis < 10.0 {
         format!("{millis:.1} ms")
@@ -1613,7 +1553,6 @@ fn milliseconds(millis: f64) -> String {
     }
 }
 
-/// What the batch box shows: the text typed, or how much was pasted.
 fn batch_input(app: &App) -> String {
     if app.batch_text.contains('\n') {
         let lines = app
@@ -1627,7 +1566,6 @@ fn batch_input(app: &App) -> String {
     }
 }
 
-/// The pasted addresses with the answer for each.
 fn batch_table(app: &App, area: Rect) -> Vec<Line<'static>> {
     let rows = &app.batch_rows;
     if rows.is_empty() {
@@ -1691,7 +1629,6 @@ fn batch_table(app: &App, area: Rect) -> Vec<Line<'static>> {
     lines
 }
 
-/// Search's score or reverse's distance, six cells wide.
 fn measure(measure: Measure) -> String {
     match measure {
         Measure::Score(score) => format!("{score:>6.1}"),
@@ -1721,12 +1658,10 @@ fn hit_row(hit: &Hit, selected: bool) -> Line<'static> {
     ])
 }
 
-/// The answer as the API returns it, one styled line per JSON line.
 pub(crate) fn json_lines(app: &App) -> Vec<Line<'static>> {
     app.json_text().lines().map(json_line).collect()
 }
 
-/// Colours one line of pretty JSON: keys, strings, numbers and punctuation.
 fn json_line(line: &str) -> Line<'static> {
     let indent = line.len() - line.trim_start().len();
     let mut spans = vec![plain(" ".repeat(indent + 1))];
@@ -1828,7 +1763,6 @@ fn json(frame: &mut Frame, area: Rect, app: &App) {
     footer(frame, app, &hints);
 }
 
-/// The line that opens a batch run in terminal history.
 pub(crate) fn batch_header(app: &App) -> Vec<Line<'static>> {
     let name = app
         .batch
@@ -1846,8 +1780,6 @@ pub(crate) fn batch_header(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
-/// Whether a column is in the address, as it reads above the column; the
-/// selected column's mark is in brackets.
 fn use_span(used: bool, selected: bool, cells: usize) -> Span<'static> {
     let mark = if used { "✓ address" } else { "· skip" };
     let label = if selected {
@@ -1864,7 +1796,6 @@ fn use_span(used: bool, selected: bool, cells: usize) -> Span<'static> {
     }
 }
 
-/// Which columns of a table fit in `avail` cells, keeping `selected` in view.
 fn visible_columns(widths: &[usize], selected: usize, avail: usize) -> std::ops::Range<usize> {
     let mut start = 0;
     loop {
@@ -1946,8 +1877,6 @@ fn result_line(
     Line::from(spans)
 }
 
-/// `10,000 rows · 4.2 MB · header found`, the rows marked as a count so
-/// far until the whole file is counted.
 fn file_facts(file: &batch::BatchFile) -> String {
     let rows = if file.counted() {
         format!("{} rows", format::thousands(file.rows()))
@@ -1965,7 +1894,6 @@ fn file_facts(file: &batch::BatchFile) -> String {
     )
 }
 
-/// The file named in the batch tab, with a choice to continue or drop it.
 fn batch_card(app: &App) -> Vec<Line<'static>> {
     let Some(file) = &app.batch_candidate else {
         return Vec::new();
@@ -2171,7 +2099,6 @@ fn batch_run(frame: &mut Frame, area: Rect, app: &App) {
     footer(frame, app, &[("esc", "cancel")]);
 }
 
-/// The first rows of the output file as it was written.
 fn output_table(head: &[Vec<String>], inner: usize) -> Vec<Line<'static>> {
     let Some((header, rows)) = head.split_first() else {
         return Vec::new();
@@ -2188,8 +2115,6 @@ fn output_table(head: &[Vec<String>], inner: usize) -> Vec<Line<'static>> {
             (width(name).max(cells) + 2).clamp(6, 18)
         })
         .collect();
-    // The lat and lon the run added are the last two columns: keep them in
-    // view and drop columns before them that do not fit.
     let tail = widths.len().saturating_sub(2);
     let mut avail = inner.saturating_sub(3 + widths[tail..].iter().sum::<usize>());
     let mut shown = Vec::new();

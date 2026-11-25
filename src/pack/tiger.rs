@@ -118,8 +118,6 @@ impl Range {
     }
 }
 
-// Separate streets from ranges so a road's id is written once. Three bytes
-// give sub-metre precision even along a street longer than a state.
 pub(crate) fn encode(mut ranges: Vec<Range>) -> Result<Vec<u8>> {
     if ranges.is_empty() {
         return Ok(Vec::new());

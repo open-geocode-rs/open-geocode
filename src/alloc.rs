@@ -1,27 +1,9 @@
-//! Heap accounting for the global allocator.
-//!
-//! [`CountingAlloc`] wraps an allocator and keeps a count of the bytes live
-//! on the heap, so the build can hold its tracked buffers back when memory
-//! nobody reserved (boundaries, maps, Tantivy's own allocations) grows, and
-//! report the most the heap held. Each thread counts into a local delta and
-//! adds it to the shared count once it passes [`FLUSH_BYTES`], so the count
-//! costs no shared cache line on the common path; it is behind by at most
-//! that much per thread.
-//!
-//! The binary installs it over mimalloc:
-//!
-//! ```ignore
-//! #[global_allocator]
-//! static ALLOCATOR: CountingAlloc<mimalloc::MiMalloc> = CountingAlloc::new(mimalloc::MiMalloc);
-//! ```
-
 use std::{
     alloc::{GlobalAlloc, Layout},
     cell::Cell,
     sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
 };
 
-/// Bytes a thread allocates or frees before it adds them to the shared count.
 const FLUSH_BYTES: isize = 256 << 10;
 
 static LIVE: AtomicIsize = AtomicIsize::new(0);
@@ -34,7 +16,6 @@ thread_local! {
     static DELTA: Cell<isize> = const { Cell::new(0) };
 }
 
-/// An allocator that counts the bytes live on the heap.
 #[derive(Debug)]
 pub struct CountingAlloc<A> {
     inner: A,
@@ -46,8 +27,6 @@ impl<A> CountingAlloc<A> {
     }
 }
 
-// A store of the same value still takes the cache line exclusive, and every
-// allocation of every thread stores here: test first.
 #[inline]
 fn mark_installed() {
     if !INSTALLED.load(Ordering::Relaxed) {
@@ -71,7 +50,6 @@ fn count(bytes: isize) {
     let flush = flushed.unwrap_or(bytes);
     if flush != 0 {
         let live = (LIVE.fetch_add(flush, Ordering::Relaxed) + flush).max(0) as usize;
-        // Read first, as for `INSTALLED`: the peak rarely moves.
         if PEAK.load(Ordering::Relaxed) < live {
             PEAK.fetch_max(live, Ordering::Relaxed);
         }
@@ -125,7 +103,6 @@ pub fn live_bytes() -> Option<usize> {
         .then(|| LIVE.load(Ordering::Relaxed).max(0) as usize)
 }
 
-/// The most bytes the heap held at once, when counted.
 pub fn peak_bytes() -> Option<usize> {
     INSTALLED
         .load(Ordering::Relaxed)

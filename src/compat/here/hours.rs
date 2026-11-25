@@ -1,34 +1,23 @@
-//! A place's opening hours as HERE's `openingHours`.
-//!
-//! [`Week`] reads OpenStreetMap's value. A value it does not read gives no
-//! hours, so the slot stays empty.
-
 use serde::Serialize;
 
 use crate::compat::hours::{DAY_MINUTES, Span, Week, Weekday};
 
-/// HERE's `openingHours` entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct OpeningHours {
-    /// The categories the hours are of. OpenStreetMap's hours are the
-    /// place's, so they are of its own kind.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     categories: Vec<CategoryId>,
-    /// One line per group of days that share their hours, Monday first.
     text: Vec<String>,
     structured: Vec<Structured>,
     #[serde(rename = "isOpen", skip_serializing_if = "Option::is_none")]
     is_open: Option<bool>,
 }
 
-/// A category as hours and contacts name it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct CategoryId {
     pub(super) id: String,
 }
 
 impl OpeningHours {
-    /// The hours, of the place's own kind when it has one.
     pub(super) fn of_kind(mut self, id: Option<&str>) -> Self {
         self.categories = id
             .map(|id| CategoryId { id: id.to_string() })
@@ -38,18 +27,13 @@ impl OpeningHours {
     }
 }
 
-/// One span of hours in iCalendar terms, on every day of `recurrence`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct Structured {
-    /// The opening time, `T093000`.
     start: String,
-    /// How long it stays open, `PT08H30M`.
     duration: String,
-    /// The days, `FREQ:DAILY;BYDAY:MO,TU`.
     recurrence: String,
 }
 
-/// HERE's text and iCalendar names for a day.
 fn names(day: Weekday) -> (&'static str, &'static str) {
     match day {
         Weekday::Monday => ("Mon", "MO"),
@@ -62,7 +46,6 @@ fn names(day: Weekday) -> (&'static str, &'static str) {
     }
 }
 
-/// `value` as HERE's opening hours, `None` when [`Week`] does not read it.
 pub(super) fn parse(value: &str, zone: Option<&str>) -> Option<OpeningHours> {
     let week = Week::parse(value)?;
     let is_open = week.open_at(zone, jiff::Timestamp::now());
@@ -123,8 +106,6 @@ fn clock(minutes: u16) -> String {
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
-/// Days as HERE writes them: a run of three or more as `Mon-Thu`, any
-/// other day on its own, comma separated (`Fri, Sat`).
 fn day_names(days: &[Weekday]) -> String {
     let mut runs: Vec<(Weekday, Weekday)> = Vec::new();
     for &day in days {

@@ -1,9 +1,3 @@
-//! Named points of interest.
-//!
-//! What counts as a place comes from iD tagging schema presets
-//! (`catalog/places.json`, filtered by `catalog/curation.toml`), not a key
-//! list here: a new kind of place counts once mappers get a preset for it.
-
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::OnceLock,
@@ -60,7 +54,6 @@ struct CatalogPreset {
     match_score: f64,
     #[serde(default)]
     needs_wikidata: bool,
-    /// Never a place: an object it matches best is none.
     #[serde(default)]
     never: bool,
 }
@@ -174,7 +167,6 @@ fn place_preset(tags: &BTreeMap<String, String>, drawn: Drawn) -> Option<&'stati
     (!preset.never).then_some(preset)
 }
 
-// Order decides which value a record keeps when both keys state one.
 const PHONE_KEYS: &[&str] = &["phone", "contact:phone"];
 const WEBSITE_KEYS: &[&str] = &["website", "contact:website"];
 const EMAIL_KEYS: &[&str] = &["email", "contact:email"];
@@ -193,13 +185,9 @@ pub(crate) struct PoiCandidate {
     pub lat: f64,
     pub lon: f64,
     pub location_precision: LocationPrecision,
-    /// The tags [`poi_tags`] keeps.
     pub tags: BTreeMap<String, String>,
-    /// See [`Identity::outline`].
     pub outline: Option<Vec<u8>>,
-    /// See [`Identity::nodes`].
     pub nodes: Vec<i64>,
-    /// The entrances mapped for it (see [`Entrance`]).
     pub entrances: Vec<Entrance>,
 }
 
@@ -217,43 +205,27 @@ pub(crate) fn count_left_out(tags: &BTreeMap<String, String>, drawn: Drawn, out:
     }
 }
 
-/// What tells a place from another of its name, kept until places resolve.
-/// The Pack stores none of it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Identity {
-    /// Its outline as a [`containment`] shape block; none for a point or a line.
     pub outline: Option<Vec<u8>>,
-    /// The nodes it is drawn with, sorted: a node's own id.
     pub nodes: Vec<i64>,
     pub websites: Vec<String>,
     pub phones: Vec<String>,
     pub refs: Vec<String>,
 }
 
-/// A place as it waits to resolve.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Place {
     pub record: PoiRecord,
     pub identity: Identity,
 }
 
-/// The shape block of `geometry`, for [`Identity::outline`].
 pub(crate) fn outline(geometry: &MultiPolygon<f64>) -> Vec<u8> {
     let mut block = Vec::new();
     containment::encode_shape(geometry, &mut block);
     block
 }
 
-/// Entity resolution blocked by name, on exact keys, never distance: same
-/// name and distance mostly join different things (chalets 9B and 9D, two
-/// pubs facing each other, both sides of a bus stop). Two records are one
-/// place when nothing conflicts and one holds: the same Wikidata item or
-/// kind with one's point inside the other's outline; the same kind and
-/// address; the same kind drawn with a shared node, as a canal in pieces.
-/// A shared item alone is not enough: an organisation tags every office
-/// with its own. A wrong merge hides a real place, a missed one only shows
-/// it twice. Each joins the leader, never another member (center
-/// clustering), so a run cannot chain. Merged ids stay as aliases.
 pub(crate) fn resolve(mut places: Vec<Place>) -> Vec<PoiRecord> {
     if places.len() < 2 {
         return places.into_iter().map(|place| place.record).collect();
@@ -275,8 +247,6 @@ pub(crate) fn resolve(mut places: Vec<Place>) -> Vec<PoiRecord> {
     let mut leaders: Vec<Place> = Vec::new();
     let mut addresses = HashMap::<(String, AddressKey), Vec<usize>>::new();
     let mut nodes = HashMap::<i64, Vec<usize>>::new();
-    // A chain's name group holds thousands of copies: the boxes keep each
-    // test to the outlines that could cover it.
     let mut outlines = RTree::<GeomWithData<Rectangle<[f64; 2]>, usize>>::new();
     let mut points = RTree::<GeomWithData<[f64; 2], usize>>::new();
     for place in places {
@@ -330,8 +300,6 @@ pub(crate) fn resolve(mut places: Vec<Place>) -> Vec<PoiRecord> {
                     }
                 }
                 merge(&mut leader.record, place.record);
-                // An address the leader takes from a member is its own now:
-                // a later copy stating it joins.
                 if unaddressed
                     && let Some(key) = leader.record.address.as_ref().and_then(address_key)
                 {
@@ -366,7 +334,6 @@ pub(crate) fn resolve(mut places: Vec<Place>) -> Vec<PoiRecord> {
     leaders.into_iter().map(|place| place.record).collect()
 }
 
-/// Whether `member`, at `point`, is the place `leader` is.
 fn one_place(leader: &Place, member: &Place, point: [f64; 2]) -> bool {
     if conflict(leader, member) {
         return false;
@@ -397,9 +364,6 @@ fn one_place(leader: &Place, member: &Place, point: [f64; 2]) -> bool {
     ((kind || item) && within()) || (kind && (addressed() || touch()))
 }
 
-/// Two records that state different addresses, items, websites, phones or
-/// refs are two places, whatever else they share: chains share a name, an
-/// organisation its item.
 fn conflict(leader: &Place, member: &Place) -> bool {
     let (own, theirs) = (&leader.record, &member.record);
     let addresses = own.address.as_ref().zip(theirs.address.as_ref());
@@ -414,9 +378,6 @@ fn conflict(leader: &Place, member: &Place) -> bool {
         || disjoint(&leader.identity.refs, &member.identity.refs)
 }
 
-/// What an address puts its house at, as search spells it: house number,
-/// street or place, unit. An address of the block scheme names no street, so
-/// its areas stand in.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AddressKey {
     number: String,
@@ -449,8 +410,6 @@ fn address_key(address: &AddressComponents) -> Option<AddressKey> {
     })
 }
 
-/// A postcode or town only one of two states says nothing; two that differ
-/// tell the same street and number in two towns apart.
 fn same_address(own: &AddressComponents, theirs: &AddressComponents) -> bool {
     let agree = |own: &Option<String>, theirs: &Option<String>| {
         let key = |value: &Option<String>| {
@@ -486,7 +445,6 @@ fn merge(leader: &mut PoiRecord, member: PoiRecord) {
     if leader.brand.is_none() {
         leader.brand = member.brand;
     }
-    // One place: what a copy alone states is the place's.
     let unboxed = |details: Option<Box<PoiDetails>>| details.map(|details| *details);
     let (own, theirs) = (
         unboxed(leader.details.take()).unwrap_or_default(),
@@ -528,8 +486,6 @@ fn merge(leader: &mut PoiRecord, member: PoiRecord) {
     }
 }
 
-/// The first value of `keys` that `states` one, as written: one tag may
-/// hold several, split by `;`.
 fn first_stated(
     tags: &BTreeMap<String, String>,
     keys: &[&str],
@@ -574,9 +530,6 @@ fn brand(tags: &BTreeMap<String, String>) -> Option<Brand> {
     })
 }
 
-/// The tags a POI keeps: its names, its category tags, its Wikidata and
-/// Wikipedia links, what tells it from another of its name, how to reach it,
-/// its opening hours, and, when they state a valid address, its `addr:*` tags.
 pub(crate) fn poi_tags(
     tags: &BTreeMap<String, String>,
     address_tags: Option<&BTreeMap<String, String>>,
@@ -602,8 +555,6 @@ pub(crate) fn poi_tags(
         .collect()
 }
 
-/// The kinds of food a place's `cuisine` tag lists, each once, in lower
-/// case and in the tag's order: `Pizza; italian` is `pizza` and `italian`.
 fn cuisine(tags: &BTreeMap<String, String>) -> Vec<String> {
     let mut kinds = Vec::<String>::new();
     for kind in tags
@@ -619,7 +570,6 @@ fn cuisine(tags: &BTreeMap<String, String>) -> Vec<String> {
     kinds
 }
 
-/// Emit a POI from its kept tags; their `addr:*` tags are already validated.
 pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
     let tags = &candidate.tags;
     let drawn = Drawn::of(candidate.object_type);
@@ -629,8 +579,6 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
     let address = address_components(tags).ok();
     let source = SourceProvenance::osm(candidate.object_type, candidate.object_id);
     let geometry = point_geometry(candidate.lon, candidate.lat);
-    // Address search reads addresses alone: without this it misses every
-    // house only a POI states.
     if let Some(address) = &address {
         let record = AddressRecord {
             building: super::address::building_of(tags),
@@ -658,7 +606,6 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
         brand: brand(tags),
         details: PoiDetails {
             contact: contact(tags),
-            // Whitespace is its syntax's separator: only the ends are trimmed.
             opening_hours: tags
                 .get("opening_hours")
                 .map(|hours| hours.trim())
@@ -694,8 +641,6 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
                 let value = value.strip_prefix("www.").unwrap_or(value);
                 Some(value.trim_end_matches('/').to_string())
             }),
-            // The last nine digits: one number written with its country
-            // code and without.
             phones: values(tags, PHONE_KEYS, |value| {
                 let digits = value
                     .chars()
@@ -709,8 +654,6 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
     });
 }
 
-/// The values of `keys`, each as `spelled` spells it: one tag may hold
-/// several, split by `;`.
 fn values(
     tags: &BTreeMap<String, String>,
     keys: &[&str],
@@ -728,7 +671,6 @@ fn values(
     values
 }
 
-/// House numbers and ref codes in `name` are no names.
 fn poi_name(tags: &BTreeMap<String, String>) -> Option<String> {
     ["name", "brand"].into_iter().find_map(|key| {
         tags.cleaned(key)
@@ -768,7 +710,6 @@ mod tests {
 
     const LAT: f64 = 53.2;
 
-    /// Longitude `m` metres east of 6.56 at [`LAT`].
     fn east(m: f64) -> f64 {
         6.56 + m / 66_660.0
     }
@@ -796,8 +737,6 @@ mod tests {
         }
     }
 
-    /// `place` drawn as a way: a square `half` metres each side of its point,
-    /// on nodes `id * 10 ..`.
     fn outlined(mut place: Place, half: f64) -> Place {
         let [lon, lat] = point_of(&place.record).expect("a point");
         let (dx, dy) = (half / 66_660.0, half / 111_320.0);
@@ -847,7 +786,6 @@ mod tests {
         place
     }
 
-    /// Each resolved place by id, with the ids merged into it.
     fn ids(resolved: Vec<PoiRecord>) -> Vec<(i64, Vec<(ObjectType, i64)>)> {
         let mut ids = resolved
             .into_iter()
@@ -972,7 +910,6 @@ mod tests {
             ])),
             [(10, vec![(ObjectType::Node, 1)])]
         );
-        // So far east a degree is narrow and the cells of a grid were not.
         let tokyo = |mut place: Place, lon: f64| {
             place.record.geometry = point_geometry(lon, 35.68);
             place
@@ -1155,7 +1092,6 @@ mod tests {
             ("addr:housenumber", "123"),
             ("addr:street", "King Street West"),
         ]);
-        // `cuisine` is kept: presets tell kinds of restaurant apart by it.
         assert_eq!(
             poi_tags(&source, None),
             tags(&[
@@ -1383,8 +1319,6 @@ mod tests {
         );
     }
 
-    /// A lifecycle prefix makes another key, which no preset reads: what is
-    /// closed for good is no place, so no record can say it is closed.
     #[test]
     fn an_object_closed_for_good_is_no_poi() {
         for prefix in ["disused", "abandoned", "was", "demolished", "razed"] {

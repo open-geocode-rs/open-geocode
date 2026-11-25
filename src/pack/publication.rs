@@ -90,16 +90,12 @@ pub(super) fn create_generation(destination: &Path) -> Result<PathBuf> {
     Ok(generation)
 }
 
-/// Validate a generation and point `CURRENT` at it. `keep` is set the moment
-/// `CURRENT` may name the generation, so a later failure never deletes the
-/// Pack that servers are told to open.
 pub(super) fn publish(
     destination: &Path,
     generation: &Path,
     manifest: &Manifest,
     keep: &mut bool,
 ) -> Result<()> {
-    // Exercise the same readers used for serving before making the build visible.
     let pack = generation.join(PACK_FILE);
     let reader = Reader::open(&pack)?;
     reader.verify()?;
@@ -108,8 +104,6 @@ pub(super) fn publish(
     }
     let text = crate::text_index::open_text_index(reader.container())?;
     let searcher = text.reader()?.searcher();
-    // A street group's document stands for its addresses, so the documents
-    // cover every record once between them.
     let mut covered = 0;
     for segment in searcher.segment_readers() {
         let counts = segment
@@ -131,8 +125,6 @@ pub(super) fn publish(
     sync_tree(generation)?;
     sync_directory(&destination.join(GENERATIONS))?;
 
-    // A unique temporary pointer allows simultaneous builders without sharing writes.
-    // Keep old generations: running servers may still map them.
     let pending = destination.join(format!(".CURRENT-{}", Uuid::new_v4()));
     let mut file = File::create_new(&pending)?;
     writeln!(
@@ -147,7 +139,6 @@ pub(super) fn publish(
     drop(file);
     *keep = true;
     if let Err(error) = fs::rename(&pending, destination.join(CURRENT)) {
-        // CURRENT still names the previous generation.
         *keep = false;
         let _ = fs::remove_file(&pending);
         return Err(Error::IoPath {
@@ -168,7 +159,6 @@ pub(super) fn publish(
 
 #[cfg(test)]
 thread_local! {
-    /// Simulates a failure after `CURRENT` already names the new generation.
     pub(super) static FAIL_AFTER_SWITCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 

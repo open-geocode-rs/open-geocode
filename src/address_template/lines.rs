@@ -1,6 +1,3 @@
-//! A result's address as the lines of a postal address, top to bottom, laid
-//! out by the address template of the country it lies in.
-
 use std::{cell::Cell, collections::BTreeMap, sync::OnceLock};
 
 use crate::{
@@ -10,7 +7,6 @@ use crate::{
     record::Layer,
 };
 
-/// A part of an address og can state, which a template field asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Part {
     Unit,
@@ -32,19 +28,14 @@ enum Part {
 const PARTS: usize = Part::Country as usize + 1;
 
 impl Part {
-    /// The part a template field of this name takes. `None` for a field og
-    /// has nothing for, which stays empty.
     fn of(name: &str) -> Option<Self> {
         Some(match name {
-            // The template's line for what stands inside the plot the house
-            // number names, which is where a unit is written.
             "house" => Self::Unit,
             "house_number" => Self::HouseNumber,
             "road" => Self::Street,
             "place" => Self::Place,
             "suburb" | "city_district" => Self::Sublocality,
             "neighbourhood" | "quarter" => Self::Neighbourhood,
-            // Templates can list village and city separately; OG has one locality slot.
             "city" => Self::Locality,
             "county" => Self::District,
             "county_code" => Self::DistrictCode,
@@ -65,7 +56,6 @@ fn templates() -> &'static BTreeMap<String, Template> {
     TABLE.get_or_init(|| address_template::table(Part::of))
 }
 
-/// An area's ISO 3166-2 code without its country, as `ON` of `CA-ON`.
 fn short_code<'a>(area: Option<&'a ContextArea>, country: &str) -> Option<&'a str> {
     area?
         .code
@@ -75,8 +65,6 @@ fn short_code<'a>(area: Option<&'a ContextArea>, country: &str) -> Option<&'a st
         .filter(|code| !code.is_empty())
 }
 
-/// The value of each part, which is what the record states, or else the
-/// area the record lies in.
 fn parts<'a>(
     address: &'a Address,
     context: &'a Context,
@@ -85,16 +73,12 @@ fn parts<'a>(
 ) -> [Option<String>; PARTS] {
     let name = |area: &'a Option<ContextArea>| area.as_ref().map(|area| area.name.as_str());
     let region_code = short_code(context.region.as_ref(), country_code);
-    // A stated region that is not the one the record lies in has no code og
-    // knows.
     let region_agrees = address.region.as_deref().is_none_or(|stated| {
         [name(&context.region), region_code]
             .into_iter()
             .flatten()
             .any(|known| known.eq_ignore_ascii_case(stated))
     });
-    // Stated areas do not say which tier each is. The outermost is written
-    // where the template writes the area below the locality.
     let stated_area = address.areas.first().map(String::as_str);
     let mut values: [Option<String>; PARTS] = Default::default();
     for (part, value) in [
@@ -143,10 +127,6 @@ fn parts<'a>(
     values
 }
 
-/// What joins two values of a line, which is the template's text between
-/// them. Where
-/// a field between them is empty, only the first separator stays, so
-/// `Toronto, {state} M5H 1A1` reads `Toronto, M5H 1A1`.
 fn separator(gap: &[&str], skipped: bool) -> String {
     let squeeze = |text: &str| {
         let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -172,13 +152,10 @@ fn separator(gap: &[&str], skipped: bool) -> String {
     }
 }
 
-/// One line being written.
 #[derive(Default)]
 struct Line<'a> {
     text: String,
-    /// The template's text since the last value.
     gap: Vec<&'a str>,
-    /// Whether a field since the last value was empty.
     skipped: bool,
 }
 
@@ -192,8 +169,6 @@ impl<'a> Line<'a> {
         self.text.push_str(value);
     }
 
-    /// Ends the line. Text after its last value stays only when no empty
-    /// field follows it (`{road} {house_number}.`).
     fn end(&mut self, lines: &mut Vec<String>) {
         let mut line = std::mem::take(self);
         if !line.text.is_empty() {
@@ -206,8 +181,6 @@ impl<'a> Line<'a> {
 }
 
 fn render(template: &Template, values: &[Option<String>; PARTS]) -> Vec<String> {
-    // A part is written once, where the template first asks for it. Some
-    // templates name a field twice, or fall back to one written above.
     let written = Cell::new(0u32);
     let value = |part: &Option<Part>| {
         (*part)
@@ -242,12 +215,6 @@ fn render(template: &Template, values: &[Option<String>; PARTS]) -> Vec<String> 
     lines
 }
 
-/// The address of a result as postal lines, top to bottom, the way its
-/// country writes an address. Empty for a result that is no address. That
-/// is one of another layer than an address, an interpolation or a POI, one that
-/// states neither a street nor a place its house number belongs to, an
-/// interpolation's whole range, which is no one house, and one in no
-/// country og has a template for.
 pub(crate) fn address_lines(layer: Layer, address: &Address, context: &Context) -> Vec<String> {
     let addressed = match layer {
         Layer::Address | Layer::Interpolation => address.housenumber.is_some(),
@@ -263,7 +230,6 @@ pub(crate) fn address_lines(layer: Layer, address: &Address, context: &Context) 
     let Some(code) = &country.code else {
         return Vec::new();
     };
-    // The default row `ZZ` is no country's code, so no result selects it.
     let Some(template) = templates().get(code.as_str()).filter(|_| code != "ZZ") else {
         return Vec::new();
     };

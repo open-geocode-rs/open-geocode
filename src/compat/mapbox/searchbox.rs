@@ -1,6 +1,3 @@
-//! Search Box v1: `suggest`, `retrieve`, `forward` and `reverse`. Category
-//! search is in [`super::category`].
-
 use axum::{
     Json,
     extract::{Path, Query, State, rejection::QueryRejection},
@@ -21,7 +18,6 @@ use crate::{
     runtime::AppState,
 };
 
-/// A Search Box context layer, keyed `id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct Layer {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -30,7 +26,6 @@ struct Layer {
     fields: LayerFields,
 }
 
-/// What a suggestion and a feature's properties share.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct Described {
     name: String,
@@ -45,17 +40,14 @@ struct Described {
     context: Context<Layer>,
 }
 
-/// The POI fields og has, after `context` and `coordinates`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct Poi {
     #[serde(skip_serializing_if = "Option::is_none")]
     maki: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     brand: Option<Vec<String>>,
-    /// The names of the listed kinds the place is, closest first.
     #[serde(skip_serializing_if = "Option::is_none")]
     poi_category: Option<Vec<String>>,
-    /// The canonical ids of those kinds, as `list/category` gives them.
     #[serde(skip_serializing_if = "Option::is_none")]
     poi_category_ids: Option<Vec<&'static str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,7 +61,6 @@ struct ExternalIds {
     wikidata: String,
 }
 
-/// What og knows of how to reach a place and when it is open.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 struct Metadata {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,13 +95,11 @@ impl Metadata {
     }
 }
 
-/// What a feature has besides what a suggestion has.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct Placed {
     coordinates: Coordinates,
     #[serde(skip_serializing_if = "Option::is_none")]
     bbox: Option<[f64; 4]>,
-    /// Metres from `proximity`, on a forward search only.
     #[serde(skip_serializing_if = "Option::is_none")]
     distance: Option<f64>,
 }
@@ -119,8 +108,6 @@ fn described(found: Found, pack: &Reader) -> (Described, Placed, Poi) {
     let common = found.common;
     let translated = Translated::of(Api::SearchBox, found);
     let kinds = common.category.as_deref().and_then(category::kinds);
-    // The context keeps the unit og states only in Geocoding, whose
-    // `secondary_address` layer Search Box has no counterpart of.
     let context = Context {
         secondary_address: None,
         block: common
@@ -163,8 +150,6 @@ fn described(found: Found, pack: &Reader) -> (Described, Placed, Poi) {
     )
 }
 
-/// `/suggest`'s answer. Suggestions carry no coordinates. `/retrieve` has
-/// them.
 #[derive(Debug, Serialize)]
 pub(super) struct Suggestions {
     suggestions: Vec<Suggestion>,
@@ -175,17 +160,13 @@ pub(super) struct Suggestions {
 struct Suggestion {
     #[serde(flatten)]
     described: Described,
-    /// The language the suggestion is named in, which every suggestion
-    /// states.
     language: String,
-    /// Metres from `proximity`.
     #[serde(skip_serializing_if = "Option::is_none")]
     distance: Option<f64>,
     #[serde(flatten)]
     poi: Poi,
 }
 
-/// The FeatureCollection `/retrieve`, `/forward` and `/reverse` answer.
 #[derive(Debug, Serialize)]
 pub(super) struct Collection {
     #[serde(rename = "type")]
@@ -263,8 +244,6 @@ impl Collection {
     }
 }
 
-/// The one language Search Box names results in. It is the first of
-/// `language`, or English when none is sent.
 pub(super) fn language(params: &Params) -> &str {
     params
         .get("language")
@@ -280,7 +259,6 @@ pub(super) fn language(params: &Params) -> &str {
 /// Search Box's largest `limit` on `suggest` and `forward`.
 const MAX_LIMIT: usize = 10;
 
-/// `limit`, checked against Search Box's largest.
 fn limit(params: &Params) -> Result<Option<usize>, VendorError> {
     params
         .get("limit")
@@ -297,18 +275,12 @@ fn limit(params: &Params) -> Result<Option<usize>, VendorError> {
         .transpose()
 }
 
-/// What a text search asks of og beyond its text, checked.
 struct Asked {
     limit: Option<usize>,
-    /// og's categories a POI must be of, `None` for any.
     categories: Option<Vec<&'static str>>,
     excluded: Vec<&'static str>,
 }
 
-/// Parameters that pick which places come back by what og does not hold:
-/// a route, a travel time, a place resolved from free text, a radius around
-/// it. Sent, they are refused, since answering without them would answer
-/// another question.
 const UNHONOURED: [&str; 10] = [
     "near",
     "origin",
@@ -362,8 +334,6 @@ impl Asked {
         })
     }
 
-    /// Keeps the results the categories admit: with `poi_category` only POIs
-    /// of those kinds, and never a POI of an excluded kind.
     fn keep(&self, collection: &mut ForwardCollection) {
         collection.features.retain(|feature| {
             let category = feature.properties.common.category.as_deref();
@@ -377,8 +347,6 @@ impl Asked {
         }
     }
 
-    /// How many og is asked for: more than answered when categories filter
-    /// what comes back.
     fn fetch(&self) -> Option<String> {
         match self.categories.is_some() || !self.excluded.is_empty() {
             true => Some(MAX_LIMIT.to_string()),
@@ -397,7 +365,6 @@ fn failed(problem: crate::http::problem::Problem) -> VendorError {
     Api::SearchBox.failed(problem)
 }
 
-/// Suggest places as typed (Mapbox Search Box v1)
 pub(super) async fn suggest(
     State(state): State<AppState>,
     query: Result<Query<Vec<(String, String)>>, QueryRejection>,
@@ -438,7 +405,6 @@ pub(super) async fn suggest(
     }))
 }
 
-/// Retrieve a suggestion (Mapbox Search Box v1)
 pub(super) async fn retrieve(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -458,13 +424,6 @@ pub(super) async fn retrieve(
     Ok(Json(Collection::forward(&collection, None, state.pack())))
 }
 
-/// Search by text (Mapbox Search Box v1)
-///
-/// Each Mapbox switch picks the og search of the same meaning.
-/// `auto_complete=true` is og's `/autocomplete`, `types=poi` alone is
-/// `/places`, another single type is `/geocode` of that layer, and no
-/// type searches addresses and places together, with the town, region or
-/// country the whole text names first.
 pub(super) async fn forward(
     State(state): State<AppState>,
     query: Result<Query<Vec<(String, String)>>, QueryRejection>,
@@ -490,7 +449,6 @@ pub(super) async fn forward(
         match layer {
             Some("poi") => native::places(&state, args).await,
             Some(_) => super::forward_geocode(&state, args, types.as_ref()).await,
-            // A town the text names comes first, as og's search answers it.
             None => native::search(&state, args).await,
         }
     }
@@ -503,7 +461,6 @@ pub(super) async fn forward(
     )))
 }
 
-/// Reverse geocode a point (Mapbox Search Box v1)
 pub(super) async fn reverse(
     State(state): State<AppState>,
     query: Result<Query<Vec<(String, String)>>, QueryRejection>,
@@ -518,7 +475,6 @@ pub(super) async fn reverse(
         .set("lon", lon)
         .set("lat", lat)
         .maybe("layer", layer)
-        // og answers several of one layer only when asked for that layer.
         .maybe(
             "limit",
             limit

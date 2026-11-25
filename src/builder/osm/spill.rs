@@ -1,8 +1,3 @@
-//! Scratch-file types for the streaming build.
-//!
-//! The build never holds all records in memory: finished records wait in
-//! Hilbert-ordered sorters until they are written.
-
 use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{Error, Result};
@@ -44,8 +39,6 @@ pub(crate) enum WayKind {
     Poi,
 }
 
-/// A way kept by the scan, without its node list: the way pass reads that
-/// again from the input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WayFeature {
     pub kind: WayKind,
@@ -53,9 +46,6 @@ pub(crate) struct WayFeature {
     pub tags: BTreeMap<String, String>,
 }
 
-/// A finished record waiting for its final position. `key` is the Hilbert
-/// index of its display point; `seq` is emission order, which breaks ties and
-/// keeps the build deterministic.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingRecord {
     pub key: u64,
@@ -64,9 +54,6 @@ pub(crate) struct PendingRecord {
     pub body: Body,
 }
 
-/// What a pending record holds: the record, or for an address where the
-/// address book keeps it, so an address is not copied into every sort it
-/// passes through.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Body {
     Record(Box<Record>),
@@ -91,11 +78,6 @@ fn geometry_mut(record: &mut Record) -> &mut Geometry {
     }
 }
 
-/// Give `geometry` the value a spill reads back. Line vertices spill in 1e-7
-/// degree steps and read back by a division that the node store's conversion
-/// does not always match to the last bit, so a record a sorter kept in memory
-/// would otherwise differ from one it spilled: a street joined from it gets
-/// another representative point, and near a border another context.
 fn as_spilled(geometry: &mut Geometry) {
     let mut bytes = Vec::new();
     encode_geometry(&mut bytes, geometry);
@@ -103,27 +85,17 @@ fn as_spilled(geometry: &mut Geometry) {
         .expect("a geometry reads back as it was just written");
 }
 
-/// Addresses group by street within a grid cell this many degrees wide
-/// (about 2 km): a street with one name in two towns, or a long rural road,
-/// becomes runs that each stay compact, so the record blocks a run fills
-/// cover a small area for the spatial index.
 const ADDRESS_GROUP_CELL_DEGREES: f64 = 0.02;
 
-/// Bytes of a street order key that name its cell: latitude, then longitude.
 const CELL_KEY_LEN: usize = 8;
 
-/// Where an address comes from, naming an imported row's dataset by its
-/// index in the build's [`Datasets`] instead of by name: a row would
-/// otherwise carry its dataset's name through every scratch file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Source {
     pub object_type: ObjectType,
     pub object_id: i64,
-    /// 0 for OSM.
     pub dataset: u32,
 }
 
-/// The datasets imported rows come from, each name stored once.
 #[derive(Debug, Default)]
 pub(crate) struct Datasets {
     names: Vec<String>,
@@ -131,7 +103,6 @@ pub(crate) struct Datasets {
 }
 
 impl Datasets {
-    /// The index of `name`, given one the first time it is seen.
     pub(crate) fn id(&mut self, name: &str) -> u32 {
         if let Some(id) = self.ids.get(name) {
             return *id;
@@ -142,12 +113,10 @@ impl Datasets {
         id
     }
 
-    /// Every name, in the order of their indexes.
     pub(crate) fn names(&self) -> &[String] {
         &self.names
     }
 
-    /// The table that gave `names` their indexes.
     pub(crate) fn from_names(names: Vec<String>) -> Self {
         let ids = names
             .iter()
@@ -174,33 +143,16 @@ impl Datasets {
     }
 }
 
-/// An address on its way to being written with the rest of its street.
-/// Sorted by its street, then by what it states but its number and unit,
-/// then by number, so the addresses of one street come out together and in
-/// order.
-///
-/// The sort key holds every component the address states, so the address is
-/// its key, its point and where it comes from: nothing is stored twice. An
-/// address arrives undisputed and lent no postcodes; both are decided after
-/// it is sorted, and travel beside it from then on.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingAddress {
-    /// The group key, then the number key.
     pub order: Vec<u8>,
-    /// Length of the start of `order` its street shares in street order: the
-    /// cell and the street as search spells it.
     pub street_len: usize,
-    /// Length of the start of `order` its group shares: its street's key and
-    /// everything else it states.
     pub group_len: usize,
     pub seq: u64,
     pub point: [f64; 2],
     pub precision: LocationPrecision,
     pub source: Source,
-    /// The entrances its source maps. A boxed slice, as few have any and
-    /// every pending address is as wide as this makes it.
     pub access: Box<[Entrance]>,
-    /// The building its source draws it as, boxed for the same reason.
     pub building: Option<Box<Building>>,
 }
 
@@ -215,7 +167,6 @@ pub(crate) fn in_capitals(text: &str) -> bool {
     uppercase > 1
 }
 
-/// The components a street order key holds, borrowed from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Fields<'a> {
     pub street: Option<&'a str>,
@@ -231,7 +182,6 @@ pub(crate) struct Fields<'a> {
 }
 
 impl<'a> Fields<'a> {
-    /// What the house number is on, as [`AddressComponents::subject`].
     pub(crate) fn subject(&self) -> Option<&'a str> {
         self.street
             .or(self.place)
@@ -301,14 +251,8 @@ impl<'a> Fields<'a> {
     }
 }
 
-/// Bit of a pending address's kind byte. When set, its entrances follow
-/// its point.
 const PENDING_ACCESS: u8 = 8;
-/// Bit of a pending address's kind byte. When set, its source draws it as
-/// a building.
 const PENDING_BUILDING: u8 = 16;
-/// Bit of a pending address's kind byte. When set, its building's name
-/// follows its entrances.
 const PENDING_BUILDING_NAME: u8 = 32;
 
 impl PendingAddress {
@@ -343,7 +287,6 @@ impl PendingAddress {
     ) -> Self {
         let [lon, lat] = point;
         let mut order = Vec::new();
-        // Two's complement, big-endian: the cells sort as they did as i64.
         let cell = |degrees: f64| (degrees / ADDRESS_GROUP_CELL_DEGREES).floor() as i32;
         order.extend_from_slice(&cell(lat).to_be_bytes());
         order.extend_from_slice(&cell(lon).to_be_bytes());
@@ -355,8 +298,6 @@ impl PendingAddress {
                 .as_deref(),
         );
         let street_len = order.len();
-        // Addresses stating a postcode first: the street's postcodes are all
-        // known by the time its addresses without one come out.
         order.push(u8::from(address.postcode.is_none()));
         for field in [
             &address.street,
@@ -393,14 +334,12 @@ impl PendingAddress {
         }
     }
 
-    /// The address as pushed `seq`th, from `dataset`.
     pub(super) fn numbered(mut self, seq: u64, dataset: u32) -> Self {
         self.seq = seq;
         self.source.dataset = dataset;
         self
     }
 
-    /// The same address stating `address` instead.
     pub(super) fn restated(&self, address: &AddressComponents) -> Self {
         Self::from_parts(
             address,
@@ -413,7 +352,6 @@ impl PendingAddress {
         )
     }
 
-    /// The components its key holds.
     pub(crate) fn fields(&self) -> Fields<'_> {
         Fields::parse(&self.order).expect("a pending address's key was checked")
     }
@@ -422,7 +360,6 @@ impl PendingAddress {
         self.fields().to_address()
     }
 
-    /// The address record it stands for, undisputed and lent no postcodes.
     pub(crate) fn record(&self, datasets: &Datasets) -> Result<AddressRecord> {
         Ok(AddressRecord {
             address: self.address(),
@@ -436,32 +373,22 @@ impl PendingAddress {
         })
     }
 
-    /// The start of its key its street shares.
     pub(crate) fn street_key(&self) -> &[u8] {
         &self.order[..self.street_len]
     }
 
-    /// The start of its key its group shares.
     pub(crate) fn group_key(&self) -> &[u8] {
         &self.order[..self.group_len]
     }
 
-    /// Whether `other` is in the same group: on the same street in the same
-    /// cell, stating the same.
     pub(super) fn same_group(&self, other: &Self) -> bool {
         self.group_key() == other.group_key()
     }
 
-    /// Whether both lie in one grid cell.
     pub(super) fn same_cell(&self, other: &Self) -> bool {
         self.order[..CELL_KEY_LEN] == other.order[..CELL_KEY_LEN]
     }
 
-    /// Its house, for finding the addresses that repeat it: the street as
-    /// search spells it, the number and the unit. No cell: one house on both
-    /// sides of a cell edge is still one house, and distance tells apart the
-    /// towns that share a street name. `at` is where it waits in the address
-    /// book.
     pub(super) fn house(&self, at: u64) -> House {
         let fields = self.fields();
         let normalized = |value: Option<&str>| value.and_then(crate::util::fold::search_key);
@@ -495,9 +422,6 @@ impl PendingAddress {
         }
     }
 
-    /// Its encoding, after `previous` in a chunk of the address book: the
-    /// keys of one street share most of their bytes, so there only the rest
-    /// of each is written.
     fn encode_rest(&self, previous: Option<&Self>, out: &mut Vec<u8>) {
         let shared = previous.map(|previous| {
             previous
@@ -619,37 +543,24 @@ impl PendingAddress {
     }
 }
 
-/// An address in house order, while the imported rows that repeat an
-/// address the Pack already has are found: a hash of its house, the
-/// rows of one house OSM ones first, and what tells two of them apart.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct House {
-    /// Hash of the street as search spells it, the number and the unit.
     pub key: u128,
     pub imported: bool,
     pub seq: u64,
     pub point: [f64; 2],
-    /// Where the address waits in the address book.
     pub at: u64,
     pub dataset: u32,
-    /// Hashes of the postcode, the locality and the areas it states, as
-    /// [`crate::text_index::compact_postcode`] and
-    /// [`crate::util::fold::search_key`] write them.
     pub postcode: Option<u64>,
     pub locality: Option<u64>,
     pub areas: Option<u64>,
 }
 
 impl House {
-    /// Whether both are rows of one imported file. OSM's addresses carry
-    /// dataset 0 too, the first file's index.
     pub(super) fn same_source(&self, other: &Self) -> bool {
         self.imported && other.imported && self.dataset == other.dataset
     }
 
-    /// Whether two addresses of one house key state where they are
-    /// differently: both state a postcode, a locality or areas, and they
-    /// differ. Then they are two houses, however close.
     pub(super) fn other_house(&self, other: &Self) -> bool {
         fn differ(left: Option<u64>, right: Option<u64>) -> bool {
             left.zip(right).is_some_and(|(left, right)| left != right)
@@ -728,20 +639,13 @@ impl Spill for House {
     }
 }
 
-/// An address placed in record order, standing for its record until it is
-/// written: where it waits in the address book, the street postcodes lent to
-/// it, and whether a source disputes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedAddress {
     pub at: u64,
-    /// Where what its street lends it waits, when it is lent anything.
     pub lent: Option<u64>,
     pub disputed: bool,
 }
 
-/// What an address is lent from the others of its street: the postcodes
-/// they state, when it states none, and their spelling of its street, when
-/// it writes the street in capitals alone.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Lent {
     pub postcodes: Vec<String>,
@@ -774,9 +678,6 @@ impl Entry for PendingAddress {
     }
 }
 
-/// A point in 1e-7 degree steps when it is exactly one, as OSM's nodes and
-/// most imported rows are, and in full otherwise: nothing a point decodes to
-/// differs from what was encoded.
 fn encode_compact_point(out: &mut Vec<u8>, point: [f64; 2]) {
     let compact = point.map(|degrees| {
         let steps = (degrees * COORDINATE_SCALE).round();
@@ -821,17 +722,12 @@ fn decode_compact_point(input: &mut &[u8]) -> Result<[f64; 2]> {
     Ok(point)
 }
 
-/// Sorted by search key then Hilbert, so a name's records come out together,
-/// near ones close.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingNamed {
-    /// The name key, then the Hilbert key of its representative point.
     pub order: Vec<u8>,
-    /// Length of the start of `order` its name takes.
     pub name_len: usize,
     pub seq: u64,
     pub record: Record,
-    /// A place's; a street has none.
     pub identity: Option<Box<Identity>>,
 }
 
@@ -900,7 +796,6 @@ impl PendingNamed {
         }
     }
 
-    /// Its name as search spells it, as the sort key holds it.
     pub(super) fn name_key(&self) -> &[u8] {
         &self.order[..self.name_len]
     }
@@ -969,7 +864,6 @@ impl Spill for PendingNamed {
         Self::decode_rest(order, input)
     }
 
-    /// Ways of one name sort together, so their keys share the name.
     fn encode_after(&self, delta: &mut Delta, out: &mut Vec<u8>) {
         put_front(out, delta, &self.order);
         self.encode_rest(out);
@@ -995,9 +889,6 @@ impl Spill for PendingNamed {
     }
 }
 
-/// Text for a sort key: absent before present, and each value prefixed by
-/// its length so no value can run into the next. Values sort by length, then
-/// by their bytes.
 fn put_order_text(order: &mut Vec<u8>, value: Option<&str>) {
     match value {
         None => order.push(0),
@@ -1022,8 +913,6 @@ fn get_order_text<'a>(input: &mut &'a [u8]) -> Result<Option<&'a str>> {
     })?))
 }
 
-/// A length in one byte below [`LONG_ORDER_LEN`], else that byte and four
-/// big-endian ones: either way a longer length sorts after a shorter one.
 fn put_order_len(order: &mut Vec<u8>, len: usize) {
     match u8::try_from(len) {
         Ok(short) if short < LONG_ORDER_LEN => order.push(short),
@@ -1046,7 +935,6 @@ fn get_order_len(input: &mut &[u8]) -> Result<usize> {
     Ok(u32::from_be_bytes(bytes.try_into().expect("4 bytes")) as usize)
 }
 
-/// The first length byte that says four more follow.
 const LONG_ORDER_LEN: u8 = u8::MAX;
 
 impl Eq for PendingAddress {}
@@ -1097,7 +985,6 @@ impl Ord for PendingRecord {
     }
 }
 
-/// The origin byte of a placed address, which has none.
 const PLACED_ADDRESS: u8 = 3;
 
 impl PendingRecord {
@@ -1169,8 +1056,6 @@ impl Spill for PendingRecord {
         Self::decode_rest(get_u64(input)?, input)
     }
 
-    /// Records sort along the Hilbert curve, so neighbouring keys differ by
-    /// little.
     fn encode_after(&self, delta: &mut Delta, out: &mut Vec<u8>) {
         put_delta(out, delta, self.key as i64);
         self.encode_rest(out);
@@ -1634,7 +1519,6 @@ fn decode_source(input: &mut &[u8]) -> Result<SourceProvenance> {
     Ok(SourceProvenance::osm(object_type, get_i64(input)?))
 }
 
-/// Points keep full precision; they are quantized once, by the record store.
 fn encode_point(out: &mut Vec<u8>, point: [f64; 2]) {
     out.extend_from_slice(&point[0].to_bits().to_le_bytes());
     out.extend_from_slice(&point[1].to_bits().to_le_bytes());
@@ -1652,11 +1536,6 @@ fn decode_point(input: &mut &[u8]) -> Result<[f64; 2]> {
     Ok(point)
 }
 
-/// Line vertices are stored as 1e-7 degree deltas, the precision the record
-/// store keeps, without its range limit: a spilled line decodes to the values
-/// the store would quantize anyway, so an out-of-range vertex fails the build
-/// the same way whether or not it was spilled. Non-finite vertices keep their
-/// raw bits for the same reason.
 fn encode_geometry(out: &mut Vec<u8>, geometry: &Geometry) {
     match &geometry.value {
         GeometryValue::LineString { coordinates } => {
@@ -1982,8 +1861,6 @@ mod tests {
         }
     }
 
-    /// Addresses whose points take every form a point is stored in, and
-    /// whose keys hold every component, long and absent ones too.
     fn varied_addresses() -> Vec<AddressRecord> {
         let osm_node = |e7: i32| 1e-9 * (i64::from(e7) * 100) as f64;
         let long = "Avenue ".repeat(40);
@@ -2153,7 +2030,6 @@ mod tests {
             );
             assert!(input.is_empty());
         }
-        // Stating its street another way, it is still the same building.
         let mut restated = record.address.clone();
         restated.street = Some("Kade Weg".into());
         assert_eq!(

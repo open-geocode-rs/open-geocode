@@ -1,13 +1,3 @@
-//! OpenAddresses as an [`AddressSource`]: the address files of the countries
-//! a Pack covers, fetched from the OpenAddresses batch service and kept in a
-//! cache between builds, or read from a collection archive downloaded whole
-//! ([`Collection`]).
-//!
-//! Listing the sources is open, but downloading their data needs an
-//! OpenAddresses account: its API token is read from [`TOKEN_VARIABLE`], or
-//! from that line of a `.env` file in the working directory, so it never
-//! lands in a shell history or a build report.
-
 use std::{
     fs::{self, File},
     io::{self, BufWriter},
@@ -25,20 +15,13 @@ use crate::{
 
 pub const TOKEN_VARIABLE: &str = "OA_TOKEN";
 const API: &str = "https://batch.openaddresses.io/api";
-/// How long to wait before each retry of a download that failed on the way:
-/// a dropped connection or a busy server. A Canada build fetches some 200
-/// sources, and one stalled connect should not cost it the rest.
 const RETRY_WAITS: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(8),
     Duration::from_secs(30),
 ];
-/// The prefix the records of an OpenAddresses source name as their dataset:
-/// `openaddresses:nz/countrywide`.
 pub const DATASET_PREFIX: &str = "openaddresses:";
 
-/// The OpenAddresses sources of the Pack's countries, downloaded into
-/// `cache`.
 #[derive(Clone)]
 pub struct OpenAddresses {
     token: String,
@@ -56,24 +39,17 @@ impl std::fmt::Debug for OpenAddresses {
     }
 }
 
-/// One source's latest address data, as the service lists it.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Source {
-    /// Its path in the OpenAddresses tree, `nz/countrywide`.
     pub source: String,
-    /// Which of the source's data sets: most sources have one, a few have
-    /// several (a city's and a county's).
     #[serde(default)]
     pub name: String,
-    /// The job whose output is the latest data.
     pub job: u64,
-    /// Bytes of the output; the service lists some sources without one.
     #[serde(default)]
     pub size: Option<u64>,
 }
 
 impl OpenAddresses {
-    /// With the token [`token`] finds; fails when there is none.
     pub fn from_env(cache: impl Into<PathBuf>) -> Result<Self> {
         let token = token().ok_or_else(|| {
             Error::BadOptions(
@@ -92,15 +68,11 @@ impl OpenAddresses {
         })
     }
 
-    /// Take the data sets whose licence forbids use for gain too, for a
-    /// non-commercial Pack.
     pub fn non_commercial(mut self, non_commercial: bool) -> Self {
         self.non_commercial = non_commercial;
         self
     }
 
-    /// The sources whose data a Pack covering `coverage` needs, each with
-    /// the code of the area its rows lie in.
     pub fn sources(coverage: &Coverage) -> Result<Vec<(Source, String)>> {
         let url = format!("{API}/data?layer=addresses");
         let listed: Vec<Source> = agent()
@@ -124,8 +96,6 @@ impl OpenAddresses {
         let parent = path.parent().expect("cache files have a directory");
         fs::create_dir_all(parent).map_err(|error| io_error("failed to create", parent, error))?;
         let url = format!("{API}/job/{}/output/source.geojson.gz", source.job);
-        // Written beside its final name, so an interrupted download is never
-        // taken for a cached one.
         let partial = path.with_extension("gz.part");
         let mut waits = RETRY_WAITS.iter();
         loop {
@@ -142,7 +112,6 @@ impl OpenAddresses {
         Ok(path)
     }
 
-    /// One try at downloading `url` into `partial`.
     fn fetch(&self, url: &str, partial: &Path) -> std::result::Result<(), Attempt> {
         let mut response = agent()
             .get(url)
@@ -175,8 +144,6 @@ impl OpenAddresses {
             .map_err(|error| Attempt::Final(io_error("failed to write", partial, error)))
     }
 
-    /// The licence the job that made `source`'s output states, read from
-    /// the service once and kept beside the output.
     fn job_licence(&self, source: &Source) -> Result<Option<Stated>> {
         let path = self
             .cache
@@ -246,9 +213,6 @@ fn job_licence(license: Option<serde_json::Value>) -> Option<Stated> {
     (stated.text.is_some() || stated.url.is_some()).then_some(stated)
 }
 
-/// The job record kept at `path`, or none when there is none or it is not
-/// one: an unreadable record is removed, so the next build asks again
-/// instead of failing on it.
 fn cached_job(path: &Path) -> Option<Job> {
     let text = fs::read_to_string(path).ok()?;
     match serde_json::from_str(&text) {
@@ -260,8 +224,6 @@ fn cached_job(path: &Path) -> Option<Job> {
     }
 }
 
-/// Keeps job record `text` at `path` once it reads as one, written beside
-/// its final name, so a cut-off or garbled reply is never cached.
 fn store_job(path: &Path, text: &str) -> Result<Job> {
     let job: Job = serde_json::from_str(text)
         .map_err(|error| Error::BadInput(format!("not an OpenAddresses job: {error}")))?;
@@ -273,19 +235,12 @@ fn store_job(path: &Path, text: &str) -> Result<Job> {
     Ok(job)
 }
 
-/// The part of a job record a build reads.
 #[derive(Debug, Deserialize)]
 struct Job {
     #[serde(default)]
     license: Option<serde_json::Value>,
 }
 
-/// Of the sources a Pack needs, the ones whose licence a build takes, each
-/// with its area and dataset, and a warning for each one left out. A job
-/// that states no licence is judged by its source's in the pinned catalog,
-/// and one with none there states no licence, which a build takes.
-/// Datasets are named from every needed source, so leaving one out never
-/// renames another's records.
 fn licensed(
     sources: &[(Source, String)],
     non_commercial: bool,
@@ -321,15 +276,11 @@ fn licensed(
     Ok(Licensed { kept, left_out })
 }
 
-/// The sources a build takes, each with its area and dataset, and a warning
-/// for each one left out.
 struct Licensed<'a> {
     kept: Vec<(&'a Source, &'a String, String)>,
     left_out: Vec<String>,
 }
 
-/// The dataset a source's records name: its path, and its name too when the
-/// source has several data sets.
 fn dataset_of(source: &Source, sources: &[(Source, String)]) -> String {
     let shared = sources
         .iter()
@@ -355,15 +306,12 @@ pub struct Collection {
     non_commercial: bool,
 }
 
-/// What a `.geojson.meta` entry says of its source.
 #[derive(Debug, Deserialize)]
 struct EntryMeta {
-    /// The source's path, `nz/countrywide`.
     source_name: String,
     layer: String,
     #[serde(default)]
     name: String,
-    /// The job that made the output.
     id: u64,
     #[serde(default)]
     size: Option<u64>,
@@ -380,15 +328,11 @@ impl Collection {
         }
     }
 
-    /// Take the data sets whose licence forbids use for gain too, for a
-    /// non-commercial Pack.
     pub fn non_commercial(mut self, non_commercial: bool) -> Self {
         self.non_commercial = non_commercial;
         self
     }
 
-    /// Every address source in the archive, with the entry that holds it
-    /// and the licence its job states.
     fn listed(&self) -> Result<Vec<(Source, String, Option<Stated>)>> {
         let file = File::open(&self.path)
             .map_err(|error| io_error("failed to open", &self.path, error))?;
@@ -484,8 +428,6 @@ pub fn token() -> Option<String> {
     (!token.is_empty()).then(|| token.to_string())
 }
 
-/// The value of `name` in `.env` text: `NAME=value` lines, `export` allowed,
-/// the value optionally in quotes; `#` starts a comment line.
 fn dotenv_value(text: &str, name: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let line = line.trim();
@@ -504,15 +446,6 @@ fn dotenv_value(text: &str, name: &str) -> Option<String> {
     })
 }
 
-/// Of the listed sources, those `coverage` needs, each with the ISO 3166
-/// code of the area its rows must lie in. A country covered whole takes
-/// every source under its path, `countrywide` and the others alike: they
-/// come from different publishers and need not cover the same addresses, and
-/// the build drops a row repeating an address another source has. A region
-/// of a country covered in part takes the sources under its path (`CA-ON` the
-/// ones under `ca/on/`), and never the countrywide one, which would bring in
-/// the rest of the country. A data set listed twice is taken once, at its
-/// latest job.
 fn select(mut listed: Vec<Source>, coverage: &Coverage) -> Vec<(Source, String)> {
     listed.sort_by(|left, right| {
         (&left.source, &left.name)
@@ -534,7 +467,6 @@ fn select(mut listed: Vec<Source>, coverage: &Coverage) -> Vec<(Source, String)>
     selected
 }
 
-/// How a download try ended: worth another try, or not.
 enum Attempt {
     Again(Error),
     Final(Error),
@@ -733,14 +665,10 @@ mod tests {
         );
     }
 
-    /// An archive laid out as OpenAddresses' collections are: each job's
-    /// output beside its `.meta`, deflated, in several layers.
     fn collection(dir: &Path) -> PathBuf {
         collection_with(dir, &[])
     }
 
-    /// The archive of [`collection`], with `licensed` address entries added:
-    /// (source, job, the `license` of its job record as JSON).
     fn collection_with(dir: &Path, licensed: &[(&str, u64, &str)]) -> PathBuf {
         use std::io::Write;
         let path = dir.join("collection.zip");

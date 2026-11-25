@@ -1,29 +1,3 @@
-//! Training the parser's weights from the Pack's own records, inside `build`.
-//!
-//! While the builder writes records, a [`Sampler`] draws a uniform sample of
-//! them for each country and kind of record (Vitter's Algorithm R), so a
-//! planet build trains each country on as many rows as a build of that
-//! country alone, in memory that does not grow with the input. Once the Pack
-//! is sealed, [`train`] reads the drawn records back in Pack order and writes
-//! them out the way people write addresses, through its country's address
-//! template ([`crate::address_template`]), with the noise real queries carry:
-//! commas dropped, fields left out or swapped, street types abbreviated, a
-//! unit added, one-letter typos. Some rows hide the dictionary hits of their
-//! street or venue, so the model also learns to read names the Pack does not
-//! know from their shape and place alone; the areas a row names are always
-//! names the Pack knows, as a locality or region must be.
-//!
-//! The weights are those of a semi-Markov conditional random field (Sarawagi
-//! and Cohen, 2004), learned by stochastic gradient ascent on each row's
-//! log-likelihood with AdaGrad step sizes: move every weight by the expected
-//! count of its feature over the gold labellings less that over all
-//! labellings, both from forward-backward over the row's lattice. Averaging
-//! the weights over every step keeps the model from following the last rows
-//! it saw. Rows stream from scratch files, so training memory does not grow
-//! with the number of countries either. A lattice does not depend on the
-//! weights, so each row's is built once and read by every epoch: from memory
-//! while the build's pool grants it, else from a scratch file.
-
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
@@ -60,38 +34,17 @@ use crate::{
     },
 };
 
-/// Training rows rendered for each country of the Pack. Deepparse trains on
-/// 100,000 addresses per country; on the Japan Pack 200,000 rows label the
-/// held-out rows and the libpostal bench as well as 400,000, and 100,000
-/// worse.
 pub const ROWS_PER_COUNTRY: usize = 200_000;
-/// Passes over the training rows.
 pub const EPOCHS: usize = 5;
-/// Seed of the record draw, the noise and the row order, so a build of the
-/// same input trains the same weights.
 const SEED: u64 = 1;
-/// A Pack that renders fewer rows than this parses with the built-in
-/// weights: too few rows teach a model less than the hand-set weights know.
 const MIN_TRAIN_ROWS: usize = 1_000;
-/// Shards trained side by side: more shards see fewer rows between two mixes
-/// and converge slower. Fixed, not taken from the cores, so a build trains
-/// the same weights on every machine.
 const TRAIN_SHARDS: usize = 4;
-/// The share of rendered rows held out to measure the model.
 const HELD_OUT_SHARE: f64 = 0.05;
-/// Records drawn per wanted row: a few draws render no row.
 const OVERSAMPLE: f64 = 1.25;
-/// Rows a shard holds to read its rows in an order of its own each epoch.
 const SHUFFLE_WINDOW: usize = 1 << 16;
-/// Rows whose lattices are built side by side.
 const LATTICE_BATCH: usize = 1 << 10;
-/// Held-out rows labelled per parallel batch.
 const EVALUATE_BATCH: usize = 1 << 12;
 
-/// What one country's rows are made of: mostly addresses, then POIs,
-/// streets, places and postcodes. Block scheme addresses have a share of
-/// their own on top of the addresses', so their house numbers and the
-/// streets beside them are seen often.
 const SHARES: [(Draw, f64); 11] = [
     (Draw::Layer(Layer::Address), 0.40),
     (Draw::BlockAddress, BLOCK_ADDRESS_SHARE),
@@ -106,8 +59,6 @@ const SHARES: [(Draw, f64); 11] = [
     (Draw::Layer(Layer::Postcode), 0.04),
 ];
 
-/// The rows one country renders of a kind of record, or `None` for a kind
-/// that is not trained on.
 fn quota(draw: Draw) -> Option<usize> {
     SHARES
         .iter()
@@ -115,56 +66,37 @@ fn quota(draw: Draw) -> Option<usize> {
         .map(|(_, share)| ((ROWS_PER_COUNTRY as f64 * share).ceil() as usize).max(1))
 }
 
-/// What a training run did and how well the weights label held-out rows.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Report {
     pub rows_per_country: usize,
-    /// Rendered rows by the `name` of the country record they lie in.
     pub rows_by_country: BTreeMap<String, usize>,
     pub rendered_rows: usize,
-    /// Rendered rows with a house number, and rows of block scheme
-    /// addresses (see [`BLOCK_ADDRESS_SHARE`]).
     pub house_number_rows: usize,
     pub block_address_rows: usize,
     pub held_out_rows: usize,
-    /// Memory the record sample held while records were written.
     pub sample_bytes: u64,
     pub shards: usize,
     pub epochs: usize,
-    /// Countries with their own transition table.
     pub countries: Vec<String>,
-    /// Whether the Pack carries the trained weights; without them it parses
-    /// with the built-in ones.
     pub trained: bool,
     pub accuracy: Accuracy,
     pub seconds: f64,
-    /// Seconds spent rendering rows from the Pack, building their lattices,
-    /// and learning from them.
     pub render_seconds: f64,
     pub lattice_seconds: f64,
     pub learn_seconds: f64,
-    /// Bytes the training rows' lattices took, in memory and in scratch
-    /// files, and how many shards read theirs from a file.
     pub lattice_memory_bytes: u64,
     pub lattice_file_bytes: u64,
     pub lattice_file_shards: usize,
-    /// Whether the Pack's `parse/*` sections, all training looks up, were
-    /// read into memory up front, as they are when they fit in half the
-    /// memory available.
     pub pack_prefaulted: bool,
 }
 
-/// Token and whole-row accuracy on the held-out rows.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Accuracy {
     pub tokens: f64,
     pub rows: f64,
-    /// Per gold label: the share of its tokens labelled right.
     pub by_label: BTreeMap<String, f64>,
 }
 
-/// Records drawn for training while the Pack is written: for each country
-/// and kind of record a uniform sample of a fixed size.
 #[derive(Debug)]
 pub struct Sampler {
     reservoirs: BTreeMap<(Option<RecordId>, Draw), Reservoir>,
@@ -213,7 +145,6 @@ impl Sampler {
         }
     }
 
-    /// The sample as a checkpoint saves it.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         put_u64(&mut out, self.random.0);
@@ -233,7 +164,6 @@ impl Sampler {
         out
     }
 
-    /// The sample [`Sampler::to_bytes`] saved.
     pub fn from_bytes(mut input: &[u8]) -> Result<Self> {
         let input = &mut input;
         let random = Random(get_u64(input)?);
@@ -258,7 +188,6 @@ impl Sampler {
         Ok(Self { reservoirs, random })
     }
 
-    /// Bytes the sample holds.
     pub fn resident_bytes(&self) -> usize {
         self.reservoirs
             .values()
@@ -269,10 +198,6 @@ impl Sampler {
             .sum()
     }
 
-    /// The drawn records of each country, each with the kind it was drawn
-    /// as and its rank in a random order of its kind's draws, in record
-    /// order. A block scheme address drawn for both of its kinds is drawn
-    /// once, as a block address.
     fn candidates(self, random: &mut Random) -> BTreeMap<Option<RecordId>, Vec<Candidate>> {
         let mut countries = BTreeMap::<Option<RecordId>, Vec<Candidate>>::new();
         for ((country, draw), reservoir) in self.reservoirs {
@@ -320,24 +245,15 @@ pub fn train(
     };
     let pack = Reader::open(pack)?;
     let dictionaries = pack.container();
-    // Every lattice looks names up all over the dictionaries, and nothing
-    // else of the Pack is read at random: the records drawn are read once,
-    // in Pack order. The whole file need not fit, only them.
     report.pack_prefaulted =
         dictionaries.prefault_sections("parse/", Resources::probe().available_memory_bytes) > 0;
     let tagger = LatticeTagger::new(Dictionaries::open(dictionaries)?, Weights::zero());
     let mut random = Random::new(SEED);
 
-    // Each country's rows, rendered from its drawn records read in Pack
-    // order, and sorted by a random key into one random order of all rows.
     let mut shuffled =
         ExternalSorter::<Shuffled>::new(scratch, "parse-rows", memory, sort_budget_bytes);
     let mut renderer = Renderer::new(&pack, &tagger);
     let candidates = sample.candidates(&mut random);
-    // Records in no country stand for a country only in a Pack that has
-    // none, such as a city extract cut inside its country's boundary. Beside
-    // countries they are the strip an extract takes past a border, and would
-    // take a whole country's rows.
     let in_countries = candidates.keys().any(Option::is_some);
     let mut drawn_rows = 0;
     for (country, candidates) in candidates {
@@ -356,7 +272,6 @@ pub fn train(
                     .push((candidate.rank, row));
             }
         }
-        // The areas of one country are not those of the next.
         renderer.names.clear();
         let mut rows = 0;
         for (draw, mut drawn) in drawn {
@@ -416,8 +331,6 @@ pub fn train(
         return Ok((None, report));
     }
 
-    // Every row's lattice, built once on every core. Each shard's cache is
-    // open on the pool before any is filled, so they split it fairly.
     let at = Instant::now();
     let mut caches = parts
         .iter()
@@ -464,12 +377,6 @@ pub fn train(
         }
     }
 
-    // Iterative parameter mixing (McDonald, Hall and Mann 2010): every epoch
-    // each shard of the rows trains its own model from the mixed weights,
-    // in parallel, and the shards' weights are averaged. The result is the
-    // average over epochs of the shards' averaged weights. Each shard reads
-    // its rows in an order of its own seed, so the weights do not depend on
-    // scheduling.
     let mut mixed = Weights::zero();
     let mut averages = Vec::with_capacity(EPOCHS);
     for epoch in 0..EPOCHS {
@@ -494,7 +401,6 @@ pub fn train(
                 Ok((model.averaged(), model.weights, at.elapsed().as_secs_f64()))
             })
             .collect::<Result<Vec<_>>>()?;
-        // Per-shard seconds, spread over the shards that ran side by side.
         report.learn_seconds += results.iter().map(|result| result.2).sum::<f64>() / shards as f64;
         mixed = Weights::mean(results.iter().map(|result| &result.1));
         averages.push(Weights::mean(results.iter().map(|result| &result.0)));
@@ -508,10 +414,6 @@ pub fn train(
     Ok((Some(weights), report))
 }
 
-/// The indices `0..len` in a random order drawn through a window of
-/// [`SHUFFLE_WINDOW`] indices: once the window is full, each next index
-/// takes the place of a random one in it, which comes next, and the window
-/// ends in a random order of its own. A shard reads its rows in this order.
 fn shuffled_order(len: usize, random: &mut Random) -> Vec<u32> {
     let mut order = Vec::with_capacity(len);
     let mut window = Vec::with_capacity(SHUFFLE_WINDOW.min(len));
@@ -528,7 +430,6 @@ fn shuffled_order(len: usize, random: &mut Random) -> Vec<u32> {
     order
 }
 
-/// A training row as learning reads it: its gold labels and its lattice.
 #[derive(Debug, Clone, PartialEq)]
 struct Learned {
     gold: Vec<Label>,
@@ -564,9 +465,6 @@ impl Spill for Learned {
     }
 }
 
-/// One shard's rows with their lattices, as they are built: in memory while
-/// its fair share of the pool grants them, else, from the row the pool
-/// refuses on, every row in a scratch file read back by index.
 struct LatticeCache {
     scratch: Arc<Scratch>,
     reservation: Spillable,
@@ -574,7 +472,6 @@ struct LatticeCache {
     file: Option<IndexedSpool<Learned>>,
 }
 
-/// One shard's rows with their lattices, built.
 enum Lattices {
     Memory(Vec<Learned>, Reservation),
     File(Box<IndexedSpoolFile<Learned>>),
@@ -629,7 +526,6 @@ impl Lattices {
         }
     }
 
-    /// Call `visit` with row `index`.
     fn visit(&self, index: usize, visit: impl FnOnce(&Learned)) -> Result<()> {
         match self {
             Self::Memory(rows, _) => visit(&rows[index]),
@@ -639,9 +535,6 @@ impl Lattices {
     }
 }
 
-/// A row with the random key that orders it among all rows, and its draw
-/// order: two rows whose keys collide keep the order they were drawn in,
-/// so a build stays deterministic though the sort is not stable.
 #[derive(Debug)]
 struct Shuffled {
     key: u64,
@@ -703,17 +596,14 @@ impl Spill for Shuffled {
     }
 }
 
-/// One labelled training row.
 #[derive(Debug, Clone)]
 pub(super) struct Row {
     pub tokens: Tokens,
     pub gold: Vec<Label>,
     pub suppression: Suppression,
-    /// Whether the row was rendered from a block scheme address.
     pub block_address: bool,
 }
 
-/// The dictionaries a training row hides its hits in.
 const HIDDEN_FIELDS: [Field; 2] = [Field::Street, Field::Poi];
 
 impl Spill for Row {
@@ -808,35 +698,18 @@ impl Spill for Row {
     }
 }
 
-/// The model being trained: a semi-Markov conditional random field
-/// (Sarawagi and Cohen, 2004) over the lattice, learned by stochastic
-/// gradient ascent on each row's log-likelihood with AdaGrad step sizes
-/// (Duchi, Hazan and Singer, 2011), and averaged over every step.
-///
-/// The likelihood of a row sums over every segmentation that gives its
-/// tokens their gold labels and over the countries the lattice is decoded
-/// as, since neither is given, as neither is for a query. Its gradient is
-/// the expected features of the gold labellings less those of all
-/// labellings, both from forward-backward over the lattice.
 #[derive(Debug)]
 struct Model {
     weights: Weights,
-    /// Every update times the step it was made at, to average lazily.
     totals: Weights,
-    /// The sum of every squared gradient, for AdaGrad's step sizes.
     squares: Weights,
     step: f32,
 }
 
-/// AdaGrad's base step size.
 const LEARNING_RATE: f32 = 0.1;
-/// A feature whose expected count differs by less than this between the gold
-/// labellings and all labellings is left as it is: the cost of a row is then
-/// the spans and labels the model is unsure of, not every one.
 const MIN_GRADIENT: f64 = 1e-4;
 
 impl Model {
-    /// A model that starts from `weights`.
     fn from_weights(weights: Weights) -> Self {
         Self {
             weights,
@@ -846,7 +719,6 @@ impl Model {
         }
     }
 
-    /// Learn from one row, labelled `gold` by token.
     fn learn(&mut self, lattice: &Lattice, gold: &[Label]) {
         let gold = lattice.units.expand(gold);
         let gradient = Gradient::of(lattice, &self.weights, &gold);
@@ -863,8 +735,6 @@ impl Model {
         }
         for (country, values) in gradient.transitions {
             let kept = |value: f32| f64::from(value).abs() >= MIN_GRADIENT;
-            // A country's tables are made by its first kept value, so a
-            // country with none must not make them.
             if !values.iter().any(|value| kept(*value)) {
                 continue;
             }
@@ -883,7 +753,6 @@ impl Model {
         self.step += 1.0;
     }
 
-    /// The weights averaged over every step.
     fn averaged(&self) -> Weights {
         let average = |weights: &[f32], totals: &[f32]| {
             weights
@@ -912,15 +781,11 @@ impl Model {
     }
 }
 
-/// AdaGrad's step for one weight: the gradient scaled down by the root of
-/// every squared gradient the weight has had.
 fn adagrad(squares: &mut f32, gradient: f32) -> f32 {
     *squares += gradient * gradient;
     LEARNING_RATE * gradient / (squares.sqrt() + 1e-6)
 }
 
-/// The transition table of `country` in `weights`, the global one for
-/// `None`, made when it is missing.
 fn table(weights: &mut Weights, country: Option<CountryCode>) -> &mut Vec<f32> {
     match country {
         None => &mut weights.global,
@@ -931,9 +796,6 @@ fn table(weights: &mut Weights, country: Option<CountryCode>) -> &mut Vec<f32> {
     }
 }
 
-/// The gradient of one row's log-likelihood: per feature, its value for each
-/// label and a bit for each label it has one for; and per transition table
-/// (`None` the global one) by previous and next state.
 #[derive(Debug, Default)]
 struct Gradient {
     edge: FxHashMap<usize, ([f32; LABELS], u8)>,
@@ -980,8 +842,6 @@ impl Gradient {
     }
 }
 
-/// The score of every span for every label, decoded as `country`. Both
-/// readings of a country share them.
 fn span_edges(
     lattice: &Lattice,
     weights: &Weights,
@@ -994,16 +854,12 @@ fn span_edges(
         .collect()
 }
 
-/// The lattice's span indices by where the spans end, the order the forward
-/// pass visits them in.
 fn span_order(lattice: &Lattice) -> Vec<usize> {
     let mut order = (0..lattice.spans.len()).collect::<Vec<_>>();
     order.sort_by_key(|index| lattice.spans[*index].end);
     order
 }
 
-/// Per span, the labels a gold labelling may give it, one bit per label: the
-/// label every unit of the span has in `gold`, or none when they differ.
 fn gold_labels(lattice: &Lattice, gold: &[Label]) -> Vec<u8> {
     lattice
         .spans
@@ -1019,18 +875,11 @@ fn gold_labels(lattice: &Lattice, gold: &[Label]) -> Vec<u8> {
         .collect()
 }
 
-/// Forward-backward over a lattice decoded as one country, over every
-/// labelling or only those that give each unit its gold label.
 struct Reading<'a> {
-    /// [`gold_labels`] of the lattice, when only gold labellings count.
     golds: Option<&'a [u8]>,
-    /// `edges[span][label]`.
     edges: Vec<[f64; LABELS]>,
     transitions: [[f64; STATES]; STATES],
-    /// `alpha[position][state]`: the log-sum of the paths ending there.
     alpha: Vec<[f64; STATES]>,
-    /// `beta[position][state]`: the log-sum of the rest of the paths from a
-    /// segment of `state` ending at `position`.
     beta: Vec<[f64; STATES]>,
     log_z: f64,
 }
@@ -1054,8 +903,6 @@ impl<'a> Reading<'a> {
         let len = lattice.len;
         let mut alpha = vec![[f64::NEG_INFINITY; STATES]; len + 1];
         alpha[0][START] = 0.0;
-        // Spans are visited by end, so `alpha[start]` is final by the first
-        // span that starts there, and every later one reads the same sum.
         let mut sums = vec![[None; LABELS]; len + 1];
         for &index in order {
             let span = &lattice.spans[index];
@@ -1105,8 +952,6 @@ impl<'a> Reading<'a> {
         }
     }
 
-    /// Add `scale` times the expected count of every feature and transition
-    /// under this reading to `gradient`.
     fn add_expectations(
         &self,
         lattice: &Lattice,
@@ -1146,8 +991,6 @@ impl<'a> Reading<'a> {
             if set == 0 {
                 continue;
             }
-            // One entry per feature for all its labels: each label's sum
-            // still takes the spans in the same order.
             for feature in span.features_in(country) {
                 let (sums, seen) = gradient.edge.entry(feature as usize).or_default();
                 for (label, value) in values.iter().enumerate() {
@@ -1179,15 +1022,10 @@ impl<'a> Reading<'a> {
     }
 }
 
-/// Whether a reading over `golds` (every labelling when `None`) may give span
-/// `index` the label `label`.
 fn allowed(golds: Option<&[u8]>, index: usize, label: Label) -> bool {
     golds.is_none_or(|golds| golds[index] & (1 << label as u8) != 0)
 }
 
-/// The probability of each label of each unit of `lattice` under
-/// `weights`: forward-backward over every labelling, in every country the
-/// lattice is decoded as, as learning reads its expected counts.
 pub(super) fn label_marginals(lattice: &Lattice, weights: &Weights) -> Vec<[f64; LABELS]> {
     let order = span_order(lattice);
     let readings = decode::countries(lattice)
@@ -1223,7 +1061,6 @@ pub(super) fn label_marginals(lattice: &Lattice, weights: &Weights) -> Vec<[f64;
     marginals
 }
 
-/// The states a segment starting at `start` can follow.
 fn previous_states(start: usize) -> std::ops::Range<usize> {
     if start == 0 {
         START..START + 1
@@ -1234,11 +1071,7 @@ fn previous_states(start: usize) -> std::ops::Range<usize> {
 
 fn log_add(left: f64, right: f64) -> f64 {
     let high = left.max(right);
-    // `abs` and not `min`: a NaN input must stay NaN, as it did.
     let gap = -(left - right).abs();
-    // The higher term's exp is exactly 1. Below -37.5 the lower term is under
-    // half an ulp of it, so the sum is 1 and its ln 0: the same bits as the
-    // full formula without two exp and an ln. Most sums are like this.
     if high == f64::NEG_INFINITY || gap < -37.5 {
         return high;
     }
@@ -1249,8 +1082,6 @@ fn log_sum(values: impl Iterator<Item = f64>) -> f64 {
     values.fold(f64::NEG_INFINITY, log_add)
 }
 
-/// Token and row accuracy of `weights` on the rows of `rows`, read in
-/// batches.
 fn evaluate_file(
     tagger: &LatticeTagger,
     weights: &Weights,
@@ -1271,7 +1102,6 @@ fn evaluate_file(
     Ok(tally.accuracy())
 }
 
-/// Counts of rows and tokens labelled right.
 #[derive(Debug, Default)]
 struct Tally {
     rows: usize,
@@ -1329,7 +1159,6 @@ impl Tally {
     }
 }
 
-/// The fields of one address, each as the words it is written in.
 #[derive(Debug, Clone, Default)]
 struct Fields {
     house: Option<Tokens>,
@@ -1338,19 +1167,14 @@ struct Fields {
     street: Option<Tokens>,
     suburb: Option<Tokens>,
     locality: Option<Tokens>,
-    /// The place area the record lies in outside the admin areas: an island.
     island: Option<Tokens>,
-    /// The area between the locality and the region: a county, a Kreis.
     district: Option<Tokens>,
     region: Option<Tokens>,
     postcode: Option<Tokens>,
     country: Option<Tokens>,
-    /// The field the row is about, which is never dropped: the region or
-    /// country a row of a region or country names.
     subject: Option<Slot>,
 }
 
-/// A field of a template the parser has a label for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
     House,
@@ -1390,8 +1214,6 @@ impl Slot {
             Self::HouseNumber => Label::HouseNumber,
             Self::Street => Label::Street,
             Self::Suburb | Self::Locality | Self::Island => Label::Locality,
-            // A district is written on the region side, as libpostal labels
-            // its state_district.
             Self::District => Label::Region,
             Self::Region => Label::Region,
             Self::Postcode => Label::Postcode,
@@ -1415,34 +1237,26 @@ impl Slot {
     }
 }
 
-/// An address template, each field the label the parser has for it. `None`
-/// is a field it has none for (`attention`, `county_code`).
 type Node = address_template::Node<Option<Slot>>;
 
-/// Every country's template, parsed once.
 fn templates() -> &'static BTreeMap<String, Vec<Node>> {
     static TABLE: OnceLock<BTreeMap<String, Vec<Node>>> = OnceLock::new();
     TABLE.get_or_init(|| address_template::table(Slot::of))
 }
 
-/// One field of a rendered address.
 #[derive(Debug, Clone)]
 struct Group {
     label: Label,
     words: Tokens,
-    /// Whether a comma or line break precedes it.
     break_before: bool,
-    /// What joins its first word to the word before it ("602-670").
     joiner: Option<char>,
 }
 
-/// The fields of `fields` in the order `nodes` writes them.
 fn render(nodes: &[Node], fields: &Fields, groups: &mut Vec<Group>, pending_break: &mut bool) {
     address_template::write(
         nodes,
         &|slot| slot.is_some_and(|slot| slot.value(fields).is_some()),
         &mut |piece| match piece {
-            // Only the field breaks in literal text matter.
             Piece::Text(text) => {
                 if text.contains(FIELD_BREAKS) && !groups.is_empty() {
                     *pending_break = true;
@@ -1463,8 +1277,6 @@ fn render(nodes: &[Node], fields: &Fields, groups: &mut Vec<Group>, pending_brea
     );
 }
 
-/// Write `groups` in the opposite order, each field break staying between
-/// the same two fields.
 fn reverse_groups(groups: &mut [Group]) {
     let breaks = groups
         .iter()
@@ -1478,7 +1290,6 @@ fn reverse_groups(groups: &mut [Group]) {
     }
 }
 
-/// Whether `nodes` have a place for `slot`.
 fn writes_slot(nodes: &[Node], slot: Slot) -> bool {
     nodes.iter().any(|node| match node {
         Node::Field(written) => *written == Some(slot),
@@ -1487,8 +1298,6 @@ fn writes_slot(nodes: &[Node], slot: Slot) -> bool {
     })
 }
 
-/// Few templates write an island or a district; a query writes each as a
-/// field of its own after the localities and before the region.
 fn insert_area(groups: &mut Vec<Group>, label: Label, words: &Tokens) {
     let at = groups
         .iter()
@@ -1518,28 +1327,13 @@ fn insert_area(groups: &mut Vec<Group>, label: Label, words: &Tokens) {
     );
 }
 
-/// Share of rows that name a record or an area by one of its alternate names
-/// (`name:ja-Hira`, `name:en`, ...) when it has any, so the model sees names
-/// in the other scripts and languages queries write them in.
 const ALT_NAME_SHARE: f64 = 0.3;
-/// Share of the rows of POIs with an address that write the address beside
-/// the POI's name, so the model sees a venue name next to the street and
-/// areas it is in, and the POI dictionary hit on the venue alone.
 const POI_ADDRESS_SHARE: f64 = 0.7;
-/// Share of written units whose unit, PO box or level word follows the
-/// number instead of leading it.
 const UNIT_WORD_AFTER_SHARE: f64 = 0.5;
-/// Share of rows that keep the commas and line breaks between their fields.
 const KEEP_BREAKS_SHARE: f64 = 0.4;
-/// Share of the unit fields of rows without their breaks that keep the
-/// comma before them anyway, as an address written on one line keeps it.
 const UNIT_BREAK_SHARE: f64 = 0.5;
-/// Share of the street fields of rows whose street hits are hidden, so a
-/// name before a street type is learned as a street without the dictionary.
 const HIDDEN_STREET_SHARE: f64 = 0.3;
-/// Share of the venue fields of rows whose POI hits are hidden.
 const HIDDEN_POI_SHARE: f64 = 0.15;
-/// Share of street names with a glued street type that write it apart.
 const SPLIT_STREET_TYPE_SHARE: f64 = 0.15;
 /// libpostal's level and unit words written without a number
 /// ("erdgeschoss", "penthouse"), MIT (see `NOTICE`).
@@ -1547,51 +1341,19 @@ const STANDALONE_UNIT_WORDS: [&str; 2] = [
     include_str!("data/level_standalone.txt"),
     include_str!("data/unit_standalone.txt"),
 ];
-/// Share of written units of one word and a number that glue the two into
-/// one token ("4og", "apt4"), in scripts written with spaces.
 const GLUED_UNIT_SHARE: f64 = 0.3;
-/// Share of the rows of a venue or a place that ask for what is near it
-/// ("cafe near toronto", "haus in der nähe von köln"), the phrase labelled
-/// other as libpostal labels it.
 const NEAR_SHARE: f64 = 0.04;
-/// Share of the rows that name areas that ask for a kind of place in them
-/// instead ("bäckerei in bremen", "hotels near toronto"), the kind and the
-/// phrase labelled other as libpostal labels them.
 const CATEGORY_SHARE: f64 = 0.03;
-/// Share of the numbered areas of addresses ("2丁目") written as their
-/// number alone after the area they number ("林2"), as libpostal's data
-/// writes them.
 const NUMBERED_AREA_SHARE: f64 = 0.3;
-/// Share of the postcodes of rows written after their country's letters
-/// ("de09496", "D-80331", "d 18211"), as libpostal's generator writes them
-/// (`resources/postal_codes/config.yaml`).
 const POSTCODE_PREFIX_SHARE: f64 = 0.05;
-/// Share of rows with words of a script written without spaces whose
-/// numbers are written in numeral ideographs.
 const NUMERAL_SHARE: f64 = 0.1;
-/// Share of rows of records on an island that name it.
 const ISLAND_SHARE: f64 = 0.35;
-/// Share of rows of records in a district that name it.
 const DISTRICT_SHARE: f64 = 0.4;
-/// Share of rows of addresses that state several areas that write them as
-/// one locality field (see [`chained_areas`]).
 const CHAIN_SHARE: f64 = 0.5;
-/// Share of the rows naming a region, district or locality that name it
-/// without the word of its type, when the dictionaries hold it so ("愛知" of
-/// "愛知県", see [`admin_aliases`]).
 const ADMIN_ALIAS_SHARE: f64 = 0.3;
-/// Share of the rows in a region that lies in a group of regions
-/// ("千葉県" in "関東地方") that name the group, as libpostal's data does
-/// ("北九州市, 九州地方, 日本").
 const REGION_GROUP_SHARE: f64 = 0.3;
-/// Share of the rows naming a group of regions that write the region
-/// before it ("東京都関東地方"), not the group alone.
 const REGION_AND_GROUP_SHARE: f64 = 0.2;
 
-/// Renders training rows from the Pack's records.
-/// Venue names and region names of rows rendered so far, at most
-/// [`SEEN_NAMES`] of each: a query names a venue before an address, or a
-/// region the town is not in.
 #[derive(Debug, Default)]
 struct Seen {
     venues: Vec<Tokens>,
@@ -1599,10 +1361,6 @@ struct Seen {
 }
 
 impl Seen {
-    /// The noise of queries written by hand rather than by a template: a
-    /// field or the whole address written twice, a unit or floor phrase in
-    /// the middle, a venue's name before the address, a region more, and a
-    /// house number with a letter after it.
     fn add_noise(
         &mut self,
         unit_words: &[Vec<String>; 3],
@@ -1719,21 +1477,11 @@ impl Seen {
 struct Renderer<'a> {
     pack: &'a Reader,
     tagger: &'a LatticeTagger,
-    /// Every name of each area record, its `name` first. Shared, not cloned,
-    /// to each of the many draws from the same few areas.
     names: FxHashMap<RecordId, Rc<[String]>>,
-    /// The country code each country record's `name` reads as, looked up
-    /// once for the many rows drawn in one country.
     country_codes: FxHashMap<RecordId, Option<CountryCode>>,
-    /// Whether each area name names a locality, by its words: rows draw the
-    /// same few area names over and over.
     localities: RefCell<FxHashMap<String, bool>>,
-    /// The words a unit is written with: the Pack's unit words, PO box
-    /// words and level words.
     unit_words: [Vec<String>; 3],
-    /// The words that ask for what is near a place.
     near: Vec<String>,
-    /// The kinds of place a query asks for.
     categories: Vec<String>,
     template_countries: Vec<String>,
     seen: Seen,
@@ -1779,23 +1527,16 @@ impl<'a> Renderer<'a> {
             }
             Record::Street(_) => fields.street = name,
             Record::Place(layer, _) => {
-                // A place is named with the areas above it, not within, in
-                // the field of its layer.
                 fields.country = context.country.as_deref().and_then(words);
                 match layer {
                     PlaceLayer::Country => {
                         fields.country = name;
                         fields.subject = Some(Slot::Country);
                     }
-                    // A region that is a city as well (Berlin) is written as
-                    // the locality it is in queries.
                     PlaceLayer::Region if !self.names_a_locality(name.as_ref()) => {
                         fields.region = name;
                         fields.subject = Some(Slot::Region);
                     }
-                    // A district that is also the place addresses name (a city
-                    // drawn only as a district) is written as a locality, any
-                    // other on the region side.
                     PlaceLayer::District if !self.names_a_locality(name.as_ref()) => {
                         fields.district = name;
                         fields.subject = Some(Slot::District);
@@ -1862,8 +1603,6 @@ impl<'a> Renderer<'a> {
         Ok(self.finish(fields, country, random))
     }
 
-    /// Drop, render, perturb and label the fields of one row. `None` when
-    /// the template writes none of the fields left.
     fn finish(
         &mut self,
         mut fields: Fields,
@@ -1891,13 +1630,7 @@ impl<'a> Renderer<'a> {
         if let Some(street) = fields.street.as_mut()
             && random.chance(0.5)
         {
-            // Street types and directions in another of their forms, from
-            // every language's list: "straße" as "str", "hauptstraße" as
-            // "hauptstr", "north" as "n".
             let table = abbreviations();
-            // A street type glued onto the name written apart from it some
-            // of the time ("lechwehrstraße" as "lechwehr straße"), as people
-            // who do not know the name write it.
             let mut split = Tokens::default();
             for (word, joiner) in street.words.iter().zip(&street.joiners) {
                 match table.split_glued(word) {
@@ -1924,7 +1657,6 @@ impl<'a> Renderer<'a> {
                 }
             }
         }
-        // A number in parts ("993.5", "1384 1/2"), which few records state.
         if let Some(number) = fields.house_number.as_mut()
             && number
                 .words
@@ -1939,8 +1671,6 @@ impl<'a> Renderer<'a> {
                 number.push("2".to_string(), false, Some('/'));
             }
         }
-        // The record's own country writes it most often, any other some of
-        // the time, so the model sees every order of fields.
         let template_country = match country {
             Some(code) if random.chance(0.7) => code.to_string(),
             _ => self.template_countries
@@ -1963,9 +1693,6 @@ impl<'a> Renderer<'a> {
         {
             insert_area(&mut groups, Label::Region, district);
         }
-        // Many places write the largest area first and the house number
-        // last ("100-0005 東京都千代田区丸の内2-7-2"), whatever order the
-        // template states, so some rows run from largest to smallest.
         if random.chance(0.25) {
             reverse_groups(&mut groups);
         }
@@ -1982,8 +1709,6 @@ impl<'a> Renderer<'a> {
                 groups.insert(0, last);
             }
         }
-        // Rows of a script written without spaces write their numbers in
-        // numeral ideographs some of the time ("二丁目7番2号").
         let unspaced = groups.iter().any(|group| {
             group
                 .words
@@ -2057,8 +1782,6 @@ impl<'a> Renderer<'a> {
                     word.clone()
                 };
                 let (break_before, joiner) = if index == 0 {
-                    // A unit keeps the comma before it more often than other
-                    // fields: "lessingstraße 11, 9 og".
                     let unit_break = group.label == Label::Unit && random.chance(UNIT_BREAK_SHARE);
                     (
                         group.break_before && (keep_breaks || unit_break),
@@ -2070,9 +1793,6 @@ impl<'a> Renderer<'a> {
                 tokens.push(word, break_before, joiner);
                 gold.push(group.label);
             }
-            // Streets and venues are open classes: a query names many the
-            // Pack does not hold. Areas are closed: a locality or region is
-            // one the Pack knows, so their hits are never hidden.
             let (field, share) = match group.label {
                 Label::Street => (Field::Street, HIDDEN_STREET_SHARE),
                 Label::Other => (Field::Poi, HIDDEN_POI_SHARE),
@@ -2090,8 +1810,6 @@ impl<'a> Renderer<'a> {
         })
     }
 
-    /// The district the record lies in, in [`DISTRICT_SHARE`] of the rows of
-    /// records in one.
     fn district(&self, context: &Areas, random: &mut Random) -> Option<Tokens> {
         context
             .district
@@ -2100,8 +1818,6 @@ impl<'a> Renderer<'a> {
             .and_then(words)
     }
 
-    /// Whether the dictionaries know `name` as the place an address names:
-    /// a locality name addresses state or a city is drawn as.
     fn names_a_locality(&self, name: Option<&Tokens>) -> bool {
         let Some(name) = name else {
             return false;
@@ -2117,8 +1833,6 @@ impl<'a> Renderer<'a> {
         known
     }
 
-    /// The island the record lies on, in [`ISLAND_SHARE`] of the rows of
-    /// records on one.
     fn island(&self, context: &Areas, random: &mut Random) -> Option<Tokens> {
         context
             .island
@@ -2127,8 +1841,6 @@ impl<'a> Renderer<'a> {
             .and_then(words)
     }
 
-    /// A near phrase before the areas of a row ("cafe near toronto"), or
-    /// after everything when it names none ("cafe near me").
     fn add_near(&self, groups: &mut Vec<Group>, phrase: Tokens) {
         let at = groups
             .iter()
@@ -2154,9 +1866,6 @@ impl<'a> Renderer<'a> {
         );
     }
 
-    /// A unit, as its own field after the street ("unit 602"), before the
-    /// address ("apt 4, 670 ..."), or before the house number ("602 670 king
-    /// street", from "602-670").
     fn add_unit(&self, groups: &mut Vec<Group>, unit: Option<Tokens>, random: &mut Random) {
         let value = unit.unwrap_or_else(|| {
             let number = 1 + random.below(2_000);
@@ -2179,7 +1888,6 @@ impl<'a> Renderer<'a> {
         {
             let break_before = groups[at].break_before;
             groups[at].break_before = false;
-            // "10-1367" in most places, "10/1367" in Australia and New Zealand.
             groups[at].joiner = match random.below(5) {
                 0 | 1 => None,
                 2 | 3 => Some('-'),
@@ -2196,8 +1904,6 @@ impl<'a> Renderer<'a> {
             );
             return;
         }
-        // A unit word, or a PO box or level phrase, before the number or,
-        // some of the time, after it ("301号室", "3階").
         let kind = match random.below(10) {
             0..=5 => 0,
             6 | 7 => 1,
@@ -2208,8 +1914,6 @@ impl<'a> Renderer<'a> {
             .then(|| &vocabulary[random.below(vocabulary.len() as u64) as usize])
             .and_then(|phrase| words(phrase));
         let after = random.chance(UNIT_WORD_AFTER_SHARE);
-        // A word that is a unit or level of its own ("erdgeschoss") takes no
-        // number.
         if let Some(phrase) = &phrase
             && standalone_unit_words().contains(&phrase.words.join(" "))
         {
@@ -2255,8 +1959,6 @@ impl<'a> Renderer<'a> {
         self.insert_unit(groups, words, random);
     }
 
-    /// A unit field after the street and house number, or before the
-    /// address some of the time.
     fn insert_unit(&self, groups: &mut Vec<Group>, words: Tokens, random: &mut Random) {
         let street_end = groups
             .iter()
@@ -2279,16 +1981,11 @@ impl<'a> Renderer<'a> {
         );
     }
 
-    /// The names of the areas a record lies in, and its country's code.
     fn context(&mut self, id: RecordId, random: &mut Random) -> Result<Areas> {
         let Some(context) = self.pack.boundary_context(id)? else {
             return Ok(Areas::default());
         };
         let tuple = context.admin_context;
-        // An area with no locality below it is the locality an address
-        // names (a city drawn only as a district, a kreisfreie Stadt); a
-        // district between the record's locality and its region is written
-        // on the region side.
         let (locality, district) = match tuple.locality_record_id() {
             Some(locality) => (
                 self.admin_name(Some(locality), Field::Locality, random)?,
@@ -2299,13 +1996,8 @@ impl<'a> Renderer<'a> {
                 None,
             ),
         };
-        // A district goes on the region side only when its name names no
-        // locality: "Gütersloh" is a city as well as its Kreis, and a query
-        // naming it means the city, as libpostal's data labels such names.
         let district = district.filter(|district| !self.names_a_locality(words(district).as_ref()));
         let mut region = self.admin_name(tuple.region_record_id(), Field::Region, random)?;
-        // A city that is a region of its own (Berlin, Hamburg) is the
-        // locality of the records in it that lie in no other.
         let locality = match locality {
             None if district.is_none()
                 && self.names_a_locality(region.as_deref().and_then(words).as_ref()) =>
@@ -2340,8 +2032,6 @@ impl<'a> Renderer<'a> {
         })
     }
 
-    /// In [`REGION_GROUP_SHARE`] of draws, a name of a group of regions the
-    /// region `id` lies in.
     fn region_group(
         &mut self,
         id: Option<RecordId>,
@@ -2358,8 +2048,6 @@ impl<'a> Renderer<'a> {
         self.admin_name(Some(RecordId::from(group)), Field::Region, random)
     }
 
-    /// The country code the `name` of country record `id` reads as, its
-    /// names being `names`.
     fn country_code(&mut self, id: Option<RecordId>, names: &[String]) -> Option<CountryCode> {
         let read = || {
             names
@@ -2379,15 +2067,11 @@ impl<'a> Renderer<'a> {
         code
     }
 
-    /// One name of an area, as [`pick_name`] picks it.
     fn name(&mut self, id: Option<RecordId>, random: &mut Random) -> Result<Option<String>> {
         let names = self.names(id)?;
         Ok(pick_name(&names, random).map(str::to_string))
     }
 
-    /// One name of an admin area, as [`Self::name`] picks it, or in
-    /// [`ADMIN_ALIAS_SHARE`] of draws that name without its type word when
-    /// `field` holds it so.
     fn admin_name(
         &mut self,
         id: Option<RecordId>,
@@ -2412,7 +2096,6 @@ impl<'a> Renderer<'a> {
         Ok(Some(name))
     }
 
-    /// Every name of an area, its `name` first.
     fn names(&mut self, id: Option<RecordId>) -> Result<Rc<[String]>> {
         let Some(id) = id else {
             return Ok(Rc::default());
@@ -2426,7 +2109,6 @@ impl<'a> Renderer<'a> {
     }
 }
 
-/// The standalone unit and level words, as [`words`] writes them.
 fn standalone_unit_words() -> &'static std::collections::HashSet<String> {
     static WORDS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     WORDS.get_or_init(|| {
@@ -2441,8 +2123,6 @@ fn standalone_unit_words() -> &'static std::collections::HashSet<String> {
     })
 }
 
-/// A record's `name`, or one of its alternate names in [`ALT_NAME_SHARE`]
-/// of draws. `names` holds the `name` first.
 fn pick_name<'n, S: AsRef<str>>(names: &'n [S], random: &mut Random) -> Option<&'n str> {
     let name = match names {
         [] => return None,
@@ -2458,12 +2138,10 @@ fn pick_name<'n, S: AsRef<str>>(names: &'n [S], random: &mut Random) -> Option<&
     Some(name.as_ref())
 }
 
-/// The areas a record lies in.
 #[derive(Debug, Default)]
 struct Areas {
     locality: Option<String>,
     district: Option<String>,
-    /// The place area the record lies in (see [`Fields::island`]).
     island: Option<String>,
     suburb: Option<String>,
     region: Option<String>,
@@ -2471,33 +2149,22 @@ struct Areas {
     country_code: Option<CountryCode>,
 }
 
-/// What a drawn record is counted against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Draw {
     Layer(Layer),
     BlockAddress,
 }
 
-/// Names of each kind [`Seen::add_noise`] keeps to draw from.
 const SEEN_NAMES: usize = 4_096;
-/// Rows with a place written twice ("madrid madrid").
 const FIELD_TWICE_SHARE: f64 = 0.05;
-/// Rows written twice over, as a pasted address repeats.
 const ADDRESS_TWICE_SHARE: f64 = 0.01;
-/// Rows with a unit or floor phrase between two fields.
 const MIDDLE_UNIT_SHARE: f64 = 0.05;
-/// Rows of an address after a venue's name.
 const VENUE_BEFORE_SHARE: f64 = 0.03;
-/// Rows naming one region more, often not the town's.
 const EXTRA_REGION_SHARE: f64 = 0.04;
-/// Rows whose house number has a letter after it.
 const NUMBER_SUFFIX_SHARE: f64 = 0.05;
 
-/// The share of rows of block scheme addresses besides the addresses'.
 const BLOCK_ADDRESS_SHARE: f64 = 0.25;
 
-/// Whether a record is an address of the block scheme: numbered in the
-/// areas it states, with no street.
 fn is_block_address(record: &Record) -> bool {
     matches!(record, Record::Address(record)
         if record.address.street.is_none() && !record.address.areas.is_empty())
@@ -2506,15 +2173,11 @@ fn is_block_address(record: &Record) -> bool {
 fn address_fields(address: &AddressComponents, fields: &mut Fields) {
     fields.house_number = words(&address.number);
     fields.street = address.street.as_deref().and_then(words);
-    // The areas an address states, largest first as Japanese addresses
-    // write them: the ward, quarter and neighbourhood a block number is in.
     fields.suburb = words(&address.areas.join(" "));
     fields.unit = address.unit.as_deref().and_then(words);
     fields.postcode = address.postcode.as_deref().and_then(words);
 }
 
-/// `postcode` after its country's code or the code's first letter, glued
-/// ("de09496"), joined by a hyphen ("d-80331") or apart ("d 18211").
 fn with_country_prefix(postcode: &Tokens, country: CountryCode, random: &mut Random) -> Tokens {
     let code = country.as_str().to_ascii_lowercase();
     let prefix = if random.chance(0.5) {
@@ -2544,9 +2207,6 @@ fn with_country_prefix(postcode: &Tokens, country: CountryCode, random: &mut Ran
     written
 }
 
-/// The numbered areas of an address ("2丁目", "3 chome") written as their
-/// number alone in [`NUMBERED_AREA_SHARE`] of rows, so "林2" is read as one
-/// area with its number.
 fn number_areas(fields: &mut Fields, random: &mut Random) {
     let Some(areas) = fields.suburb.as_mut() else {
         return;
@@ -2566,12 +2226,6 @@ fn number_areas(fields: &mut Fields, random: &mut Random) {
     }
 }
 
-/// The areas an address states, largest first, glued into one field the
-/// way an `addr:city` tag or a written address often holds them:
-/// `神奈川県横浜市西区みなとみらい3丁目` is a region, a city, a ward and a
-/// neighbourhood with no break between them. Names of a script written
-/// without spaces join directly, others with a space. The region leads half
-/// the time. `None` when the address states fewer than two areas.
 fn chained_areas(address: &AddressComponents, random: &mut Random) -> Option<Tokens> {
     let region = address.region.as_deref().filter(|_| random.chance(0.5));
     let locality = address.locality.as_deref().or(address.place.as_deref());
@@ -2595,8 +2249,6 @@ fn chained_areas(address: &AddressComponents, random: &mut Random) -> Option<Tok
     words(&chain)
 }
 
-/// `word` with its ASCII digits written as the numeral ideographs of the
-/// same value (see [`super::numeral_value`]), digit by digit.
 fn in_numerals(word: &str) -> String {
     static DIGITS: OnceLock<[Option<char>; 10]> = OnceLock::new();
     let digits = DIGITS.get_or_init(|| {
@@ -2629,11 +2281,6 @@ fn words(value: &str) -> Option<Tokens> {
     (!tokens.is_empty()).then_some(tokens)
 }
 
-/// One edit inside a word of four letters or more: a letter dropped,
-/// doubled, replaced or swapped with the next. The first and last letters
-/// stay, as they do in most typing errors. A word of a script written
-/// without spaces is typed through an input method that picks whole
-/// characters, so it gets no typo.
 fn typo(word: &str, random: &mut Random) -> String {
     let mut chars = word.chars().collect::<Vec<_>>();
     if chars.len() < 4
@@ -2655,8 +2302,6 @@ fn typo(word: &str, random: &mut Random) -> String {
     chars.into_iter().collect()
 }
 
-/// SplitMix64: small, fast and the same on every platform, so a seed gives
-/// the same rows and weights everywhere.
 #[derive(Debug, Clone)]
 struct Random(u64);
 
@@ -2673,7 +2318,6 @@ impl Random {
         value ^ (value >> 31)
     }
 
-    /// A number below `bound`, which must not be zero.
     fn below(&mut self, bound: u64) -> u64 {
         ((u128::from(self.next()) * u128::from(bound)) >> 64) as u64
     }
@@ -2861,7 +2505,6 @@ mod tests {
         let large = &candidates[&Some(1)];
         assert!(large.windows(2).all(|pair| pair[0].id < pair[1].id));
         assert!(large.last().expect("drawn").id > 2 * addresses as u64);
-        // A block address drawn for both of its kinds is drawn once.
         let small = &candidates[&Some(2)];
         assert_eq!(small.len(), 10);
         assert!(
@@ -2968,8 +2611,6 @@ mod tests {
 
     #[test]
     fn forward_backward_sums_every_labelling() {
-        // Two words no dictionary knows: one span each, so every labelling
-        // has one path, and the decoder can list them all.
         let tagger = LatticeTagger::new(Dictionaries::empty(), Weights::built_in());
         let lattice = tagger.lattice(&Tokens::new("kingsway 12"), &Suppression::default());
         assert_eq!(lattice.spans.len(), 2);
@@ -2985,8 +2626,6 @@ mod tests {
             "{} {brute}",
             reading.log_z
         );
-        // Every unit has one label in each labelling, so the expected count
-        // of each span's bias over its labels is one.
         let mut gradient = Gradient::default();
         reading.add_expectations(&lattice, None, 1.0, &mut gradient);
         let bias = super::super::features::by_name("bias:bias") as usize;

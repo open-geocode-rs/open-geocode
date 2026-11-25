@@ -1,21 +1,3 @@
-//! `geocode calibrate`: fit a Pack's ranker (see [`crate::rank`]) and
-//! confidence model (see [`crate::confidence`]) to address points the Pack
-//! was not built from.
-//!
-//! Each held-out row is a right answer whose query is unknown, so it is
-//! written the way messy input looks: its street type dropped or
-//! abbreviated, a typo in a long word, its postcode left out, a unit or a
-//! business name before it, its parts out of order. Each of those happens
-//! on a fair coin, so the queries range from clean to badly mangled, as real
-//! ones do. Every query is searched, and each of its first answers is an
-//! example: right when it is the row's house (its number and street) within
-//! a distance of the row's point. A prefix of the clean query is put to
-//! autocomplete the same way. The model is fit to the examples and written
-//! beside the Pack.
-//!
-//! The rows must be held out: a row the Pack was built from is found as
-//! itself, so a model fit to it rates every answer too high.
-
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use rayon::prelude::*;
@@ -36,38 +18,25 @@ use crate::{
     util::{fold::search_key, geo::point_lon_lat},
 };
 
-/// Answers of one query taken as examples: the first few, so the model also
-/// rates the answers below the first.
 const ANSWERS_PER_QUERY: usize = 3;
-/// Names of POIs drawn from the Pack to write before an address, as a
-/// business that sends its own name with its address does.
 const BUSINESS_NAMES: usize = 64;
-/// Record draws per business name wanted, at most: a Pack may hold few POIs.
 const DRAWS_PER_NAME: usize = 64;
-/// Units written before an address that states none run up to this.
 const MAX_UNIT: usize = 30;
-/// Words this long or longer, all letters, may get the typo.
 const MIN_TYPO_CHARS: usize = 5;
-/// Characters of the street an autocomplete prefix keeps at least.
 const MIN_PREFIX_STREET_CHARS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct Options {
     pub pack: PathBuf,
-    /// Held-out address points, read like a build's `--addresses`.
     pub files: Vec<AddressFile>,
-    /// Rows drawn from each file.
     pub rows: usize,
-    /// Messy queries written of each row.
     pub variants: usize,
     pub seed: u64,
-    /// How far from its row's point an answer may lie and still be right.
     pub radius_m: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
-    /// The sidecar file the model was written to.
     pub model: PathBuf,
     pub rows: usize,
     pub queries: usize,
@@ -81,21 +50,13 @@ pub struct Report {
     pub ranker: RankerReport,
 }
 
-/// How the ranker was fit, and how it does on queries it was not fit to.
 #[derive(Debug, Clone, Serialize)]
 pub struct RankerReport {
-    /// The sidecar file the ranker was written to.
     pub model: PathBuf,
-    /// Queries whose pool held the answer and another hit, fit to.
     pub fitted: usize,
-    /// Queries held out of the fit, every [`HELD_OUT_EVERY`]th.
     pub held_out: usize,
-    /// Share of the held-out queries whose first answer is the row, chosen
-    /// by evidence alone, and by the ranker.
     pub first_by_evidence: f64,
     pub first_ranked: f64,
-    /// Share of the held-out queries whose pool holds the row at all: what
-    /// any order could reach.
     pub in_pool: f64,
 }
 
@@ -103,15 +64,10 @@ pub struct RankerReport {
 pub struct CountryReport {
     pub examples: usize,
     pub correct: usize,
-    /// Mean confidence the fitted model gives them, to set beside the share
-    /// that is right.
     pub mean_confidence: f64,
 }
 
-/// Every this many queries one is held out of the ranker's fit, to measure
-/// it on.
 const HELD_OUT_EVERY: usize = 5;
-/// Hits a calibration search answers with, so its pool is a served query's.
 const POOL_LIMIT: usize = 10;
 
 /// Fit the Pack's ranker and confidence model to `options.files` and write
@@ -124,8 +80,6 @@ pub fn run(options: &Options) -> Result<Report> {
         ));
     }
     let pack = Arc::new(pack::Reader::open(&options.pack)?);
-    // No clock: what a calibration learns must not depend on how loaded the
-    // machine was.
     let mut searcher =
         TextSearcher::from_pack(Arc::clone(&pack))?.with_budget(Duration::from_secs(3_600));
     searcher.set_ranker(None);
@@ -274,8 +228,6 @@ pub fn run(options: &Options) -> Result<Report> {
     })
 }
 
-/// `count` rows of `file`, drawn evenly by reservoir sampling, so a file of
-/// any size is read once and held to `count` rows.
 fn draw_rows(file: &AddressFile, count: usize, seed: u64) -> Result<Vec<AddressRecord>> {
     let mut rng = Rng::new(xxh3_64_with_seed(file.dataset.as_bytes(), seed));
     let mut drawn = Vec::with_capacity(count);
@@ -295,8 +247,6 @@ fn draw_rows(file: &AddressFile, count: usize, seed: u64) -> Result<Vec<AddressR
     Ok(drawn)
 }
 
-/// Names of POIs of the Pack, drawn at random: names of the languages and
-/// places the Pack covers, as no fixed list could give for every country.
 fn business_names(pack: &pack::Reader, rng: &mut Rng) -> Result<Vec<String>> {
     let records = pack.records();
     let total = usize::try_from(records.record_count())?;
@@ -318,7 +268,6 @@ fn business_names(pack: &pack::Reader, rng: &mut Rng) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// The queries written of one row, and the prefix of it typed so far.
 fn row_queries(
     row: &AddressRecord,
     options: &Options,
@@ -332,8 +281,6 @@ fn row_queries(
     (queries, typed_prefix(row, rng))
 }
 
-/// The examples the answers to one row's queries give, and how many
-/// queries there were.
 fn row_examples(
     searcher: &TextSearcher,
     row: &AddressRecord,
@@ -373,9 +320,6 @@ fn row_examples(
     Ok((queries.len() + usize::from(prefix.is_some()), examples))
 }
 
-/// Whether `hit` is the row's house: its number and street, within
-/// `radius_m` of the row's point. A street standing in for the number is
-/// not, nor is the house next door.
 fn is_row(hit: &TextSearchHit, row: &AddressRecord, radius_m: f64) -> bool {
     let (Some(point), Some([lon, lat])) = (hit.record.point, point_lon_lat(&row.geometry)) else {
         return false;
@@ -392,8 +336,6 @@ fn is_row(hit: &TextSearchHit, row: &AddressRecord, radius_m: f64) -> bool {
         && street(hit.record.address.street.as_deref()) == street(row.address.street.as_deref())
 }
 
-/// The row as a messy query (see the module docs). `describes_street` tells
-/// a street type from a word of the street's name.
 fn messy_query(
     row: &AddressRecord,
     names: &[String],
@@ -452,8 +394,6 @@ fn messy_query(
     parts.join(", ")
 }
 
-/// One typo in one word of [`MIN_TYPO_CHARS`] letters or more, when the
-/// parts have one.
 fn typo_in_a_long_word(parts: &mut [String], rng: &mut Rng) {
     let long = |word: &str| {
         word.chars().count() >= MIN_TYPO_CHARS && word.chars().all(char::is_alphabetic)
@@ -482,8 +422,6 @@ fn typo_in_a_long_word(parts: &mut [String], rng: &mut Rng) {
     parts[part] = words.join(" ");
 }
 
-/// The house number and street as typed so far: cut after at least a few
-/// characters of the street, `None` for a row with no street.
 fn typed_prefix(row: &AddressRecord, rng: &mut Rng) -> Option<String> {
     let street = row.address.street.as_deref()?;
     let typed = format!("{} {street}", row.address.number);

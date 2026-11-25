@@ -1,6 +1,3 @@
-//! Real-time Geo Addressing v1. Geocode, reverse geocode, lookup and
-//! autocomplete, each item answered by og's own lookup.
-
 use std::time::Instant;
 
 use axum::{
@@ -24,11 +21,8 @@ use crate::{
     runtime::AppState,
 };
 
-/// Items one request may carry.
 const MAX_ITEMS: usize = 25;
 
-/// An input address, `RequestAddress`. Fields og has no parameter for
-/// (`admin2`, `building`, `floor` and so on) are not read.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct InputAddress {
@@ -49,8 +43,6 @@ impl InputAddress {
         given(self.country.as_deref())
     }
 
-    /// The street line. The address lines, or failing them the house
-    /// number and street.
     fn street_line(&self) -> Option<String> {
         let lines = self
             .address_lines
@@ -69,7 +61,6 @@ impl InputAddress {
         (!line.is_empty()).then_some(line)
     }
 
-    /// The address as free text.
     fn text(&self) -> String {
         let street_line = self.street_line();
         [
@@ -85,9 +76,6 @@ impl InputAddress {
         .join(", ")
     }
 
-    /// og's `/geocode` parameters. A street line with its town, region or
-    /// postcode apart goes in og's address fields, which match each part on
-    /// its own; anything else is free text.
     pub(super) fn geocode_params(&self, limit: usize) -> Vec<(&'static str, String)> {
         let mut params = vec![("limit", limit.to_string())];
         if let Some(country) = self.country() {
@@ -126,9 +114,6 @@ struct ReverseRequest {
     locations: Vec<InputLocation>,
 }
 
-/// `LocationDetail`. og finds the country from the point, so a stated
-/// `country` keeps only results in it, as a point near a border may answer
-/// with the other side.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InputLocation {
@@ -145,7 +130,6 @@ struct LookupRequest {
     preferences: Preferences,
 }
 
-/// `LookupSingleRequest`. Country scopes each key independently.
 #[derive(Debug, Deserialize)]
 struct LookupKey {
     #[serde(default)]
@@ -162,7 +146,6 @@ struct AutocompleteRequest {
     address: InputAddress,
 }
 
-/// One item's answer, `Response`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ItemResponse {
@@ -180,7 +163,6 @@ struct Responses {
     responses: Vec<ItemResponse>,
 }
 
-/// One item's answer, and the Problem behind a failed one.
 #[derive(Debug)]
 struct Outcome {
     response: ItemResponse,
@@ -202,7 +184,6 @@ impl Outcome {
         Self::answered(address_id, results)
     }
 
-    /// An item answered with these candidates, `ZERO_RESULTS` when none.
     fn answered(address_id: Option<String>, results: Vec<Candidate>) -> Self {
         let status = if results.is_empty() {
             "ZERO_RESULTS"
@@ -232,7 +213,6 @@ impl Outcome {
         }
     }
 
-    /// An item og could not answer, its Problem as Precisely names it.
     fn refused(address_id: Option<String>, problem: Problem, country: Option<&str>) -> Self {
         Self::failed(address_id, Failure::of(&problem, country), Some(problem))
     }
@@ -268,7 +248,6 @@ fn args(params: Vec<(&'static str, String)>) -> Args {
         .fold(Args::new(), |args, (name, value)| args.set(name, value))
 }
 
-/// The batch's items, refused whole when there are none or too many.
 fn checked<T>(items: Vec<T>) -> Result<Vec<T>, VendorError> {
     if items.is_empty() {
         return Err(error(
@@ -287,9 +266,6 @@ fn checked<T>(items: Vec<T>) -> Result<Vec<T>, VendorError> {
     Ok(items)
 }
 
-/// A batch answers 200 when every item is answered, 206 when one failed. A
-/// failure no item escaped, or one of the request's own preferences, fails
-/// the request instead, as the whole request's error.
 fn respond(
     log: &ErrorLog,
     route: &str,
@@ -314,8 +290,6 @@ fn respond(
             None => error(failure.http, failure.status, failure.message).into_response(),
         };
     }
-    // A 500 inside a 206 is no 500 to the request-id layer, so it is
-    // logged here, by item.
     for (index, outcome) in outcomes.iter().enumerate() {
         if let Some((failure, Some(problem))) = &outcome.failure
             && failure.http == StatusCode::INTERNAL_SERVER_ERROR
@@ -355,8 +329,6 @@ pub(super) async fn geocode(
     addresses(state, request, Product::Geocode).await
 }
 
-/// Verify reads the address as geocode does and answers the record og
-/// matched, standardized, with how each stated part matched it.
 pub(super) async fn verify(
     State(state): State<AppState>,
     request: Request,
@@ -438,8 +410,6 @@ pub(super) async fn reverse(
         let wanted = given(location.country.as_deref()).map(country_code);
         outcomes.push(match native::reverse(&state, args).await {
             Ok(collection) => {
-                // A result past the search radius is not one Precisely would
-                // find; an area holds the point, so it has no distance.
                 let features = collection
                     .features
                     .iter()
@@ -476,7 +446,6 @@ pub(super) async fn reverse(
     ))
 }
 
-/// Key types Precisely documents. The `PB_KEY` route resolves og references.
 const KEY_TYPES: [&str; 5] = ["PB_KEY", "GNAF_PID", "UDPRN", "UPRN", "EIR_CODE"];
 
 pub(super) async fn lookup(
@@ -578,14 +547,12 @@ struct Predictions {
 #[derive(Debug, Serialize)]
 struct Prediction {
     prediction: String,
-    /// How far the prediction is from `originXY`, when the request gives it.
     #[serde(skip_serializing_if = "Option::is_none")]
     distance: Option<Metres>,
     #[serde(flatten)]
     candidate: Candidate,
 }
 
-/// Precisely's `Distance` in metres, the unit og measures in.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Metres {
@@ -601,8 +568,6 @@ pub(super) async fn autocomplete(
     complete(&state, body, None, Autocomplete::V1).await
 }
 
-/// `/v2/express-autocomplete`, v1's request with `filterBias` added, which
-/// filters or biases the results by city and postcode.
 pub(super) async fn express_autocomplete_v2(
     State(state): State<AppState>,
     request: Request,
@@ -626,7 +591,6 @@ async fn complete(
     let address = body.address;
     let args = Args::new()
         .set("q", address.text())
-        // A filter or bias picks from all og can suggest.
         .set(
             "limit",
             match filter_bias {
@@ -700,7 +664,6 @@ async fn complete(
             let (city, postcode) = fields(prediction);
             filter_bias.keeps(city.as_deref(), postcode.as_deref())
         });
-        // A stable sort keeps og's order within each.
         predictions.sort_by_key(|prediction| {
             let (city, postcode) = fields(prediction);
             !filter_bias.favours(city.as_deref(), postcode.as_deref())

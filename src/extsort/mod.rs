@@ -1,26 +1,3 @@
-//! Disk-backed sorting and spooling for builds larger than memory.
-//!
-//! [`ExternalSorter`] buffers items until part of its fair share of the
-//! build [`Budget`] is used (or the shared pool runs out), then hands the
-//! buffer to a spill thread that sorts it in place, codes and compresses it
-//! in parallel and writes it as a run, while the producer fills the next
-//! buffer. Reading merges every run in one pass when memory allows (see
-//! [`merge`]). When everything fits no run is written and the sort is an
-//! ordinary in-memory sort, so a city extract and a planet build share one
-//! code path.
-//!
-//! [`Spool`] is the unsorted sibling: an append-only scratch file replayed in
-//! write order, once or, closed into a [`SpoolFile`], as often as needed.
-//! [`IndexedSpool`] is read back by index, in any order, so it is not
-//! compressed.
-//!
-//! Every byte is reserved in the [`Scratch`] ledger before it is written;
-//! see [`scratch`] for what happens when it runs out.
-//!
-//! A sorter or a closed spool can be saved at a checkpoint and restored
-//! from it ([`SorterState`], [`RunState`]): a build that stops goes on with
-//! the runs already on disk.
-
 mod block;
 mod merge;
 mod scratch;
@@ -57,12 +34,8 @@ pub use scratch::{
 };
 
 const IO_BUFFER_BYTES: usize = 1 << 20;
-/// When the shared pool is full, a sorter spills only once its buffer holds at
-/// least this fraction of its share; smaller runs would cost more than they free.
 const MIN_RUN_FRACTION: usize = 16;
-/// Smallest buffer growth step, in items.
 const MIN_CAPACITY: usize = 1_024;
-/// Items a merge writes between two checks of whether the build goes on.
 const CHECK_EVERY_ITEMS: usize = 1 << 16;
 
 /// A value that can be written to and read back from scratch files.
@@ -78,22 +51,16 @@ pub trait Spill: Sized {
     fn resident_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
     }
-    /// Encode after the value before it in the same scratch block, which
-    /// left `delta`. A type whose sort key leads with an integer or shares
-    /// prefixes with its neighbours codes the key against it
-    /// ([`put_delta`], [`crate::util::codec::put_front`]).
     fn encode_after(&self, delta: &mut Delta, out: &mut Vec<u8>) {
         let _ = delta;
         self.encode(out);
     }
-    /// Decode what [`Spill::encode_after`] wrote.
     fn decode_after(delta: &mut Delta, input: &mut &[u8]) -> Result<Self> {
         let _ = delta;
         Self::decode(input)
     }
 }
 
-/// Spill statistics for one sorter, surfaced in the build report.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SortStats {
     pub items: u64,
@@ -101,27 +68,20 @@ pub struct SortStats {
 }
 
 impl SortStats {
-    /// Adds another sorter's work to this total. A build with several inputs
-    /// sorts once per input, and the report counts them together.
     pub fn merge(&mut self, other: Self) {
         self.items += other.items;
         self.runs += other.runs;
     }
 }
 
-/// How a sorter's share is split: the buffer it fills, the one being
-/// written (as much again) and the blocks that buffer is coded into.
 fn buffer_bytes(share: usize) -> usize {
     (share / 8 * 3).max(1)
 }
 
-/// Raw bytes of a run's blocks for a sorter with `share` bytes.
 fn block_bytes(share: usize) -> usize {
     (share / 32).clamp(MIN_BLOCK_BYTES, BLOCK_BYTES)
 }
 
-/// A sorter as a checkpoint names it: every item it was given is in its
-/// runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SorterState {
     pub label: String,
@@ -131,7 +91,6 @@ pub struct SorterState {
 }
 
 impl SorterState {
-    /// The files its runs are in.
     pub fn files<'a>(
         &'a self,
         scratch: &'a Scratch,
@@ -139,7 +98,6 @@ impl SorterState {
         self.runs.iter().flat_map(|run| run.files(scratch))
     }
 
-    /// Bytes its runs hold on disk.
     pub fn bytes(&self) -> u64 {
         self.runs.iter().map(|run| run.bytes).sum()
     }
@@ -150,14 +108,9 @@ pub struct ExternalSorter<T> {
     scratch: Arc<Scratch>,
     budget: Arc<Budget>,
     owner: Arc<Owner>,
-    /// The most bytes this sorter may hold before it spills, whatever its
-    /// fair share of the pool.
     share_bytes: usize,
-    /// Buffer capacity plus the heap bytes of buffered items.
     reservation: Spillable,
     buffer: Vec<T>,
-    /// Runs written on the producer's own thread (see
-    /// [`ExternalSorter::spill`]).
     runs: Vec<Run>,
     spiller: Option<Spiller<T>>,
     items: u64,
@@ -193,10 +146,6 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
         let (mut growth, mut needed) = self.needed(heap, share);
         let over_share = self.reservation.bytes() + needed > share;
         if over_share || !self.reservation.reservation().try_grow(needed) {
-            // Spill when the share is used up, or when the pool is full and
-            // the buffer is big enough to be worth a run. Worth counts items
-            // held, not capacity reserved ahead. One growth step of large
-            // items would otherwise cut a run after its first item.
             if over_share || self.buffered_bytes() >= share / MIN_RUN_FRACTION {
                 self.spill()?;
                 (growth, needed) = self.needed(heap, share);
@@ -206,8 +155,6 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
             }
         }
         if self.buffer.try_reserve_exact(growth).is_err() {
-            // The allocator refused to grow the buffer: spill it and grow
-            // from empty, as GNU sort halves its buffer rather than fail.
             self.spill()?;
             (growth, needed) = self.needed(heap, share);
             self.reservation.reservation().force_grow(needed);
@@ -223,14 +170,11 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
         Ok(())
     }
 
-    /// Bytes of the buffered items, without capacity reserved for later ones.
     fn buffered_bytes(&self) -> usize {
         let spare = (self.buffer.capacity() - self.buffer.len()) * std::mem::size_of::<T>();
         self.reservation.bytes().saturating_sub(spare)
     }
 
-    /// Items the buffer must grow by to take one more item, and the bytes that
-    /// costs including the item's own heap data.
     fn needed(&self, heap: usize, share: usize) -> (usize, usize) {
         let growth = if self.buffer.len() == self.buffer.capacity() {
             let share_items = (share / std::mem::size_of::<T>().max(1)).max(1);
@@ -252,9 +196,6 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
         }
     }
 
-    /// Write what the buffer holds as a run and wait for every run to be
-    /// on disk, for a checkpoint to name them. The buffer's memory is free
-    /// again after.
     pub fn checkpoint(&mut self) -> Result<SorterState> {
         self.spill()?;
         if let Some(spiller) = self.spiller.take() {
@@ -268,8 +209,6 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
         })
     }
 
-    /// A sorter holding the runs `state` names, as [`ExternalSorter::new`]
-    /// makes an empty one.
     pub fn restore(
         scratch: &Arc<Scratch>,
         budget: &Arc<Budget>,
@@ -294,7 +233,6 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
         Ok(sorter)
     }
 
-    /// Sorted items, ascending.
     pub fn finish(mut self) -> Result<Sorted<T>> {
         if self.runs.is_empty() && self.spiller.is_none() {
             self.buffer.par_sort_unstable();
@@ -306,8 +244,6 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
                 reservation,
             ));
         }
-        // Once anything spilled, the tail is spilled too, so a finished sorter
-        // holds only merge read buffers while later phases fill their own.
         self.spill()?;
         let mut runs = std::mem::take(&mut self.runs);
         if let Some(spiller) = self.spiller.take() {
@@ -325,8 +261,6 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
         )?))
     }
 
-    /// Hand the buffer to the spill thread, waiting while it still writes
-    /// the one before.
     fn spill(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -343,8 +277,6 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
             runs_written: Arc::clone(&self.runs_written),
         };
         if rayon::current_thread_index().is_some() {
-            // A pool worker waiting on the spill thread could leave that
-            // thread no worker to sort on: write here instead.
             return writer.write(batch, &mut self.runs);
         }
         let spiller = self.spiller.get_or_insert_with(|| Spiller::start(writer));
@@ -361,7 +293,6 @@ impl<T: Spill + Ord + Send + Sync + 'static> ExternalSorter<T> {
     }
 }
 
-/// A full buffer and the memory it holds until it is written.
 struct Batch<T> {
     items: Vec<T>,
     reservation: Reservation,
@@ -377,7 +308,6 @@ impl<T> std::fmt::Debug for Batch<T> {
     }
 }
 
-/// What a spill needs, on whichever thread it runs.
 struct RunSpill {
     scratch: Arc<Scratch>,
     owner: Arc<Owner>,
@@ -387,10 +317,6 @@ struct RunSpill {
 }
 
 impl RunSpill {
-    /// Sort `batch` in place and write it as a run. When the ledger refuses
-    /// it even at the highest level, the runs written at lower levels are
-    /// merged at this one, freeing what the higher level saves chunk by
-    /// chunk as they are read, and the run is written again.
     fn write<T: Spill + Ord + Send + Sync>(
         &self,
         mut batch: Batch<T>,
@@ -437,8 +363,6 @@ impl RunSpill {
     }
 }
 
-/// Code a sorted buffer into blocks of about `block` raw bytes, `wave` at a
-/// time compressed in parallel and written in order.
 fn write_run<T: Spill + Sync>(
     scratch: &Arc<Scratch>,
     owner: &Arc<Owner>,
@@ -476,9 +400,6 @@ fn write_run<T: Spill + Sync>(
     Ok(writer.finish())
 }
 
-/// The thread that writes a sorter's full buffers while the producer fills
-/// the next. The queue holds none: the producer waits while one is written,
-/// so at most two buffers, both reserved, exist at once.
 #[derive(Debug)]
 struct Spiller<T> {
     sender: Option<SyncSender<Batch<T>>>,
@@ -501,7 +422,6 @@ impl<T: Spill + Ord + Send + Sync + 'static> Spiller<T> {
         }
     }
 
-    /// Wait for the last buffer to be written: every run, or why not.
     fn join(mut self) -> Result<Vec<Run>> {
         drop(self.sender.take());
         self.thread
@@ -521,7 +441,6 @@ impl<T> Drop for Spiller<T> {
     }
 }
 
-/// Sorted output. The in-memory form keeps its memory reserved until dropped.
 #[derive(Debug)]
 pub enum Sorted<T> {
     Memory(std::vec::IntoIter<T>, Reservation),
@@ -539,7 +458,6 @@ impl<T: Spill + Ord> Iterator for Sorted<T> {
     }
 }
 
-/// Append-only scratch file replayed in write order.
 #[derive(Debug)]
 pub struct Spool<T> {
     scratch: Arc<Scratch>,
@@ -558,7 +476,6 @@ impl<T: Spill> Spool<T> {
         Ok(self.stream.push(item)?)
     }
 
-    /// Items written so far.
     pub fn written(&self) -> u64 {
         self.stream.items
     }
@@ -581,7 +498,6 @@ impl<T: Spill> Spool<T> {
     }
 }
 
-/// A closed spool, read from the start by each [`SpoolFile::reader`].
 #[derive(Debug)]
 pub struct SpoolFile<T> {
     run: Run,
@@ -599,12 +515,10 @@ impl<T: Spill> SpoolFile<T> {
         SpoolReader::new(&self.scratch, Cursor::consume(self.run))
     }
 
-    /// The spool as a checkpoint names it.
     pub fn state(&self) -> RunState {
         self.run.state()
     }
 
-    /// The spool a checkpoint named.
     pub fn restore(scratch: &Arc<Scratch>, state: &RunState) -> Result<Self> {
         Ok(Self {
             run: Run::restore(scratch, state)?,
@@ -613,7 +527,6 @@ impl<T: Spill> SpoolFile<T> {
         })
     }
 
-    /// Items the spool holds.
     pub fn len(&self) -> u64 {
         self.run.items
     }
@@ -623,7 +536,6 @@ impl<T: Spill> SpoolFile<T> {
     }
 }
 
-/// A spool read in order, its blocks read and decompressed ahead.
 #[derive(Debug)]
 pub struct SpoolReader<T> {
     prefetch: Prefetch,
@@ -671,8 +583,6 @@ impl<T: Spill> Iterator for SpoolReader<T> {
     }
 }
 
-/// A scratch file of items read back by their index, in any order and as
-/// often as needed.
 #[derive(Debug)]
 pub struct IndexedSpool<T> {
     file: BufWriter<ScratchFile>,
@@ -715,7 +625,6 @@ impl<T: Spill> IndexedSpool<T> {
         Ok(())
     }
 
-    /// Bytes written so far.
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -731,20 +640,16 @@ impl<T: Spill> IndexedSpool<T> {
     }
 }
 
-/// A closed [`IndexedSpool`].
 #[derive(Debug)]
 pub struct IndexedSpoolFile<T> {
     /// Taken before the file is removed: Windows cannot remove a mapped file.
     map: Option<memmap2::Mmap>,
     file: ScratchFile,
     offsets: Vec<u64>,
-    /// The offsets, once a checkpoint wrote them out.
     saved: Option<ScratchFile>,
     _marker: PhantomData<T>,
 }
 
-/// An [`IndexedSpoolFile`] as a checkpoint names it: its file and the file
-/// of its items' offsets, by name and length.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedState {
     pub label: String,
@@ -776,7 +681,6 @@ impl<T> IndexedSpoolFile<T> {
         })
     }
 
-    /// The file as a checkpoint names it, its offsets written out once.
     pub fn state(&mut self, scratch: &Arc<Scratch>) -> Result<IndexedState> {
         if self.saved.is_none() {
             let name = scratch.new_file(&format!("{}-offsets", self.file.label()));
@@ -799,7 +703,6 @@ impl<T> IndexedSpoolFile<T> {
         })
     }
 
-    /// The files a checkpoint names for it.
     pub fn files(&self) -> Vec<std::path::PathBuf> {
         std::iter::once(&self.file)
             .chain(self.saved.as_ref())
@@ -807,7 +710,6 @@ impl<T> IndexedSpoolFile<T> {
             .collect()
     }
 
-    /// The file a checkpoint named.
     pub fn restore(scratch: &Arc<Scratch>, state: &IndexedState) -> Result<Self> {
         let file = ScratchFile::reopen(scratch, &state.label, &state.file.0, state.file.1)?;
         let saved = ScratchFile::reopen(scratch, &state.label, &state.offsets.0, state.offsets.1)?;
@@ -830,12 +732,10 @@ impl<T: Spill> IndexedSpoolFile<T> {
         self.offsets.is_empty()
     }
 
-    /// Bytes the file holds.
     pub fn bytes(&self) -> u64 {
         self.map.as_ref().map_or(0, |map| map.len() as u64)
     }
 
-    /// Item `index`, decoded.
     pub fn get(&self, index: usize) -> Result<T> {
         let bytes = self.map.as_deref().unwrap_or_default();
         let truncated = || Error::BadScratch {
@@ -866,8 +766,6 @@ impl<T> Drop for IndexedSpoolFile<T> {
     }
 }
 
-/// Unsigned tuples, the first value coded against the one before: it leads
-/// the sort.
 macro_rules! spill_tuple_of_unsigned {
     ($first:ident: $first_ty:ty, $($name:ident: $ty:ty),+) => {
         impl Spill for ($first_ty, $($ty,)+) {
@@ -1036,7 +934,6 @@ mod tests {
                 write_run(&scratch, &owner, &chunk, MIN_BLOCK_BYTES, 1).expect("run")
             })
             .collect::<Vec<_>>();
-        // Three runs at once: 30 runs merge 2 first, then 3 at a time.
         let share = 3 * runs
             .iter()
             .map(Run::read_bytes)
@@ -1068,7 +965,6 @@ mod tests {
         let budget = Budget::unlimited();
         let owner = scratch.owner("pairs");
         let low = (0..100u64).map(|key| (key, 0)).collect::<Vec<_>>();
-        // Many blocks, more than are read ahead.
         let high = (1_000..60_000u64).map(|key| (key, 0)).collect::<Vec<_>>();
         let runs = [&low, &high, &high]
             .into_iter()
@@ -1079,7 +975,6 @@ mod tests {
         for _ in 0..100 {
             merge.next().expect("item").expect("item");
         }
-        // The low run's last item came out: its file went with it.
         assert_eq!(files(&scratch), 2);
         assert_eq!(merge.count(), 2 * 59_000);
         assert_eq!(files(&scratch), 0);
@@ -1090,7 +985,6 @@ mod tests {
     fn sorters_sharing_a_budget_stay_within_it() {
         let (_dir, scratch) = scratch("shared");
         let item = std::mem::size_of::<(u64, u64)>();
-        // Each sorter's share alone would fit; together they do not.
         let budget = Budget::new(64 * 1024 * item);
         let mut first = ExternalSorter::new(&scratch, "first", &budget, 48 * 1024 * item);
         let mut second = ExternalSorter::new(&scratch, "second", &budget, 48 * 1024 * item);
@@ -1116,8 +1010,6 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    /// Runs a sorter writes for `items` while a buffer that cannot spill
-    /// holds the whole pool.
     fn runs_beside_a_full_pool<T: Spill + Ord + Send + Sync + Clone + std::fmt::Debug + 'static>(
         name: &str,
         items: &[T],
@@ -1286,7 +1178,6 @@ mod tests {
             .expect("fits");
     }
 
-    /// An item as large as a named feature, 512 bytes in memory.
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct Wide {
         key: u64,
@@ -1306,7 +1197,6 @@ mod tests {
         }
     }
 
-    /// Text compressing better at higher zstd levels than at level 1.
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct Line {
         key: u64,
@@ -1370,7 +1260,6 @@ mod tests {
         }
     }
 
-    /// Bytes `items` take as one run at `level`.
     fn run_bytes(items: &[Line], level: i32) -> u64 {
         let (_dir, scratch) = scratch("measure");
         while scratch.level() < level {
@@ -1392,8 +1281,6 @@ mod tests {
         let older_small = run_bytes(&older.concat(), 9);
         let newer_small = run_bytes(&newer, 9);
         let saved = older_fast - older_small;
-        // Room for the merged older runs while they are merged, but for the
-        // newer run only once the merge has saved its bytes.
         let room = newer_small - saved / 2;
         assert!(saved > 0 && room >= older_small + older_small / 10 && room < newer_small);
 
@@ -1444,8 +1331,6 @@ mod tests {
         assert_eq!(scratch.live_bytes(), 0);
     }
 
-    /// A sorter checkpointed and committed outlives a build that fails,
-    /// and a scratch reopened from the checkpoint sorts what it held.
     #[test]
     fn a_checkpointed_sorter_survives_a_failure_and_is_restored() {
         let (_dir, scratch) = scratch("checkpoint");
@@ -1460,7 +1345,6 @@ mod tests {
         let files = state.files(&scratch).collect::<Vec<_>>();
         assert!(!files.is_empty());
         scratch.commit(&files, b"{}").expect("commit");
-        // Work after the checkpoint is not the checkpoint's.
         for item in &input[3_000..] {
             sorter.push(*item).expect("push");
         }
@@ -1495,8 +1379,6 @@ mod tests {
         assert!(!path.exists(), "a completed build leaves nothing");
     }
 
-    /// Files a checkpoint keeps after the build is done with them are given
-    /// up, with the checkpoint, before the ledger refuses a write.
     #[test]
     fn retired_files_give_way_when_the_ledger_runs_short() {
         let (_dir, scratch) = scratch("reclaim");
@@ -1513,7 +1395,6 @@ mod tests {
         let retained = scratch.retained_bytes();
         assert_eq!(retained, state.bytes());
         assert_eq!(scratch.peak_retained_bytes(), retained);
-        // Room for the write only once the retired runs are gone.
         scratch.set_budget(Some(retained + scratch.live_bytes()));
         let owner = scratch.owner("pack-records");
         scratch.reserve(&owner, retained).expect("room made");

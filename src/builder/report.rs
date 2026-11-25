@@ -13,12 +13,9 @@ use crate::{
 
 pub const BUILD_REPORT_SCHEMA_VERSION: u32 = 23;
 
-/// One extract a build read.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ReportInput {
     pub path: String,
-    /// What the input is, as the caller named it: a region id for a Pack
-    /// built from a catalog region.
     pub source: Option<String>,
     /// When the input's data was taken from OpenStreetMap, in seconds since
     /// the Unix epoch, as the PBF header states it.
@@ -29,14 +26,9 @@ pub struct ReportInput {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BuilderReport {
     pub schema_version: u32,
-    /// The extracts the Pack was built from, in the order they were read.
-    /// A Pack covering several regions has one entry per region.
     pub inputs: Vec<ReportInput>,
     pub pack: String,
-    /// The bytes of every input together.
     pub input_bytes: u64,
-    /// The datasets the Pack's records come from, by the id their
-    /// provenance names ([`crate::record::OSM_DATASET`]).
     pub datasets: Vec<String>,
     pub scanned: ScannedCounts,
     pub accepted: AcceptedCounts,
@@ -53,22 +45,13 @@ pub struct BuilderReport {
     pub resources: ResourceReport,
     pub scratch: ScratchReport,
     pub output: PackOutputReport,
-    /// The address parser trained on the Pack's records.
     pub parser_training: Report,
-    /// Address files added from outside OSM, such as OpenAddresses, one
-    /// entry per file.
     pub imports: Vec<crate::builder::addresses::ImportReport>,
-    /// Ways and relations libpostal's admin level table names for the
-    /// input's countries that the input lacks: rules that apply to nothing.
     pub unmatched_admin_level_ids: Vec<String>,
     pub slash_numbers: SlashNumberCounts,
-    /// What each stage cost, in the order they ran; a stage run once per
-    /// input has one entry per input.
     pub stages: Vec<StageReport>,
-    /// The checkpoints the build wrote, every run's together.
     #[serde(default)]
     pub checkpoints: CheckpointReport,
-    /// Each time the build went on from a checkpoint a run before left.
     #[serde(default)]
     pub resumes: Vec<ResumeReport>,
     #[serde(default)]
@@ -84,13 +67,9 @@ pub struct TimezoneReport {
     pub modified_unix: u64,
     pub zones: u64,
     pub areas: u64,
-    /// Areas that lie wholly in one zone, which their records read it from.
     pub areas_in_one_zone: u64,
-    /// Records in such an area.
     pub records_zoned_by_area: u64,
-    /// Records in no such area, given the zone at their own point.
     pub records_zoned_by_point: u64,
-    /// Records in no such area whose point lies in no zone, or in two.
     pub records_without_zone: u64,
 }
 
@@ -103,52 +82,31 @@ pub struct QRankReport {
     pub ranked_places: u64,
 }
 
-/// What checkpointing cost.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CheckpointReport {
     pub count: u64,
-    /// Time spent writing them: spilling sorter buffers, saving state and
-    /// syncing the files they name.
     pub wall_ms: u64,
-    /// The stage the last one completed.
     pub last: Option<String>,
-    /// Most bytes held on disk at once for a checkpoint that the build was
-    /// done with: inputs a stage consumed, kept until the stage's own
-    /// checkpoint replaced the one before. Not live: given up first when
-    /// the scratch disk runs short.
     pub peak_retained_bytes: u64,
-    /// The stage in which retained files were given up to make room, so
-    /// the build could not have gone on from the checkpoint before it.
     pub voided: Option<String>,
 }
 
-/// A run that went on from the checkpoint another left.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ResumeReport {
-    /// The last stage the stopped run completed.
     pub after: String,
-    /// Scratch bytes it went on with, by owner: sorters, spools, the node
-    /// store, the address books, the Pack writer's parts.
     pub reused: BTreeMap<String, u64>,
     pub reused_bytes: u64,
-    /// Build time up to the checkpoint, not spent again.
     pub saved_ms: u64,
 }
 
-/// How the build read the house numbers written "N/M".
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SlashNumberCounts {
-    /// Read as UNIT/NUMBER: stored as the number, with the unit.
     pub unit_first: u64,
-    /// Read as a number first: a range, a corner or a building and its flat.
     pub number_first: u64,
-    /// No neighbours to read them by: kept as written.
     pub unresolved: u64,
 }
 
 impl BuilderReport {
-    /// Derive build throughput from the final wall-clock and record counts.
-    /// Call once `phases.total_ms` is final.
     pub(crate) fn finalize_throughput(&mut self) {
         let secs = self.phases.total_ms as f64 / 1000.0;
         if secs <= 0.0 {
@@ -159,9 +117,6 @@ impl BuilderReport {
             *self.accepted.by_layer.get("address").unwrap_or(&0) as f64 / secs;
     }
 
-    /// Fold a report produced by a parallel worker into this one. Workers cover
-    /// consecutive input ranges and are merged in input order, so capped sample
-    /// lists keep the same entries a sequential build would.
     pub(crate) fn merge(&mut self, other: BuilderReport) {
         let BuilderReport {
             scanned,
@@ -284,42 +239,26 @@ fn merge_samples<T>(
     }
 }
 
-/// What the machine gave the build.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ResourceReport {
-    /// The probe, the sizes chosen from it and the pre-flight check.
     pub plan: BuildPlan,
-    /// Worker threads the build ran on.
     pub threads: usize,
-    /// The probe again when the parser's training started.
     pub at_training: Resources,
 }
 
-/// Disk used for build scratch files and how often each sorter spilled.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ScratchReport {
     pub memory_budget_bytes: u64,
-    /// Most memory held at once by sort, merge, text indexing and lattice
-    /// buffers.
     pub peak_tracked_bytes: u64,
     /// Most bytes the heap held at once, as the global allocator counts
     /// them; 0 when it does not.
     pub peak_heap_bytes: u64,
-    /// Bytes written to scratch files, as on disk.
     pub spilled_bytes: u64,
     pub sorters: BTreeMap<String, SorterReport>,
-    /// The `--scratch-budget-mb` cap; `None` when only the scratch volume's
-    /// free space capped the build.
     pub budget_bytes: Option<u64>,
-    /// Most scratch bytes on disk at once, every owner together.
     pub peak_live_bytes: u64,
-    /// What each owner held when that peak was reached.
     pub peak_owners: BTreeMap<String, u64>,
-    /// The zstd level spill blocks ended at: above 1 when the ledger ran
-    /// short and blocks were compressed harder.
     pub zstd_level: i32,
-    /// Every scratch owner's traffic: sorters and spools by label, the Pack
-    /// writer's files as `pack-*`.
     pub spills: BTreeMap<String, Traffic>,
 }
 
@@ -329,29 +268,19 @@ pub struct SorterReport {
     pub runs: u64,
 }
 
-/// Which resource held a stage back, judged from what it measured.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Bound {
-    /// The stage kept the threads busy, or one thread on its serial path.
     Cpu,
-    /// Waiting on the input or on scratch being read.
     ReadIo,
-    /// Writing scratch.
     WriteIo,
-    /// None of these was saturated: the stage waited on another stage, a
-    /// lock or the machine.
     #[default]
     Waiting,
 }
 
 impl Bound {
-    /// A share past which a resource counts as what held the stage back.
     const SATURATED: f64 = 0.5;
 
-    /// The resource with the largest share, if it is saturated. A stage
-    /// whose driving thread was busy all along is bound by that thread's
-    /// CPU, however idle the others were.
     pub fn classify(shares: &BoundShares) -> Self {
         let cpu = shares.cpu.max(shares.driver);
         [
@@ -375,48 +304,31 @@ impl Bound {
     }
 }
 
-/// The shares of a stage's wall time each resource was busy, from 0 to 1.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
 pub struct BoundShares {
-    /// CPU time over wall time and threads.
     pub cpu: f64,
-    /// CPU time over wall time: threads kept busy on average.
     pub cores: f64,
-    /// CPU time of the thread that drives the stage, its sink, over wall
-    /// time: near 1 when the stage waits on that one thread.
     pub driver: f64,
-    /// Time reading the input or waiting for scratch to be read ahead.
     pub read: f64,
-    /// Time writing scratch, over every writing thread.
     pub write: f64,
-    /// Time a producer waited for its previous buffer to be written.
     pub spill_wait: f64,
 }
 
-/// Bytes a stage read from one input.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct InputRead {
     pub bytes: u64,
-    /// Time spent in reads, on the thread that reads.
     pub wait_ms: u64,
 }
 
-/// What one stage of the build cost.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct StageReport {
-    /// The stage, as progress names it.
     pub stage: String,
     pub wall_ms: u64,
-    /// Process CPU time, user and kernel, over every thread.
     pub cpu_ms: u64,
     pub threads: usize,
-    /// The stage's work in its own unit ("bytes", "blocks", "ways",
-    /// "records"), or none.
     pub unit: String,
     pub units: u64,
-    /// Bytes read from each input file.
     pub inputs: BTreeMap<String, InputRead>,
-    /// Scratch traffic by owner, of owners that wrote or read in the stage.
     pub spills: BTreeMap<String, Traffic>,
     pub items_written: u64,
     pub items_read: u64,
@@ -425,9 +337,7 @@ pub struct StageReport {
     pub scratch_raw_read_bytes: u64,
     pub scratch_read_bytes: u64,
     pub peak_scratch_bytes: u64,
-    /// Most of the process in RAM, sampled every second.
     pub peak_rss_bytes: u64,
-    /// Most of the memory budget reserved at once.
     pub peak_budget_bytes: u64,
     pub shares: BoundShares,
     pub bound: Bound,
@@ -440,8 +350,6 @@ impl StageReport {
 }
 
 impl BuilderReport {
-    /// What each stage cost, as a table for a person to read at the end of
-    /// a build.
     pub fn stage_table(&self) -> String {
         let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20);
         let mut table = format!(
@@ -519,7 +427,6 @@ impl BuilderReport {
     }
 }
 
-/// What the build wrote.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PackOutputReport {
     pub pack_bytes: u64,
@@ -529,7 +436,6 @@ pub struct PackOutputReport {
     pub sections: BTreeMap<String, u64>,
 }
 
-/// Build throughput derived from `phases.total_ms` (records/addresses per second).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Throughput {
     pub records_per_sec: f64,
@@ -552,25 +458,20 @@ pub struct AcceptedCounts {
     pub way_centroid_addresses: u64,
     pub interpolation_ranges: u64,
     pub street_segments: u64,
-    /// Street records, the segments of each street joined into one.
     #[serde(default)]
     pub streets: u64,
     pub postcode_records: u64,
     pub place_nodes: u64,
-    /// Places drawn as a closed way or a multipolygon, not admin boundaries.
     #[serde(default)]
     pub place_areas: u64,
     pub poi_nodes: u64,
     pub poi_way_centroids: u64,
     pub pois_with_address: u64,
-    /// POIs by the key of their category, for example `amenity`.
     pub poi_categories: BTreeMap<String, u64>,
     #[serde(default)]
     pub places_merged: u64,
-    /// Place points merged into the boundary they name.
     #[serde(default)]
     pub place_points_merged: u64,
-    /// What the counted presets leave out, to audit curation.
     #[serde(default)]
     pub places_left_out: BTreeMap<String, u64>,
 }
@@ -722,44 +623,26 @@ pub struct GeometryResolutionCounts {
     pub resolved_node_refs: u64,
 }
 
-/// What the passes that give ways their geometry held and read, over every
-/// input.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct GeometryPassReport {
-    /// Ways the scan kept for their geometry.
     pub kept_ways: u64,
-    /// Vertices of boundary ways and boundary relation members.
     pub boundary_refs: u64,
-    /// Distinct nodes kept ways and member ways reference.
     pub needed_nodes: u64,
-    /// Needed nodes the inputs have: one stored coordinate each.
     pub stored_nodes: u64,
-    /// Nodes whose address tags interpolation ways read.
     pub tagged_nodes: u64,
-    /// Needed nodes tagged `entrance`, kept for the records drawn with them.
     #[serde(default)]
     pub entrance_nodes: u64,
-    /// Most bytes one input's node id bitmap and rank index held.
     pub peak_node_set_bytes: u64,
-    /// Most bytes one input's coordinates held.
     pub peak_location_bytes: u64,
-    /// Coordinate bytes held in scratch files instead of memory, over every
-    /// input.
     pub mapped_location_bytes: u64,
-    /// PBF bytes each pass read: the scan reads every byte, the others only
-    /// the blocks they need.
     pub scan_read_bytes: u64,
     pub boundary_member_read_bytes: u64,
     pub node_read_bytes: u64,
     pub way_read_bytes: u64,
-    /// Vertices of the boundary shapes built, a vertex shared by two areas
-    /// counted in each.
     #[serde(default)]
     pub boundary_shape_vertices: u64,
-    /// Bytes of the shape file the boundary shapes are mapped from.
     #[serde(default)]
     pub boundary_shape_bytes: u64,
-    /// Heap the boundaries hold beside their shapes: names, codes, boxes.
     #[serde(default)]
     pub boundary_heap_bytes: u64,
 }
@@ -787,38 +670,21 @@ pub struct CompletenessCounts {
     pub country: u64,
 }
 
-/// Wall-clock time per build phase.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PhaseTimings {
-    /// Pass 1: classify every OSM object.
     pub scan_ms: u128,
-    /// Pass 2: read the ways that make up boundary relations.
     pub boundary_member_scan_ms: u128,
-    /// Pass 3: store the coordinates of the nodes ways need.
     pub node_join_ms: u128,
-    /// Pass 4: read the kept ways again and turn them into records.
     pub feature_emission_ms: u128,
-    /// Build admin boundary polygons.
     pub boundary_build_ms: u128,
-    /// Fetch and read address files from outside OSM.
     pub address_import_ms: u128,
-    /// Order every address by street and number, drop the imported ones
-    /// that repeat another, lend each street's postcodes to its addresses
-    /// without one, and place each country's postcodes.
     pub address_order_ms: u128,
-    /// Write places and boundaries.
     pub context_record_write_ms: u128,
-    /// Join the ways of each street into one street record.
     #[serde(default)]
     pub street_join_ms: u128,
-    /// Write addresses, POIs, interpolations, streets and postcodes in
-    /// Hilbert order.
     pub record_write_ms: u128,
-    /// Finish the text and spatial indexes and write the Pack file.
     pub pack_seal_ms: u128,
-    /// Train the address parser and add its weights to the Pack file.
     pub parser_training_ms: u128,
-    /// Key the Pack's streets and places and add the structured index to it.
     #[serde(default)]
     pub structured_index_ms: u128,
     pub total_ms: u128,
@@ -967,7 +833,6 @@ impl BuilderReport {
         self.accepted.place_nodes += 1;
     }
 
-    /// A place drawn as an area, counted with the places and on its own.
     pub(crate) fn accept_place_area(&mut self, layer: PlaceLayer) {
         self.accept_place(layer);
         self.accepted.place_areas += 1;
@@ -1132,9 +997,6 @@ impl BuilderReport {
         });
     }
 
-    // The rejection-audit path genuinely needs the full object/tag context to
-    // triage and record a rejection; bundling it into a struct would only move
-    // the arguments around.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn reject_with_context(
         &mut self,
@@ -1659,7 +1521,6 @@ mod tests {
             spill_wait: 0.0,
         };
         assert_eq!(Bound::classify(&shares(0.9, 0.3, 0.2, 0.1)), Bound::Cpu);
-        // One thread busy of 24 is still CPU: the stage's serial path.
         assert_eq!(Bound::classify(&shares(0.06, 0.97, 0.1, 0.0)), Bound::Cpu);
         assert_eq!(Bound::classify(&shares(0.3, 0.4, 0.95, 0.1)), Bound::ReadIo);
         assert_eq!(Bound::classify(&shares(0.6, 0.2, 0.1, 0.8)), Bound::WriteIo);

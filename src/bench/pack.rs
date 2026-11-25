@@ -18,7 +18,6 @@ use crate::{
     util::fold::search_key,
 };
 
-/// Hits a sampled POI case asks for: enough to score hit@5.
 const POI_CASE_LIMIT: usize = 5;
 
 #[derive(Debug, Clone)]
@@ -54,7 +53,6 @@ pub struct PackMetricReport {
     pub build: Option<BuildMetricReport>,
 }
 
-/// Build timings and throughput from the build report next to the Pack.
 #[derive(Debug, Serialize)]
 pub struct BuildMetricReport {
     pub input_bytes: u64,
@@ -68,7 +66,6 @@ pub struct BuildMetricReport {
     pub scratch: ScratchReport,
 }
 
-/// Pack bytes by section group.
 #[derive(Debug, Default, Serialize)]
 pub struct PackByteMetrics {
     pub total: u64,
@@ -108,7 +105,6 @@ pub struct OperationBenchmarkReport<T> {
     pub warmup_runs: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency: Option<LatencyStats>,
-    /// Over the cases that name the object they expect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accuracy: Option<AccuracyReport>,
     pub cases: Vec<T>,
@@ -123,7 +119,6 @@ pub struct AccuracyReport {
     pub hit_at_5_rate: f64,
 }
 
-/// The OSM object a query case should find.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpectedObject {
     pub osm_type: ObjectType,
@@ -141,7 +136,6 @@ pub struct TextQueryCaseReport {
     pub hit_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expect: Option<ExpectedObject>,
-    /// 1-based rank of the expected object, absent when it was not returned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_rank: Option<usize>,
     pub latency: LatencyStats,
@@ -466,7 +460,6 @@ fn operation_report<T>(
 }
 
 impl AccuracyReport {
-    /// `None` when no case expects an object.
     fn from_ranks(ranks: impl Iterator<Item = Option<usize>>) -> Option<Self> {
         let (mut cases, mut hit_at_1, mut hit_at_5) = (0, 0, 0);
         for rank in ranks {
@@ -491,16 +484,9 @@ pub struct PoiFixtureOptions {
     pub seed: u64,
 }
 
-/// An answer key of named POIs: `count` cases drawn with `seed` from the POIs
-/// whose name is unique within their locality, each queried as
-/// "<name>, <locality>" and expected to find that POI. The locality is the
-/// one [`Reader::locality`] names; POIs without one are not drawn.
 pub fn sample_poi_fixture(options: &PoiFixtureOptions) -> Result<BenchmarkFixture> {
     let reader = Reader::open(&options.pack)?;
     let mut candidates = Vec::new();
-    // POIs per (area, name), over both the locality and the district a POI
-    // lies in: "<name>, Toronto" must be unique among every POI in Toronto,
-    // including those in a locality inside it.
     let mut name_counts: HashMap<(String, String), usize> = HashMap::new();
     for record_id in 0..reader.manifest().record_count {
         if reader.records().header(record_id)?.layer != Layer::Poi {
@@ -534,7 +520,6 @@ pub fn sample_poi_fixture(options: &PoiFixtureOptions) -> Result<BenchmarkFixtur
     }
     candidates.retain(|(key, _, _)| name_counts[key] == 1);
 
-    // A seeded Fisher-Yates prefix: reproducible for one Pack and seed.
     let mut random = SplitMix64(options.seed);
     let count = options.count.min(candidates.len());
     for index in 0..count {
@@ -672,7 +657,6 @@ mod tests {
                 )
                 .expect("area")
         };
-        // Toronto is a district with no locality over its core.
         let toronto = area(PlaceLayer::District, "Toronto", 1);
         let north_york = area(PlaceLayer::Locality, "North York", 2);
         let hamilton = area(PlaceLayer::Locality, "Hamilton", 3);
@@ -702,14 +686,11 @@ mod tests {
         };
         let downtown = in_area(None, Some(toronto));
         for (object_id, name, context) in [
-            // Two in Toronto share a name: neither can be expected.
             (10, "Tim Hortons", downtown.clone()),
             (11, "TIM  HORTONS", downtown.clone()),
             (12, "Tim Hortons", in_area(Some(hamilton), None)),
             (13, "Riverdale Farm", downtown.clone()),
-            // No locality to query it with.
             (14, "Lonely Cabin", None),
-            // Unique in North York, but "Ali Baba, Toronto" would find both.
             (15, "Ali Baba", in_area(Some(north_york), Some(toronto))),
             (16, "Ali Baba", downtown),
         ] {

@@ -5,14 +5,9 @@ use crate::{
     util::{text::collapse_whitespace, transliterate::to_latin},
 };
 
-/// Convenience accessors over an OSM tag map. Replaces the per-module
-/// `tag_value`/`has_*` free functions with one shared, testable surface.
 pub(crate) trait OsmTags {
-    /// Whitespace-cleaned value for `key`, cut before any other tag pasted
-    /// into it (see [`without_pasted_tags`]), or `None` if missing or blank.
     fn cleaned(&self, key: &str) -> Option<String>;
 
-    /// Whether `key` has a non-blank value.
     fn has(&self, key: &str) -> bool {
         self.cleaned(key).is_some()
     }
@@ -42,10 +37,6 @@ pub(crate) fn without_pasted_tags(value: &str) -> &str {
         }
         let key = &value[start..equals];
         let parts = key.split(':').collect::<Vec<_>>();
-        // The key may be glued to the value it was pasted after:
-        // "Evansvilleaddr:state" is "Evansville" and "addr:state". Its first
-        // part is cut back to the namespace a key of that kind starts with,
-        // the longest that fits, and a key in none is no key.
         let first = parts[0];
         let Some(namespace) = PASTED_KEY_NAMESPACES
             .iter()
@@ -65,8 +56,6 @@ pub(crate) fn without_pasted_tags(value: &str) -> &str {
     value
 }
 
-/// The namespaces of the keys whose tags are pasted into values: a key
-/// glued to the value before it is told apart from that value by them.
 const PASTED_KEY_NAMESPACES: [&str; 8] = [
     "addr",
     "name",
@@ -78,9 +67,6 @@ const PASTED_KEY_NAMESPACES: [&str; 8] = [
     "building",
 ];
 
-/// Keys whose values are other names of the feature, with or without a
-/// `:<lang>` suffix.
-/// Airport codes count: travellers type "AMS".
 const ALT_NAME_KEYS: [&str; 10] = [
     "alt_name",
     "official_name",
@@ -110,8 +96,6 @@ pub(crate) fn is_name_key(key: &str) -> bool {
     base_ok && language.is_none_or(is_language_tag)
 }
 
-/// The Wikidata item `key` names, `Q42` as 42. Several items in one value
-/// name none.
 pub(crate) fn item(tags: &BTreeMap<String, String>, key: &str) -> Option<u32> {
     tags.cleaned(key)?
         .strip_prefix('Q')?
@@ -120,7 +104,6 @@ pub(crate) fn item(tags: &BTreeMap<String, String>, key: &str) -> Option<u32> {
         .filter(|item| *item > 0)
 }
 
-/// How widely a feature is known by its tags (see [`Prominence`]).
 pub(crate) fn prominence(tags: &BTreeMap<String, String>) -> Prominence {
     let mut languages = tags
         .iter()
@@ -138,8 +121,6 @@ pub(crate) fn prominence(tags: &BTreeMap<String, String>) -> Prominence {
     }
 }
 
-/// `ja`, `ja-Hira`, `ja_rm`, `zh-Hant-TW`: a two or three letter lower case
-/// language, then subtags of letters and digits.
 fn is_language_tag(value: &str) -> bool {
     let mut parts = value.split(['-', '_']);
     let language = parts.next().unwrap_or_default();
@@ -152,10 +133,6 @@ fn is_language_tag(value: &str) -> bool {
         })
 }
 
-/// The names a feature has besides `primary`, in key order, `;`-separated
-/// values split, then the Latin form of each name written in kana, Cyrillic
-/// or Greek (see [`to_latin`]), `primary` first. Each is whitespace-cleaned,
-/// and none repeats `primary` or an earlier one, ignoring case.
 pub(crate) fn alternate_names(tags: &BTreeMap<String, String>, primary: &str) -> Vec<String> {
     let mut seen = vec![primary.to_lowercase()];
     let mut names = Vec::new();
@@ -185,9 +162,6 @@ pub(crate) fn alternate_names(tags: &BTreeMap<String, String>, primary: &str) ->
     names
 }
 
-/// The feature's name in each language a `name:<lang>` tag states, as pairs
-/// of the language code as written and the name, in code order. A
-/// `;`-separated value gives its first name.
 pub(crate) fn language_names(tags: &BTreeMap<String, String>) -> Vec<(String, String)> {
     tags.iter()
         .filter_map(|(key, value)| {
@@ -201,8 +175,6 @@ pub(crate) fn language_names(tags: &BTreeMap<String, String>) -> Vec<(String, St
         .collect()
 }
 
-/// The name tags of `tags`, for the features that keep only some tags past
-/// the scan.
 pub(crate) fn name_tags(tags: &BTreeMap<String, String>) -> impl Iterator<Item = (String, String)> {
     tags.iter()
         .filter(|(key, _)| is_name_key(key))
@@ -353,7 +325,6 @@ mod tests {
             alternate_names(&tags, "横浜市"),
             vec!["Hama", "浜", "Yokohama", "よこはまし", "yokohamashi"]
         );
-        // The Latin form of a name in kana or Cyrillic, unless a tag states it.
         let tags = BTreeMap::from([
             ("name".to_string(), "マクドナルド".to_string()),
             ("name:ru".to_string(), "Макдоналдс".to_string()),

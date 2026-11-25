@@ -1,8 +1,3 @@
-//! The region tree the build picker browses: the planet, continents,
-//! countries and sub-regions. It is the catalog `catalog/regions.json`, which
-//! `catalog/catalog.py` generates from pinned upstream snapshots, so
-//! every size and date here is upstream's own.
-
 use std::sync::OnceLock;
 
 use open_geocode::record::OSM_DATASET;
@@ -15,7 +10,6 @@ pub(crate) enum Kind {
     Continent,
     Country,
     Subregion,
-    /// An extract that overlaps others, such as the Alps. Not browsable.
     Group,
 }
 
@@ -38,52 +32,39 @@ struct Entry {
     openaddresses: Option<OpenAddresses>,
 }
 
-/// The region's OpenStreetMap extract, as the catalog snapshot saw it.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Osm {
-    /// What Geofabrik's index calls the extract. The planet is not in it.
     pub id: Option<String>,
     pub url: String,
     pub bytes: u64,
 }
 
-/// The OpenAddresses data within the region, as the catalog snapshot saw it.
-/// Sources overlap (a countrywide one and a city's): a build downloads them
-/// all, and the Pack keeps one record of an address several of them state.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub(crate) struct OpenAddresses {
     pub rows: u64,
     pub bytes: u64,
 }
 
-/// The catalog schema this build reads.
 const SCHEMA: u32 = 1;
 
 pub(crate) struct Region {
     pub index: usize,
     pub id: String,
     pub name: String,
-    /// The name with the countries above it, `Canada / Ontario`.
     pub label: String,
     pub kind: Kind,
     pub parent: Option<usize>,
-    /// Browsable regions directly below this one, by name.
     pub children: Vec<usize>,
-    /// Other names the region is known by, for search.
     pub aliases: Vec<String>,
     pub osm: Osm,
     pub openaddresses: Option<OpenAddresses>,
 }
 
 impl Region {
-    /// The Pack directory name: the id with its parts joined by `-`, so two
-    /// regions of one name (`georgia`, `us-georgia`) never share one.
     pub(crate) fn slug(&self) -> String {
         self.id.replace('/', "-")
     }
 
-    /// The dataset a Pack of the region is built from: its extract is
-    /// OpenStreetMap's.
     pub(crate) fn dataset(&self) -> &'static str {
         OSM_DATASET
     }
@@ -102,7 +83,6 @@ impl Region {
             .map(|base| format!("{base}-updates/state.txt"))
     }
 
-    /// What the regions below are called.
     pub(crate) fn unit(&self) -> &'static str {
         match self.kind {
             Kind::World => "continents",
@@ -130,15 +110,12 @@ impl Tree {
         &self.regions[index]
     }
 
-    /// Everything a search can find: the browsable regions, not the planet.
     pub(crate) fn searchable(&self) -> impl Iterator<Item = &Region> {
         self.regions
             .iter()
             .filter(|region| !matches!(region.kind, Kind::World | Kind::Group))
     }
 
-    /// The regions above this one, nearest first, without the planet:
-    /// `Canada · North America` for Ontario.
     pub(crate) fn trail(&self, region: &Region) -> String {
         let mut names = Vec::new();
         let mut next = region.parent;
@@ -152,7 +129,6 @@ impl Tree {
         names.join(" · ")
     }
 
-    /// The indices from the top continent down to this region's parent.
     pub(crate) fn ancestors(&self, region: &Region) -> Vec<usize> {
         let mut chain = Vec::new();
         let mut next = region.parent;
@@ -167,18 +143,12 @@ impl Tree {
     }
 }
 
-/// Whether one region contains the other, either way round.
-///
-/// Two overlapping extracts index the same places twice, so a Pack is built
-/// from regions that are pairwise disjoint: `canada` and `canada/ontario`
-/// together would hold Ontario's addresses once from each.
 pub(crate) fn overlaps(tree: &Tree, one: &Region, other: &Region) -> bool {
     one.index == other.index
         || tree.ancestors(one).contains(&other.index)
         || tree.ancestors(other).contains(&one.index)
 }
 
-/// How a dataset id reads: `osm` is OpenStreetMap.
 pub(crate) fn dataset_name(id: &str) -> &str {
     match id {
         OSM_DATASET => "OpenStreetMap",
@@ -272,8 +242,6 @@ mod tests {
         }
     }
 
-    /// A region overlaps itself and everything above or below it, and nothing
-    /// beside it.
     #[test]
     fn overlapping_regions_are_those_one_contains() {
         let tree = tree();

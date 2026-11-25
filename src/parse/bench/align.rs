@@ -1,14 +1,3 @@
-//! Turning source rows and baseline output into fixture rows.
-//!
-//! Sources tokenize addresses their own way, so both directions go through
-//! [`search_key`], the key og matches text by. A source token is normalized on its own and
-//! every word it yields keeps its label; since the key never joins across
-//! whitespace, that is the same as normalizing the whole address and carrying
-//! labels by character span. A
-//! baseline's output is aligned back to the gold tokens character by
-//! character, so a parser that splits, joins or drops punctuation differently
-//! is still scored on og's tokens.
-
 use anyhow::{Context, Result, bail, ensure};
 
 use super::{
@@ -20,8 +9,6 @@ use crate::{
     util::fold::search_key,
 };
 
-/// A raw `lang<TAB>country<TAB>token/label ...` row in a source's own labels,
-/// as a fixture row. `None` when no token survives normalization.
 pub fn normalize_raw_line(line: &str, scheme: Scheme) -> Result<Option<TaggedRow>> {
     let mut columns = line.split('\t');
     let (Some(lang), Some(country), Some(fields), None) = (
@@ -67,11 +54,6 @@ pub fn normalize_raw_line(line: &str, scheme: Scheme) -> Result<Option<TaggedRow
     Ok((!row.tokens.is_empty()).then_some(row))
 }
 
-/// The label a baseline gave each gold token, from its `(label, value)`
-/// components in its own scheme. Each gold token takes the label most of its
-/// characters were given after a longest-common-subsequence alignment of the
-/// two character streams, ties going to the earlier character; a token none
-/// of whose characters the baseline returned is [`Label::Other`].
 pub fn align_components(
     gold: &TaggedRow,
     components: &[(String, String)],
@@ -154,10 +136,8 @@ pub fn align_components(
         .collect())
 }
 
-/// Index pairs of one longest common subsequence of `left` and `right`.
 fn lcs_pairs(left: &[char], right: &[char]) -> Vec<(usize, usize)> {
     let width = right.len() + 1;
-    // lengths[i * width + j]: LCS length of left[i..] and right[j..].
     let mut lengths = vec![0u32; (left.len() + 1) * width];
     for i in (0..left.len()).rev() {
         for j in (0..right.len()).rev() {
@@ -184,8 +164,6 @@ fn lcs_pairs(left: &[char], right: &[char]) -> Vec<(usize, usize)> {
     pairs
 }
 
-/// A baseline's labels for a gold row, as a prediction row: the gold tokens
-/// and part boundaries with the baseline's labels.
 pub fn prediction_row(gold: &TaggedRow, labels: &[Label]) -> Result<TaggedRow> {
     ensure!(
         labels.len() == gold.tokens.len(),
@@ -248,8 +226,6 @@ mod tests {
 
     #[test]
     fn a_dotted_capital_i_stays_in_its_word() {
-        // Lowercased, "İ" is "i" and a combining dot: an accent, never a
-        // word break.
         let row = normalize_raw_line("tr\tch\tİsviçre/country", Scheme::Libpostal)
             .expect("row")
             .expect("tokens");
@@ -288,7 +264,6 @@ mod tests {
 
     #[test]
     fn differently_tokenized_output_aligns_by_character() {
-        // The baseline glued "26 th" and dropped "york".
         let gold = TaggedRow::parse_line(
             "en\tus\t26/street th/street st/street new/locality york/locality",
         )

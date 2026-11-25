@@ -2,11 +2,8 @@ use geojson::{Geometry, GeometryValue, Position};
 
 use crate::record::Extent;
 
-/// Metres in a degree of latitude, near enough for sizing a lookup box or
-/// comparing short distances.
 pub(crate) const METRES_PER_DEGREE: f64 = 111_320.0;
 
-/// The mean Earth radius `haversine_m` measures with.
 pub(crate) const EARTH_RADIUS_M: f64 = 6_371_008.8;
 
 pub(crate) fn haversine_m(a_lon: f64, a_lat: f64, b_lon: f64, b_lat: f64) -> f64 {
@@ -20,10 +17,6 @@ pub(crate) fn haversine_m(a_lon: f64, a_lat: f64, b_lon: f64, b_lat: f64) -> f64
     2.0 * EARTH_RADIUS_M * h.sqrt().asin()
 }
 
-/// Longitude/latitude of a point geometry, or `None` if it is not a point or
-/// either coordinate is non-finite. This is the single canonical, strict
-/// reader; callers that previously skipped the finite check now reject NaN/inf
-/// coordinates, which is the safer behavior.
 pub(crate) fn point_lon_lat(geometry: &Geometry) -> Option<[f64; 2]> {
     let GeometryValue::Point { coordinates } = &geometry.value else {
         return None;
@@ -34,8 +27,6 @@ pub(crate) fn point_lon_lat(geometry: &Geometry) -> Option<[f64; 2]> {
     (lon.is_finite() && lat.is_finite()).then_some([*lon, *lat])
 }
 
-/// The lines of a line geometry: one for a line string, each of a multi line
-/// string (a street of several ways). `None` for any other geometry.
 pub(crate) fn line_parts(geometry: &Geometry) -> Option<Vec<&[Position]>> {
     match &geometry.value {
         GeometryValue::LineString { coordinates } => Some(vec![coordinates.as_slice()]),
@@ -46,8 +37,6 @@ pub(crate) fn line_parts(geometry: &Geometry) -> Option<Vec<&[Position]>> {
     }
 }
 
-/// A line geometry of `parts`: a line string for one, else a multi line
-/// string.
 pub(crate) fn line_geometry(mut parts: Vec<Vec<Position>>) -> Geometry {
     Geometry::new(if parts.len() == 1 {
         GeometryValue::LineString {
@@ -58,8 +47,6 @@ pub(crate) fn line_geometry(mut parts: Vec<Vec<Position>>) -> Geometry {
     })
 }
 
-/// The box around `points`, each a longitude and a latitude in 1e-7
-/// degrees. `None` without a point.
 pub(crate) fn box_around(points: impl IntoIterator<Item = [i32; 2]>) -> Option<Extent> {
     points
         .into_iter()
@@ -74,12 +61,7 @@ pub(crate) fn box_around(points: impl IntoIterator<Item = [i32; 2]>) -> Option<E
         })
 }
 
-/// The narrowest box holding every one of `parts`, each the box around one
-/// ring or line, which never crosses the antimeridian itself. The widest
-/// stretch of longitude no part reaches is left out, so parts on both sides
-/// of the antimeridian make a box that crosses it. `None` without a part.
 pub(crate) fn narrowest_box(parts: impl IntoIterator<Item = Extent>) -> Option<Extent> {
-    /// A full turn of longitude in 1e-7 degrees.
     const TURN: i64 = 3_600_000_000;
     let (mut south, mut north) = (i32::MAX, i32::MIN);
     let mut spans = Vec::new();
@@ -116,7 +98,6 @@ pub(crate) fn narrowest_box(parts: impl IntoIterator<Item = Extent>) -> Option<E
 
 const GEOHASH_ALPHABET: &[u8] = b"0123456789bcdefghjkmnpqrstuvwxyz";
 
-/// The geohash of a point, `chars` characters long.
 pub(crate) fn geohash(lat: f64, lon: f64, chars: usize) -> String {
     let mut lat_range = (-90.0f64, 90.0f64);
     let mut lon_range = (-180.0f64, 180.0f64);
@@ -171,17 +152,14 @@ mod tests {
             narrowest_box([part(7, 43, 8, 44)]),
             Some(part(7, 43, 8, 44))
         );
-        // Far apart, yet nearer each other the short way round.
         assert_eq!(
             narrowest_box([part(-60, -5, -50, 5), part(100, 10, 110, 20)]),
             Some(part(-60, -5, 110, 20))
         );
-        // A ring ending at 180 and one starting at -180 are one area.
         assert_eq!(
             narrowest_box([part(-180, -20, -178, -16), part(177, -19, 180, -12)]),
             Some(part(177, -20, -178, -12))
         );
-        // Islands either side of the antimeridian that do not touch it.
         assert_eq!(
             narrowest_box([
                 part(-179, -18, -178, -17),
@@ -190,7 +168,6 @@ mod tests {
             ]),
             Some(part(176, -19, -178, -15))
         );
-        // With two gaps of one width the box stays in one piece.
         assert_eq!(
             narrowest_box([part(-90, 0, -80, 1), part(90, 0, 100, 1)]),
             Some(part(-90, 0, 100, 1))

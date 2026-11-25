@@ -1,7 +1,3 @@
-//! Minimal OSM PBF writer for builder tests: uncompressed blobs, dense nodes,
-//! ways and relations. Each slice passed to [`write_pbf`] becomes one block, so
-//! tests control how objects are split across blocks.
-
 use std::{collections::BTreeMap, path::Path};
 
 pub(crate) enum TestElement {
@@ -18,9 +14,7 @@ pub(crate) enum TestElement {
     },
     Relation {
         id: i64,
-        /// Way members.
         members: Vec<(i64, &'static str)>,
-        /// Node members, written before the ways.
         nodes: Vec<(i64, &'static str)>,
         tags: Vec<(&'static str, &'static str)>,
     },

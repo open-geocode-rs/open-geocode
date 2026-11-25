@@ -1,9 +1,5 @@
-//! A route a vendor searches along: its points, decoded from the polyline
-//! the vendor takes, and how far either side of it a result may lie.
-
 use crate::util::geo::haversine_m;
 
-/// A polyline that does not decode.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Malformed;
 
@@ -104,15 +100,12 @@ fn signed(
     }))
 }
 
-/// A route and how far either side of it a result may lie.
 #[derive(Debug, Clone)]
 pub(crate) struct Corridor {
     points: Vec<[f64; 2]>,
     width_m: f64,
 }
 
-/// Where a point lies by a route: how far along it the nearest point of the
-/// route is, and how far off the route the point lies.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Reach {
     pub(crate) along_m: f64,
@@ -120,12 +113,10 @@ pub(crate) struct Reach {
 }
 
 impl Corridor {
-    /// A corridor of at least two points.
     pub(crate) fn new(points: Vec<[f64; 2]>, width_m: f64) -> Option<Self> {
         (points.len() >= 2).then_some(Self { points, width_m })
     }
 
-    /// The box holding the corridor, `[west, south, east, north]`.
     pub(crate) fn bbox(&self) -> [f64; 4] {
         let mut bbox = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
         for [lon, lat] in &self.points {
@@ -136,7 +127,6 @@ impl Corridor {
                 bbox[3].max(*lat),
             ];
         }
-        // Use the outer latitude for longitude padding, where a degree spans less distance.
         let pad_lat = self.width_m / 111_000.0;
         let widest = bbox[1].abs().max(bbox[3].abs()).min(89.0);
         let pad_lon = pad_lat / widest.to_radians().cos();
@@ -154,7 +144,6 @@ impl Corridor {
         ]
     }
 
-    /// Where `point` lies by the route, when it lies within the width.
     pub(crate) fn reach(&self, point: [f64; 2]) -> Option<Reach> {
         let mut best: Option<Reach> = None;
         let mut walked = 0.0;
@@ -183,8 +172,6 @@ fn longitude_delta(from: f64, to: f64) -> f64 {
     (to - from + 180.0).rem_euclid(360.0) - 180.0
 }
 
-/// How far along a segment its point nearest `point` lies, 0 to 1, on a
-/// plane scaled to the segment's latitude.
 fn nearest_share(start: [f64; 2], end: [f64; 2], point: [f64; 2]) -> f64 {
     let scale = ((start[1] + end[1]) / 2.0).to_radians().cos();
     let (dx, dy) = (longitude_delta(start[0], end[0]) * scale, end[1] - start[1]);
@@ -221,7 +208,6 @@ mod tests {
         }
     }
 
-    /// The examples each encoding's own description decodes.
     #[test]
     fn polylines_decode_as_their_encodings_describe() {
         close(
@@ -243,7 +229,6 @@ mod tests {
 
     #[test]
     fn a_corridor_holds_what_lies_within_its_width_and_says_how_far_along() {
-        // About 1.1 km east along the equator.
         let corridor = Corridor::new(vec![[0.0, 0.0], [0.01, 0.0]], 100.0).expect("two points");
         let reach = corridor.reach([0.005, 0.0005]).expect("55 m off");
         assert!((reach.along_m - 556.0).abs() < 2.0, "{reach:?}");

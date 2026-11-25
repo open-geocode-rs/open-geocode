@@ -19,11 +19,9 @@ pub(crate) struct AddressCandidate {
     pub lon: f64,
     pub location_precision: LocationPrecision,
     pub tags: BTreeMap<String, String>,
-    /// The entrances mapped for it (see [`Entrance`]).
     pub entrances: Vec<Entrance>,
 }
 
-/// Turn a candidate into an address record, or count why it was not one.
 pub(crate) fn emit_address(candidate: &AddressCandidate, out: &mut Emitted) {
     match address_record_from_candidate(candidate) {
         Ok(record) => {
@@ -62,7 +60,6 @@ pub(crate) fn address_record_from_candidate(
 /// a city: 237k of New Zealand's addresses state only an `addr:hamlet`.
 pub(crate) const LOCALITY_KEYS: [&str; 4] =
     ["addr:city", "addr:town", "addr:village", "addr:hamlet"];
-/// The areas below the locality an address may state, outermost first.
 const AREA_KEYS: [&str; 3] = ["addr:suburb", "addr:quarter", "addr:neighbourhood"];
 /// The areas that place a house number when no street does: the Japanese
 /// block scheme numbers blocks within a quarter or neighbourhood
@@ -70,13 +67,6 @@ const AREA_KEYS: [&str; 3] = ["addr:suburb", "addr:quarter", "addr:neighbourhood
 /// `addr:block_number=10`, `addr:housenumber=8`).
 const BLOCK_AREA_KEYS: [&str; 2] = ["addr:quarter", "addr:neighbourhood"];
 
-/// The address `addr:*` tags state, if they name a house number and a street
-/// or place, or a number of the block scheme.
-///
-/// A block scheme address has an `addr:block_number`, or a house number in
-/// an `addr:quarter` or `addr:neighbourhood`, and no street. Its number is
-/// the block and house numbers joined as they are written, `10-8`, or the
-/// one of them it has, and its areas say where the block is.
 pub(crate) fn address_components(
     tags: &BTreeMap<String, String>,
 ) -> std::result::Result<AddressComponents, CandidateIssue> {
@@ -131,9 +121,6 @@ pub(crate) fn collect_clean_tags<'a>(
     .collect()
 }
 
-/// An object's `addr:*` tags, and, when it states an address and is a
-/// building, its `building` and `name` tags, which say the building the
-/// address is drawn as.
 pub(crate) fn collect_addr_tags_from_map(
     tags: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
@@ -152,8 +139,6 @@ pub(crate) fn collect_addr_tags_from_map(
     kept
 }
 
-/// The building an object's tags draw it as: a `building` tag other than
-/// `no`, named by its `name` tag.
 pub(crate) fn building_of(tags: &BTreeMap<String, String>) -> Option<Building> {
     tags.cleaned("building").filter(|value| value != "no")?;
     Some(Building {
@@ -287,7 +272,6 @@ mod tests {
             locality(&[("addr:city", "Auckland"), ("addr:hamlet", "Waimauku")]).as_deref(),
             Some("Auckland")
         );
-        // A suburb is an area of the locality, not the locality.
         assert_eq!(locality(&[("addr:suburb", "Grey Lynn")]), None);
     }
 

@@ -1,10 +1,3 @@
-//! Byte-level encoding shared by the Pack format and the build scratch files.
-//!
-//! Integers use LEB128 varints; signed values are zigzag-mapped first so small
-//! magnitudes of either sign stay small. Readers advance a `&[u8]` cursor and
-//! report truncation as an error instead of panicking, because Pack bytes come
-//! from disk.
-
 use crate::{
     error::{Error, Result},
     record::{Entrance, Extent},
@@ -56,7 +49,6 @@ pub(crate) fn get_extent(input: &mut &[u8]) -> Result<Extent> {
     Ok(extent)
 }
 
-/// A presence byte, then the extent it flags.
 pub(crate) fn put_opt_extent(out: &mut Vec<u8>, extent: Option<Extent>) {
     out.push(u8::from(extent.is_some()));
     if let Some(extent) = extent {
@@ -72,7 +64,6 @@ pub(crate) fn get_opt_extent(input: &mut &[u8]) -> Result<Option<Extent>> {
     }
 }
 
-/// A count, then each entrance as its longitude, its latitude and its kind.
 pub(crate) fn put_entrances(out: &mut Vec<u8>, entrances: &[Entrance]) {
     put_u64(out, entrances.len() as u64);
     for entrance in entrances {
@@ -84,7 +75,6 @@ pub(crate) fn put_entrances(out: &mut Vec<u8>, entrances: &[Entrance]) {
 
 pub(crate) fn get_entrances(input: &mut &[u8]) -> Result<Vec<Entrance>> {
     let count = get_u64(input)?;
-    // Each takes at least three bytes, so a corrupt count allocates nothing.
     if count > input.len() as u64 {
         return Err(Error::Decode("entrances are truncated"));
     }
@@ -166,19 +156,12 @@ pub(crate) fn get_opt_string(input: &mut &[u8]) -> Result<Option<String>> {
     }
 }
 
-/// What the value before in a scratch block leaves for the next one to be
-/// coded against. A block starts from the default, so blocks decode on
-/// their own and in parallel.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Delta {
     int: i64,
     bytes: Vec<u8>,
 }
 
-/// An integer as its difference from the one before. Sorted ids and
-/// Hilbert keys differ from their neighbours by little, so most take a
-/// byte or two instead of up to ten. Wrapping, so a value of any size and
-/// either order round-trips.
 pub(crate) fn put_delta(out: &mut Vec<u8>, delta: &mut Delta, value: i64) {
     put_i64(out, value.wrapping_sub(delta.int));
     delta.int = value;
@@ -190,9 +173,6 @@ pub(crate) fn get_delta(input: &mut &[u8], delta: &mut Delta) -> Result<i64> {
     Ok(value)
 }
 
-/// Bytes front coded against the ones before: the length of the prefix
-/// both share, then the rest. Sort keys that start with a cell, a street or
-/// a name share most of their bytes with their neighbours in a sorted run.
 pub(crate) fn put_front(out: &mut Vec<u8>, delta: &mut Delta, bytes: &[u8]) {
     let shared = delta
         .bytes
@@ -206,7 +186,6 @@ pub(crate) fn put_front(out: &mut Vec<u8>, delta: &mut Delta, bytes: &[u8]) {
     delta.bytes.extend_from_slice(&bytes[shared..]);
 }
 
-/// The bytes [`put_front`] wrote, borrowed from `delta` until the next call.
 pub(crate) fn get_front<'a>(input: &mut &[u8], delta: &'a mut Delta) -> Result<&'a [u8]> {
     let shared = usize::try_from(get_u64(input)?)
         .map_err(|_| Error::Decode("length does not fit in usize"))?;

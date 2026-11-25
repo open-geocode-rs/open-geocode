@@ -78,7 +78,6 @@ pub fn poi_label(
     .join(", ")
 }
 
-/// "Ponsonby Road, Auckland": a street and the locality it lies in.
 pub fn street_label(name: &str, locality: Option<&str>) -> String {
     match locality {
         Some(locality) if !locality.is_empty() => format!("{name}, {locality}"),
@@ -95,7 +94,6 @@ pub fn interpolation_name(components: &InterpolationAddressComponents) -> String
         .to_string()
 }
 
-/// "825 College Street": a house number estimated on an interpolation range.
 pub fn estimated_address_name(
     number: u32,
     components: &InterpolationAddressComponents,
@@ -107,7 +105,6 @@ pub fn estimated_address_name(
         .map(|street_or_place| format!("{number} {street_or_place}"))
 }
 
-/// The label of an estimated address, laid out like an address label.
 pub fn estimated_address_label(
     number: u32,
     components: &InterpolationAddressComponents,
@@ -180,8 +177,6 @@ pub fn derived_country_id(code: &str) -> String {
     format!("derived:country:{code}")
 }
 
-/// A house number placed between two stated numbers, by the ids of their
-/// records.
 pub fn estimated_address_id(number: u32, low_id: &str, high_id: &str) -> String {
     format!("derived:estimate:{number}:{low_id}:{high_id}")
 }

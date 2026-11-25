@@ -1,19 +1,3 @@
-//! The structured index: sections of a Pack that answer the common query, a house
-//! number on a named street, without a text search. Built from the sealed
-//! Pack in one pass over its text index, and added to it before it is
-//! published (see [`add_to`]).
-//!
-//! Three maps. `streets` from a street and country to the street's
-//! documents, sorted by map cell (see [`cell`]), so the documents inside a
-//! place are a few ranges of the list. `places` from a place name and
-//! country to its footprint: the cells where the Pack's records use that
-//! name, from their own locality, region and postcode values, every name of
-//! every area of their chain, and the areas themselves. `cell streets` from
-//! a cell to the streets in it, for a misspelt street found near the places
-//! a query names. Every key is written as the parser writes a query (see
-//! [`crate::search::TextSearcher::structured_keys`]). The country goes last,
-//! so a query that names none reads every country with one range scan.
-
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashSet},
@@ -41,35 +25,20 @@ use crate::{
     search::TextSearcher,
 };
 
-/// Between the parts of a key. No parser word holds a control character.
 pub(crate) const SEPARATOR: u8 = 0x1f;
-/// A run entry of `cell streets`, as cell, street and country. Its document
-/// is always zero.
 const CELL_TAG: u8 = b'C';
-/// A run entry of `places`, as name and country. Its document is a cell.
 const PLACE_TAG: u8 = b'P';
-/// A run entry of `streets`, as street and country.
 const STREET_TAG: u8 = b'Z';
-/// Documents keyed per run file: a run is sorted in memory, and 2M
-/// documents' keys, places with them, fit in a few gigabytes.
 const RUN_DOCUMENTS: u32 = 1 << 21;
-/// Documents keyed together. Neighbouring documents share most places and
-/// cells, so a chunk's entries are deduplicated before they join a run:
-/// every name of every area of every address would not fit in memory.
 const CHUNK_DOCUMENTS: u32 = 4096;
 const META_FILE: &str = "meta.json";
 const STREET_FILE: &str = "streets.fst";
 const LISTS_FILE: &str = "docs.u32";
-/// The cell of each document, by document id: the build's own, to sort a
-/// street's documents by; the Pack keeps none, a document's cell follows
-/// from its extent (see [`crate::search::TextSearcher::doc_cell`]).
 const DOC_CELLS_FILE: &str = "doc-cells.u32";
 const PLACE_FILE: &str = "places.fst";
 const PLACE_RECORDS_FILE: &str = "places.rec";
 const PLACE_CELLS_FILE: &str = "places.u32";
 const CELL_STREET_FILE: &str = "cell-streets.fst";
-/// The Pack section each file of a build goes into, the meta first: a Pack
-/// holds the structured index when it holds its meta.
 const SECTIONS: [(&str, &str); 7] = [
     ("streets/meta", META_FILE),
     ("streets/keys", STREET_FILE),
@@ -80,27 +49,15 @@ const SECTIONS: [(&str, &str); 7] = [
     ("streets/by_cell", CELL_STREET_FILE),
 ];
 const SECTION_VERSION: u32 = 1;
-/// A list's length in the low bits of its map value, its offset above.
 const LENGTH_BITS: u32 = 24;
-/// A place used in more cells than this (a region, a large city) keeps only
-/// its extent: a list that long filters little a box does not, and costs a
-/// query more to read.
 pub(crate) const PLACE_CELLS: usize = 4096;
-/// An area record adds every cell of its extent up to this many, about
-/// 32 by 32 km; a larger one adds its corners, which keep its extent.
 pub(crate) const AREA_CELLS: usize = 1024;
-/// Extent and cell list of one place, see [`Place`].
 const PLACE_RECORD_BYTES: usize = 24;
 
-/// Grid rows: 0.009 degrees of latitude each, about one kilometre.
 const ROW_E7: i64 = 90_000;
 const ROWS: u32 = 20_000;
-/// Columns at the equator, 0.009 degrees of longitude each.
 const EQUATOR_COLUMNS: f64 = 40_000.0;
 
-/// How many columns grid row `row` has: as many as keep a cell about one
-/// kilometre wide at its latitude, so a ring of cells is about the same
-/// size anywhere.
 fn columns(row: u32) -> u32 {
     static COLUMNS: OnceLock<Vec<u32>> = OnceLock::new();
     COLUMNS.get_or_init(|| {
@@ -122,17 +79,11 @@ fn column_of(row: u32, lon: i32) -> u32 {
     ((i64::from(lon) + 1_800_000_000) * count / 3_600_000_000).clamp(0, count - 1) as u32
 }
 
-/// The map cell of a point in 1e-7 degrees: a fixed grid of rows of
-/// latitude, each cut into as many columns as keep its cells about a
-/// kilometre square. Chosen over S2 or H3 for needing no library and for
-/// ids that sort row by row, so the cells of a box are one range per row.
 pub(crate) fn cell(lon: i32, lat: i32) -> u32 {
     let row = row_of(lat);
     row << 16 | column_of(row, lon)
 }
 
-/// The box `[min_lon, min_lat, max_lon, max_lat]` of `cell` in 1e-7
-/// degrees.
 pub(crate) fn cell_box(cell: u32) -> [i32; 4] {
     let (row, column) = (cell >> 16, i64::from(cell & 0xFFFF));
     let count = i64::from(columns(row));
@@ -147,9 +98,6 @@ pub(crate) fn cell_box(cell: u32) -> [i32; 4] {
     ]
 }
 
-/// `cell` and the cells around it, sorted. A row above or below may have a
-/// column more or less, so the ring holds every cell there that touches
-/// the columns beside `cell`'s.
 pub(crate) fn ring(cell: u32) -> Vec<u32> {
     let (row, column) = (cell >> 16, cell & 0xFFFF);
     let count = u64::from(columns(row));
@@ -168,8 +116,6 @@ pub(crate) fn ring(cell: u32) -> Vec<u32> {
     ring
 }
 
-/// The cells of the box `[min_lon, min_lat, max_lon, max_lat]`, `None` when
-/// more than `limit`.
 pub(crate) fn box_cells(extent: [i32; 4], limit: usize) -> Option<Vec<u32>> {
     let mut cells = Vec::new();
     for (row, west, east) in box_rows(extent) {
@@ -183,7 +129,6 @@ pub(crate) fn box_cells(extent: [i32; 4], limit: usize) -> Option<Vec<u32>> {
     Some(cells)
 }
 
-/// The rows of the box `extent`, each with its first and last column in it.
 pub(crate) fn box_rows(extent: [i32; 4]) -> impl Iterator<Item = (u32, u32, u32)> {
     let [west, south, east, north] = extent;
     (row_of(south)..=row_of(north))
@@ -192,27 +137,18 @@ pub(crate) fn box_rows(extent: [i32; 4]) -> impl Iterator<Item = (u32, u32, u32)
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Meta {
-    /// The text index's segments and their document counts, in the order
-    /// a searcher reads them: a document's id is its id in its segment plus
-    /// the counts of the segments before it.
     segments: Vec<(String, u32)>,
     max_doc: u32,
     keyed_documents: u64,
     street_keys: u64,
-    /// Street names keyed a second way, their ambiguous abbreviations left
-    /// out as a type rather than expanded (see
-    /// [`crate::search::TextSearcher::street_keys`]).
     second_street_keys: u64,
     place_keys: u64,
-    /// Places past [`PLACE_CELLS`], kept as an extent.
     capped_places: u64,
-    /// Cells per place: 50th, 90th, 99th percentile and largest.
     place_cells: [u64; 4],
     cell_street_keys: u64,
     entries: u64,
 }
 
-/// The structured index of a Pack, read from its sections.
 pub struct StructuredIndex {
     streets: Map<Bytes>,
     lists: Bytes,
@@ -245,7 +181,6 @@ impl std::fmt::Debug for StructuredIndex {
     }
 }
 
-/// The documents of one street key in one country, sorted by cell.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StreetList {
     pub(crate) country: String,
@@ -259,8 +194,6 @@ impl StreetList {
     }
 }
 
-/// Where one place name of one country is used: its extent, and its cells
-/// unless there are more than [`PLACE_CELLS`].
 #[derive(Debug, Clone)]
 pub(crate) struct Place {
     pub(crate) name: String,
@@ -270,7 +203,6 @@ pub(crate) struct Place {
 }
 
 impl Place {
-    /// Whether only the extent is kept.
     pub(crate) fn capped(&self) -> bool {
         self.cells.is_none()
     }
@@ -314,11 +246,6 @@ impl StructuredIndex {
         }))
     }
 
-    /// The lists of the street keyed `street` in `countries` (any when
-    /// empty), and of the same name with a direction word more or less at
-    /// either end: one source's "roosevelt blvd" is another's "e roosevelt
-    /// blvd". Whether such a list is the same road is for its records'
-    /// places and points to tell (see [`crate::search::road`]).
     pub(crate) fn street_lists(&self, street: &str, countries: &[String]) -> Vec<StreetList> {
         let mut found = self.street_lists_keyed(street, countries);
         for other in direction_spellings(street) {
@@ -331,7 +258,6 @@ impl StructuredIndex {
         found
     }
 
-    /// The lists of the street keyed exactly `street` in `countries`.
     fn street_lists_keyed(&self, street: &str, countries: &[String]) -> Vec<StreetList> {
         let mut found = Vec::new();
         scan(
@@ -354,13 +280,10 @@ impl StructuredIndex {
         found
     }
 
-    /// Document `index` of `list`.
     pub(crate) fn list_doc(&self, list: &StreetList, index: usize) -> DocId {
         u32_at(&self.lists, (list.offset + index) * 4)
     }
 
-    /// The positions in `list` of its documents in cells `first` to `last`,
-    /// each document's cell read by `cell_of`.
     pub(crate) fn list_range(
         &self,
         list: &StreetList,
@@ -383,9 +306,6 @@ impl StructuredIndex {
         (bound(first), bound(last.saturating_add(1)))
     }
 
-    /// The places keyed `name` in `countries` (any when empty), or when
-    /// `fuzzy` those one edit from it with its first character as written,
-    /// as a typo keeps it.
     pub(crate) fn places(&self, name: &str, countries: &[String], fuzzy: bool) -> Vec<Place> {
         let mut found = Vec::new();
         scan(
@@ -420,7 +340,6 @@ impl StructuredIndex {
         found
     }
 
-    /// The cells of `place`, sorted; empty when only its extent is kept.
     pub(crate) fn place_cells(&self, place: &Place) -> Vec<u32> {
         let Some((offset, len)) = place.cells else {
             return Vec::new();
@@ -433,8 +352,6 @@ impl StructuredIndex {
             .collect()
     }
 
-    /// Whether a document in `cell` at `lon`, `lat` lies in `place`: in or
-    /// beside one of its cells, or inside its extent when only that is kept.
     pub(crate) fn place_holds(&self, place: &Place, cell: u32, lon: i32, lat: i32) -> bool {
         let Some((offset, len)) = place.cells else {
             let [west, south, east, north] = place.extent;
@@ -456,7 +373,6 @@ impl StructuredIndex {
         })
     }
 
-    /// The streets in `cells` in `countries` (any when empty), each once.
     pub(crate) fn streets_in(&self, cells: &[u32], countries: &[String]) -> Vec<String> {
         let mut found = HashSet::new();
         for cell in cells {
@@ -486,11 +402,6 @@ impl StructuredIndex {
     }
 }
 
-/// Visit the keys of `map` that are `prefix` then `word` (or when `fuzzy`
-/// a word one edit from it with its first character as written), then a
-/// separator and a country when `tail`, else nothing. `visit` gets the
-/// word part, the country and the value, and stops the scan with `false`,
-/// which is returned.
 fn scan(
     map: &Map<Bytes>,
     prefix: &[u8],
@@ -549,9 +460,6 @@ fn scan(
     true
 }
 
-/// Keys whose word part is within a Levenshtein automaton of the one
-/// sought, after a literal prefix, then a separator and any country when
-/// `tail`, else the end of the key.
 struct KeyAutomaton<'a> {
     prefix: &'a [u8],
     dfa: &'a DFA,
@@ -608,32 +516,20 @@ impl Automaton for KeyAutomaton<'_> {
     }
 }
 
-/// What [`TextSearcher::structured_keys`] reads of one document.
 #[derive(Debug, Default)]
 pub(crate) struct Keyed {
-    /// The cell of the middle of its extent, when it is on a street.
     pub(crate) cell: u32,
     pub(crate) country: String,
-    /// Every key of every street it is on (or is).
     pub(crate) streets: Vec<String>,
-    /// The one key per street a misspelt street is matched against.
     pub(crate) canonical: Vec<String>,
-    /// How many of its streets have a second key.
     pub(crate) second_keys: u64,
-    /// Place names it states or is, and its postcodes.
     pub(crate) names: Vec<String>,
-    /// The areas of its chain, or the area it is, whose every name holds it.
     pub(crate) areas: Vec<u32>,
-    /// The cells it covers.
     pub(crate) cells: Vec<u32>,
 }
 
-/// Every name of every area, by area id: the Pack's own lists of the areas
-/// each name names (see [`crate::parse::lattice::dictionary`]), turned
-/// round.
 struct AreaNames {
     names: Vec<String>,
-    /// Area id and index into `names`, sorted.
     pairs: Vec<(u32, u32)>,
 }
 
@@ -660,7 +556,6 @@ impl AreaNames {
     }
 }
 
-/// The run entries and cells of the documents `begin..end`.
 struct Chunk {
     cells: Vec<u32>,
     entries: Vec<(Vec<u8>, u32)>,
@@ -731,9 +626,6 @@ fn key_chunk(
     Ok(chunk)
 }
 
-/// Build the structured index of the sealed Pack `sealed` and add it to the Pack:
-/// one pass over its text index's documents into files beside it, each then
-/// copied into a section of its own.
 pub fn add_to(sealed: &mut pack::SealedPack) -> Result<()> {
     let out = sealed.generation().join("structured.tmp");
     if out.exists() {
@@ -749,7 +641,6 @@ pub fn add_to(sealed: &mut pack::SealedPack) -> Result<()> {
     Ok(())
 }
 
-/// Build the structured index of the Pack at `pack_path` into the directory `out`.
 fn build(pack_path: &Path, out: &Path) -> Result<()> {
     let pack = Arc::new(pack::Reader::open(pack_path)?);
     let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
@@ -797,8 +688,6 @@ fn build(pack_path: &Path, out: &Path) -> Result<()> {
         entries.dedup();
         let path = scratch.join(format!("run-{:05}.bin", runs.len()));
         let mut writer = BufWriter::with_capacity(1 << 20, fs::File::create(&path)?);
-        // Sorted keys share most of each one's start with the one before:
-        // written whole, a planet's runs outgrow the disk.
         let mut previous: &[u8] = &[];
         for (key, doc) in &entries {
             let shared = previous
@@ -836,7 +725,6 @@ fn write_varint(writer: &mut impl Write, mut value: u32) -> io::Result<()> {
     writer.write_all(&[value as u8])
 }
 
-/// `None` at the end of the file.
 fn read_varint(reader: &mut impl Read) -> io::Result<Option<u32>> {
     let mut value = 0u32;
     for shift in (0..35).step_by(7) {
@@ -860,7 +748,6 @@ fn read_varint(reader: &mut impl Read) -> io::Result<Option<u32>> {
 
 struct Run {
     reader: BufReader<fs::File>,
-    /// The key read last, which the next shares its start with.
     key: Vec<u8>,
 }
 
@@ -880,7 +767,6 @@ impl Run {
     }
 }
 
-/// The maps being written, in key order.
 struct Writers {
     streets: MapBuilder<BufWriter<fs::File>>,
     places: MapBuilder<BufWriter<fs::File>>,
@@ -890,9 +776,7 @@ struct Writers {
     place_records: BufWriter<fs::File>,
     place_cells: BufWriter<fs::File>,
     place_offset: u64,
-    /// Cells of each place.
     sizes: Vec<u32>,
-    /// The cell of each document (see [`DOC_CELLS_FILE`]).
     doc_cells: Mmap,
 }
 
@@ -904,7 +788,6 @@ impl Writers {
             .map_or(0, |bytes| u32_at(bytes, 0))
     }
 
-    /// Write the documents (or cells) of one run key.
     fn flush(&mut self, key: &[u8], docs: &mut Vec<DocId>, meta: &mut Meta) -> Result<()> {
         docs.dedup();
         let rest = &key[1..];
@@ -966,7 +849,6 @@ impl Writers {
     }
 }
 
-/// Merge the sorted runs into the three maps and their lists.
 fn merge(runs: &[PathBuf], out: &Path, meta: &mut Meta) -> Result<()> {
     let mut readers = runs
         .iter()
@@ -1034,8 +916,6 @@ fn merge(runs: &[PathBuf], out: &Path, meta: &mut Meta) -> Result<()> {
     Ok(())
 }
 
-/// The words a street name may lead or end with to state its direction,
-/// abbreviated and in full.
 const DIRECTION_WORDS: [&str; 16] = [
     "n",
     "s",
@@ -1055,9 +935,6 @@ const DIRECTION_WORDS: [&str; 16] = [
     "southwest",
 ];
 
-/// `street` with a direction word added at either end, or, when it leads
-/// or ends with one, without it. A name of one word besides the direction
-/// keeps it: "north street" is a name, not a direction.
 fn direction_spellings(street: &str) -> Vec<String> {
     let words = street.split_whitespace().collect::<Vec<_>>();
     let is_direction = |word: &str| DIRECTION_WORDS.contains(&word);
@@ -1080,7 +957,6 @@ fn direction_spellings(street: &str) -> Vec<String> {
     out
 }
 
-/// The run key of `street` in `country`: a `streets` entry.
 pub(crate) fn street_key(street: &str, country: &str) -> Vec<u8> {
     let mut key = vec![STREET_TAG];
     key.extend(street.as_bytes());
@@ -1089,7 +965,6 @@ pub(crate) fn street_key(street: &str, country: &str) -> Vec<u8> {
     key
 }
 
-/// The run key of place `name` in `country`: a `places` entry.
 fn place_key(name: &str, country: &str) -> Vec<u8> {
     let mut key = vec![PLACE_TAG];
     key.extend(name.as_bytes());
@@ -1098,7 +973,6 @@ fn place_key(name: &str, country: &str) -> Vec<u8> {
     key
 }
 
-/// The run key of `street` in `cell` of `country`: a `cell streets` entry.
 fn cell_street_key(cell: u32, street: &str, country: &str) -> Vec<u8> {
     let mut key = vec![CELL_TAG];
     key.extend(cell.to_be_bytes());

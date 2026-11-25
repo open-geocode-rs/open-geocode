@@ -1,6 +1,3 @@
-//! Address token labels shared by the parser and the parse benchmark.
-
-/// The role a query token plays in an address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Label {
     HouseNumber,
@@ -25,7 +22,6 @@ impl Label {
         Label::Other,
     ];
 
-    /// The snake_case name used in TSV fixtures.
     pub fn name(self) -> &'static str {
         match self {
             Label::HouseNumber => "house_number",
@@ -44,15 +40,12 @@ impl Label {
     }
 }
 
-/// One query token with its label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tagged {
     pub token: String,
     pub label: Label,
 }
 
-/// Anything that labels the tokens of a free-text address query.
 pub trait Tagger {
-    /// Label every whitespace-separated token of the normalized query, in order.
     fn tag(&self, query: &str) -> Vec<Tagged>;
 }

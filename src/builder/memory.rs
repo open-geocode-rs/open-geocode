@@ -1,23 +1,3 @@
-//! Build memory accounting.
-//!
-//! One [`Budget`] is shared by every large buffer of a build: sort
-//! buffers (counted by capacity, so `Vec` growth is included), merge read
-//! buffers, the text indexing buffers and the parser's lattice cache. A
-//! buffer reserves bytes before it grows; when the pool is full its owner
-//! spills to disk instead. Buffers that can spill hold a [`Spillable`]
-//! reservation, and each of them may hold a fair share of what the buffers
-//! that cannot spill leave, as DataFusion's `FairSpillPool` does: a sorter
-//! open alone may take the whole pool, and four take a quarter each.
-//!
-//! The limit is derived from the memory the process can use
-//! ([`derived_budget`]), within [`MIN_BUDGET_BYTES`] and
-//! [`MAX_DERIVED_BUDGET_BYTES`], unless `--memory-budget-mb` sets it. The pool also
-//! refuses to grow once the heap itself, counted by the global allocator
-//! ([`crate::alloc`]), would pass a ceiling below the memory that was
-//! available, so memory nobody reserved (boundaries, maps, Tantivy's own)
-//! makes the tracked buffers spill sooner instead of the machine paging.
-//! The build report records the peaks.
-
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -25,34 +5,12 @@ use std::sync::{
 
 use crate::{alloc, resources::Resources};
 
-/// The share of usable memory the derived budget takes. The rest is headroom
-/// for what the pool does not track and for the page cache that keeps the
-/// Pack and the input resident: DuckDB takes 80% of memory, ClickHouse
-/// spills at half, GNU sort leaves a quarter.
 const BUDGET_PERCENT: u64 = 50;
-/// The heap may grow by at most this share of the memory available when the
-/// pool was last sampled before tracked buffers must spill.
 const HEAP_CEILING_PERCENT: u64 = 85;
-/// Least fair share while buffers that cannot spill hold the pool, such as
-/// the node store while ways are assembled. A share of nothing makes a
-/// sorter write a run per item, 1.2 million street runs for the Netherlands
-/// at a 1 GiB budget.
 const MIN_FAIR_SHARE_BYTES: usize = 16 << 20;
-/// The smallest derived budget: below it, sorters spill so often that a
-/// build drowns in tiny run files.
 pub const MIN_BUDGET_BYTES: usize = 256 << 20;
-/// The largest derived budget. Past it a build gets slower, not faster:
-/// sorting, hashing and indexing in buffers far larger than the CPU caches
-/// cost more than the spill they save. Germany with a 6.2 GiB budget took
-/// 57, 63 and 278 s to scan, join nodes and write records, against 49, 46
-/// and 194 s with 1 GiB, on either allocator, while spilling 9.8 GB instead
-/// of 15.0 GB to an SSD that was never the bottleneck.
 pub const MAX_DERIVED_BUDGET_BYTES: usize = 1 << 30;
 
-/// The budget of a build that expects `untracked_bytes` of memory outside
-/// the pool: half of what it can use, between [`MIN_BUDGET_BYTES`] and
-/// [`MAX_DERIVED_BUDGET_BYTES`]. A small machine gets less, so the build
-/// spills sooner instead of paging.
 pub fn derived_budget(resources: &Resources, untracked_bytes: u64) -> usize {
     let usable = resources
         .available_memory_bytes
@@ -67,14 +25,10 @@ pub fn derived_budget(resources: &Resources, untracked_bytes: u64) -> usize {
 pub struct Budget {
     limit: usize,
     used: AtomicUsize,
-    /// Bytes reserved by buffers that can spill.
     spillable_used: AtomicUsize,
-    /// Buffers that can spill and are open.
     spillable: AtomicUsize,
     peak: AtomicUsize,
-    /// Most bytes reserved at once since [`Budget::reset_stage_peak`].
     stage_peak: AtomicUsize,
-    /// The most bytes the heap may hold before reservations are refused.
     heap_ceiling: AtomicUsize,
 }
 
@@ -91,7 +45,6 @@ impl Budget {
         })
     }
 
-    /// A budget that never refuses, for writers used outside a build.
     pub fn unlimited() -> Arc<Self> {
         Self::new(usize::MAX)
     }
@@ -104,25 +57,18 @@ impl Budget {
         self.used.load(Ordering::Relaxed)
     }
 
-    /// Most bytes reserved at once.
     pub fn peak(&self) -> usize {
         self.peak.load(Ordering::Relaxed)
     }
 
-    /// Most bytes reserved at once since the last call to
-    /// [`Budget::reset_stage_peak`].
     pub fn stage_peak(&self) -> usize {
         self.stage_peak.load(Ordering::Relaxed)
     }
 
-    /// Start a new stage's peak from what is reserved now.
     pub fn reset_stage_peak(&self) {
         self.stage_peak.store(self.used(), Ordering::Relaxed);
     }
 
-    /// Let the heap grow by a share of what `resources` found available.
-    /// Called when a build starts and again at stage boundaries, by when
-    /// other processes and the page cache have moved.
     pub fn sample(&self, resources: &Resources) {
         let Some(live) = alloc::live_bytes() else {
             return;
@@ -135,11 +81,6 @@ impl Budget {
         );
     }
 
-    /// The bytes one buffer that can spill may hold: a fair share of what
-    /// the buffers that cannot spill leave of the pool, and at least
-    /// [`MIN_FAIR_SHARE_BYTES`]. A full pool still lets each buffer grow to
-    /// the floor, so the floor is capped at half a fair share of the whole
-    /// pool. All floors together go at most half the limit over it.
     pub fn fair_share(&self) -> usize {
         let unspillable = self
             .used()
@@ -149,15 +90,12 @@ impl Budget {
         (self.limit.saturating_sub(unspillable) / spillable).max(floor)
     }
 
-    /// Reserve `bytes` if they fit, in the pool and under the heap ceiling.
     fn try_reserve(&self, bytes: usize, spillable: bool) -> bool {
         if let Some(live) = alloc::live_bytes()
             && live.saturating_add(bytes) > self.heap_ceiling.load(Ordering::Relaxed)
         {
             return false;
         }
-        // Nothing to add: only whether the pool is within its limit, as the
-        // loop would answer, without writing to the pool's cache line.
         if bytes == 0 {
             return self.used() <= self.limit;
         }
@@ -183,8 +121,6 @@ impl Budget {
         }
     }
 
-    /// Reserve `bytes` even past the limit: the minimum a caller needs to make
-    /// progress, such as a single item after spilling everything else.
     fn force_reserve(&self, bytes: usize, spillable: bool) {
         let next = self
             .used
@@ -205,10 +141,6 @@ impl Budget {
     }
 }
 
-/// Bytes held from a budget, returned when dropped.
-/// Raise `peak` to `value`. Reading first leaves the cache line shared while
-/// the peak stands, as it does on nearly every call: `fetch_max` takes it
-/// exclusive even when it changes nothing.
 fn raise(peak: &AtomicUsize, value: usize) {
     if peak.load(Ordering::Relaxed) < value {
         peak.fetch_max(value, Ordering::Relaxed);
@@ -223,7 +155,6 @@ pub struct Reservation {
 }
 
 impl Reservation {
-    /// A reservation of a buffer that cannot spill.
     pub fn empty(budget: &Arc<Budget>) -> Self {
         Self {
             budget: Arc::clone(budget),
@@ -232,7 +163,6 @@ impl Reservation {
         }
     }
 
-    /// A reservation that is granted regardless of the limit.
     pub fn forced(budget: &Arc<Budget>, bytes: usize) -> Self {
         let mut reservation = Self::empty(budget);
         reservation.force_grow(bytes);
@@ -261,8 +191,6 @@ impl Reservation {
         self.bytes = 0;
     }
 
-    /// Move everything reserved to a new reservation, as a buffer handed to
-    /// another thread takes its bytes along: the pool sees no change.
     pub fn take(&mut self) -> Self {
         let bytes = std::mem::take(&mut self.bytes);
         Self {
@@ -279,8 +207,6 @@ impl Drop for Reservation {
     }
 }
 
-/// The reservation of a buffer that can spill. While it lives the pool's
-/// fair share is split with it.
 #[derive(Debug)]
 pub struct Spillable {
     reservation: Reservation,
@@ -298,7 +224,6 @@ impl Spillable {
         }
     }
 
-    /// The bytes this buffer may hold now, at most `cap`.
     pub fn share(&self, cap: usize) -> usize {
         self.reservation.budget.fair_share().min(cap).max(1)
     }
@@ -311,8 +236,6 @@ impl Spillable {
         self.reservation.bytes()
     }
 
-    /// Keep what is reserved as a buffer that no longer spills or grows,
-    /// such as a sorter's sorted buffer being read.
     pub fn into_reservation(mut self) -> Reservation {
         let bytes = self.reservation.bytes();
         self.reservation.release_all();
@@ -363,7 +286,6 @@ mod tests {
         assert_eq!(second.share(100), 100);
         let kept = first.into_reservation();
         assert_eq!(kept.bytes(), 300);
-        // The kept buffer no longer spills, so it is taken off the pool first.
         assert_eq!(second.share(usize::MAX), 500);
         drop(kept);
         drop(second);
@@ -377,7 +299,6 @@ mod tests {
         let first = Spillable::new(&budget);
         assert_eq!(first.share(usize::MAX), MIN_FAIR_SHARE_BYTES);
         assert_eq!(first.share(1_000), 1_000);
-        // A small pool's floor is half a fair share of it.
         let small = Budget::new(1_000);
         let _fixed = Reservation::forced(&small, 1_000);
         let buffers = [Spillable::new(&small), Spillable::new(&small)];
@@ -392,7 +313,6 @@ mod tests {
         let handed = buffer.reservation().take();
         assert_eq!((buffer.bytes(), handed.bytes()), (0, 300));
         assert_eq!(budget.used(), 300);
-        // Still a buffer that could have spilled: not taken off the pool.
         assert_eq!(buffer.share(usize::MAX), 1_000);
         budget.reset_stage_peak();
         drop(handed);

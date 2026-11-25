@@ -1,11 +1,7 @@
-//! Response field masks: a comma-separated list of dotted paths naming the
-//! fields to return, such as `places.displayName,places.id`, or `*` for all.
-
 use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-/// The fields a client asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FieldMask {
     All,
@@ -19,7 +15,6 @@ pub(crate) enum Node {
 }
 
 impl FieldMask {
-    /// Reads a mask. `None` when it names no field, which is no mask.
     pub(crate) fn parse(mask: &str) -> Option<Self> {
         let mut root = Node::Fields(BTreeMap::new());
         let mut any = false;
@@ -57,8 +52,6 @@ impl FieldMask {
         }
     }
 
-    /// Whether the mask keeps the field at `path`, or a field inside it.
-    /// No mask, or `*`, keeps every field.
     pub(crate) fn asks(mask: Option<&Self>, path: &[&str]) -> bool {
         let Some(Self::Paths(node)) = mask else {
             return true;
@@ -76,8 +69,6 @@ impl FieldMask {
         true
     }
 
-    /// Drops every field the mask leaves out. Arrays are masked element by
-    /// element, so `places.id` keeps the `id` of every place.
     pub(crate) fn apply(&self, value: &mut Value) {
         if let Self::Paths(node) = self {
             node.apply(value);
