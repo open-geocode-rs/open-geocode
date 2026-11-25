@@ -196,18 +196,22 @@ fn serve_pack(pack: PathBuf, bind: SocketAddr) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(serve(ServeOptions {
-            pack,
-            demo: None,
-            bind,
-            basemap: None,
-            job_dir: None,
-            limits: Limits::DEFAULT,
-            hook_hosts: Vec::new(),
-            public_url: None,
-            shutdown_timeout: Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
-        }))
+        .block_on(serve(serve_options(pack, bind)))
         .map_err(Into::into)
+}
+
+fn serve_options(pack: PathBuf, bind: SocketAddr) -> ServeOptions {
+    ServeOptions {
+        pack,
+        demo: None,
+        bind,
+        basemap: None,
+        job_dir: None,
+        limits: Limits::DEFAULT,
+        hook_hosts: Vec::new(),
+        public_url: None,
+        shutdown_timeout: Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
+    }
 }
 
 /// How `og build` was asked to build.
@@ -546,27 +550,32 @@ mod tests {
         let dir = TempDir::new("og-shell");
         let pack = dir.join("pack");
         write_pack(&pack);
-        let free_address = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|free| free.local_addr())
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
             .unwrap();
-        let served = pack.clone();
-        std::thread::spawn(move || super::serve_pack(served, free_address));
-        let ready = std::time::Instant::now();
-        while ureq::get(&format!("http://{free_address}/readyz"))
-            .call()
-            .is_err()
-        {
-            assert!(
-                ready.elapsed() < std::time::Duration::from_secs(30),
-                "the server never got ready"
-            );
-            std::thread::yield_now();
-        }
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let bind = listener.local_addr().unwrap();
+        let options = open_geocode::runtime::ServeOptions {
+            job_dir: Some(dir.join("jobs")),
+            ..super::serve_options(pack.clone(), bind)
+        };
+        let (stopped_tx, stopped) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            let _ = stopped_tx.send(open_geocode::runtime::serve_on(listener, options).await);
+        });
         let engine = crate::engine::Engine::open(&pack).unwrap();
         let get = |path: &str| -> serde_json::Value {
-            let text = ureq::get(&format!("http://{free_address}{path}"))
+            let text = ureq::get(&format!("http://{bind}{path}"))
                 .call()
-                .unwrap()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "GET {path} failed with {error}, and the server ended with {:?}",
+                        stopped.recv_timeout(std::time::Duration::from_secs(1))
+                    )
+                })
                 .body_mut()
                 .read_to_string()
                 .unwrap();
