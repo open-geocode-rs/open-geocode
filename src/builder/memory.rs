@@ -1,3 +1,25 @@
+//! Build memory accounting.
+//!
+//! One [`Budget`] is shared by every large buffer of a build: sort
+//! buffers (counted by capacity, so `Vec` growth is included), merge read
+//! buffers, the text indexing buffers and the parser's lattice cache. A
+//! buffer reserves bytes before it grows; when the pool is full its owner
+//! spills to disk instead. Buffers that can spill hold a [`Spillable`]
+//! reservation, and each of them may hold a fair share of what the buffers
+//! that cannot spill leave, as DataFusion's `FairSpillPool` does: a sorter
+//! open alone may take the whole pool, and four take a quarter each.
+//!
+//! The limit is derived from the memory the process can use
+//! ([`derived_budget`]), within [`MIN_BUDGET_BYTES`] and
+//! [`MAX_DERIVED_BUDGET_BYTES`], unless `--memory-budget-mb` sets it. The pool also
+//! refuses to grow once the heap itself, counted by the global allocator
+//! ([`crate::alloc`]), would pass the budget and the heap the build holds
+//! outside it by design ([`Budget::limit_heap`]), or a ceiling below the
+//! memory that was available. Memory nobody reserved (the parser's
+//! dictionaries, maps, Tantivy's own) then makes the tracked buffers spill
+//! instead of the heap growing past the budget.
+//! The build report records the peaks.
+
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -30,6 +52,7 @@ pub struct Budget {
     peak: AtomicUsize,
     stage_peak: AtomicUsize,
     heap_ceiling: AtomicUsize,
+    heap_limit: AtomicUsize,
 }
 
 impl Budget {
@@ -42,6 +65,7 @@ impl Budget {
             peak: AtomicUsize::new(0),
             stage_peak: AtomicUsize::new(0),
             heap_ceiling: AtomicUsize::new(usize::MAX),
+            heap_limit: AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -74,13 +98,23 @@ impl Budget {
             return;
         };
         let room = resources.available_memory_bytes / 100 * HEAP_CEILING_PERCENT;
-        let ceiling = (live as u64).saturating_add(room);
+        let ceiling = usize::try_from((live as u64).saturating_add(room)).unwrap_or(usize::MAX);
         self.heap_ceiling.store(
-            usize::try_from(ceiling).unwrap_or(usize::MAX),
+            ceiling.min(self.heap_limit.load(Ordering::Relaxed)),
             Ordering::Relaxed,
         );
     }
 
+    pub fn limit_heap(&self, bytes: usize) {
+        self.heap_limit.store(bytes, Ordering::Relaxed);
+        self.heap_ceiling.fetch_min(bytes, Ordering::Relaxed);
+    }
+
+    /// The bytes one buffer that can spill may hold: a fair share of what
+    /// the buffers that cannot spill leave of the pool, and at least
+    /// [`MIN_FAIR_SHARE_BYTES`]. A full pool still lets each buffer grow to
+    /// the floor, so the floor is capped at half a fair share of the whole
+    /// pool. All floors together go at most half the limit over it.
     pub fn fair_share(&self) -> usize {
         let unspillable = self
             .used()

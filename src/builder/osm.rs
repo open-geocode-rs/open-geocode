@@ -2159,6 +2159,7 @@ fn sorter_of<T: Spill + Ord + Send + Sync + 'static>(
 
 fn budget_of(plan: &BuildPlan) -> Arc<Budget> {
     let memory = Budget::new(usize::try_from(plan.memory_budget_bytes).unwrap_or(usize::MAX));
+    memory.limit_heap(usize::try_from(plan.heap_limit_bytes()).unwrap_or(usize::MAX));
     memory.sample(&plan.resources);
     memory
 }

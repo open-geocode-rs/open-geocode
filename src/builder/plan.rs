@@ -148,6 +148,11 @@ impl BuildPlan {
         self.check()
     }
 
+    pub fn heap_limit_bytes(&self) -> u64 {
+        self.memory_budget_bytes + untracked_beside_boundaries(self.threads)
+    }
+
+    /// Set the needs from `items`.
     fn size(&mut self) {
         let items = &self.items;
         let least_budget = if self.memory_budget_derived {
@@ -307,13 +312,25 @@ fn derived_budget(resources: &Resources, threads: usize) -> u64 {
         .max(MIN_BUDGET_BYTES as u64)
 }
 
+/// Worker threads the build's pool runs: as many as `RAYON_NUM_THREADS`
+/// names, as the pool reads it, else every usable CPU.
+fn worker_threads(resources: &Resources) -> usize {
+    std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|threads| threads.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or(resources.usable_cpus)
+        .max(1)
+}
+
+/// The plan before any work, on `resources`.
 fn preflight(
     resources: Resources,
+    threads: usize,
     input_bytes: u64,
     imported_rows: u64,
     budget_override: Option<usize>,
 ) -> BuildPlan {
-    let threads = resources.usable_cpus.max(1);
     let memory_budget_bytes = budget_override.map_or_else(
         || derived_budget(&resources, threads),
         |budget| budget as u64,
@@ -369,6 +386,8 @@ pub(crate) fn plan_build_holding(
     force: bool,
     held: u64,
 ) -> Result<BuildPlan> {
+    let resources = Resources::probe();
+    let threads = worker_threads(&resources);
     let mut plan = BuildPlan {
         scratch_budget_bytes: scratch_budget,
         scratch_dir: scratch.to_path_buf(),
@@ -376,7 +395,8 @@ pub(crate) fn plan_build_holding(
         forced: force,
         held_scratch_bytes: held,
         ..preflight(
-            Resources::probe(),
+            resources,
+            threads,
             input_bytes,
             imported_rows,
             budget_override,
@@ -436,7 +456,7 @@ mod tests {
         let plan = plan_build(1 << 20, 0, &scratch, &scratch, None, None, false).expect("plan");
         assert!(plan.memory_budget_derived);
         assert!(plan.memory_budget_bytes >= MIN_BUDGET_BYTES as u64);
-        assert_eq!(plan.threads, plan.resources.usable_cpus.max(1));
+        assert_eq!(plan.threads, worker_threads(&plan.resources));
         assert!(plan.sorter_bytes <= MAX_DERIVED_BUDGET_BYTES as u64);
         let set =
             plan_build(1 << 20, 0, &scratch, &scratch, Some(64 << 20), None, false).expect("plan");
@@ -447,7 +467,7 @@ mod tests {
 
     #[test]
     fn a_small_machine_keeps_the_least_budget_and_every_worker() {
-        let small = preflight(machine(1), 1 << 30, 0, None);
+        let small = preflight(machine(1), 24, 1 << 30, 0, None);
         assert_eq!(small.memory_budget_bytes, MIN_BUDGET_BYTES as u64);
         assert_eq!(small.threads, 24);
     }
@@ -455,7 +475,7 @@ mod tests {
     #[test]
     fn the_planet_fits_this_machine_before_and_after_its_scan() {
         let disk = 233_000_000_000;
-        let planet = preflight(machine(28), 95_380_942_829, 0, None);
+        let planet = preflight(machine(28), 24, 95_380_942_829, 0, None);
         assert_eq!(planet.threads, 24);
         assert!(planet.memory_budget_bytes > 16 << 30);
         assert!(planet.items.needed_nodes > 3_000_000_000);
@@ -502,7 +522,7 @@ mod tests {
 
     #[test]
     fn coordinates_count_as_scratch_in_memory_or_mapped() {
-        let mut plan = preflight(machine(28), 200_000_000, 0, None);
+        let mut plan = preflight(machine(28), 24, 200_000_000, 0, None);
         plan.items.needed_nodes = 0;
         plan.size();
         let none = plan.scratch_disk_needed_bytes;
@@ -524,7 +544,7 @@ mod tests {
             scratch_dir: dir.clone(),
             output_dir: dir,
             scratch_budget_bytes: Some(1 << 30),
-            ..preflight(machine(28), 1 << 20, 0, None)
+            ..preflight(machine(28), 24, 1 << 20, 0, None)
         };
         plan.check().expect("a small input fits");
         let scanned = Scanned {

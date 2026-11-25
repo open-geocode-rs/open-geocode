@@ -490,13 +490,11 @@ fn run(
     };
     let plan = plan_osm_build(&options)?;
     *progress.plan.lock().expect("plan lock") = Some(plan.clone());
-    let threads = if std::env::var_os("RAYON_NUM_THREADS").is_some() {
-        0
-    } else {
-        plan.threads
-    };
+    // The process's global pool is the batch runs', sized to every CPU the
+    // first time one runs. The build gets a pool of its own, sized by the
+    // plan.
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
+        .num_threads(plan.threads)
         .build()
         .context("failed to start the build's worker threads")?;
     let started = Instant::now();

@@ -681,12 +681,11 @@ async fn main() -> Result<()> {
                 ..BuildOsmOptions::default()
             };
             let plan = plan_osm_build(&options)?;
-            if std::env::var_os("RAYON_NUM_THREADS").is_none() {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(plan.threads)
-                    .build_global()
-                    .context("failed to start the build's worker threads")?;
-            }
+            // One pool serves every stage of the build, sized by the plan.
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(plan.threads)
+                .build_global()
+                .context("failed to start the build's worker threads")?;
             let found = &plan.resources;
             eprintln!(
                 "{} MiB memory budget ({}), {} threads; {} usable CPUs ({}), {} MiB memory available ({})",
