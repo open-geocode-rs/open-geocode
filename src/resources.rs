@@ -434,7 +434,8 @@ mod platform {
     /// The tightest cgroup memory limit over this process's cgroup and its
     /// ancestors, and what is left under it: v2 `memory.max` less
     /// `memory.current`, or v1 `memory.limit_in_bytes` less
-    /// `memory.usage_in_bytes`. `groups` and `mountinfo` are
+    /// `memory.usage_in_bytes`, each less the inactive file pages
+    /// `memory.stat` counts in it. `groups` and `mountinfo` are
     /// `/proc/self/cgroup` and `/proc/self/mountinfo`; `read` reads a file.
     #[cfg(target_os = "linux")]
     pub(super) fn cgroup_memory_from(
@@ -460,10 +461,14 @@ mod platform {
             {
                 continue;
             }
-            let (limit_file, usage_file) = if v2 {
-                ("memory.max", "memory.current")
+            let (limit_file, usage_file, inactive_file) = if v2 {
+                ("memory.max", "memory.current", "inactive_file")
             } else {
-                ("memory.limit_in_bytes", "memory.usage_in_bytes")
+                (
+                    "memory.limit_in_bytes",
+                    "memory.usage_in_bytes",
+                    "total_inactive_file",
+                )
             };
             let hierarchy: Vec<&CgroupMount> = mounts
                 .iter()
@@ -493,8 +498,19 @@ mod platform {
                     if let Some(limit) =
                         number(&directory.join(limit_file)).filter(|limit| *limit < 1 << 62)
                     {
-                        let left =
-                            limit.saturating_sub(number(&directory.join(usage_file)).unwrap_or(0));
+                        // Reclaimed before any kill, so free, as in the host's MemAvailable.
+                        let inactive = read(&directory.join("memory.stat"))
+                            .and_then(|stat| {
+                                stat.lines().find_map(|line| {
+                                    let (key, value) = line.split_once(' ')?;
+                                    (key == inactive_file).then(|| value.trim().parse().ok())?
+                                })
+                            })
+                            .unwrap_or(0);
+                        let used = number(&directory.join(usage_file))
+                            .unwrap_or(0)
+                            .saturating_sub(inactive);
+                        let left = limit.saturating_sub(used);
                         if tightest.is_none_or(|(_, best)| left < best) {
                             tightest = Some((limit, left));
                         }
@@ -756,6 +772,42 @@ mod cgroup_tests {
             ],
         );
         assert_eq!(found, Some((2 * GIB, 2 * GIB - GIB / 2)));
+    }
+
+    #[test]
+    fn inactive_file_pages_count_as_free_under_the_limit() {
+        let v2 = probe(
+            "0::/build.scope\n",
+            "467 466 0:30 / /sys/fs/cgroup ro,nosuid - cgroup2 cgroup rw\n",
+            &[
+                ("/sys/fs/cgroup/build.scope/memory.max", "3221225472\n"),
+                ("/sys/fs/cgroup/build.scope/memory.current", "2147483648\n"),
+                (
+                    "/sys/fs/cgroup/build.scope/memory.stat",
+                    "anon 1073741824\nfile 1073741824\nactive_file 536870912\ninactive_file 268435456\n",
+                ),
+            ],
+        );
+        assert_eq!(v2, Some((3 * GIB, GIB + GIB / 4)));
+        let v1 = probe(
+            "4:memory:/build\n",
+            "31 25 0:27 / /sys/fs/cgroup/memory ro,nosuid shared:10 - cgroup cgroup rw,memory\n",
+            &[
+                (
+                    "/sys/fs/cgroup/memory/build/memory.limit_in_bytes",
+                    "3221225472\n",
+                ),
+                (
+                    "/sys/fs/cgroup/memory/build/memory.usage_in_bytes",
+                    "2147483648\n",
+                ),
+                (
+                    "/sys/fs/cgroup/memory/build/memory.stat",
+                    "inactive_file 1\ntotal_inactive_file 536870912\n",
+                ),
+            ],
+        );
+        assert_eq!(v1, Some((3 * GIB, GIB + GIB / 2)));
     }
 
     #[test]
