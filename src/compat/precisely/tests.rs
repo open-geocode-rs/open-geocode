@@ -1660,6 +1660,107 @@ async fn an_upload_may_be_as_large_as_a_job_upload() {
     );
 }
 
+fn mentions(dir: &Path, needle: &str) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .expect("dir")
+        .map(|entry| entry.expect("entry"))
+    {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(mentions(&path, needle));
+        } else if path.to_string_lossy().contains(needle)
+            || std::fs::read(&path)
+                .expect("file")
+                .windows(needle.len())
+                .any(|window| window == needle.as_bytes())
+        {
+            found.push(path);
+        }
+    }
+    found
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uploads_and_jobs_expire_with_og_jobs() {
+    let fixture = Fixture::new("sweep");
+    let state = fixture.state(Limits::DEFAULT);
+    let router = build_router(state.clone(), None, None);
+    let kept = upload(&router, "addressid|address|country\n1|99 Nowhere Lane|CA\n").await;
+    let expired = upload(&router, "addressid|address|country\n2|7 Stale Lane|CA\n").await;
+    // Expiry reads the system clock and the API hides expired files unswept, so age the record and read the disk.
+    let record = mentions(&fixture.jobs, &format!("\"fileId\":\"{expired}\""));
+    let [record] = record.as_slice() else {
+        panic!("one record for {expired}, found {record:?}");
+    };
+    let mut aged =
+        serde_json::from_slice::<Value>(&std::fs::read(record).expect("record")).expect("JSON");
+    aged["createdNs"] = json!(0);
+    std::fs::write(record, aged.to_string()).expect("write");
+
+    let submit = async |file_id: &str| {
+        let reply = post(&router, "/v2/bulk-geocode", &json!({"fileId": file_id})).await;
+        assert_eq!(reply.status, StatusCode::ACCEPTED, "{}", reply.text());
+        reply.json()["statusUrl"]
+            .as_str()
+            .and_then(|url| url.rsplit('/').next())
+            .expect("job id")
+            .to_string()
+    };
+    let dropped = submit(&kept).await;
+    assert_eq!(finished(&router, &dropped).await["status"], "COMPLETED");
+    let og_id = uuid::Uuid::try_parse(&dropped)
+        .expect("a UUID")
+        .simple()
+        .to_string();
+    let deleted = send(
+        &router,
+        Request::delete(format!("/jobs/{og_id}"))
+            .body(Body::empty())
+            .expect("delete"),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+    let fresh = submit(&kept).await;
+    assert_eq!(finished(&router, &fresh).await["status"], "COMPLETED");
+
+    super::sweep(&state);
+    for gone in [
+        expired.as_str(),
+        "7 Stale Lane",
+        dropped.as_str(),
+        og_id.as_str(),
+    ] {
+        assert_eq!(
+            mentions(&fixture.jobs, gone),
+            Vec::<std::path::PathBuf>::new(),
+            "{gone}"
+        );
+    }
+
+    assert_eq!(
+        get(&router, "/compat/precisely/v2/files").await.json(),
+        json!({"results": [{"fileId": kept, "fileName": "test"}]})
+    );
+    let resubmitted = post(&router, "/v2/bulk-geocode", &json!({"fileId": expired})).await;
+    assert_eq!(resubmitted.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resubmitted.json(),
+        errors("INVALID_REQUEST", "Invalid File Id (DIS-LI-1052)")
+    );
+    let gone = get(
+        &router,
+        &format!("/compat/precisely/v2/bulk/jobs/{dropped}"),
+    )
+    .await;
+    assert_eq!(gone.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        gone.json(),
+        errors("INVALID_REQUEST", "Invalid Job Id (DIS-LI-1051)")
+    );
+    assert_eq!(finished(&router, &fresh).await["status"], "COMPLETED");
+}
+
 #[test]
 fn a_country_is_read_as_any_iso_code() {
     for (sent, sent_on) in [
