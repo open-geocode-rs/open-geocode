@@ -50,11 +50,17 @@ fn count(bytes: isize) {
     // A thread being torn down has no local delta left; count directly.
     let flush = flushed.unwrap_or(bytes);
     if flush != 0 {
-        let live = (LIVE.fetch_add(flush, Ordering::Relaxed) + flush).max(0) as usize;
-        for peak in [&PEAK, &STAGE_PEAK] {
-            if peak.load(Ordering::Relaxed) < live {
-                peak.fetch_max(live, Ordering::Relaxed);
-            }
+        flush_live(flush);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn flush_live(bytes: isize) {
+    let live = (LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes).max(0) as usize;
+    for peak in [&PEAK, &STAGE_PEAK] {
+        if peak.load(Ordering::Relaxed) < live {
+            peak.fetch_max(live, Ordering::Relaxed);
         }
     }
 }
