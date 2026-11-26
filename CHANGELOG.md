@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.0.1](https://github.com/open-geocode-rs/open-geocode/compare/v1.0.0...v1.0.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* **build:** hold a build to its memory budget and train the parser in less time ([#235](https://github.com/open-geocode-rs/open-geocode/issues/235)) ([6db3b2e](https://github.com/open-geocode-rs/open-geocode/commit/6db3b2eeba71c17fe76dba4e4e4e88f7b8e6fd53))
+* **search:** autocomplete finds postcodes, towns named with their area, and famous places beside near ones ([#236](https://github.com/open-geocode-rs/open-geocode/issues/236)) ([a7f50d2](https://github.com/open-geocode-rs/open-geocode/commit/a7f50d2a3f200627b08dbd20e3272be1d6770bb0))
+* **serve:** og serve on port 0 names and uses the port it got ([#232](https://github.com/open-geocode-rs/open-geocode/issues/232)) ([75079b1](https://github.com/open-geocode-rs/open-geocode/commit/75079b14c0869b9528dfdb8b54997903c0b0dd6d))
+
+
+### Performance Improvements
+
+* **build:** fold the vendored word lists once per process ([#230](https://github.com/open-geocode-rs/open-geocode/issues/230)) ([dade22c](https://github.com/open-geocode-rs/open-geocode/commit/dade22c9dab1aec4c192a42114e5198c772f74cd))
+
 ## [1.0.0](https://github.com/open-geocode-rs/open-geocode/compare/v0.1.0...v1.0.0) (2026-11-23)
 
 
