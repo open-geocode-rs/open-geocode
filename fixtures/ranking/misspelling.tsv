@@ -1,0 +1,14 @@
+# A place name with a common spelling mistake.
+# query	focus	top	expect	note
+cincinatti		1	place@39.103,-84.512~20
+philidelphia		1	place@39.953,-75.165~20
+pittsburg		3	place@40.440,-79.996~20
+massachusets		1	place@42.300,-71.800~250
+tornto		1	place@43.653,-79.383~30
+amsterdm		1	place@52.370,4.895~15
+san fransisco		1	place@37.775,-122.419~20
+los angelos		1	place@34.052,-118.244~40
+tuscon		1	place@32.222,-110.975~20
+edinborough		3	place@55.953,-3.188~15
+mineapolis		1	place@44.978,-93.265~20
+missisauga		1	place@43.589,-79.644~15

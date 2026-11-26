@@ -1,0 +1,22 @@
+# A postcode with its town, in either order.
+# query	focus	top	expect	note
+10115 Berlin		1	postcode@52.532,13.384~4
+Berlin 10115		1	postcode@52.532,13.384~4
+75001 Paris		1	postcode@48.863,2.336~4
+Paris 75001	-74.006,40.713	1	postcode@48.863,2.336~4
+8001 Zürich		1	postcode@47.370,8.540~4
+3011 Bern		1	postcode@46.948,7.447~4
+28013 Madrid		1	postcode@40.420,-3.710~4
+80331 München		1	postcode@48.137,11.575~4
+10001 New York		1	postcode@40.750,-73.997~4
+M5V 3L9 Toronto		1	postcode@43.642,-79.387~4
+90210 Beverly Hills		1	postcode@34.090,-118.410~5
+Sydney 2000		1	postcode@-33.870,151.210~4
+1012 Amsterdam		1	postcode@52.373,4.893~3	
+Amsterdam 1012 AB		1	postcode@52.373,4.893~3	
+SW1A 1AA London		1	postcode@51.501,-0.141~2	
+H2X 1Y4 Montréal		1	postcode@45.510,-73.567~3	
+São Paulo 01310-100		1	postcode@-23.561,-46.656~3	
+100-0001 Tokyo		1	postcode@35.685,139.753~3	
+110001 New Delhi		1	postcode@28.630,77.220~5	
+Sydney NSW 2000		1	postcode@-33.870,151.210~4	

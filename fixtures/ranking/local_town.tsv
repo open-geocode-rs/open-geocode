@@ -1,0 +1,33 @@
+# The first letters of the small town the caller is in.
+# query	focus	top	expect	note
+Kalw	14.7412,47.4548	5	place@47.4259,14.7586~30:Kalwang	Kalwang
+Caha	19.8636,-7.7515	5	place@-7.7962,19.8585~30:Cahata	Cahata
+Ghaz	77.3847,28.6396	5	place@28.7198,77.4036~30:Ghaziabad	Ghaziabad
+Colm	-3.7121,40.7242	5	place@40.6588,-3.7659~30:Colmenar Viejo	Colmenar Viejo
+Sipa	122.3485,9.7430	5	place@9.7366,122.3936~30:Sipalay	Sipalay
+Kaly	73.0963,19.1454	5	place@19.2392,73.1293~30:Kalyan-Dombivli	Kalyan-Dombivli
+Cien	-76.7929,-12.2130	5	place@-12.0765,-76.7775~30:Cieneguilla	Cieneguilla
+Ober	13.1272,52.6551	1	place@52.6947,13.1043~30:Oberkrämer	Oberkrämer
+Bura	122.8542,-32.9152	5	place@-32.9362,122.9015~30:Buraminya	Buraminya
+Woło	21.2635,52.3947	5	place@52.3469,21.2420~30:Wołomin	Wołomin
+Bail	2.6145,49.4140	5	place@49.4161,2.5767~30:Bailleul-le-Soc	Bailleul-le-Soc
+Sera	4.2010,49.6078	5	place@49.6111,4.2021~30:Seraincourt	Seraincourt
+Merc	-73.7545,45.2249	5	place@45.3104,-73.7461~30:Mercier	Mercier
+Rand	27.9531,-26.1001	5	place@-26.0914,28.0021~30:Randburg	Randburg
+Ivan	144.5899,-32.6746	5	place@-32.6997,144.1411~30:Ivanhoe	Ivanhoe
+Mies	20.8663,52.0833	5	place@52.0434,20.8998~30:Mieszkowo	Mieszkowo
+บ้าน	100.4919,13.9465	5	place@13.9484,100.4456~30:บ้านหัวคู้	บ้านหัวคู้
+Indi	-117.1236,59.8799	5	place@59.8673,-117.0378~30:Indian Cabins	Indian Cabins
+Cida	32.9765,-25.6463	5	place@-25.9583,32.6185~30:Cidade de Maputo	Cidade de Maputo
+نهر 	47.0431,31.2406	5	place@31.2208,46.9960~30:نهر المنجورة	نهر المنجورة
+Chih	-103.4558,26.5290	5	place@28.6369,-106.0767~30:Chihuahua	Chihuahua
+Midv	28.0359,-26.3423	5	place@-26.6230,28.1292~30:Midvaal Local Municipality	Midvaal Local Municipality
+Coda	-63.0788,-3.1323	5	place@-3.8413,-62.0603~30:Codajás	Codajás
+уроч	73.0156,38.2671	5	place@38.2864,72.9639~30:урочище Вихтонлах	урочище Вихтонлах
+Furu	10.1478,6.7673	5	place@6.8145,10.2318~30:Furu-Awa	Furu-Awa
+Midd	-74.0121,40.4663	5	place@40.3843,-74.0899~30:Middletown Township	Middletown Township
+Well	-97.0650,35.7413	5	place@35.6942,-97.0634~30:Wellston	Wellston
+Cale	-70.8282,-33.6813	5	place@-33.6309,-70.7593~30:Calera de Tango	Calera de Tango
+Elst	-0.2191,51.6298	5	place@51.6548,-0.2802~30:Elstree and Borehamwood	Elstree and Borehamwood
+Coll	148.6744,-29.6436	5	place@-29.3842,148.5512~30:Collarenebri	Collarenebri
+Oberh	13.1272,52.6551	3	place@52.6551,13.1272~60:Oberhavel	the caller's county

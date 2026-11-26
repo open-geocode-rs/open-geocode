@@ -1,0 +1,33 @@
+# A name several towns share; the caller's position picks one.
+# query	focus	top	expect	note
+London	-81.250,42.984	1	place@42.984,-81.250~15
+Paris	-80.264,43.139	3	place@43.194,-80.384~10
+Birmingham	-86.300,32.367	1	place@33.521,-86.802~20
+Birmingham	-0.128,51.507	1	place@52.486,-1.890~20
+Cambridge	-71.059,42.360	1	place@42.373,-71.110~8
+Cambridge	-0.128,51.507	1	place@52.205,0.119~10
+Richmond	-123.121,49.283	1	place@49.166,-123.137~10
+Richmond	-77.037,38.907	1	place@37.541,-77.436~15
+Hamilton	-79.383,43.653	1	place@43.256,-79.869~15
+Hamilton	174.763,-36.848	1	place@-37.787,175.279~15
+Perth	-3.188,55.953	1	place@56.396,-3.437~10
+Perth	151.209,-33.869	1	place@-31.950,115.860~30
+Córdoba	-58.382,-34.604	1	place@-31.420,-64.180~30
+Cordoba	-3.704,40.417	1	place@37.888,-4.779~15
+Newcastle	-2.244,53.481	1	place@54.978,-1.617~10
+Newcastle	151.209,-33.869	1	place@-32.927,151.776~20
+Springfield	-74.006,40.713	1	place@40.700,-74.320~10
+Springfield	-87.630,41.878	1	place@39.800,-89.650~20
+Kingston	-79.383,43.653	1	place@44.230,-76.480~15
+Kingston	-80.192,25.762	3	place@17.997,-76.794~20
+London	151.209,-33.869	1	place@51.507,-0.128~30
+London	-74.006,40.713	1	place@51.507,-0.128~30
+Victoria	-123.121,49.283	1	place@48.428,-123.365~10
+Valencia	-66.904,10.481	1	place@10.162,-68.008~20
+Valencia	-3.704,40.417	1	place@39.470,-0.376~15
+Portland	-122.332,47.606	1	place@45.515,-122.678~20
+Portland	-71.059,42.360	1	place@43.661,-70.255~15
+Cairo	-74.006,40.713	2	place@30.044,31.236~40
+Hyderabad	67.001,24.861	1	place@25.396,68.377~20	Hyderabad, Pakistan from Karachi
+London	-74.006,40.713	5	place@42.865,-71.374~10	Londonderry NH
+Tokyo	-118.244,34.052	1	place@35.690,139.692~60

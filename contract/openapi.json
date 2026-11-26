@@ -527,7 +527,7 @@
                 "type": "number"
               },
               "fallback": {
-                "description": "`true` when no match was found and the result is the most precise\narea the query names instead: its postcode, a town or other area,\nits region or its country. `layer` says which. Absent otherwise.",
+                "description": "`true` when no match was found and the result is the most precise\nplace the query names instead: the street of a house number missing\nfrom the data, its postcode, a town or other area, its region or its\ncountry. `layer` says which. Absent otherwise.",
                 "type": "boolean"
               },
               "highlights": {

@@ -41,4 +41,5 @@ __pycache__/
 # committed so every answer key can be rebuilt.
 /scripts/*
 !/scripts/fixtures/
+!/scripts/ranking/
 node_modules/

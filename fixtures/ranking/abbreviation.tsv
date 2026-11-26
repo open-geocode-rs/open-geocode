@@ -1,0 +1,17 @@
+# A short form or nickname of a place.
+# query	focus	top	expect	note
+nyc		1	place@40.713,-74.006~30
+la	-122.419,37.775	1	place@34.052,-118.244~40
+sf	-118.244,34.052	1	place@37.775,-122.419~20
+dc	-74.006,40.713	1	place@38.907,-77.037~20
+st louis		1	place@38.627,-90.199~20
+saint louis		1	place@38.627,-90.199~20
+ft worth	-96.797,32.777	1	place@32.755,-97.331~20
+fort worth	-96.797,32.777	1	place@32.755,-97.331~20
+st catharines	-79.383,43.653	1	place@43.159,-79.247~10
+st john's		1	place@47.561,-52.712~15
+philly	-74.006,40.713	1	place@39.953,-75.165~20
+vegas		1	place@36.170,-115.140~30
+uk		1	place@54.000,-2.500~500
+usa		1	place@39.800,-98.600~2000
+st louis		1	place@38.627,-90.199~20	

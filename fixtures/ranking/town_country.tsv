@@ -1,0 +1,17 @@
+# A town followed by its country.
+# query	focus	top	expect	note
+paris france	-74.006,40.713	1	place@48.857,2.352~20 & !poi@53.77,-7.6~100
+paris, france		1	place@48.857,2.352~20
+london uk		1	place@51.507,-0.128~30
+london england		1	place@51.507,-0.128~30
+tokyo japan		1	place@35.690,139.692~60
+toronto canada		1	place@43.653,-79.383~30
+berlin germany		1	place@52.520,13.405~30
+lima peru		1	place@-12.046,-77.043~40
+cordoba argentina		1	place@-31.420,-64.180~30
+cordoba spain		1	place@37.888,-4.779~15
+valencia spain		1	place@39.470,-0.376~15
+san jose costa rica		1	place@9.930,-84.080~15
+dublin ireland		1	place@53.350,-6.260~15
+tokyo japan		1	place@35.68,139.76~30	
+toronto canada		1	place@43.653,-79.383~30	

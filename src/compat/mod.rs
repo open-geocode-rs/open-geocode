@@ -496,9 +496,9 @@ pub(crate) mod native {
         args: Args,
     ) -> Result<ForwardCollection, Problem> {
         let args_lang = args.get("lang").is_some();
-        runtime::autocomplete(State(state.clone()), args.query())
+        runtime::autocomplete_lookup(state.clone(), args.query())
             .await
-            .map(|json| local_forward(state, args_lang, json.0))
+            .map(|found| local_forward(state, args_lang, found))
     }
 
     pub(crate) async fn search(state: &AppState, args: Args) -> Result<ForwardCollection, Problem> {

@@ -1,0 +1,18 @@
+# A town followed by its state or province.
+# query	focus	top	expect	note
+portland or	-122.332,47.606	1	place@45.515,-122.678~20
+portland maine		1	place@43.661,-70.255~15
+portland me		1	place@43.661,-70.255~15
+springfield il		1	place@39.800,-89.650~20
+springfield, ma		1	place@42.100,-72.590~15
+kingston on	-79.383,43.653	1	place@44.230,-76.480~15
+perth wa		1	place@-31.950,115.860~30
+london ontario		1	place@42.984,-81.250~15
+cambridge ma		1	place@42.373,-71.110~8
+paris tx		1	place@33.660,-95.555~10
+paris texas		1	place@33.660,-95.555~10
+san francisco ca		1	place@37.775,-122.419~20
+sydney nsw		1	place@-33.869,151.209~40
+richmond va		1	place@37.541,-77.436~15
+victoria bc		1	place@48.428,-123.365~10
+austin tx		1	place@30.267,-97.743~20

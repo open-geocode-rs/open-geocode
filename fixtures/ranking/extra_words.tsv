@@ -1,0 +1,12 @@
+# A place with words people add around it.
+# query	focus	top	expect	note
+new york city		1	place@40.713,-74.006~30
+toronto, 		1	place@43.653,-79.383~30
+london 		1	place@51.507,-0.128~30
+city of london		1	place@51.515,-0.092~5
+downtown toronto		3	place@43.650,-79.380~5
+greater london		1	place@51.500,-0.120~40
+the hague		1	place@52.070,4.300~15
+den haag		1	place@52.070,4.300~15
+new york, ny		1	place@40.713,-74.006~30
+manhattan, new york		1	place@40.780,-73.970~15

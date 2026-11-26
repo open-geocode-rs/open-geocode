@@ -1,0 +1,9 @@
+# Near matches fill most rows, but a famous place that starts with the typed text keeps one.
+# query	focus	top	expect	note
+Provence	2.352,48.857	5	place@43.900,6.000~250	the region, typed from Paris
+Normandie	2.352,48.857	5	place@49.100,0.300~200
+Lond	-79.383,43.653	5	place@51.507,-0.128~30	London UK, typed from Toronto
+Pari	-73.567,45.501	5	place@48.857,2.352~20
+Ber	9.993,53.551	5	place@52.520,13.405~30	Berlin, typed from Hamburg
+Flor	-80.192,25.762	5	place@28.500,-81.700~600	the state, typed from Miami
+Tor	-73.567,45.501	5	place@43.653,-79.383~30	Toronto, typed from Montreal

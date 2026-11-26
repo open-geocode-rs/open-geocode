@@ -1,0 +1,22 @@
+# A famous landmark by its name alone.
+# query	focus	top	expect	note
+Eiffel Tower		1	poi@48.8584,2.2945~1
+Tour Eiffel		1	poi@48.8584,2.2945~1
+Statue of Liberty		1	poi@40.6892,-74.0445~1
+Colosseum		1	any@41.8902,12.4922~1
+Big Ben		1	poi@51.5007,-0.1246~1
+Sydney Opera House		1	poi@-33.8568,151.2153~1
+Golden Gate Bridge		1	any@37.8199,-122.4783~3
+CN Tower		1	poi@43.6426,-79.3871~1
+Taj Mahal		1	poi@27.1751,78.0421~1
+Brandenburger Tor		1	poi@52.5163,13.3777~1
+Sagrada Familia		1	poi@41.4036,2.1744~1
+Space Needle		1	poi@47.6205,-122.3493~1
+Louvre		1	poi@48.8606,2.3376~1
+Machu Picchu		1	any@-13.163,-72.545~5
+Burj Khalifa		1	poi@25.1972,55.2744~1
+Central Park		1	poi@40.7829,-73.9654~3	
+Times Square		1	poi@40.7580,-73.9855~1	
+Hyde Park		1	poi@51.5073,-0.1657~2	
+Taj Mahal		1	poi@27.1751,78.0421~1	
+Christ the Redeemer		1	poi@-22.9519,-43.2105~1	
