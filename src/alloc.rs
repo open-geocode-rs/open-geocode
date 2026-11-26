@@ -8,6 +8,7 @@ const FLUSH_BYTES: isize = 256 << 10;
 
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+static STAGE_PEAK: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
@@ -49,9 +50,17 @@ fn count(bytes: isize) {
     // A thread being torn down has no local delta left; count directly.
     let flush = flushed.unwrap_or(bytes);
     if flush != 0 {
-        let live = (LIVE.fetch_add(flush, Ordering::Relaxed) + flush).max(0) as usize;
-        if PEAK.load(Ordering::Relaxed) < live {
-            PEAK.fetch_max(live, Ordering::Relaxed);
+        flush_live(flush);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn flush_live(bytes: isize) {
+    let live = (LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes).max(0) as usize;
+    for peak in [&PEAK, &STAGE_PEAK] {
+        if peak.load(Ordering::Relaxed) < live {
+            peak.fetch_max(live, Ordering::Relaxed);
         }
     }
 }
@@ -107,4 +116,17 @@ pub fn peak_bytes() -> Option<usize> {
     INSTALLED
         .load(Ordering::Relaxed)
         .then(|| PEAK.load(Ordering::Relaxed))
+}
+
+pub fn stage_peak_bytes() -> Option<usize> {
+    INSTALLED
+        .load(Ordering::Relaxed)
+        .then(|| STAGE_PEAK.load(Ordering::Relaxed))
+}
+
+pub fn reset_stage_peak() {
+    STAGE_PEAK.store(
+        LIVE.load(Ordering::Relaxed).max(0) as usize,
+        Ordering::Relaxed,
+    );
 }

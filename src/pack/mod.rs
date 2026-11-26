@@ -18,7 +18,7 @@ use crate::{
     enclosing::AreaTags,
     extsort::Scratch,
     labels,
-    memory::Budget,
+    memory::{Budget, MAX_DERIVED_BUDGET_BYTES},
     parse::lattice::{
         CountryCode,
         dictionary::{Builder, RecordNames},
@@ -408,6 +408,7 @@ fn zone_of(entry: &[u8; AREA_ZONE_BYTES]) -> u16 {
 pub struct WriterOptions {
     pub memory: Arc<Budget>,
     pub text_index_memory_bytes: usize,
+    pub sorter_bytes: usize,
 }
 
 impl Default for WriterOptions {
@@ -415,6 +416,7 @@ impl Default for WriterOptions {
         Self {
             memory: Budget::unlimited(),
             text_index_memory_bytes: DEFAULT_TEXT_INDEX_MEMORY_BYTES,
+            sorter_bytes: MAX_DERIVED_BUDGET_BYTES,
         }
     }
 }
@@ -449,6 +451,9 @@ struct AreaZones {
 #[derive(Debug)]
 pub struct Writer {
     scratch: Arc<Scratch>,
+    failed: bool,
+    memory: Arc<Budget>,
+    sorter_bytes: usize,
     records: records::Writer,
     contexts: TupleWriter,
     text: text_index::Writer,
@@ -581,7 +586,11 @@ impl Writer {
                 options.text_index_memory_bytes,
             )?,
             spatial: spatial_index::Writer::new(&scratch)?,
+            dictionaries: Builder::new(&scratch, &options.memory, options.sorter_bytes),
             scratch,
+            failed: false,
+            memory: Arc::clone(&options.memory),
+            sorter_bytes: options.sorter_bytes,
             generation,
             layer_counts: BTreeMap::new(),
             context_names: Arc::default(),
@@ -595,7 +604,6 @@ impl Writer {
             timezones: None,
             postcode_areas: Arc::default(),
             postcode_addresses: PostcodeAddresses::default(),
-            dictionaries: Builder::default(),
         })
     }
 
@@ -682,6 +690,7 @@ impl Writer {
     }
 
     pub fn commit(&mut self, batch: PreparedBatch) -> Result<()> {
+        self.check_usable()?;
         let first = self.records.record_count();
         if batch.first != first {
             return Err(Error::Inconsistent(format!(
@@ -689,6 +698,21 @@ impl Writer {
                 batch.first
             )));
         }
+        let result = self.commit_batch(batch, first);
+        self.failed = result.is_err();
+        result
+    }
+
+    fn check_usable(&self) -> Result<()> {
+        if self.failed {
+            return Err(Error::Inconsistent(
+                "a batch failed partway, so this writer holds a partial Pack; discard it and start a new writer".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit_batch(&mut self, batch: PreparedBatch, first: u64) -> Result<()> {
         let mut placed = Vec::with_capacity(batch.records.len());
         let mut names = Vec::with_capacity(batch.records.len());
         let mut documents = Vec::with_capacity(batch.records.len());
@@ -709,7 +733,7 @@ impl Writer {
         } = self;
         let placed = &placed;
         std::thread::scope(|scope| {
-            let named = scope.spawn(move || {
+            let named = scope.spawn(move || -> Result<()> {
                 for (offset, (names, (_, context))) in names.into_iter().zip(placed).enumerate() {
                     let context = context.as_ref().filter(|context| !context.is_area_list());
                     if let Some(context) = context
@@ -717,8 +741,9 @@ impl Writer {
                     {
                         dictionaries.add_place(first + offset as u64, context, &names);
                     }
-                    dictionaries.add(names, context);
+                    dictionaries.add(names, context)?;
                 }
+                Ok(())
             });
             let indexed = scope.spawn(move || {
                 documents
@@ -748,7 +773,7 @@ impl Writer {
                 });
             named
                 .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
             indexed
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
@@ -763,6 +788,7 @@ impl Writer {
     }
 
     pub fn into_sealing(self) -> Result<Sealing> {
+        self.check_usable()?;
         let Self {
             generation,
             scratch,
@@ -863,9 +889,12 @@ impl Writer {
     }
 
     pub fn finish(self) -> Result<Manifest> {
+        let scratch = Arc::clone(&self.scratch);
+        let memory = Arc::clone(&self.memory);
+        let sorter_bytes = self.sorter_bytes;
         let (mut sealed, _) = self.seal()?;
-        crate::structured::add_to(&mut sealed)?;
-        crate::ids::add_to(&mut sealed)?;
+        crate::structured::add_to(&mut sealed, &scratch, &memory, sorter_bytes)?;
+        crate::ids::add_to(&mut sealed, &scratch, &memory, sorter_bytes)?;
         sealed.publish()
     }
 }
@@ -2090,6 +2119,7 @@ mod tests {
             &WriterOptions {
                 memory: Arc::clone(&memory),
                 text_index_memory_bytes: 16 << 20,
+                ..WriterOptions::default()
             },
         )
         .expect("writer");
@@ -2110,6 +2140,36 @@ mod tests {
         );
         writer.finish().expect("finish");
         assert_eq!(first_hit(&root, "king").as_deref(), Some("osm:node:1"));
+    }
+
+    #[test]
+    fn a_writer_whose_batch_failed_partway_refuses_every_later_call() {
+        let dir = TempDir::new("failed-batch");
+        let mut writer = Writer::create_with(
+            dir.join("pack"),
+            &WriterOptions {
+                sorter_bytes: 1,
+                ..WriterOptions::default()
+            },
+        )
+        .expect("writer");
+        writer.scratch().set_budget(Some(1));
+        let batch: Vec<_> = (0..2000)
+            .map(|number| {
+                (
+                    address_record(number, "10", &format!("King {number} Street")),
+                    None,
+                )
+            })
+            .collect();
+        assert!(writer.write_batch(&batch).is_err());
+        writer.scratch().set_budget(None);
+        let message = writer
+            .write_batch(&batch)
+            .expect_err("a failed writer is refused")
+            .to_string();
+        assert!(message.contains("partial Pack"), "{message}");
+        assert!(writer.finish().is_err());
     }
 
     #[test]

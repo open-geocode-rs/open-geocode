@@ -1,9 +1,8 @@
 use std::{
-    cmp::Reverse,
-    collections::{BinaryHeap, HashSet},
+    collections::HashSet,
     fs,
-    io::{self, BufReader, BufWriter, Read, Write},
-    path::{Path, PathBuf},
+    io::{BufWriter, Write},
+    path::Path,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -20,16 +19,19 @@ use tantivy::DocId;
 use crate::{
     container::{Bytes, Container},
     error::{Error, Result},
+    extsort::{ExternalSorter, Scratch, Sorted, Spill},
+    memory::Budget,
     pack,
     parse::lattice::automaton_builder,
     search::TextSearcher,
+    util::codec::{get_bytes, get_u32, put_bytes, put_u64},
 };
 
 pub(crate) const SEPARATOR: u8 = 0x1f;
 const CELL_TAG: u8 = b'C';
 const PLACE_TAG: u8 = b'P';
 const STREET_TAG: u8 = b'Z';
-const RUN_DOCUMENTS: u32 = 1 << 21;
+const CHUNKS_PER_THREAD: u32 = 2;
 const CHUNK_DOCUMENTS: u32 = 4096;
 const META_FILE: &str = "meta.json";
 const STREET_FILE: &str = "streets.fst";
@@ -39,7 +41,7 @@ const PLACE_FILE: &str = "places.fst";
 const PLACE_RECORDS_FILE: &str = "places.rec";
 const PLACE_CELLS_FILE: &str = "places.u32";
 const CELL_STREET_FILE: &str = "cell-streets.fst";
-const SECTIONS: [(&str, &str); 7] = [
+pub(crate) const SECTIONS: [(&str, &str); 7] = [
     ("streets/meta", META_FILE),
     ("streets/keys", STREET_FILE),
     ("streets/lists", LISTS_FILE),
@@ -626,12 +628,18 @@ fn key_chunk(
     Ok(chunk)
 }
 
-pub fn add_to(sealed: &mut pack::SealedPack) -> Result<()> {
+pub fn add_to(
+    sealed: &mut pack::SealedPack,
+    scratch: &Arc<Scratch>,
+    memory: &Arc<Budget>,
+    share_bytes: usize,
+) -> Result<()> {
     let out = sealed.generation().join("structured.tmp");
     if out.exists() {
         fs::remove_dir_all(&out)?;
     }
-    build(&sealed.path(), &out)?;
+    let keys = ExternalSorter::new(scratch, "structured-keys", memory, share_bytes);
+    build(&sealed.path(), &out, keys)?;
     let sections = SECTIONS
         .iter()
         .map(|(section, file)| (*section, SECTION_VERSION, out.join(file)))
@@ -641,7 +649,7 @@ pub fn add_to(sealed: &mut pack::SealedPack) -> Result<()> {
     Ok(())
 }
 
-fn build(pack_path: &Path, out: &Path) -> Result<()> {
+fn build(pack_path: &Path, out: &Path, mut keys: ExternalSorter<Entry>) -> Result<()> {
     let pack = Arc::new(pack::Reader::open(pack_path)?);
     let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
     let segments = searcher.structured_segments();
@@ -651,9 +659,6 @@ fn build(pack_path: &Path, out: &Path) -> Result<()> {
         .ok_or_else(|| Error::Inconsistent("more documents than a u32 holds".into()))?;
     let areas = AreaNames::new(searcher.area_names());
     fs::create_dir_all(out)?;
-    let scratch = out.join("runs.tmp");
-    fs::create_dir_all(&scratch)?;
-    let mut runs = Vec::new();
     let mut meta = Meta {
         segments,
         max_doc,
@@ -662,9 +667,10 @@ fn build(pack_path: &Path, out: &Path) -> Result<()> {
     let second_keys = AtomicU64::new(0);
     let mut doc_cells =
         BufWriter::with_capacity(1 << 20, fs::File::create(out.join(DOC_CELLS_FILE))?);
+    let round = CHUNK_DOCUMENTS * CHUNKS_PER_THREAD * rayon::current_num_threads() as u32;
     let mut begin = 0u32;
     while begin < max_doc {
-        let end = begin.saturating_add(RUN_DOCUMENTS).min(max_doc);
+        let end = begin.saturating_add(round).min(max_doc);
         let chunks = (begin..end)
             .step_by(CHUNK_DOCUMENTS as usize)
             .collect::<Vec<_>>()
@@ -676,94 +682,46 @@ fn build(pack_path: &Path, out: &Path) -> Result<()> {
                 Ok(chunk)
             })
             .collect::<Result<Vec<_>>>()?;
-        let mut entries = Vec::new();
         for chunk in chunks {
             for cell in &chunk.cells {
                 doc_cells.write_all(&cell.to_le_bytes())?;
             }
             meta.keyed_documents += chunk.keyed;
-            entries.extend(chunk.entries);
+            for (key, value) in chunk.entries {
+                keys.push(Entry { key, value })?;
+            }
         }
-        entries.par_sort_unstable();
-        entries.dedup();
-        let path = scratch.join(format!("run-{:05}.bin", runs.len()));
-        let mut writer = BufWriter::with_capacity(1 << 20, fs::File::create(&path)?);
-        let mut previous: &[u8] = &[];
-        for (key, doc) in &entries {
-            let shared = previous
-                .iter()
-                .zip(key)
-                .take_while(|(left, right)| left == right)
-                .count();
-            write_varint(&mut writer, shared as u32)?;
-            write_varint(&mut writer, u32::try_from(key.len() - shared)?)?;
-            writer.write_all(&key[shared..])?;
-            write_varint(&mut writer, *doc)?;
-            previous = key;
-        }
-        writer.flush()?;
-        runs.push(path);
         begin = end;
     }
     doc_cells.flush()?;
     drop(doc_cells);
-    merge(&runs, out, &mut meta)?;
+    merge(keys.finish()?, out, &mut meta)?;
     meta.second_street_keys = second_keys.load(Ordering::Relaxed);
     fs::write(out.join(META_FILE), serde_json::to_vec_pretty(&meta)?)?;
-    for run in &runs {
-        fs::remove_file(run)?;
-    }
-    fs::remove_dir(&scratch)?;
     Ok(())
 }
 
-fn write_varint(writer: &mut impl Write, mut value: u32) -> io::Result<()> {
-    while value >= 0x80 {
-        writer.write_all(&[(value as u8) | 0x80])?;
-        value >>= 7;
-    }
-    writer.write_all(&[value as u8])
-}
-
-fn read_varint(reader: &mut impl Read) -> io::Result<Option<u32>> {
-    let mut value = 0u32;
-    for shift in (0..35).step_by(7) {
-        let mut byte = [0; 1];
-        match reader.read_exact(&mut byte) {
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof && shift == 0 => {
-                return Ok(None);
-            }
-            result => result?,
-        }
-        value |= u32::from(byte[0] & 0x7F) << shift;
-        if byte[0] < 0x80 {
-            return Ok(Some(value));
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "varint too long",
-    ))
-}
-
-struct Run {
-    reader: BufReader<fs::File>,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Entry {
     key: Vec<u8>,
+    value: u32,
 }
 
-impl Run {
-    fn next(&mut self) -> io::Result<Option<(Vec<u8>, DocId)>> {
-        let Some(shared) = read_varint(&mut self.reader)? else {
-            return Ok(None);
-        };
-        let truncated = || io::Error::from(io::ErrorKind::UnexpectedEof);
-        let rest = read_varint(&mut self.reader)?.ok_or_else(truncated)?;
-        self.key.truncate(shared as usize);
-        let start = self.key.len();
-        self.key.resize(start + rest as usize, 0);
-        self.reader.read_exact(&mut self.key[start..])?;
-        let doc = read_varint(&mut self.reader)?.ok_or_else(truncated)?;
-        Ok(Some((self.key.clone(), doc)))
+impl Spill for Entry {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_bytes(out, &self.key);
+        put_u64(out, u64::from(self.value));
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        Ok(Self {
+            key: get_bytes(input)?.to_vec(),
+            value: get_u32(input)?,
+        })
+    }
+
+    fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.key.capacity()
     }
 }
 
@@ -849,22 +807,7 @@ impl Writers {
     }
 }
 
-fn merge(runs: &[PathBuf], out: &Path, meta: &mut Meta) -> Result<()> {
-    let mut readers = runs
-        .iter()
-        .map(|path| {
-            Ok(Run {
-                reader: BufReader::with_capacity(1 << 20, fs::File::open(path)?),
-                key: Vec::new(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut heap = BinaryHeap::new();
-    for (index, run) in readers.iter_mut().enumerate() {
-        if let Some((key, doc)) = run.next()? {
-            heap.push(Reverse((key, doc, index)));
-        }
-    }
+fn merge(entries: Sorted<Entry>, out: &Path, meta: &mut Meta) -> Result<()> {
     let create = |name: &str| -> Result<BufWriter<fs::File>> {
         Ok(BufWriter::with_capacity(
             1 << 20,
@@ -885,17 +828,17 @@ fn merge(runs: &[PathBuf], out: &Path, meta: &mut Meta) -> Result<()> {
     };
     let mut current: Option<Vec<u8>> = None;
     let mut docs = Vec::<DocId>::new();
-    while let Some(Reverse((key, doc, index))) = heap.pop() {
-        if let Some((next, next_doc)) = readers[index].next()? {
-            heap.push(Reverse((next, next_doc, index)));
-        }
-        meta.entries += 1;
+    for entry in entries {
+        let Entry { key, value: doc } = entry?;
         if current.as_deref() != Some(key.as_slice()) {
             if let Some(held) = current.take() {
                 writers.flush(&held, &mut docs, meta)?;
             }
             current = Some(key);
+        } else if docs.last() == Some(&doc) {
+            continue;
         }
+        meta.entries += 1;
         docs.push(doc);
     }
     if let Some(held) = current.take() {

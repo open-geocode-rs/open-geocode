@@ -156,10 +156,13 @@ enum PackCommand {
         #[arg(long)]
         pack: PathBuf,
 
-        /// Memory for the build's buffers, in MiB (64 to 1048576). Larger
-        /// inputs spill to scratch files on disk instead of using more memory.
-        /// Defaults to half of the memory this process can use, less what the
-        /// build holds outside its buffers.
+        /// Memory the build may hold, in MiB (64 to 1048576), beside a fixed
+        /// 512 MiB and 64 MiB per worker thread. Larger inputs spill to
+        /// scratch files on disk instead of using more memory. The check
+        /// before the build stops it when the budget and that overhead do not
+        /// fit the memory free beyond what the process already holds outside
+        /// its heap, such as allocator pages and recently read files. Defaults
+        /// to three quarters of what this process can use, less the overhead.
         #[arg(
             long,
             value_parser = clap::value_parser!(u64).range(MIN_MEMORY_BUDGET_MB..=MAX_MEMORY_BUDGET_MB),
@@ -681,21 +684,20 @@ async fn main() -> Result<()> {
                 ..BuildOsmOptions::default()
             };
             let plan = plan_osm_build(&options)?;
-            if std::env::var_os("RAYON_NUM_THREADS").is_none() {
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(plan.threads)
-                    .build_global()
-                    .context("failed to start the build's worker threads")?;
-            }
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(plan.threads)
+                .build_global()
+                .context("failed to start the build's worker threads")?;
             let found = &plan.resources;
             eprintln!(
-                "{} MiB memory budget ({}), {} threads; {} usable CPUs ({}), {} MiB memory available ({})",
+                "{} MiB memory budget ({}) and {} MiB beside it, {} threads; {} usable CPUs ({}), {} MiB memory available ({})",
                 plan.memory_budget_bytes >> 20,
                 if plan.memory_budget_derived {
                     "derived"
                 } else {
                     "set"
                 },
+                plan.untracked_bytes >> 20,
                 rayon::current_num_threads(),
                 found.usable_cpus,
                 found.cpu_limit,

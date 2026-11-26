@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::{
+    alloc,
     builder::report::{Bound, BoundShares, InputRead, ResumeReport, StageReport},
     error::Result,
     extsort::{IoTimes, Scratch, Traffic},
@@ -331,6 +332,7 @@ impl Meter {
         self.scratch.measure();
         self.scratch.reset_stage_peak();
         self.budget.reset_stage_peak();
+        alloc::reset_stage_peak();
         self.units.store(0, Ordering::Relaxed);
         self.peak_rss
             .store(resources::resident_bytes().unwrap_or(0), Ordering::Relaxed);
@@ -412,6 +414,7 @@ impl Meter {
             peak_scratch_bytes: self.scratch.stage_peak_bytes(),
             peak_rss_bytes: self.peak_rss.load(Ordering::Relaxed),
             peak_budget_bytes: self.budget.stage_peak() as u64,
+            peak_heap_bytes: alloc::stage_peak_bytes().map(|bytes| bytes as u64),
             shares,
             bound,
         };

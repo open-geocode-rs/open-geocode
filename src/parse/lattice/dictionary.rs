@@ -1,12 +1,18 @@
+mod spill;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
-    sync::{LazyLock, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
 };
 
 use crate::error::{Error, Result};
-use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
+use fst::{
+    Map, MapBuilder, Streamer,
+    raw::{Fst, Node, Output},
+};
 use levenshtein_automata::{DFA, Distance, SINK_STATE};
+use rustc_hash::FxHashMap;
 
 use unicode_script::{Script, UnicodeScript};
 
@@ -14,6 +20,8 @@ use super::{CountryCode, dictionary_key, is_numeral, is_unspaced, mask_numerals}
 use crate::{
     container::{Bytes, Container, Writer},
     context::AdminContextTuple,
+    extsort::Scratch,
+    memory::Budget,
     pack::{RecordContext, RecordId},
     record::{AddressComponents, PlaceLayer, Record},
 };
@@ -358,33 +366,25 @@ impl Dictionaries {
     }
 
     pub fn fuzzy(&self, field: Field, dfa: &DFA, prefix: &str) -> Option<(String, Match)> {
-        // No key holds the byte 0xFF, which UTF-8 never uses, so every key
-        // with the prefix sorts below it.
-        let mut upper = prefix.as_bytes().to_vec();
-        upper.push(0xFF);
-        let mut stream = self
-            .map(field)
-            .search_with_state(Levenshtein(dfa))
-            .ge(prefix)
-            .lt(upper)
-            .into_stream();
-        let mut best: Option<(Vec<u8>, Match)> = None;
-        while let Some((key, value, state)) = stream.next() {
-            let Distance::Exact(distance) = dfa.distance(state) else {
-                continue;
-            };
-            let found = Match {
-                entry: Entry::decode(value),
-                distance,
-            };
-            if best.as_ref().is_none_or(|(_, best)| {
-                (found.distance, std::cmp::Reverse(found.entry.count))
-                    < (best.distance, std::cmp::Reverse(best.entry.count))
-            }) {
-                best = Some((key.to_vec(), found));
-            }
+        let fst = self.map(field).as_fst();
+        let mut node = fst.root();
+        let mut state = dfa.initial_state();
+        let mut out = Output::zero();
+        for &byte in prefix.as_bytes() {
+            let transition = node.transition(node.find_input(byte)?);
+            state = dfa.transition(state, byte);
+            out = out.cat(transition.out);
+            node = fst.node(transition.addr);
         }
-        best.map(|(key, hit)| (String::from_utf8_lossy(&key).into_owned(), hit))
+        let mut walk = Walk {
+            fst,
+            dfa,
+            key: prefix.as_bytes().to_vec(),
+            best: None,
+        };
+        walk.visit(node, state, out);
+        walk.best
+            .map(|(key, hit)| (String::from_utf8_lossy(&key).into_owned(), hit))
     }
 
     /// The record ids of the areas named `key`; empty when it names none, or
@@ -490,25 +490,42 @@ impl Dictionaries {
     }
 }
 
-struct Levenshtein<'a>(&'a DFA);
+struct Walk<'a> {
+    fst: &'a Fst<Bytes>,
+    dfa: &'a DFA,
+    key: Vec<u8>,
+    best: Option<(Vec<u8>, Match)>,
+}
 
-impl Automaton for Levenshtein<'_> {
-    type State = u32;
-
-    fn start(&self) -> u32 {
-        self.0.initial_state()
-    }
-
-    fn is_match(&self, state: &u32) -> bool {
-        matches!(self.0.distance(*state), Distance::Exact(_))
-    }
-
-    fn can_match(&self, state: &u32) -> bool {
-        *state != SINK_STATE
-    }
-
-    fn accept(&self, state: &u32, byte: u8) -> u32 {
-        self.0.transition(*state, byte)
+impl Walk<'_> {
+    fn visit(&mut self, node: Node<'_>, state: u32, out: Output) {
+        if node.is_final()
+            && let Distance::Exact(distance) = self.dfa.distance(state)
+        {
+            let found = Match {
+                entry: Entry::decode(out.cat(node.final_output()).value()),
+                distance,
+            };
+            if self.best.as_ref().is_none_or(|(_, best)| {
+                (found.distance, std::cmp::Reverse(found.entry.count))
+                    < (best.distance, std::cmp::Reverse(best.entry.count))
+            }) {
+                self.best = Some((self.key.clone(), found));
+            }
+        }
+        for transition in node.transitions() {
+            let next = self.dfa.transition(state, transition.inp);
+            if next == SINK_STATE {
+                continue;
+            }
+            self.key.push(transition.inp);
+            self.visit(
+                self.fst.node(transition.addr),
+                next,
+                out.cat(transition.out),
+            );
+            self.key.pop();
+        }
     }
 }
 
@@ -726,9 +743,10 @@ struct Alias {
     areas: Vec<u32>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Builder {
     names: HashMap<(Field, String), NameStats>,
+    streamed: spill::Streamed,
     areas: HashMap<RecordId, Area>,
     area_pairs: Vec<u64>,
     place_names: Vec<(String, u32, u8)>,
@@ -744,6 +762,19 @@ struct StatedRegion {
 }
 
 impl Builder {
+    pub fn new(scratch: &Arc<Scratch>, memory: &Arc<Budget>, share: usize) -> Self {
+        Self {
+            names: HashMap::new(),
+            streamed: spill::Streamed::new(scratch, memory, share),
+            areas: HashMap::new(),
+            area_pairs: Vec::new(),
+            place_names: Vec::new(),
+            country_codes: HashMap::new(),
+            region_groups: HashMap::new(),
+            stated_regions: HashMap::new(),
+        }
+    }
+
     pub fn set_country_codes(&mut self, codes: HashMap<RecordId, CountryCode>) {
         self.country_codes = codes;
     }
@@ -770,7 +801,7 @@ impl Builder {
         }
     }
 
-    pub fn add(&mut self, names: RecordNames, context: Option<&RecordContext>) {
+    pub fn add(&mut self, names: RecordNames, context: Option<&RecordContext>) -> Result<()> {
         let tuple = context.map(|context| &context.admin_context);
         let country = tuple
             .and_then(|tuple| tuple.country_record_id())
@@ -798,12 +829,16 @@ impl Builder {
                     *stated.regions.entry(*region).or_default() += 1;
                 }
             }
+            if spill::Streamed::FIELDS.contains(&field) {
+                self.streamed.add(field, name, country, level)?;
+                continue;
+            }
             let stats = self.names.entry((field, name)).or_default();
             stats.add(1, country);
             stats.levels |= level;
         }
         let Some(tuple) = tuple else {
-            return;
+            return Ok(());
         };
         let tiers = tuple.entries().iter().flat_map(|entry| {
             entry.tiers.iter().map(move |tier| {
@@ -834,6 +869,7 @@ impl Builder {
                     .add(1, country);
             }
         }
+        Ok(())
     }
 
     pub fn finish(
@@ -844,6 +880,7 @@ impl Builder {
     ) -> Result<()> {
         let Self {
             mut names,
+            streamed,
             areas,
             area_pairs,
             place_names,
@@ -950,13 +987,8 @@ impl Builder {
         for ((field, name), stats) in &names {
             fields[field.index()].insert(name.clone(), stats.entry());
         }
-        fields[Field::StreetType.index()] = street_types(&fields[Field::Street.index()]);
-        let (bare, tail) = street_aliases(
-            &fields[Field::Street.index()],
-            &fields[Field::StreetType.index()],
-        );
-        fields[Field::StreetBare.index()] = bare;
-        fields[Field::StreetTail.index()] = tail;
+        let mut streamed = streamed.finish()?;
+        fields[Field::StreetType.index()] = streamed.types().clone();
         let mut units = VOCABULARY.units.clone();
         for (word, entry) in &fields[Field::Unit.index()] {
             if entry.count >= MIN_UNIT_WORD_VALUES {
@@ -1000,6 +1032,9 @@ impl Builder {
             fields[field.index()].remove(phrase);
         }
         for field in Field::ALL {
+            if streamed.write(field, &fields[field.index()], pack)? {
+                continue;
+            }
             match VOCABULARY
                 .list_fields
                 .iter()
@@ -1116,8 +1151,8 @@ enum Attach {
     Before,
 }
 
-fn admin_types() -> &'static [(String, Attach)] {
-    static TYPES: OnceLock<Vec<(String, Attach)>> = OnceLock::new();
+fn admin_types() -> &'static FxHashMap<String, Vec<(usize, Attach)>> {
+    static TYPES: OnceLock<FxHashMap<String, Vec<(usize, Attach)>>> = OnceLock::new();
     TYPES.get_or_init(|| {
         let phrases = |list: &'static str| {
             list.lines()
@@ -1157,7 +1192,11 @@ fn admin_types() -> &'static [(String, Attach)] {
         }
         types.sort();
         types.dedup();
-        types
+        let mut index = FxHashMap::<String, Vec<(usize, Attach)>>::default();
+        for (rank, (phrase, attach)) in types.into_iter().enumerate() {
+            index.entry(phrase).or_default().push((rank, attach));
+        }
+        index
     })
 }
 
@@ -1166,7 +1205,7 @@ pub fn designates_unit(key: &str) -> bool {
 }
 
 pub(super) fn is_admin_type(key: &str) -> bool {
-    admin_types().iter().any(|(phrase, _)| phrase == key)
+    admin_types().contains_key(key)
 }
 
 pub(crate) fn same_admin_name(left: &str, right: &str) -> bool {
@@ -1176,104 +1215,83 @@ pub(crate) fn same_admin_name(left: &str, right: &str) -> bool {
 }
 
 pub(crate) fn admin_aliases(key: &str) -> Vec<String> {
-    let mut aliases = Vec::new();
-    for (phrase, attach) in admin_types() {
-        let rests = match attach {
-            Attach::Word => [
-                key.strip_suffix(phrase.as_str())
-                    .and_then(|rest| rest.strip_suffix(' ')),
-                key.strip_prefix(phrase.as_str())
-                    .and_then(|rest| rest.strip_prefix(' ')),
-            ],
-            Attach::WordBefore => [
-                key.strip_prefix(phrase.as_str())
-                    .and_then(|rest| rest.strip_prefix(' ')),
-                None,
-            ],
-            Attach::WordAfter => [
-                key.strip_suffix(phrase.as_str())
-                    .and_then(|rest| rest.strip_suffix(' ')),
-                None,
-            ],
-            Attach::After => [
-                key.strip_suffix(phrase.as_str())
-                    .filter(|rest| !rest.ends_with(' ')),
-                None,
-            ],
-            Attach::Before => [
-                key.strip_prefix(phrase.as_str())
-                    .filter(|rest| !rest.starts_with(' ')),
-                None,
-            ],
-        };
-        for rest in rests.into_iter().flatten() {
-            let usable = rest.chars().count() >= 2
-                && !rest.chars().any(is_numeral)
-                && rest.chars().any(char::is_alphabetic);
-            if usable && !aliases.iter().any(|alias| alias == rest) {
-                aliases.push(rest.to_string());
-            }
+    let types = admin_types();
+    let mut rests = Vec::new();
+    for at in key.char_indices().map(|(at, _)| at).chain([key.len()]) {
+        let (head, tail) = key.split_at(at);
+        for (rank, attach) in types.get(head).into_iter().flatten() {
+            let rest = match attach {
+                Attach::Word | Attach::WordBefore => tail.strip_prefix(' '),
+                Attach::Before => Some(tail).filter(|rest| !rest.starts_with(' ')),
+                Attach::WordAfter | Attach::After => None,
+            };
+            let order = (*rank, u8::from(*attach == Attach::Word));
+            rests.extend(rest.map(|rest| (order, rest)));
+        }
+        for (rank, attach) in types.get(tail).into_iter().flatten() {
+            let rest = match attach {
+                Attach::Word | Attach::WordAfter => head.strip_suffix(' '),
+                Attach::After => Some(head).filter(|rest| !rest.ends_with(' ')),
+                Attach::WordBefore | Attach::Before => None,
+            };
+            rests.extend(rest.map(|rest| ((*rank, 0), rest)));
+        }
+    }
+    rests.sort_unstable_by_key(|(order, _)| *order);
+    let mut aliases = Vec::<String>::new();
+    for (_, rest) in rests {
+        let usable = rest.chars().count() >= 2
+            && !rest.chars().any(is_numeral)
+            && rest.chars().any(char::is_alphabetic);
+        if usable && !aliases.iter().any(|alias| alias == rest) {
+            aliases.push(rest.to_string());
         }
     }
     aliases
 }
 
-fn street_aliases(
-    streets: &BTreeMap<String, Entry>,
-    types: &BTreeMap<String, Entry>,
-) -> (BTreeMap<String, Entry>, BTreeMap<String, Entry>) {
-    let merge = |map: &mut BTreeMap<String, Entry>, key: String, entry: Entry| {
-        map.entry(key)
-            .and_modify(|held| {
-                if entry.count > held.count {
-                    held.country = entry.country;
-                }
-                held.count = held.count.saturating_add(entry.count);
-                held.levels |= entry.levels;
-            })
-            .or_insert(entry);
-    };
-    let mut bare = BTreeMap::new();
-    let mut tail = BTreeMap::new();
-    for (key, entry) in streets {
-        let words = key
-            .split_whitespace()
-            .filter(|word| !types.contains_key(*word))
-            .collect::<Vec<_>>();
-        let named = words.join(" ");
-        if !named.is_empty() && named != *key {
-            merge(&mut bare, named, *entry);
-        }
-        for start in 1..words.len() {
-            let last = words[start..].join(" ");
-            if last.chars().count() >= MIN_TAIL_CHARS {
-                merge(&mut tail, last, *entry);
-            }
-        }
-    }
-    (bare, tail)
+fn street_alias_keys(key: &str, types: &BTreeMap<String, Entry>) -> (Option<String>, Vec<String>) {
+    let words = key
+        .split_whitespace()
+        .filter(|word| !types.contains_key(*word))
+        .collect::<Vec<_>>();
+    let named = words.join(" ");
+    let bare = (!named.is_empty() && named != key).then_some(named);
+    let tails = (1..words.len())
+        .map(|start| words[start..].join(" "))
+        .filter(|last| last.chars().count() >= MIN_TAIL_CHARS)
+        .collect();
+    (bare, tails)
 }
 
-fn street_types(streets: &BTreeMap<String, Entry>) -> BTreeMap<String, Entry> {
-    let mut ends = HashMap::<&str, u64>::new();
-    for name in streets.keys() {
-        let words = name.split_whitespace().collect::<Vec<_>>();
-        if words.len() < 2 {
-            continue;
-        }
-        let distinct = [words[0], words[words.len() - 1]]
-            .into_iter()
-            .collect::<HashSet<_>>();
-        for word in distinct {
-            *ends.entry(word).or_default() += 1;
-        }
+fn merge_alias(held: &mut Entry, entry: Entry) {
+    if entry.count > held.count {
+        held.country = entry.country;
     }
-    let threshold = ((streets.len() as f64 * STREET_TYPE_SHARE) as u64).max(MIN_STREET_TYPE_NAMES);
+    held.count = held.count.saturating_add(entry.count);
+    held.levels |= entry.levels;
+}
+
+fn count_street_ends(ends: &mut HashMap<String, u64>, name: &str) {
+    let words = name.split_whitespace().collect::<Vec<_>>();
+    if words.len() < 2 {
+        return;
+    }
+    let distinct = [words[0], words[words.len() - 1]]
+        .into_iter()
+        .collect::<HashSet<_>>();
+    for word in distinct {
+        *ends.entry(word.to_string()).or_default() += 1;
+    }
+}
+
+fn street_types(ends: HashMap<String, u64>, names: u64) -> BTreeMap<String, Entry> {
+    let threshold = ((names as f64 * STREET_TYPE_SHARE) as u64).max(MIN_STREET_TYPE_NAMES);
     let mut types = VOCABULARY.street_types.clone();
     for (word, count) in ends {
         if count >= threshold && !word.chars().any(|character| character.is_numeric()) {
             types
-                .entry(word.to_string())
+                .entry(word)
                 .or_insert(Entry {
                     count: 0,
                     country: None,
@@ -1541,45 +1559,116 @@ mod tests {
                 .fuzzy(Field::Street, &two.build_dfa("toronto"), "t")
                 .is_none()
         );
+        let tied = Dictionaries::from_entries([
+            (Field::Locality, "berm", entry(5, None)),
+            (Field::Locality, "bern", entry(5, None)),
+        ]);
+        let (name, _) = tied
+            .fuzzy(Field::Locality, &one.build_dfa("berx"), "b")
+            .expect("one edit");
+        assert_eq!(name, "berm");
         assert_eq!(
             dictionaries.country_weight(CountryCode::parse("CA").unwrap()),
             0.0
         );
     }
 
+    fn street_sections(share: usize) -> TempDir {
+        let dir = TempDir::new("street-sections");
+        let scratch = Scratch::create(dir.join("scratch")).expect("scratch");
+        let mut builder = Builder::new(&scratch, &Budget::unlimited(), share);
+        for (street, country, records) in [
+            ("calle pintor ribera", "ES", 2),
+            ("pintor ribera", "PT", 2),
+            ("king street", "CA", 5),
+            ("king road", "GB", 5),
+            ("main", "CA", 1),
+        ] {
+            for _ in 0..records {
+                builder
+                    .add(
+                        RecordNames {
+                            names: vec![(Field::Street, street.to_string(), 0)],
+                            country: CountryCode::parse(country),
+                            place: false,
+                        },
+                        None,
+                    )
+                    .expect("add");
+            }
+        }
+        let mut pack = Writer::create(dir.join("pack.ogp")).expect("pack");
+        builder
+            .finish(&mut pack, &HashMap::new(), &[])
+            .expect("finish");
+        pack.finish().expect("seal");
+        dir
+    }
+
     #[test]
     fn a_street_is_keyed_without_its_type_and_by_its_last_words() {
-        let entry = |count| Entry {
-            count,
-            country: None,
-            levels: 0,
+        let spilled = street_sections(1);
+        let held = street_sections(usize::MAX);
+        let open = |dir: &TempDir| Container::open(dir.join("pack.ogp")).expect("open");
+        let (spilled, held) = (open(&spilled), open(&held));
+        for field in [
+            Field::Street,
+            Field::StreetBare,
+            Field::StreetTail,
+            Field::Word,
+        ] {
+            assert_eq!(
+                spilled
+                    .raw_section(field.section())
+                    .expect("section")
+                    .as_slice(),
+                held.raw_section(field.section())
+                    .expect("section")
+                    .as_slice(),
+                "{field:?}"
+            );
+        }
+        let dictionaries = Dictionaries::open(&spilled).expect("dicts");
+        let entries = |field| {
+            ["pintor ribera", "king", "main", "ribera"]
+                .into_iter()
+                .filter_map(|key| Some((key, dictionaries.get(field, key)?)))
+                .collect::<Vec<_>>()
         };
-        let streets = BTreeMap::from([
-            ("calle pintor ribera".to_string(), entry(3)),
-            ("pintor ribera".to_string(), entry(2)),
-            ("king street".to_string(), entry(5)),
-            ("main".to_string(), entry(1)),
-            ("rue de la paix".to_string(), entry(4)),
-        ]);
-        let types = BTreeMap::from([
-            ("calle".to_string(), entry(0)),
-            ("street".to_string(), entry(0)),
-            ("rue".to_string(), entry(0)),
-        ]);
-        let (bare, tail) = street_aliases(&streets, &types);
         assert_eq!(
-            bare.iter()
-                .map(|(key, entry)| (key.as_str(), entry.count))
-                .collect::<Vec<_>>(),
-            [("de la paix", 4), ("king", 5), ("pintor ribera", 3)],
-            "a street without a type word has no alias; one alias of two streets adds up"
+            entries(Field::StreetBare),
+            [
+                ("pintor ribera", entry(2, Some("ES"))),
+                ("king", entry(10, Some("GB"))),
+            ],
+            "a street without a type word has no alias; one alias of two streets adds up, \
+             and keeps the country of the first street when their counts tie"
         );
         assert_eq!(
-            tail.iter()
-                .map(|(key, entry)| (key.as_str(), entry.count))
-                .collect::<Vec<_>>(),
-            [("la paix", 4), ("paix", 4), ("ribera", 5)],
-            "last words of four letters or more; \"de\" alone is too short"
+            entries(Field::StreetTail),
+            [("ribera", entry(4, Some("ES")))],
+            "the last words of a street of several name words"
+        );
+        assert_eq!(
+            dictionaries.get(Field::Word, "pintor"),
+            Some(entry(3, None))
+        );
+        assert_eq!(dictionaries.get(Field::Word, "king"), Some(entry(3, None)));
+        assert_eq!(
+            dictionaries.get(Field::Word, "ribera"),
+            Some(entry(
+                4 + VOCABULARY.pre_override_list_word_counts["ribera"],
+                None
+            )),
+            "a listed word adds its list count to the streets'"
+        );
+        let (listed, count) = VOCABULARY
+            .pre_override_list_word_counts
+            .first_key_value()
+            .expect("listed words");
+        assert_eq!(
+            dictionaries.get(Field::Word, listed),
+            Some(entry(*count, None))
         );
     }
 
@@ -1591,12 +1680,37 @@ mod tests {
             streets.insert(format!("rue name{index}"), entry(1, None));
         }
         streets.insert("king street west".to_string(), entry(1, None));
-        let types = street_types(&streets);
+        let mut ends = HashMap::new();
+        for name in streets.keys() {
+            count_street_ends(&mut ends, name);
+        }
+        let types = street_types(ends, streets.len() as u64);
         assert!(types.contains_key("street"));
         assert!(types.contains_key("rue"));
         assert!(types.contains_key("strasse"));
         assert!(!types.contains_key("king"));
         assert!(!types.contains_key("name1"));
+    }
+
+    #[test]
+    fn a_word_ending_exactly_the_least_number_of_street_names_is_learned_as_a_type() {
+        let mut ends = HashMap::new();
+        for index in 0..MIN_STREET_TYPE_NAMES {
+            count_street_ends(&mut ends, &format!("name{index} zorblax"));
+        }
+        for index in 0..MIN_STREET_TYPE_NAMES - 1 {
+            count_street_ends(&mut ends, &format!("name{index} quorlane"));
+        }
+        let types = street_types(ends, 1000);
+        assert_eq!(
+            types.get("zorblax"),
+            Some(&Entry {
+                count: MIN_STREET_TYPE_NAMES,
+                country: None,
+                levels: 0,
+            })
+        );
+        assert!(!types.contains_key("quorlane"));
     }
 
     #[test]
@@ -1652,6 +1766,7 @@ mod tests {
     }
 
     static DICTIONARY_SECTIONS: LazyLock<TempDir> = LazyLock::new(|| {
+        let dir = TempDir::new("dictionary-sections");
         let address = |unit: &str| {
             Record::Address(crate::record::AddressRecord {
                 building: None,
@@ -1680,10 +1795,13 @@ mod tests {
             flags: 0,
             ..Default::default()
         };
-        let mut builder = Builder::default();
+        let scratch = Scratch::create(dir.join("scratch")).expect("scratch");
+        let mut builder = Builder::new(&scratch, &Budget::unlimited(), 1 << 20);
         let chiyoda = context(&[(PlaceLayer::Locality, 9)]);
         for _ in 0..3 {
-            builder.add(RecordNames::default(), Some(&chiyoda));
+            builder
+                .add(RecordNames::default(), Some(&chiyoda))
+                .expect("add");
         }
         let nested = [(1, 2), (3, 4), (3, 5)].map(|(region, locality)| {
             context(&[
@@ -1692,12 +1810,18 @@ mod tests {
             ])
         });
         for context in &nested {
-            builder.add(RecordNames::default(), Some(context));
+            builder
+                .add(RecordNames::default(), Some(context))
+                .expect("add");
         }
         for index in 0..MIN_UNIT_WORD_VALUES {
-            builder.add(RecordNames::of(&address(&format!("Bay {index}"))), None);
+            builder
+                .add(RecordNames::of(&address(&format!("Bay {index}"))), None)
+                .expect("add");
         }
-        builder.add(RecordNames::of(&address("Booth 1")), None);
+        builder
+            .add(RecordNames::of(&address("Booth 1")), None)
+            .expect("add");
         let names = HashMap::from([
             (1, vec!["愛知県".to_string()]),
             (2, vec!["名古屋市".to_string()]),
@@ -1710,7 +1834,6 @@ mod tests {
             .chain(&nested)
             .map(|context| context.admin_context.clone())
             .collect::<Vec<_>>();
-        let dir = TempDir::new("dictionary-sections");
         let mut pack = Writer::create(dir.join("pack.ogp")).expect("pack");
         builder
             .finish(&mut pack, &names, &contexts)

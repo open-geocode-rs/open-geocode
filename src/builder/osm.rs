@@ -862,6 +862,7 @@ impl<'a> Run<'a> {
         WriterOptions {
             memory: Arc::clone(&self.memory),
             text_index_memory_bytes: (self.budget / 2).max(1),
+            sorter_bytes: self.budget,
         }
     }
 
@@ -1997,6 +1998,18 @@ impl<'a> Run<'a> {
         report
     }
 
+    fn record_scratch(&mut self, scratch: &Scratch) {
+        let report = &mut self.build.report;
+        report.scratch.spilled_bytes = scratch.spilled_bytes();
+        report.scratch.budget_bytes = scratch.budget();
+        report.scratch.peak_live_bytes = scratch.peak_bytes();
+        report.scratch.peak_owners = scratch.peak_owners();
+        report.scratch.zstd_level = scratch.level();
+        report.scratch.spills = scratch.traffic();
+        self.checkpoints.peak_retained_bytes = scratch.peak_retained_bytes();
+        self.checkpoints.voided = scratch.voided();
+    }
+
     fn finish(mut self) -> Result<BuilderReport> {
         let phase = Instant::now();
         let (mut sealed, mut stats) = self.sealed.take().ok_or_else(|| missing("the Pack"))?;
@@ -2029,21 +2042,13 @@ impl<'a> Run<'a> {
         let scratch = Arc::clone(&self.scratch);
         self.sample_saved = None;
         scratch.complete();
-        let report = &mut self.build.report;
-        report.scratch.spilled_bytes = scratch.spilled_bytes();
-        report.scratch.budget_bytes = scratch.budget();
-        report.scratch.peak_live_bytes = scratch.peak_bytes();
-        report.scratch.peak_owners = scratch.peak_owners();
-        report.scratch.zstd_level = scratch.level();
-        report.scratch.spills = scratch.traffic();
-        self.checkpoints.peak_retained_bytes = scratch.peak_retained_bytes();
-        self.checkpoints.voided = scratch.voided();
+        self.record_scratch(&scratch);
         self.progress.finish(BuildStage::Parser);
         let parser_training_ms = phase.elapsed().as_millis();
         self.progress.start(BuildStage::StructuredIndex, None)?;
         let structured = Instant::now();
-        crate::structured::add_to(&mut sealed)?;
-        crate::ids::add_to(&mut sealed)?;
+        crate::structured::add_to(&mut sealed, &scratch, &self.memory, self.budget)?;
+        crate::ids::add_to(&mut sealed, &scratch, &self.memory, self.budget)?;
         if self.options.tiger {
             let counties = tiger::counties_for_pack(&sealed.path(), &self.options.pack)?;
             let sections =
@@ -2099,6 +2104,7 @@ impl<'a> Run<'a> {
         }
         stats.bytes = sealed.bytes();
         self.progress.finish(BuildStage::StructuredIndex);
+        self.record_scratch(&scratch);
         let mut report = self.report();
         report.checkpoints = self.checkpoints.clone();
         self.progress.check()?;
@@ -2159,6 +2165,7 @@ fn sorter_of<T: Spill + Ord + Send + Sync + 'static>(
 
 fn budget_of(plan: &BuildPlan) -> Arc<Budget> {
     let memory = Budget::new(usize::try_from(plan.memory_budget_bytes).unwrap_or(usize::MAX));
+    memory.limit_heap(usize::try_from(plan.heap_limit_bytes()).unwrap_or(usize::MAX));
     memory.sample(&plan.resources);
     memory
 }
@@ -5894,6 +5901,19 @@ mod tests {
             let spill = &ledger.spills[owner];
             assert!(spill.written_bytes > 0, "{owner}: {spill:?}");
         }
+        for owner in [
+            "dictionary-streets",
+            "dictionary-pois",
+            "dictionary-words",
+            "dictionary-aliases",
+        ] {
+            let spill = ledger.spills.get(owner);
+            assert!(
+                spill.is_some_and(|spill| spill.merges > 0),
+                "{owner}: {:?}",
+                ledger.spills
+            );
+        }
         let records = &ledger.spills["records"];
         assert_eq!(records.items_read, records.items_written);
         assert!(records.merge_passes >= 1);
@@ -5919,9 +5939,63 @@ mod tests {
         assert_eq!(in_memory.accepted, spilled.accepted);
         assert_eq!(in_memory.rejected, spilled.rejected);
         assert_eq!(in_memory.triage, spilled.triage);
+        let structured = spilled.stages.last().expect("structured index stage");
+        assert_eq!(structured.stage, BuildStage::StructuredIndex.description());
+        for owner in ["structured-keys", "places-ids"] {
+            assert!(
+                structured
+                    .spills
+                    .get(owner)
+                    .is_some_and(|spill| spill.merges > 0),
+                "{owner}: {:?}",
+                structured.spills
+            );
+        }
 
         let memory = Reader::open(dir.join("memory")).expect("memory pack");
         let spilled = Reader::open(dir.join("spilled")).expect("spilled pack");
+        for (section, _) in crate::structured::SECTIONS {
+            let section_of = |pack: &Reader| {
+                let bytes = pack.container().raw_section(section).expect(section);
+                if section != "streets/meta" {
+                    return bytes.as_slice().to_vec();
+                }
+                let mut meta: serde_json::Value =
+                    serde_json::from_slice(bytes.as_slice()).expect("meta");
+                meta["segments"].take();
+                meta.to_string().into_bytes()
+            };
+            assert_eq!(section_of(&memory), section_of(&spilled), "{section}");
+        }
+        let sorted = memory
+            .container()
+            .sections()
+            .keys()
+            .filter(|name| name.starts_with("parse/") || *name == crate::ids::SECTION)
+            .collect::<Vec<_>>();
+        assert!(
+            sorted.contains(
+                &&crate::parse::lattice::dictionary::Field::Street
+                    .section()
+                    .to_string()
+            )
+        );
+        assert!(sorted.contains(&&crate::ids::SECTION.to_string()));
+        for section in sorted {
+            assert_eq!(
+                memory
+                    .container()
+                    .raw_section(section)
+                    .expect(section)
+                    .as_slice(),
+                spilled
+                    .container()
+                    .raw_section(section)
+                    .expect(section)
+                    .as_slice(),
+                "{section}"
+            );
+        }
         assert_eq!(
             memory.manifest().record_count,
             spilled.manifest().record_count

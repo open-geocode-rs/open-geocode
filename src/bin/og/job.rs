@@ -490,13 +490,8 @@ fn run(
     };
     let plan = plan_osm_build(&options)?;
     *progress.plan.lock().expect("plan lock") = Some(plan.clone());
-    let threads = if std::env::var_os("RAYON_NUM_THREADS").is_some() {
-        0
-    } else {
-        plan.threads
-    };
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
+        .num_threads(plan.threads)
         .build()
         .context("failed to start the build's worker threads")?;
     let started = Instant::now();

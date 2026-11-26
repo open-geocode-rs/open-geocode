@@ -17,6 +17,12 @@ const GERMANY_KEPT_WAYS: f64 = 21_178_798.0;
 const GERMANY_RECORDS: f64 = 26_131_991.0;
 const GERMANY_ADDRESSES: f64 = 19_719_186.0;
 const GERMANY_STREETS: f64 = 4_103_850.0;
+const PLANET_INPUT_BYTES: f64 = 95_631_115_419.0;
+const PLANET_NEEDED_NODES: f64 = 1_646_327_702.0;
+const PLANET_KEPT_WAYS: f64 = 156_619_174.0;
+const PLANET_RECORDS: f64 = 269_486_139.0;
+const PLANET_ADDRESSES: f64 = 173_821_696.0;
+const PLANET_STREETS: f64 = 56_214_445.0;
 const BOUNDARY_REFS_PER_INPUT_BYTE: f64 = 0.0025;
 const NODE_ID_SPACE: u64 = 14_300_000_000;
 
@@ -29,8 +35,8 @@ const HOUSE_SPILL_BYTES: f64 = 50.0;
 const PACK_BYTES_PER_RECORD: f64 = 102.0;
 const PACK_BYTES_PER_IMPORTED_ROW: f64 = 25.0;
 
-const WORKER_BYTES: u64 = 64 << 20;
-const BASE_UNTRACKED_BYTES: u64 = 256 << 20;
+pub const WORKER_BYTES: u64 = 64 << 20;
+pub const BASE_UNTRACKED_BYTES: u64 = 512 << 20;
 const BOUNDARY_HEAP_BYTES_PER_REF: f64 = 4.0;
 const BOUNDARY_SHAPE_BYTES_PER_REF: f64 = 30.0;
 const BUDGET_PERCENT: u64 = 75;
@@ -50,15 +56,20 @@ pub struct ItemCounts {
 
 impl ItemCounts {
     fn estimate(input_bytes: u64, imported_rows: u64) -> Self {
-        let at = |germany: f64| (input_bytes as f64 * germany / GERMANY_INPUT_BYTES) as u64;
-        let needed_nodes = at(GERMANY_NODE_REFS);
+        let bytes = input_bytes as f64;
+        let at = |germany: f64, planet: f64| {
+            let dense = bytes * germany / GERMANY_INPUT_BYTES;
+            let whole = planet * (bytes / PLANET_INPUT_BYTES).max(1.0);
+            dense.min(whole) as u64
+        };
+        let needed_nodes = at(GERMANY_NODE_REFS, PLANET_NEEDED_NODES);
         Self {
             needed_nodes,
             node_set_bytes: node_set_bytes(needed_nodes),
-            kept_ways: at(GERMANY_KEPT_WAYS),
-            records: at(GERMANY_RECORDS),
-            addresses: at(GERMANY_ADDRESSES),
-            streets: at(GERMANY_STREETS),
+            kept_ways: at(GERMANY_KEPT_WAYS, PLANET_KEPT_WAYS),
+            records: at(GERMANY_RECORDS, PLANET_RECORDS),
+            addresses: at(GERMANY_ADDRESSES, PLANET_ADDRESSES),
+            streets: at(GERMANY_STREETS, PLANET_STREETS),
             boundary_refs: (input_bytes as f64 * BOUNDARY_REFS_PER_INPUT_BYTE) as u64,
             imported_rows,
         }
@@ -146,6 +157,10 @@ impl BuildPlan {
         self.memory_free_bytes = available + scanned.heap_bytes.unwrap_or(scanned.tracked_bytes);
         self.size();
         self.check()
+    }
+
+    pub fn heap_limit_bytes(&self) -> u64 {
+        self.memory_budget_bytes + untracked_beside_boundaries(self.threads)
     }
 
     fn size(&mut self) {
@@ -307,13 +322,22 @@ fn derived_budget(resources: &Resources, threads: usize) -> u64 {
         .max(MIN_BUDGET_BYTES as u64)
 }
 
+fn worker_threads(resources: &Resources) -> usize {
+    std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|threads| threads.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or(resources.usable_cpus)
+        .max(1)
+}
+
 fn preflight(
     resources: Resources,
+    threads: usize,
     input_bytes: u64,
     imported_rows: u64,
     budget_override: Option<usize>,
 ) -> BuildPlan {
-    let threads = resources.usable_cpus.max(1);
     let memory_budget_bytes = budget_override.map_or_else(
         || derived_budget(&resources, threads),
         |budget| budget as u64,
@@ -369,6 +393,8 @@ pub(crate) fn plan_build_holding(
     force: bool,
     held: u64,
 ) -> Result<BuildPlan> {
+    let resources = Resources::probe();
+    let threads = worker_threads(&resources);
     let mut plan = BuildPlan {
         scratch_budget_bytes: scratch_budget,
         scratch_dir: scratch.to_path_buf(),
@@ -376,7 +402,8 @@ pub(crate) fn plan_build_holding(
         forced: force,
         held_scratch_bytes: held,
         ..preflight(
-            Resources::probe(),
+            resources,
+            threads,
             input_bytes,
             imported_rows,
             budget_override,
@@ -436,7 +463,7 @@ mod tests {
         let plan = plan_build(1 << 20, 0, &scratch, &scratch, None, None, false).expect("plan");
         assert!(plan.memory_budget_derived);
         assert!(plan.memory_budget_bytes >= MIN_BUDGET_BYTES as u64);
-        assert_eq!(plan.threads, plan.resources.usable_cpus.max(1));
+        assert_eq!(plan.threads, worker_threads(&plan.resources));
         assert!(plan.sorter_bytes <= MAX_DERIVED_BUDGET_BYTES as u64);
         let set =
             plan_build(1 << 20, 0, &scratch, &scratch, Some(64 << 20), None, false).expect("plan");
@@ -447,7 +474,7 @@ mod tests {
 
     #[test]
     fn a_small_machine_keeps_the_least_budget_and_every_worker() {
-        let small = preflight(machine(1), 1 << 30, 0, None);
+        let small = preflight(machine(1), 24, 1 << 30, 0, None);
         assert_eq!(small.memory_budget_bytes, MIN_BUDGET_BYTES as u64);
         assert_eq!(small.threads, 24);
     }
@@ -455,11 +482,10 @@ mod tests {
     #[test]
     fn the_planet_fits_this_machine_before_and_after_its_scan() {
         let disk = 233_000_000_000;
-        let planet = preflight(machine(28), 95_380_942_829, 0, None);
+        let planet = preflight(machine(28), 24, 95_380_942_829, 0, None);
         assert_eq!(planet.threads, 24);
         assert!(planet.memory_budget_bytes > 16 << 30);
-        assert!(planet.items.needed_nodes > 3_000_000_000);
-        assert!(!planet.locations_in_memory);
+        assert!(planet.locations_in_memory);
         assert!(
             planet.shared_disk_needed_bytes < disk / 10 * 9,
             "{} GiB",
@@ -501,8 +527,72 @@ mod tests {
     }
 
     #[test]
+    fn the_planet_is_estimated_at_its_own_counts_not_germanys_density() {
+        let planet = preflight(machine(28), 24, 95_631_115_419, 0, None);
+        let items = &planet.items;
+        assert_eq!(
+            (
+                items.needed_nodes,
+                items.kept_ways,
+                items.records,
+                items.addresses,
+                items.streets
+            ),
+            (
+                1_646_327_702,
+                156_619_174,
+                269_486_139,
+                173_821_696,
+                56_214_445
+            )
+        );
+        assert!(
+            planet.shared_disk_needed_bytes < 80_000_000_000,
+            "{} MiB",
+            planet.shared_disk_needed_bytes >> 20
+        );
+        assert_eq!(planet.output_disk_needed_bytes, 27_487_586_178);
+    }
+
+    #[test]
+    fn a_small_input_is_estimated_at_germanys_density() {
+        let items = preflight(machine(28), 24, 1_000_000_000, 0, None).items;
+        assert_eq!(
+            (
+                items.needed_nodes,
+                items.kept_ways,
+                items.records,
+                items.addresses,
+                items.streets
+            ),
+            (33_593_657, 4_356_830, 5_375_784, 4_056_564, 844_230)
+        );
+    }
+
+    #[test]
+    fn an_input_larger_than_the_planet_is_estimated_at_the_planets_density() {
+        let items = preflight(machine(28), 24, 2 * 95_631_115_419, 0, None).items;
+        assert_eq!(
+            (
+                items.needed_nodes,
+                items.kept_ways,
+                items.records,
+                items.addresses,
+                items.streets
+            ),
+            (
+                2 * 1_646_327_702,
+                2 * 156_619_174,
+                2 * 269_486_139,
+                2 * 173_821_696,
+                2 * 56_214_445
+            )
+        );
+    }
+
+    #[test]
     fn coordinates_count_as_scratch_in_memory_or_mapped() {
-        let mut plan = preflight(machine(28), 200_000_000, 0, None);
+        let mut plan = preflight(machine(28), 24, 200_000_000, 0, None);
         plan.items.needed_nodes = 0;
         plan.size();
         let none = plan.scratch_disk_needed_bytes;
@@ -524,7 +614,7 @@ mod tests {
             scratch_dir: dir.clone(),
             output_dir: dir,
             scratch_budget_bytes: Some(1 << 30),
-            ..preflight(machine(28), 1 << 20, 0, None)
+            ..preflight(machine(28), 24, 1 << 20, 0, None)
         };
         plan.check().expect("a small input fits");
         let scanned = Scanned {

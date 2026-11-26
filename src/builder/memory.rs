@@ -5,21 +5,10 @@ use std::sync::{
 
 use crate::{alloc, resources::Resources};
 
-const BUDGET_PERCENT: u64 = 50;
 const HEAP_CEILING_PERCENT: u64 = 85;
 const MIN_FAIR_SHARE_BYTES: usize = 16 << 20;
 pub const MIN_BUDGET_BYTES: usize = 256 << 20;
 pub const MAX_DERIVED_BUDGET_BYTES: usize = 1 << 30;
-
-pub fn derived_budget(resources: &Resources, untracked_bytes: u64) -> usize {
-    let usable = resources
-        .available_memory_bytes
-        .saturating_sub(untracked_bytes);
-    let budget = u128::from(usable) * u128::from(BUDGET_PERCENT) / 100;
-    usize::try_from(budget)
-        .unwrap_or(usize::MAX)
-        .clamp(MIN_BUDGET_BYTES, MAX_DERIVED_BUDGET_BYTES)
-}
 
 #[derive(Debug)]
 pub struct Budget {
@@ -30,6 +19,7 @@ pub struct Budget {
     peak: AtomicUsize,
     stage_peak: AtomicUsize,
     heap_ceiling: AtomicUsize,
+    heap_limit: AtomicUsize,
 }
 
 impl Budget {
@@ -42,6 +32,7 @@ impl Budget {
             peak: AtomicUsize::new(0),
             stage_peak: AtomicUsize::new(0),
             heap_ceiling: AtomicUsize::new(usize::MAX),
+            heap_limit: AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -74,11 +65,16 @@ impl Budget {
             return;
         };
         let room = resources.available_memory_bytes / 100 * HEAP_CEILING_PERCENT;
-        let ceiling = (live as u64).saturating_add(room);
+        let ceiling = usize::try_from((live as u64).saturating_add(room)).unwrap_or(usize::MAX);
         self.heap_ceiling.store(
-            usize::try_from(ceiling).unwrap_or(usize::MAX),
+            ceiling.min(self.heap_limit.load(Ordering::Relaxed)),
             Ordering::Relaxed,
         );
+    }
+
+    pub fn limit_heap(&self, bytes: usize) {
+        self.heap_limit.store(bytes, Ordering::Relaxed);
+        self.heap_ceiling.fetch_min(bytes, Ordering::Relaxed);
     }
 
     pub fn fair_share(&self) -> usize {
@@ -320,21 +316,5 @@ mod tests {
         assert_eq!(budget.stage_peak(), 300);
         budget.reset_stage_peak();
         assert_eq!(budget.stage_peak(), 0);
-    }
-
-    #[test]
-    fn the_derived_budget_is_half_of_what_is_left_within_bounds() {
-        let available = |gib: u64| Resources {
-            usable_cpus: 8,
-            total_memory_bytes: 32 << 30,
-            available_memory_bytes: gib << 30,
-            ..Resources::default()
-        };
-        assert_eq!(derived_budget(&available(2), 1 << 30), 512 << 20);
-        assert_eq!(
-            derived_budget(&available(16), 2 << 30),
-            MAX_DERIVED_BUDGET_BYTES
-        );
-        assert_eq!(derived_budget(&available(16), 20 << 30), MIN_BUDGET_BYTES);
     }
 }

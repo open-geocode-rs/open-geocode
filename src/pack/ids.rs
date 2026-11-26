@@ -1,14 +1,22 @@
-use std::sync::Arc;
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, BufReader, BufWriter, Read, Write},
+    sync::Arc,
+};
 
-use ph::fmph::GOFunction;
+use memmap2::{Mmap, MmapMut};
+use ph::fmph::{GOBuildConf, GOFunction};
 use rayon::prelude::*;
 
 use crate::{
     container::{Bytes, Container},
     error::{Error, Result},
+    extsort::{ExternalSorter, Scratch, ScratchFile, Spill},
+    memory::Budget,
     pack::{self, RecordId},
     record::ObjectType,
     records,
+    util::codec::{get_u64, put_u64},
 };
 
 pub const SECTION: &str = "places/ids";
@@ -54,67 +62,181 @@ pub fn parse(id: &str) -> Result<Option<(ObjectType, i64)>> {
     Ok(Some((object_type, number)))
 }
 
-pub fn add_to(sealed: &mut pack::SealedPack) -> Result<()> {
-    let bytes = {
+pub fn add_to(
+    sealed: &mut pack::SealedPack,
+    scratch: &Arc<Scratch>,
+    memory: &Arc<Budget>,
+    share_bytes: usize,
+) -> Result<()> {
+    let section = {
         let pack = pack::Reader::open(sealed.path())?;
-        build(pack.records())?
+        let ids = ExternalSorter::new(scratch, LABEL, memory, share_bytes);
+        build(pack.records(), scratch, ids)?
     };
-    sealed.add_section(SECTION, VERSION, &bytes)
+    sealed.add_section_files(&[(SECTION, VERSION, section.path().to_path_buf())])
 }
 
-fn entries(records: &records::Reader) -> Result<Vec<([u8; 8], bool, u64)>> {
-    let per_block = (0..records.block_count())
-        .into_par_iter()
-        .map(|block| {
-            Ok(records
-                .block_ids(block)?
-                .into_iter()
-                .filter_map(|id| Some((key(id.object_type, id.object_id)?, id.street, block)))
-                .collect::<Vec<_>>())
+const LABEL: &str = "places-ids";
+const BLOCKS_PER_THREAD: u64 = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Catalogued {
+    key: [u8; 8],
+    street: bool,
+    block: u64,
+}
+
+impl Spill for Catalogued {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.key);
+        out.push(u8::from(self.street));
+        put_u64(out, self.block);
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self> {
+        let truncated = || Error::Decode("a spilled id is truncated");
+        let (key, rest) = input.split_first_chunk::<8>().ok_or_else(truncated)?;
+        let (street, rest) = rest.split_first().ok_or_else(truncated)?;
+        let key = *key;
+        let street = *street != 0;
+        *input = rest;
+        Ok(Self {
+            key,
+            street,
+            block: get_u64(input)?,
         })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(per_block.into_iter().flatten().collect())
+    }
 }
 
-fn build(records: &records::Reader) -> Result<Vec<u8>> {
-    let mut places = entries(records)?;
-    places.sort_unstable_by_key(|(key, street, block)| (*key, *street, *block));
-    let mut more = Vec::new();
-    places.dedup_by(|(key, _, block), (held_key, _, held_block)| {
-        let same = key == held_key;
-        if same && block != held_block {
-            more.push((*key, *block));
+fn build(
+    records: &records::Reader,
+    scratch: &Arc<Scratch>,
+    mut ids: ExternalSorter<Catalogued>,
+) -> Result<ScratchFile> {
+    let blocks = records.block_count();
+    let round = rayon::current_num_threads() as u64 * BLOCKS_PER_THREAD;
+    for first in (0..blocks).step_by(round.max(1) as usize) {
+        let read = (first..(first + round).min(blocks))
+            .into_par_iter()
+            .map(|block| {
+                Ok(records
+                    .block_ids(block)?
+                    .into_iter()
+                    .filter_map(|id| {
+                        Some(Catalogued {
+                            key: key(id.object_type, id.object_id)?,
+                            street: id.street,
+                            block,
+                        })
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for catalogued in read.into_iter().flatten() {
+            ids.push(catalogued)?;
         }
-        same
-    });
-    more.sort_unstable();
-    more.dedup();
-    let keys = places.iter().map(|(key, ..)| *key).collect::<Vec<_>>();
-    let function = GOFunction::from_slice(&keys);
-    drop(keys);
-    let width = (u64::BITS - records.block_count().leading_zeros())
-        .div_ceil(8)
-        .max(1) as usize;
-    let mut values = vec![0u8; places.len() * width];
-    for (key, _, block) in &places {
-        let slot = function
-            .get(key)
-            .ok_or_else(|| Error::Inconsistent("a catalogued id has no slot".into()))?
-            as usize;
-        values[slot * width..(slot + 1) * width].copy_from_slice(&block.to_le_bytes()[..width]);
     }
-    let mut bytes =
-        Vec::with_capacity(17 + values.len() + more.len() * (8 + width) + function.write_bytes());
-    bytes.push(width as u8);
-    bytes.extend_from_slice(&(places.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(&values);
-    bytes.extend_from_slice(&(more.len() as u64).to_le_bytes());
-    for (key, block) in &more {
-        bytes.extend_from_slice(key);
-        bytes.extend_from_slice(&block.to_le_bytes()[..width]);
+    let width = (u64::BITS - blocks.leading_zeros()).div_ceil(8).max(1) as usize;
+    let mut keys = BufWriter::new(ScratchFile::create(scratch, LABEL, "places-ids.keys")?);
+    let mut firsts = BufWriter::new(ScratchFile::create(scratch, LABEL, "places-ids.firsts")?);
+    let mut more = BufWriter::new(ScratchFile::create(scratch, LABEL, "places-ids.more")?);
+    let (mut places, mut more_count) = (0u64, 0u64);
+    let mut held: Option<Catalogued> = None;
+    let mut others = Vec::new();
+    let mut flush = |held: Catalogued, others: &mut Vec<u64>| -> Result<()> {
+        keys.write_all(&held.key)?;
+        firsts.write_all(&held.block.to_le_bytes()[..width])?;
+        places += 1;
+        others.sort_unstable();
+        others.dedup();
+        for block in others.drain(..) {
+            more.write_all(&held.key)?;
+            more.write_all(&block.to_le_bytes()[..width])?;
+            more_count += 1;
+        }
+        Ok(())
+    };
+    for catalogued in ids.finish()? {
+        let catalogued = catalogued?;
+        match held {
+            Some(first) if first.key == catalogued.key => {
+                if catalogued.block != first.block {
+                    others.push(catalogued.block);
+                }
+            }
+            _ => {
+                if let Some(first) = held.replace(catalogued) {
+                    flush(first, &mut others)?;
+                }
+            }
+        }
     }
-    function.write(&mut bytes)?;
-    Ok(bytes)
+    if let Some(first) = held {
+        flush(first, &mut others)?;
+    }
+    let keys = finished(keys)?;
+    let firsts = finished(firsts)?;
+    let more = finished(more)?;
+    let mut values = ScratchFile::create(scratch, LABEL, "places-ids.values")?;
+    io::copy(&mut io::repeat(0).take(places * width as u64), &mut values)?;
+    let function = {
+        let keys_map = mapped(&keys)?;
+        let all_keys = keys_map.as_deref().unwrap_or_default().as_chunks::<8>().0;
+        let function = perfect_hash(all_keys);
+        let mut values_map = mapped_mut(&values)?;
+        let slots = values_map.as_deref_mut().unwrap_or_default();
+        let mut blocks_in = BufReader::new(File::open(firsts.path())?);
+        let mut block = [0u8; 8];
+        for key in all_keys {
+            blocks_in.read_exact(&mut block[..width])?;
+            let slot = function
+                .get(key)
+                .ok_or_else(|| Error::Inconsistent("a catalogued id has no slot".into()))?
+                as usize;
+            slots[slot * width..(slot + 1) * width].copy_from_slice(&block[..width]);
+        }
+        function
+    };
+    drop((keys, firsts));
+    let mut section = BufWriter::new(ScratchFile::create(scratch, LABEL, "places-ids.section")?);
+    section.write_all(&[width as u8])?;
+    section.write_all(&places.to_le_bytes())?;
+    io::copy(&mut File::open(values.path())?, &mut section)?;
+    section.write_all(&more_count.to_le_bytes())?;
+    io::copy(&mut File::open(more.path())?, &mut section)?;
+    function.write(&mut section)?;
+    finished(section)
+}
+
+fn perfect_hash(keys: &[[u8; 8]]) -> GOFunction {
+    GOFunction::from_slice_with_conf(keys, GOBuildConf::with_ct(Default::default(), 0))
+}
+
+fn finished(writer: BufWriter<ScratchFile>) -> Result<ScratchFile> {
+    writer
+        .into_inner()
+        .map_err(|error| Error::Io(error.into_error()))
+}
+
+fn mapped(file: &ScratchFile) -> Result<Option<Mmap>> {
+    if file.bytes() == 0 {
+        return Ok(None);
+    }
+    // SAFETY: a scratch file of this build, written and closed, that no one
+    // writes while it is mapped.
+    Ok(Some(unsafe { Mmap::map(&File::open(file.path())?) }?))
+}
+
+fn mapped_mut(file: &ScratchFile) -> Result<Option<MmapMut>> {
+    if file.bytes() == 0 {
+        return Ok(None);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file.path())?;
+    // SAFETY: a scratch file of this build that only this mapping writes.
+    Ok(Some(unsafe { MmapMut::map_mut(&file) }?))
 }
 
 pub struct Catalogue {
@@ -267,6 +389,17 @@ mod tests {
         for malformed in ["7", "osm:node", "osm:node:x", "osm:node:-1", "osm:area:1"] {
             assert!(parse(malformed).is_err(), "{malformed}");
         }
+    }
+
+    #[test]
+    fn the_hash_built_without_a_key_cache_is_the_one_built_with_it() {
+        let keys: Vec<[u8; 8]> = (0..5000u64).map(|id| (id * 7 + 1).to_le_bytes()).collect();
+        let (mut plain, mut uncached) = (Vec::new(), Vec::new());
+        GOFunction::from_slice(&keys[..])
+            .write(&mut plain)
+            .expect("write");
+        perfect_hash(&keys).write(&mut uncached).expect("write");
+        assert_eq!(plain, uncached);
     }
 
     static IDS_PACK: LazyLock<TempDir> = LazyLock::new(|| {

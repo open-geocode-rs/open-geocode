@@ -74,8 +74,10 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
 
-        /// Memory for the build's buffers, in MiB. Sized to what this
-        /// machine can give when not set.
+        /// Memory the build may hold, in MiB, beside a fixed 512 MiB and
+        /// 64 MiB per worker thread, all free beyond what the process already
+        /// holds outside its heap. Sized to what this machine can give when
+        /// not set.
         #[arg(long)]
         memory_budget_mb: Option<u64>,
 
