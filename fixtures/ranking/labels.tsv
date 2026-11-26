@@ -1,0 +1,20 @@
+# Same-named answers carry labels that tell them apart.
+# query	focus	top	expect	note
+new york		3	distinct
+springfield		3	distinct
+london		3	distinct
+portland		3	distinct
+paris		3	distinct
+san jose		3	distinct
+richmond		3	distinct
+kingston		3	distinct
+new york		5	script	a namesake abroad is labelled in the query's script
+paris		5	script & distinct	
+Bandra	72.878,19.076	5	distinct	two rows must not both read Bandra, Mumbai
+Moscow		5	script	
+Москва		3	script	
+Munich		1	place@48.137,11.575~20:Munich	named as typed, not München
+Tokyo		1	place@35.68,139.76~30:Tokyo	
+Trevi Fountain		5	!poi@41.9038,12.4886~0.3:fontana di trevi	a station is not labelled by the sight it serves
+Kremlin		1	poi@55.752,37.617~2:kremlin & !poi@55.752,37.617~3:moskov	named in the language typed, not a third one
+Tiananmen Square		1	poi@39.905,116.397~2:tiananmen & !poi@39.905,116.397~2:plein	

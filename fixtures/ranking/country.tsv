@@ -1,0 +1,20 @@
+# A country, in English and in its own language.
+# query	focus	top	expect	note
+Germany		1	place@51.200,10.400~500
+Deutschland		1	place@51.200,10.400~500
+Japan		1	place@36.200,138.300~1000
+Nippon		3	place@36.200,138.300~1000
+Brazil		1	place@-14.200,-51.900~1500
+Brasil		1	place@-14.200,-51.900~1500
+Canada		1	place@56.100,-106.300~2000
+España		1	place@40.000,-3.700~500
+Espana		1	place@40.000,-3.700~500
+Mexico	-118.244,34.052	1	place@23.600,-102.500~700
+Egypt		1	place@26.800,30.800~600
+India		1	place@20.600,79.000~1200
+Italia		1	place@42.800,12.600~500
+Ireland		1	place@53.400,-8.200~200
+South Korea		1	place@36.000,127.800~300
+korea		3	place@36.000,127.800~300
+United States		1	place@39.800,-98.600~2000
+Switzerland		1	place@46.800,8.200~150

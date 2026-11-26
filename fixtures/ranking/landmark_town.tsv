@@ -1,0 +1,18 @@
+# A landmark followed by its town.
+# query	focus	top	expect	note
+Louvre Paris		1	poi@48.8606,2.3376~1
+Musée du Louvre Paris		1	poi@48.8606,2.3376~1
+Eiffel Tower Paris		1	poi@48.8584,2.2945~1
+Kunsthaus Zürich		1	poi@47.3704,8.5481~0.5
+British Museum London		1	poi@51.5194,-0.1270~0.5
+Rijksmuseum Amsterdam		1	poi@52.3600,4.8852~0.5
+Museo del Prado Madrid		1	poi@40.4138,-3.6921~0.5
+Prado Madrid		1	poi@40.4138,-3.6921~0.5
+Uffizi Florence		1	poi@43.7678,11.2553~0.5
+Colosseum Rome		1	poi@41.8902,12.4922~0.5
+CN Tower Toronto		1	poi@43.6426,-79.3871~0.5
+Sagrada Familia Barcelona		1	poi@41.4036,2.1744~0.5
+Brandenburger Tor Berlin		1	poi@52.5163,13.3777~0.5
+Space Needle Seattle		1	poi@47.6205,-122.3493~0.5
+Tate Modern London		1	poi@51.5076,-0.0994~0.5
+Musée d'Orsay Paris		1	poi@48.8600,2.3266~0.5

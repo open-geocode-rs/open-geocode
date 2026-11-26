@@ -224,7 +224,20 @@ pub const MAX_AUTOCOMPLETE_LIMIT: usize = 20;
 const POSTCODE_RECORDS_READ: usize = 16;
 
 const MIN_AUTOCOMPLETE_QUERY_CHARS: usize = 3;
+const FAME_WINDOW: usize = 64;
+const SHORT_NAME_REACH_M: f64 = 1_000_000.0;
+
+const PLACE_SHORT_FORMS: [(&str, &str); 5] = [
+    ("ft", "fort"),
+    ("mt", "mount"),
+    ("st", "saint"),
+    ("ste", "sainte"),
+    ("pt", "port"),
+];
 const AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS: u32 = 1_024;
+const TOWN_PREFIX_MAX_EXPANSIONS: u32 = 16_384;
+const SAME_STREET_M: f64 = 2_000.0;
+const TOWN_PREFIX_WINDOW: usize = 256;
 const MAX_COMPLETION_SCAN: usize = 1 << 16;
 const POSTCODE_AREA_TERMS: usize = 256;
 const POSTCODE_AREA_RECORDS: usize = 64;
@@ -1382,6 +1395,286 @@ impl TextSearcher {
         Ok(if completed.is_empty() { far } else { completed })
     }
 
+    pub fn place_in_area(&self, options: &TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
+        let words = search_key(&options.query)
+            .map(|key| {
+                key.split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let records = self.pack.records();
+        let mut found = Vec::<(u8, TextSearchHit)>::new();
+        for tail in 1..words.len().min(4) {
+            let (head, area) = words.split_at(words.len() - tail);
+            let (head, area) = (head.join(" "), area.join(" "));
+            let head_tokens = autocomplete_query_tokens(&head);
+            if head.bytes().any(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            let towns = self.famous_as(
+                &TextAutocompleteOptions {
+                    query: head.clone(),
+                    layer: None,
+                    focus: None,
+                    ..options.clone()
+                },
+                &head_tokens,
+                &[Completion::InOrder],
+            )?;
+            for hit in towns {
+                if hit.record.layer == Layer::Poi.as_str()
+                    || found
+                        .iter()
+                        .any(|(_, kept)| kept.record_id == hit.record_id)
+                    || !self
+                        .names_of(hit.record_id, &hit.record.name)?
+                        .contains(&head)
+                {
+                    continue;
+                }
+                let Some(context) = self.pack.boundary_context(hit.record_id)? else {
+                    continue;
+                };
+                let mut holds = false;
+                for entry in context.admin_context.entries() {
+                    let id = entry.record_id;
+                    let code = self
+                        .pack
+                        .subdivision_code(id)
+                        .and_then(|iso| iso.split_once('-'))
+                        .map(|(_, code)| code.to_lowercase());
+                    let country = self
+                        .pack
+                        .country_code(id)
+                        .map(|code| code.as_str().to_lowercase());
+                    let named = || -> Result<bool> {
+                        let name = self.pack.record_summary(id)?.name;
+                        Ok(std::iter::once(name.as_str())
+                            .chain(self.pack.language_names(id))
+                            .filter_map(search_key)
+                            .any(|name| name == area))
+                    };
+                    if code.as_deref() == Some(area.as_str())
+                        || country.as_deref() == Some(area.as_str())
+                        || named()?
+                    {
+                        holds = true;
+                        break;
+                    }
+                }
+                if holds {
+                    let fame = records
+                        .prominence(hit.record_id)?
+                        .map_or(0, |prominence| prominence.importance);
+                    found.push((fame, hit));
+                }
+            }
+        }
+        found.sort_by_key(|(fame, hit)| {
+            let wide = [Layer::Country, Layer::Region].map(Layer::as_str);
+            (
+                wide.contains(&hit.record.layer.as_str()),
+                std::cmp::Reverse(*fame),
+            )
+        });
+        let hits = found
+            .into_iter()
+            .map(|(_, mut hit)| {
+                hit.highlights = typed_highlights(&options.query, &hit.record.label);
+                hit
+            })
+            .collect();
+        reach::merge_twins(&self.pack, hits)
+    }
+
+    pub fn postcode_reading(
+        &self,
+        options: &TextAutocompleteOptions,
+    ) -> Result<Vec<TextSearchHit>> {
+        if options
+            .layer
+            .as_deref()
+            .is_some_and(|layer| layer != Layer::Postcode.as_str())
+        {
+            return Ok(Vec::new());
+        }
+        let words = options
+            .query
+            .split(|character: char| character.is_whitespace() || character == ',')
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>();
+        let count = words.len();
+        let splits = [
+            (0, 2),
+            (0, 1),
+            (count.saturating_sub(2), count),
+            (count.saturating_sub(1), count),
+        ];
+        let searcher = self.reader.searcher();
+        for (start, end) in splits {
+            if end > count || start >= end || end - start > count {
+                continue;
+            }
+            let code_words = &words[start..end];
+            if !code_words
+                .iter()
+                .any(|word| word.bytes().any(|byte| byte.is_ascii_digit()))
+                || code_words.len() == 2
+                    && !code_words[1]
+                        .bytes()
+                        .any(|byte| byte.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            let Some(code) = compact_postcode(&code_words.join(" ")) else {
+                continue;
+            };
+            if code.chars().count() < 3 {
+                continue;
+            }
+            let rest = words[..start]
+                .iter()
+                .chain(&words[end..])
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let rest = search_key(&rest);
+            let spaced = search_key(&code_words.join(" ")).unwrap_or_else(|| code.clone());
+            let splits = match code_words.len() == 1 && spaced == code && code.is_ascii() {
+                true => (1..code.len())
+                    .map(|at| format!("{} {}", &code[..at], &code[at..]))
+                    .collect::<Vec<_>>(),
+                false => vec![spaced],
+            };
+            let prefixed = |prefix: &str| -> Result<Vec<String>> {
+                let mut terms =
+                    self.terms_with_prefix(&searcher, self.fields.postcode_exact, prefix)?;
+                if prefix == code {
+                    for split in splits.iter().filter(|split| **split != code) {
+                        terms.extend(self.terms_with_prefix(
+                            &searcher,
+                            self.fields.postcode_exact,
+                            split,
+                        )?);
+                    }
+                }
+                Ok(terms)
+            };
+            let mut terms = prefixed(&code)?;
+            let digits = |word: &str| word.bytes().any(|byte| byte.is_ascii_digit());
+            let written_apart = match code_words {
+                [first, second] => digits(first) && digits(second),
+                [word] => word
+                    .split_once('-')
+                    .is_some_and(|(left, right)| digits(left) && digits(right)),
+                _ => false,
+            };
+            let base = compact_postcode(code_words[0].split('-').next().unwrap_or_default())
+                .map_or(0, |base| base.len());
+            let mut start = code.len();
+            while terms.is_empty() && written_apart && start > base.max(3) {
+                start = code[..start].char_indices().last().map_or(0, |(at, _)| at);
+                terms = prefixed(&code[..start])?;
+            }
+            if terms.is_empty() {
+                continue;
+            }
+            let dictionaries = self.tagger.dictionaries();
+            let mut found = Vec::new();
+            let mut seen = Vec::<(String, [f64; 2])>::new();
+            let whole = terms
+                .iter()
+                .filter(|term| compact_postcode(term).as_deref() == Some(code.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let exact = self.postcode_records_in(Some(options), &whole, POSTCODE_AREA_RECORDS)?;
+            let prefixed =
+                self.postcode_records_in(Some(options), &terms, POSTCODE_AREA_RECORDS)?;
+            for record_id in exact.into_iter().chain(prefixed) {
+                let Record::Postcode(record) = self.pack.records().record(record_id)? else {
+                    continue;
+                };
+                let Some(term) = compact_postcode(&record.postcode) else {
+                    continue;
+                };
+                let summary = self.pack.record_summary(record_id)?;
+                let (_, lon, lat) = self.pack.records().point(record_id)?;
+                let at = [lon, lat];
+                if options.bbox.is_some_and(|bbox| !bbox.contains(lon, lat)) {
+                    continue;
+                }
+                if seen.iter().any(|(held, point)| {
+                    *held == term && haversine_m(point[0], point[1], at[0], at[1]) <= BIAS_RADIUS_M
+                }) {
+                    continue;
+                }
+                if let Some(rest) = &rest {
+                    let mut words = search_key(&summary.label)
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<HashSet<_>>();
+                    if let Some(context) = self.pack.boundary_context(record_id)? {
+                        for entry in context.admin_context.entries() {
+                            let name = self.pack.record_summary(entry.record_id)?.name;
+                            for name in self.names_of(entry.record_id, &name)? {
+                                words.extend(name.split_whitespace().map(str::to_string));
+                            }
+                            if let Some((_, code)) = self
+                                .pack
+                                .subdivision_code(entry.record_id)
+                                .and_then(|iso| iso.split_once('-'))
+                            {
+                                words.insert(code.to_lowercase());
+                            }
+                        }
+                    }
+                    if !rest.split_whitespace().all(|word| words.contains(word)) {
+                        continue;
+                    }
+                }
+                seen.push((term.clone(), at));
+                let distance = options
+                    .focus
+                    .map(|[lon, lat]| haversine_m(lon, lat, at[0], at[1]));
+                let near = distance.is_some_and(|distance| distance <= BIAS_RADIUS_M);
+                let weight = record
+                    .country
+                    .map_or(0.0, |country| dictionaries.country_weight(country));
+                let key = (
+                    !near,
+                    term != code,
+                    std::cmp::Reverse((weight * 1e6) as u64),
+                    distance.map_or(0, |distance| distance as u64),
+                    term,
+                );
+                let mut hit = TextSearchHit::of_record(record_id, summary);
+                hit.highlights = typed_highlights(&options.query, &hit.record.label);
+                found.push((key, hit));
+            }
+            if found.is_empty() {
+                continue;
+            }
+            found.sort_by(|left, right| left.0.cmp(&right.0));
+            return Ok(found.into_iter().map(|(_, hit)| hit).collect());
+        }
+        Ok(Vec::new())
+    }
+
+    fn names_of(&self, record_id: RecordId, name: &str) -> Result<Vec<String>> {
+        let alt_names = match self.pack.records().record(record_id)? {
+            crate::record::Record::Place(_, record) => record.alt_names,
+            crate::record::Record::Poi(record) => record.alt_names,
+            _ => Vec::new(),
+        };
+        Ok(std::iter::once(name)
+            .chain(self.pack.language_names(record_id))
+            .chain(alt_names.iter().map(String::as_str))
+            .filter_map(search_key)
+            .collect())
+    }
+
     fn complete_address(&self, options: &TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
         let hits = self.autocomplete_address(options, false)?;
         if !hits.is_empty()
@@ -1586,6 +1879,226 @@ impl TextSearcher {
         Ok(Vec::new())
     }
 
+    fn famous_places(
+        &self,
+        options: &TextAutocompleteOptions,
+        more: bool,
+    ) -> Result<Vec<TextSearchHit>> {
+        let Some(text) = search_key(options.query.trim()) else {
+            return Ok(Vec::new());
+        };
+        if typed_width(&text) < MIN_AUTOCOMPLETE_QUERY_CHARS {
+            return Ok(Vec::new());
+        }
+        let tokens = autocomplete_query_tokens(&text);
+        let mut hits = self.famous_as(
+            options,
+            &tokens,
+            &[Completion::CommonCompletions, Completion::InOrder],
+        )?;
+        if !more {
+            return Ok(hits);
+        }
+        if let [head @ .., last] = tokens.as_slice()
+            && !head.is_empty()
+            && last.chars().count() == 1
+        {
+            for hit in self.famous_as(options, head, &[Completion::InOrder])? {
+                if name_starts_as(&hit.record.name, &tokens, false)
+                    && !hits.iter().any(|held| held.record_id == hit.record_id)
+                {
+                    hits.push(hit);
+                }
+            }
+        }
+        if tokens.len() > 1
+            && !hits
+                .iter()
+                .any(|hit| name_starts_as(&hit.record.name, &tokens, false))
+        {
+            for hit in self.famous_as(options, &tokens, &[Completion::AllWords])? {
+                let words = self
+                    .names_of(hit.record_id, &hit.record.name)?
+                    .iter()
+                    .flat_map(|name| autocomplete_query_tokens(name))
+                    .collect::<Vec<_>>();
+                let last = tokens.len() - 1;
+                let all = tokens.iter().enumerate().all(|(at, typed)| {
+                    words.iter().any(|word| types_word(typed, word, at == last))
+                });
+                if all && !hits.iter().any(|held| held.record_id == hit.record_id) {
+                    hits.push(hit);
+                }
+            }
+        }
+        let long = tokens
+            .iter()
+            .map(|token| {
+                PLACE_SHORT_FORMS
+                    .iter()
+                    .find(|(short, _)| short == token)
+                    .map_or_else(|| token.clone(), |(_, long)| (*long).to_string())
+            })
+            .collect::<Vec<_>>();
+        if long != tokens {
+            for hit in self.famous_as(
+                options,
+                &long,
+                &[Completion::CommonCompletions, Completion::InOrder],
+            )? {
+                if name_starts_as(&hit.record.name, &long, false)
+                    && !hits.iter().any(|held| held.record_id == hit.record_id)
+                {
+                    hits.push(hit);
+                }
+            }
+        }
+        let typed_right = hits.iter().any(|hit| {
+            std::iter::once(hit.record.name.as_str())
+                .chain(self.pack.language_names(hit.record_id))
+                .filter_map(search_key)
+                .any(|name| name.starts_with(&text))
+        });
+        if typed_width(&text) >= reach::TYPO_WIDTH && !typed_right {
+            let fame = |hit: &TextSearchHit| -> Result<u8> {
+                Ok(self
+                    .pack
+                    .records()
+                    .prominence(hit.record_id)?
+                    .map_or(0, |prominence| prominence.importance))
+            };
+            let mut typed_best = 0;
+            for hit in &hits {
+                if self
+                    .names_of(hit.record_id, &hit.record.name)?
+                    .iter()
+                    .any(|name| name.starts_with(&text))
+                {
+                    typed_best = typed_best.max(fame(hit)?);
+                }
+            }
+            for hit in self.famous_as(options, &tokens, &[Completion::Typos])? {
+                if fame(&hit)? >= typed_best.saturating_add(reach::FAME_GROUP)
+                    && !hits.iter().any(|held| held.record_id == hit.record_id)
+                {
+                    hits.push(hit);
+                }
+            }
+        }
+        Ok(hits)
+    }
+
+    pub fn short_named(&self, options: &TextAutocompleteOptions) -> Result<Vec<TextSearchHit>> {
+        let Some(text) = search_key(options.query.trim()) else {
+            return Ok(Vec::new());
+        };
+        if text.contains(' ')
+            || typed_width(&text) >= MIN_AUTOCOMPLETE_QUERY_CHARS
+            || text.chars().count() < 2
+        {
+            return Ok(Vec::new());
+        }
+        let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(self.fields.place_name_text, &text),
+                IndexRecordOption::Basic,
+            )),
+        )];
+        if let Some(layer) = filters
+            .layer
+            .map(str::trim)
+            .filter(|layer| !layer.is_empty())
+        {
+            clauses.push((Occur::Must, self.layer_query(layer)));
+        }
+        clauses.extend(self.scope_clauses(options));
+        let query: Box<dyn Query> = Box::new(BooleanQuery::new(clauses));
+        let ranking = Ranking {
+            query_words: QueryWords::new(&options.query),
+            focus: options.focus,
+            fame_first: true,
+            typed_words: 1,
+            ..Ranking::default()
+        };
+        let mut hits = self.ranked_hits(&query, &ranking, FAME_WINDOW, &mut |hit| {
+            Ok(filters.admit(hit) && reach::is_famed(&hit.record.layer))
+        })?;
+        let dictionaries = self.tagger.dictionaries();
+        for id in dictionaries
+            .areas(&text)
+            .into_iter()
+            .chain(dictionaries.regions(&text))
+        {
+            let record_id = RecordId::from(id);
+            if !hits.iter().any(|hit| hit.record_id == record_id) {
+                let hit = TextSearchHit::of_record(record_id, self.pack.record_summary(record_id)?);
+                if self.in_scope(options, &hit)? {
+                    hits.push(hit);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        for mut hit in hits {
+            if !self
+                .names_of(hit.record_id, &hit.record.name)?
+                .contains(&text)
+            {
+                continue;
+            }
+            let fame = self
+                .pack
+                .records()
+                .prominence(hit.record_id)?
+                .map_or(0, |prominence| prominence.importance);
+            hit.highlights = Vec::new();
+            let (_, lon, lat) = self.pack.records().point(hit.record_id)?;
+            let far = options.focus.is_none_or(|[from_lon, from_lat]| {
+                haversine_m(from_lon, from_lat, lon, lat) > SHORT_NAME_REACH_M
+            });
+            found.push(((far, std::cmp::Reverse(fame)), hit));
+        }
+        found.sort_by_key(|(key, _)| *key);
+        reach::merge_twins(&self.pack, found.into_iter().map(|(_, hit)| hit).collect())
+    }
+
+    fn famous_as(
+        &self,
+        options: &TextAutocompleteOptions,
+        tokens: &[String],
+        completions: &[Completion],
+    ) -> Result<Vec<TextSearchHit>> {
+        let filters = Filters::new(options.layer.as_deref(), &options.countries, options.bbox);
+        let mut query = None;
+        for completion in completions {
+            query = self.autocomplete_query(*completion, None, tokens, true, &filters)?;
+            if query.is_some() {
+                break;
+            }
+        }
+        let Some(query) = query else {
+            return Ok(Vec::new());
+        };
+        let ranking = Ranking {
+            query_words: QueryWords::new(&options.query),
+            focus: options.focus,
+            fame_first: true,
+            typed_words: u8::try_from(tokens.len()).unwrap_or(u8::MAX),
+            ..Ranking::default()
+        };
+        let mut hits = self.ranked_hits(&query, &ranking, FAME_WINDOW, &mut |hit| {
+            Ok(filters.admit(hit) && reach::is_famed(&hit.record.layer))
+        })?;
+        let highlighter =
+            highlight::Highlighter::new(Completion::CommonCompletions, None, tokens, true);
+        for hit in &mut hits {
+            hit.features.prefix = true;
+            hit.highlights = highlighter.ranges(&hit.record.label);
+        }
+        Ok(hits)
+    }
+
     fn autocomplete_as(
         &self,
         options: &TextAutocompleteOptions,
@@ -1599,12 +2112,7 @@ impl TextSearcher {
         let Some(query_text) = search_key(options.query.trim()) else {
             return Ok(Vec::new());
         };
-        if query_text
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .count()
-            < MIN_AUTOCOMPLETE_QUERY_CHARS
-        {
+        if typed_width(&query_text) < MIN_AUTOCOMPLETE_QUERY_CHARS {
             return Ok(Vec::new());
         }
 
@@ -1618,14 +2126,40 @@ impl TextSearcher {
         };
         let tokens = autocomplete_query_tokens(text);
         if let Some(number) = autocomplete_number(&tokens) {
-            return self.autocomplete_reading(
+            let houses = self.autocomplete_reading(
                 options,
                 completion,
                 Some(number),
                 &tokens[1..],
                 true,
                 &filters,
-            );
+            )?;
+            let mut streets = match &tokens[1..] {
+                [street @ .., town]
+                    if street.len() > 1 && town.chars().all(char::is_alphabetic) =>
+                {
+                    self.streets_for_number(
+                        options,
+                        completion,
+                        number,
+                        street,
+                        Some(town),
+                        &filters,
+                    )?
+                }
+                _ => Vec::new(),
+            };
+            streets.extend(self.streets_for_number(
+                options,
+                completion,
+                number,
+                &tokens[1..],
+                None,
+                &filters,
+            )?);
+            let mut hits = self.with_streets(houses, streets);
+            hits.truncate(limit);
+            return Ok(hits);
         }
         let as_typed =
             self.autocomplete_reading(options, completion, None, &tokens, true, &filters)?;
@@ -1651,11 +2185,219 @@ impl TextSearcher {
         let typing = at + 1 < tokens.len();
         let numbered =
             self.autocomplete_reading(options, completion, Some(number), &words, typing, &filters)?;
-        Ok(if numbered.is_empty() {
-            as_typed
+        let mut hits = match &tokens[at + 1..] {
+            [town] if typing && town.chars().all(char::is_alphabetic) => {
+                self.in_town_starting(options, number, &tokens[..at], town, &filters)?
+            }
+            _ => Vec::new(),
+        };
+        for hit in numbered {
+            if !hits.iter().any(|held| held.record_id == hit.record_id) {
+                hits.push(hit);
+            }
+        }
+        let town = match &tokens[at + 1..] {
+            [] => None,
+            [town] if typing && town.chars().all(char::is_alphabetic) => Some(town.as_str()),
+            _ => return Ok(if hits.is_empty() { as_typed } else { hits }),
+        };
+        let streets =
+            self.streets_for_number(options, completion, number, &tokens[..at], town, &filters)?;
+        let mut hits = self.with_streets(hits, streets);
+        hits.truncate(limit);
+        Ok(if hits.is_empty() { as_typed } else { hits })
+    }
+
+    fn in_town_starting(
+        &self,
+        options: &TextAutocompleteOptions,
+        number: &str,
+        street: &[String],
+        town: &str,
+        filters: &Filters<'_>,
+    ) -> Result<Vec<TextSearchHit>> {
+        let limit = effective_autocomplete_limit(options.limit);
+        let Some(street_query) =
+            self.autocomplete_query(Completion::InOrder, Some(number), street, false, filters)?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut area =
+            PhrasePrefixQuery::new(vec![Term::from_field_text(self.fields.context_text, town)]);
+        area.set_max_expansions(TOWN_PREFIX_MAX_EXPANSIONS);
+        let query: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
+            (Occur::Must, street_query),
+            (Occur::Must, Box::new(area)),
+        ]));
+        let ranking = Ranking {
+            query_words: QueryWords::new(&options.query),
+            number_texts: vec![number.to_string()],
+            focus: options.focus,
+            near_first: options.focus.is_some(),
+            typed_words: u8::try_from(street.len() + 2).unwrap_or(u8::MAX),
+            ..Ranking::default()
+        };
+        let mut hits = self.ranked_hits(&query, &ranking, TOWN_PREFIX_WINDOW, &mut |hit| {
+            Ok(filters.admit(hit))
+        })?;
+        let town_starts = |hit: &TextSearchHit| {
+            let address = &hit.record.address;
+            [address.locality.as_deref(), address.place.as_deref()]
+                .into_iter()
+                .flatten()
+                .chain(address.areas.iter().map(String::as_str))
+                .filter_map(search_key)
+                .any(|name| name.split_whitespace().any(|word| word.starts_with(town)))
+        };
+        hits.sort_by_key(|hit| !town_starts(hit));
+        let words = street
+            .iter()
+            .cloned()
+            .chain(std::iter::once(town.to_string()))
+            .collect::<Vec<_>>();
+        let highlighter =
+            highlight::Highlighter::new(Completion::InOrder, Some(number), &words, true);
+        for hit in &mut hits {
+            hit.features.prefix = true;
+            hit.features.number = Some(states_number(&hit.record, &ranking));
+            hit.highlights = highlighter.ranges(&hit.record.label);
+        }
+        self.rate(&mut hits, Numbered::Yes);
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    fn streets_for_number(
+        &self,
+        options: &TextAutocompleteOptions,
+        completion: Completion,
+        number: &str,
+        street: &[String],
+        town: Option<&str>,
+        filters: &Filters<'_>,
+    ) -> Result<Vec<TextSearchHit>> {
+        let limit = effective_autocomplete_limit(options.limit);
+        let wanted = |layer: &str| filters.layer.is_none_or(|only| only.trim() == layer);
+        if self.places || street.is_empty() || !(wanted("street") || wanted("interpolation")) {
+            return Ok(Vec::new());
+        }
+        let typing = town.is_none();
+        let completion = if typing {
+            completion
         } else {
-            numbered
-        })
+            Completion::InOrder
+        };
+        let Some(street_query) =
+            self.autocomplete_query(completion, None, street, typing, filters)?
+        else {
+            return Ok(Vec::new());
+        };
+        let layers = [Layer::Street, Layer::Interpolation]
+            .into_iter()
+            .map(|layer| -> (Occur, Box<dyn Query>) {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.layer, layer.as_str()),
+                        IndexRecordOption::Basic,
+                    )),
+                )
+            })
+            .collect();
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![
+            (Occur::Must, street_query),
+            (Occur::Must, Box::new(BooleanQuery::new(layers))),
+        ];
+        if let Some(town) = town {
+            let mut area =
+                PhrasePrefixQuery::new(vec![Term::from_field_text(self.fields.context_text, town)]);
+            area.set_max_expansions(TOWN_PREFIX_MAX_EXPANSIONS);
+            clauses.push((Occur::Must, Box::new(area)));
+        }
+        let ranking = Ranking {
+            query_words: QueryWords::new(&options.query),
+            numbered: true,
+            house_number: number.parse().ok(),
+            focus: options.focus,
+            near_first: options.focus.is_some(),
+            typed_words: u8::try_from(street.len() + 1 + usize::from(town.is_some()))
+                .unwrap_or(u8::MAX),
+            ..Ranking::default()
+        };
+        let mut hits = self.ranked_hits(
+            &BooleanQuery::new(clauses),
+            &ranking,
+            TOWN_PREFIX_WINDOW,
+            &mut |hit| {
+                let estimated = hit
+                    .record
+                    .point
+                    .is_some_and(|point| point.precision == PointPrecision::Estimated);
+                Ok(filters.admit(hit)
+                    && wanted(&hit.record.layer)
+                    && (hit.record.layer == Layer::Street.as_str() || estimated))
+            },
+        )?;
+        let named_town = |hit: &TextSearchHit| {
+            town.is_some_and(|town| {
+                hit.record
+                    .label
+                    .split(", ")
+                    .nth(1)
+                    .and_then(search_key)
+                    .is_some_and(|place| {
+                        place.split_whitespace().any(|word| word.starts_with(town))
+                    })
+            })
+        };
+        hits.sort_by_key(|hit| {
+            (
+                hit.record.layer != Layer::Interpolation.as_str(),
+                !named_town(hit),
+            )
+        });
+        let words = street
+            .iter()
+            .cloned()
+            .chain(town.map(str::to_string))
+            .collect::<Vec<_>>();
+        let highlighter = highlight::Highlighter::new(Completion::InOrder, None, &words, true);
+        for hit in &mut hits {
+            hit.features.prefix = true;
+            hit.fallback = hit.record.layer == Layer::Street.as_str();
+            hit.highlights = highlighter.ranges(&hit.record.label);
+        }
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    fn with_streets(
+        &self,
+        mut houses: Vec<TextSearchHit>,
+        streets: Vec<TextSearchHit>,
+    ) -> Vec<TextSearchHit> {
+        let street_of = |hit: &TextSearchHit| match hit.record.layer.as_str() {
+            "street" => search_key(&hit.record.name),
+            _ => hit.record.address.street.as_deref().and_then(search_key),
+        };
+        let same = |left: &TextSearchHit, right: &TextSearchHit| {
+            left.record.label == right.record.label
+                || street_of(left).is_some_and(|name| street_of(right).as_ref() == Some(&name))
+                    && left
+                        .record
+                        .point
+                        .zip(right.record.point)
+                        .is_some_and(|(a, b)| {
+                            crate::util::geo::haversine_m(a.lon, a.lat, b.lon, b.lat)
+                                <= SAME_STREET_M
+                        })
+        };
+        for hit in streets {
+            if !houses.iter().any(|held| same(held, &hit)) {
+                houses.push(hit);
+            }
+        }
+        houses
     }
 
     fn autocomplete_reading(
@@ -5045,6 +5787,7 @@ impl TextSearcher {
         postcode: QueryPostcode,
     ) -> Ranking {
         Ranking {
+            fame_first: false,
             query_words: query_words.clone(),
             house_number: plan.house_number.as_ref().and_then(HouseNumber::plain),
             number_texts: plan
@@ -5946,7 +6689,16 @@ impl TextSearcher {
     }
 
     fn postcode_records(&self, terms: &[String], limit: usize) -> Result<Vec<RecordId>> {
-        let query = BooleanQuery::new(vec![
+        self.postcode_records_in(None, terms, limit)
+    }
+
+    fn postcode_records_in(
+        &self,
+        options: Option<&TextAutocompleteOptions>,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Vec<RecordId>> {
+        let mut clauses = vec![
             (Occur::Must, self.layer_query(Layer::Postcode.as_str())),
             (
                 Occur::Must,
@@ -5965,13 +6717,60 @@ impl TextSearcher {
                         .collect(),
                 )),
             ),
-        ]);
+        ];
+        clauses.extend(
+            options
+                .into_iter()
+                .flat_map(|options| self.scope_clauses(options)),
+        );
+        let query = BooleanQuery::new(clauses);
         let searcher = self.reader.searcher();
         searcher
             .search(&query, &TopDocs::with_limit(limit))?
             .into_iter()
             .map(|(_, doc)| Ok(self.document_records(&searcher, doc)?.0))
             .collect()
+    }
+
+    fn scope_clauses(&self, options: &TextAutocompleteOptions) -> Vec<(Occur, Box<dyn Query>)> {
+        let mut clauses = Vec::new();
+        if let Some(countries) = self.countries_query(&options.countries) {
+            clauses.push((Occur::Must, countries));
+        }
+        if let Some(bbox) = options.bbox {
+            clauses.push((Occur::Must, self.bbox_query(bbox)));
+        }
+        clauses
+    }
+
+    pub(crate) fn in_scope(
+        &self,
+        options: &TextAutocompleteOptions,
+        hit: &TextSearchHit,
+    ) -> Result<bool> {
+        let layer = options.layer.as_deref().map(str::trim).unwrap_or_default();
+        if !layer.is_empty() && layer != hit.record.layer {
+            return Ok(false);
+        }
+        if !Filters::new(None, &[], options.bbox).admit(hit) {
+            return Ok(false);
+        }
+        let wanted = options
+            .countries
+            .iter()
+            .map(|country| country.trim())
+            .filter(|country| !country.is_empty())
+            .collect::<Vec<_>>();
+        if wanted.is_empty() {
+            return Ok(true);
+        }
+        Ok(
+            reach::country_of(&self.pack, hit.record_id)?.is_some_and(|country| {
+                wanted
+                    .iter()
+                    .any(|wanted| wanted.eq_ignore_ascii_case(country.as_str()))
+            }),
+        )
     }
 
     /// The id of the record the Pack derived for `postcode` in `country`
@@ -6302,14 +7101,30 @@ impl TextSearcher {
                 .iter()
                 .any(|name| search_key(name) == typed))
         };
+        let fame = |hit: &TextSearchHit| -> Result<u8> {
+            Ok(records
+                .prominence(hit.record_id)?
+                .map_or(0, |prominence| prominence.importance))
+        };
         let first = |focus| -> Result<Option<(TextSearchHit, bool)>> {
-            let Some(hit) = self
-                .places_by_name_keeping(words, &Filters::default(), focus, 5, true)?
-                .into_iter()
-                .find(|hit| {
-                    !wide.contains(&hit.record.layer.as_str()) && hit.record.point.is_some()
-                })
-            else {
+            let mut best: Option<((bool, u8, bool), TextSearchHit)> = None;
+            for hit in self.places_by_name_keeping(
+                words,
+                &Filters::default(),
+                focus,
+                NAMED_PLACES_WINDOW,
+                true,
+            )? {
+                if wide.contains(&hit.record.layer.as_str()) || hit.record.point.is_none() {
+                    continue;
+                }
+                let own = search_key(&hit.record.name) == typed;
+                let key = (exact(&hit)?, fame(&hit)?, own);
+                if best.as_ref().is_none_or(|(held, _)| key > *held) {
+                    best = Some((key, hit));
+                }
+            }
+            let Some((_, hit)) = best else {
                 return Ok(None);
             };
             let exact = exact(&hit)?;
@@ -6680,7 +7495,7 @@ impl TextSearcher {
             .saturating_mul(RANK_WINDOW_FACTOR)
             .min(MAX_RANK_WINDOW)
             .max(limit);
-        let mut scored = match ranking.near_first {
+        let mut scored = match ranking.near_first || ranking.fame_first {
             true => Vec::new(),
             false => searcher.search(query, &TopDocs::with_limit(window))?,
         };
@@ -6690,7 +7505,7 @@ impl TextSearcher {
         if tie(&scored, window) && window < TIE_WINDOW {
             scored = searcher.search(query, &TopDocs::with_limit(TIE_WINDOW))?;
         }
-        let top_docs = if ranking.near_first || tie(&scored, TIE_WINDOW) {
+        let top_docs = if ranking.near_first || ranking.fame_first || tie(&scored, TIE_WINDOW) {
             let keys = RankKeys {
                 ranking,
                 columns: &self.columns,
@@ -7630,6 +8445,7 @@ struct Neighbour {
 
 #[derive(Debug, Clone, PartialEq)]
 struct RankKey {
+    fame: u64,
     house_level: bool,
     postcode_agreement: u8,
     stated: bool,
@@ -7646,6 +8462,7 @@ struct RankKey {
 impl RankKey {
     fn text(text_score: Score) -> Self {
         Self {
+            fame: 0,
             house_level: true,
             postcode_agreement: 0,
             stated: true,
@@ -7662,6 +8479,7 @@ impl RankKey {
 
     fn cmp_evidence(&self, other: &Self) -> std::cmp::Ordering {
         (
+            self.fame,
             self.house_level,
             self.postcode_agreement,
             self.stated,
@@ -7670,6 +8488,7 @@ impl RankKey {
             self.text_score,
         )
             .partial_cmp(&(
+                other.fame,
                 other.house_level,
                 other.postcode_agreement,
                 other.stated,
@@ -7791,6 +8610,7 @@ struct RankKeys<'a> {
 struct SegmentRankKeys {
     numbered: bool,
     near_first: bool,
+    fame_first: bool,
     typed_words: u8,
     whole_last: Option<SegmentPostings>,
     house_number: Column<u64>,
@@ -7957,6 +8777,7 @@ impl ScoreTweaker<RankKey> for RankKeys<'_> {
         Ok(SegmentRankKeys {
             numbered: self.ranking.numbered,
             near_first: self.ranking.near_first,
+            fame_first: self.ranking.fame_first,
             typed_words: self.ranking.typed_words,
             whole_last: match &self.ranking.whole_last {
                 Some(term) => segment
@@ -7992,8 +8813,16 @@ impl ScoreSegmentTweaker<RankKey> for SegmentRankKeys {
             Some(rank) => {
                 key.prominence = prominence;
                 key.place_rank = small(Some(rank));
+                if self.fame_first {
+                    key.fame = prominence >> 8;
+                }
             }
-            None => key.poi_prominence = prominence,
+            None => {
+                key.poi_prominence = prominence;
+                if self.fame_first {
+                    key.fame = prominence >> 8;
+                }
+            }
         }
         if self.numbered && self.house_number.first(doc).is_none() {
             key.house_level = self.interpolation_start.first(doc).is_some();
@@ -9347,6 +10176,7 @@ struct Ranking {
     postcode: QueryPostcode,
     focus: Option<[f64; 2]>,
     near_first: bool,
+    fame_first: bool,
     typed_words: u8,
     whole_last: Option<Term>,
     sought: Vec<Word>,
@@ -9583,6 +10413,37 @@ pub(crate) fn effective_limit(limit: usize) -> usize {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct Caller {
+    pub country: Option<CountryCode>,
+    pub areas: Vec<RecordId>,
+}
+
+pub fn rank_places(
+    searcher: &TextSearcher,
+    pois: Option<&TextSearcher>,
+    options: &TextAutocompleteOptions,
+    hits: Vec<TextSearchHit>,
+    caller: &Caller,
+    read: bool,
+) -> Result<Vec<TextSearchHit>> {
+    if !reach::ranks(options) {
+        return Ok(hits);
+    }
+    let mut famous = searcher.famous_places(options, !read)?;
+    if let Some(pois) = pois {
+        famous.extend(pois.famous_places(options, !read)?);
+    }
+    reach::rank(
+        searcher,
+        options,
+        hits,
+        famous,
+        caller,
+        effective_autocomplete_limit(options.limit),
+    )
+}
+
 pub fn suggest(
     addresses: &TextSearcher,
     places: &TextSearcher,
@@ -9618,6 +10479,14 @@ pub fn suggest(
         let mixed = tier(completion, false)?;
         if mixed.is_empty() {
             continue;
+        }
+        if mixed.iter().all(|hit| hit.fallback) {
+            let houses = addresses.complete_address(options)?;
+            if !houses.is_empty() {
+                let mut hits = addresses.with_streets(houses, mixed);
+                hits.truncate(effective_autocomplete_limit(options.limit));
+                return Ok(hits);
+            }
         }
         if let Some(focus) = options.focus
             && !mixed.iter().any(|hit| within_bias(hit, focus))
@@ -9777,8 +10646,12 @@ fn mix(
     mixed
 }
 
+pub(crate) fn name_words(name: &str) -> Option<String> {
+    search_key(name).map(|key| autocomplete_query_tokens(&key).join(" "))
+}
+
 pub(crate) fn name_starts_as(name: &str, words: &[String], typos: bool) -> bool {
-    let Some(name) = search_key(name) else {
+    let Some(name) = name_words(name) else {
         return false;
     };
     let name = name.split_whitespace().collect::<Vec<_>>();
@@ -9808,6 +10681,17 @@ pub(crate) fn autocomplete_tokens(query: &str) -> Vec<String> {
 pub(crate) fn typed_highlights(query: &str, label: &str) -> Vec<Highlight> {
     let words = autocomplete_tokens(query);
     highlight::Highlighter::new(Completion::AllWords, None, &words, true).ranges(label)
+}
+
+fn typed_width(text: &str) -> usize {
+    use unicode_script::{Script, UnicodeScript};
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .map(|character| match character.script() {
+            Script::Han | Script::Hiragana | Script::Katakana | Script::Hangul => 2,
+            _ => 1,
+        })
+        .sum()
 }
 
 pub(crate) fn effective_autocomplete_limit(limit: usize) -> usize {
@@ -10574,7 +11458,13 @@ fn unique_strings(values: Vec<String>) -> Vec<String> {
 
 fn autocomplete_query_tokens(query_text: &str) -> Vec<String> {
     query_text
-        .split_whitespace()
+        .split(|character: char| {
+            character.is_whitespace()
+                || !character.is_ascii()
+                    && !character.is_alphanumeric()
+                    && !lattice::is_unspaced(character)
+        })
+        .filter(|token| !token.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>()
 }
@@ -10626,6 +11516,9 @@ mod number_reading;
 mod numbered_area;
 
 mod phrase_prefix;
+
+mod reach;
+pub(crate) use reach::FAME_GROUP;
 
 use phrase_prefix::PhrasePrefix;
 
@@ -11761,6 +12654,80 @@ mod tests {
                 "{foreign} contradicts the {country} address"
             );
         }
+    }
+
+    #[test]
+    fn a_postcode_two_countries_share_is_read_in_the_country_and_box_asked() {
+        use crate::record::PlaceLayer::Country;
+
+        let dir = TempDir::new("search-postcode-scope");
+        let mut writer = Writer::create(&dir).expect("writer");
+        let countries = [
+            ("AU", "Australia", 9001, [134.0, -25.0], [151.150, -33.830]),
+            (
+                "NZ",
+                "New Zealand",
+                9002,
+                [172.0, -41.0],
+                [174.944, -37.065],
+            ),
+        ]
+        .map(|(code, name, id, at, point)| {
+            let country = place(
+                &mut writer,
+                Country,
+                name,
+                ObjectType::Relation,
+                id,
+                at,
+                None,
+            );
+            (code, country, point)
+        });
+        writer.set_country_codes(
+            countries
+                .iter()
+                .map(|(code, country, _)| (*country, CountryCode::parse(code).expect("code")))
+                .collect(),
+        );
+        for (code, country, point) in countries {
+            writer
+                .write(
+                    &postcode_record("2110", Some(code), point),
+                    chain(&[(Country, country)]),
+                )
+                .expect("postcode");
+        }
+        writer.finish().expect("finish");
+        let searcher = TextSearcher::open(&dir).expect("searcher");
+        let ids = |countries: &[&str], bbox| {
+            searcher
+                .postcode_reading(&TextAutocompleteOptions {
+                    query: "2110".to_string(),
+                    limit: 10,
+                    layer: None,
+                    countries: countries
+                        .iter()
+                        .map(|country| country.to_string())
+                        .collect(),
+                    focus: None,
+                    bbox,
+                })
+                .expect("reading")
+                .into_iter()
+                .map(|hit| hit.record.id)
+                .collect::<Vec<_>>()
+        };
+        let auckland = BoundingBox {
+            min_lon: 174.0,
+            min_lat: -38.0,
+            max_lon: 175.5,
+            max_lat: -36.0,
+        };
+        assert_eq!(ids(&["NZ"], None), ["derived:osm:postcode:nz:2110"]);
+        assert_eq!(ids(&["AU"], None), ["derived:osm:postcode:au:2110"]);
+        assert_eq!(ids(&[], Some(auckland)), ["derived:osm:postcode:nz:2110"]);
+        assert_eq!(ids(&["AU"], Some(auckland)), Vec::<String>::new());
     }
 
     #[test]
@@ -14344,8 +15311,11 @@ mod tests {
             assert_eq!(hits[0].record.id, "derived:tiger:820:L:50", "{query}");
             assert!(!hits[0].highlights.is_empty(), "{query}");
         }
+        let street = ask("51 Queen Street West, Fairview", None);
+        assert_eq!(street.len(), 1);
+        assert_eq!(street[0].record.layer, Layer::Street.as_str());
+        assert!(street[0].fallback);
         for query in [
-            "51 Queen Street West, Fairview",
             "50 Queen Street West, Wrongtown",
             "50 Queen Street West, Fairview, Massachusetts",
         ] {

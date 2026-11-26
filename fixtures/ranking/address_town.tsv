@@ -1,0 +1,9 @@
+# A street, number and the first letters of its town.
+# query	focus	top	expect	note
+Bahnhofstrasse 1 Zür		1	address@47.378,8.540~3:bahnhofstrasse
+Wiesenstrasse 7 Möh		1	address@47.559,7.845~4:wiesenstrasse
+Gartenweg 7 Gel		1	address@47.464,7.853~4:gartenweg | address@48.090,11.090~6:gartenweg
+Baslerstrasse 44 All		1	address@47.551,7.536~4:baslerstrasse
+Hauptstrasse 125 Rin		1	address@46.701,7.894~4:hauptstrasse
+Kramgasse 49 Ber		1	address@46.948,7.451~2:kramgasse
+Rue du Rhône 42 Gen		1	address@46.203,6.147~2:rhone

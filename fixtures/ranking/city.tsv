@@ -1,0 +1,37 @@
+# A city's whole name, with and without a caller position.
+# query	focus	top	expect	note
+Paris		1	place@48.857,2.352~20
+paris		1	place@48.857,2.352~20
+London		1	place@51.507,-0.128~30
+Tokyo		1	place@35.690,139.692~60
+Sydney		1	place@-33.869,151.209~40
+Toronto	-73.567,45.501	1	place@43.653,-79.383~30
+Zürich		1	place@47.377,8.541~15
+Davos		1	place@46.802,9.836~10
+Moscow	13.405,52.520	1	place@55.756,37.617~40
+Cairo		1	place@30.044,31.236~40
+Lagos		1	place@6.524,3.379~60
+Mumbai		1	place@19.076,72.878~40
+sao paulo		1	place@-23.550,-46.633~50
+montreal	-79.383,43.653	1	place@45.501,-73.567~30
+koln		1	place@50.938,6.960~20
+Köln		1	place@50.938,6.960~20
+Mexico City	-118.244,34.052	1	place@19.433,-99.133~40
+Buenos Aires		1	place@-34.604,-58.382~40
+Bogotá		1	place@4.711,-74.072~40
+Nairobi		1	place@-1.286,36.817~30
+Jakarta		1	place@-6.200,106.850~40
+Seoul		1	place@37.566,126.978~30
+Istanbul		1	place@41.008,28.978~50
+Dubai		1	place@25.204,55.270~50
+Rome		1	place@41.903,12.496~30
+Madrid		1	place@40.417,-3.704~30
+Vienna		1	place@48.208,16.373~20
+Berlin	2.352,48.857	1	place@52.520,13.405~30
+Chicago	-0.128,51.507	1	place@41.878,-87.630~40
+Lima		3	place@-12.046,-77.043~40
+Vancouver	-122.332,47.606	1	place@49.283,-123.121~20
+Melbourne		1	place@-37.814,144.963~40
+Cape Town		1	place@-33.925,18.424~40
+New York		1	place@40.713,-74.006~30
+Wien		1	place@48.208,16.373~15	

@@ -1,0 +1,18 @@
+# A state, province or region.
+# query	focus	top	expect	note
+Ontario	-74.006,40.713	1	place@49.250,-84.500~800
+Bavaria		1	place@48.900,11.400~200
+Bayern		1	place@48.900,11.400~200
+California		1	place@37.200,-119.500~500
+Tamil Nadu		1	place@11.100,78.600~300
+Queensland		1	place@-22.500,144.500~900
+Catalonia		1	place@41.800,1.500~150
+Catalunya		1	place@41.800,1.500~150
+Texas		1	place@31.000,-99.000~600
+Hokkaido		1	place@43.200,142.800~300
+Scotland		1	place@56.800,-4.200~300
+British Columbia		1	place@53.700,-125.000~800
+Provence	2.352,48.857	3	place@43.900,6.000~250
+New South Wales		1	place@-32.000,147.000~700
+calif		3	place@37.200,-119.500~500
+new york state		3	place@42.900,-75.500~400

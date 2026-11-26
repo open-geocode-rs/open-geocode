@@ -1,0 +1,15 @@
+# A chain store's name; the branch near the caller is meant.
+# query	focus	top	expect	note
+Starbucks	-122.332,47.606	1	poi@near~5:starbucks
+starb	103.820,1.352	1	poi@near~15:starbucks
+Mcd	28.047,-26.204	1	poi@near~10:mcdonald
+mcdon	-46.633,-23.550	1	poi@near~10:mcdonald
+Tesco	-2.244,53.481	1	poi@near~5:tesco
+Sains	-3.188,55.953	1	poi@near~5:sainsbury
+Walmart	-97.743,30.267	1	poi@near~15:walmart
+Costco	-122.332,47.606	1	poi@near~15:costco
+Lidl	13.405,52.520	1	poi@near~5:lidl
+Tim Hortons	-79.383,43.653	1	poi@near~5:tim hortons
+Targ	-93.265,44.978	1	poi@near~5:target
+Burger King	13.405,52.520	1	poi@near~5:burger king
+Lidl	2.352,48.857	1	poi@near~5:lidl

@@ -324,8 +324,9 @@ pub struct ForwardProperties {
     #[schema(minimum = 0, maximum = 1)]
     pub confidence: Option<f32>,
     /// `true` when no match was found and the result is the most precise
-    /// area the query names instead: its postcode, a town or other area,
-    /// its region or its country. `layer` says which. Absent otherwise.
+    /// place the query names instead: the street of a house number missing
+    /// from the data, its postcode, a town or other area, its region or its
+    /// country. `layer` says which. Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[schema(value_type = Option<bool>)]
     pub fallback: bool,
@@ -983,8 +984,14 @@ fn localize_names(
     *translations = (!found.is_empty()).then_some(found);
 }
 
-fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) -> Vec<Moved> {
+fn localize_common(
+    pack: &Reader,
+    common: &mut Common,
+    languages: &Languages,
+    keep_name: bool,
+) -> Vec<Moved> {
     if let Some(record_id) = common.record_id {
+        let name = common.name.clone();
         localize_names(
             pack,
             record_id,
@@ -993,6 +1000,9 @@ fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) ->
             &mut common.local_name,
             &mut common.translations,
         );
+        if keep_name {
+            common.name = name;
+        }
     }
     let context = &mut common.context;
     for area in [
@@ -1040,6 +1050,7 @@ fn localize_common(pack: &Reader, common: &mut Common, languages: &Languages) ->
         crate::address_lines::address_lines(common.layer, &common.address, &common.context);
     let context = &common.context;
     let renamed = std::iter::once((common.local_name.as_deref(), common.name.as_str()))
+        .filter(|_| !keep_name)
         .chain(
             [
                 &context.neighbourhood,
@@ -1114,14 +1125,334 @@ fn move_highlights(highlights: &mut Vec<Highlight>, moved: &[Moved]) {
 
 pub fn localize_forward(pack: &Reader, collection: &mut ForwardCollection, languages: &Languages) {
     for feature in &mut collection.features {
-        let moved = localize_common(pack, &mut feature.properties.common, languages);
+        let moved = localize_common(pack, &mut feature.properties.common, languages, false);
         move_highlights(&mut feature.properties.highlights, &moved);
     }
 }
 
+fn scripts(text: &str) -> std::collections::HashSet<unicode_script::Script> {
+    use unicode_script::{Script, UnicodeScript};
+    text.chars()
+        .filter(|character| character.is_alphabetic())
+        .map(|character| match character.script() {
+            Script::Hiragana | Script::Katakana => Script::Han,
+            script => script,
+        })
+        .filter(|script| !matches!(script, Script::Common | Script::Inherited))
+        .collect()
+}
+
+pub fn localize_to_query(pack: &Reader, collection: &mut ForwardCollection, query: &str) {
+    let typed = scripts(query);
+    let first = crate::util::fold::search_key(query)
+        .and_then(|key| key.split_whitespace().next().map(str::to_string))
+        .unwrap_or_default();
+    let packed = typed.iter().any(|script| {
+        matches!(
+            script,
+            unicode_script::Script::Han | unicode_script::Script::Hangul
+        )
+    });
+    if typed.is_empty() || first.chars().count() < 3 && !packed {
+        return;
+    }
+    for feature in &mut collection.features {
+        let common = &feature.properties.common;
+        let Some(record_id) = common.record_id else {
+            continue;
+        };
+        let typed_as = |name: &str| {
+            crate::util::fold::search_key(name).is_some_and(|name| name.starts_with(&first))
+        };
+        let holds = crate::util::fold::search_key(&common.name)
+            .is_some_and(|name| name.split_whitespace().any(|word| word.starts_with(&first)));
+        if holds {
+            if !scripts(&common.label).is_subset(&typed) {
+                let areas = common
+                    .context
+                    .areas()
+                    .map(|area| area.record_id)
+                    .collect::<Vec<_>>();
+                let mut counts = BTreeMap::<String, usize>::new();
+                for area in areas {
+                    for (code, name) in pack.names_by_language(area) {
+                        if scripts(name).is_subset(&typed) {
+                            *counts.entry(code.clone()).or_default() += 1;
+                        }
+                    }
+                }
+                let best = counts
+                    .into_iter()
+                    .max_by_key(|(code, count)| (*count, std::cmp::Reverse(code.clone())));
+                if let Some((code, _)) = best
+                    && let Ok(languages) = Languages::parse(&code)
+                {
+                    let moved =
+                        localize_common(pack, &mut feature.properties.common, &languages, true);
+                    move_highlights(&mut feature.properties.highlights, &moved);
+                }
+            }
+            continue;
+        }
+        let foreign = !scripts(&common.label).is_subset(&typed);
+        let holds_typed = |name: &str| {
+            crate::util::fold::search_key(name)
+                .is_some_and(|name| name.split_whitespace().any(|word| word.starts_with(&first)))
+        };
+        let fits = |name: &str| scripts(name).is_subset(&typed) && (foreign || holds_typed(name));
+        let code = pack
+            .names_by_language(record_id)
+            .iter()
+            .filter(|(_, name)| fits(name))
+            .min_by_key(|(code, name)| {
+                (
+                    !holds_typed(name),
+                    code != "en",
+                    !typed_as(name),
+                    code.clone(),
+                )
+            })
+            .map(|(code, _)| code.clone());
+        let place = !matches!(common.layer, Layer::Poi | Layer::Address | Layer::Street);
+        let other = match code {
+            Some(_) => None,
+            None if !place && !foreign => continue,
+            None => {
+                let alt_names = match pack.records().record(record_id) {
+                    Ok(crate::record::Record::Place(_, record)) => record.alt_names,
+                    Ok(crate::record::Record::Poi(record)) => record.alt_names,
+                    _ => Vec::new(),
+                };
+                let readable = |name: &String| scripts(name).is_subset(&typed);
+                let words = crate::util::fold::search_key(query).unwrap_or_default();
+                let words = words.split_whitespace().collect::<Vec<_>>();
+                let typed_name = alt_names
+                    .iter()
+                    .filter(|name| fits(name) && holds_typed(name))
+                    .min_by_key(|name| {
+                        let own = crate::util::fold::search_key(name).unwrap_or_default();
+                        let own = own
+                            .split_whitespace()
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        let matched = words
+                            .iter()
+                            .filter(|word| own.iter().any(|part| part.starts_with(**word)))
+                            .count();
+                        (std::cmp::Reverse(matched), own.len(), name.len())
+                    });
+                match typed_name.or_else(|| alt_names.iter().find(|name| foreign && readable(name)))
+                {
+                    Some(name) => Some(name.clone()),
+                    None => continue,
+                }
+            }
+        };
+        let english = typed
+            .iter()
+            .all(|script| *script == unicode_script::Script::Latin);
+        let code = match (code, english) {
+            (Some(code), _) => code,
+            (None, true) => "en".to_string(),
+            (None, false) => String::new(),
+        };
+        if let Ok(languages) = Languages::parse(&code) {
+            let moved = localize_common(pack, &mut feature.properties.common, &languages, false);
+            move_highlights(&mut feature.properties.highlights, &moved);
+        }
+        if let Some(other) = other {
+            let common = &mut feature.properties.common;
+            if let Some(rest) = common.label.strip_prefix(common.name.as_str()) {
+                common.label = format!("{other}{rest}");
+                let (old, new) = (common.name.chars().count(), other.chars().count());
+                feature.properties.highlights.retain_mut(|highlight| {
+                    if highlight.start < old {
+                        return false;
+                    }
+                    (highlight.start, highlight.end) =
+                        (highlight.start - old + new, highlight.end - old + new);
+                    true
+                });
+            }
+            common.name = other;
+        }
+    }
+}
+
+pub(crate) fn fold_same_places(features: &mut Vec<ForwardFeature>) {
+    let mut kept: Vec<ForwardFeature> = Vec::with_capacity(features.len());
+    for feature in features.drain(..) {
+        let common = &feature.properties.common;
+        let areal = |common: &Common| {
+            matches!(
+                common.layer,
+                Layer::Locality
+                    | Layer::District
+                    | Layer::Neighbourhood
+                    | Layer::Region
+                    | Layer::Country
+                    | Layer::Place
+            )
+        };
+        let within = |outer: &Common, inner: &Common| {
+            areal(outer)
+                && areal(inner)
+                && !matches!(outer.layer, Layer::Region | Layer::Country)
+                && inner.context.areas().any(|area| area.id == outer.id)
+        };
+        let same = kept.iter().any(|held| {
+            let other = &held.properties.common;
+            other.name.trim().eq_ignore_ascii_case(common.name.trim())
+                && (within(other, common) || within(common, other))
+        });
+        if !same {
+            kept.push(feature);
+        }
+    }
+    *features = kept;
+}
+
+pub(crate) fn place_labels(collection: &mut ForwardCollection) {
+    let labels = collection
+        .features
+        .iter()
+        .map(|feature| place_label(&feature.properties.common, false))
+        .collect::<Vec<_>>();
+    let shown = labels
+        .iter()
+        .zip(&collection.features)
+        .map(|(label, feature)| {
+            label
+                .clone()
+                .unwrap_or_else(|| feature.properties.common.label.clone())
+        })
+        .collect::<Vec<_>>();
+    let clashes = labels
+        .iter()
+        .enumerate()
+        .map(|(at, label)| {
+            label.is_some()
+                && shown
+                    .iter()
+                    .enumerate()
+                    .any(|(other, held)| other != at && Some(held) == label.as_ref())
+        })
+        .collect::<Vec<_>>();
+    for ((feature, label), clashes) in collection.features.iter_mut().zip(labels).zip(clashes) {
+        let common = &mut feature.properties.common;
+        let label = match clashes {
+            true => place_label(common, true),
+            false => label,
+        };
+        if let Some(label) = label {
+            common.label = label;
+        }
+    }
+    let labels = collection
+        .features
+        .iter()
+        .map(|feature| feature.properties.common.label.clone())
+        .collect::<Vec<_>>();
+    for (at, feature) in collection.features.iter_mut().enumerate() {
+        let highlights = &mut feature.properties.highlights;
+        let common = &mut feature.properties.common;
+        let clashes = labels
+            .iter()
+            .enumerate()
+            .any(|(other, label)| other != at && *label == common.label);
+        let Some(kind) = common
+            .category
+            .as_deref()
+            .and_then(|category| category.rsplit(':').next())
+            .map(|kind| kind.replace('_', " "))
+        else {
+            continue;
+        };
+        if clashes && let Some(rest) = common.label.strip_prefix(common.name.as_str()) {
+            let added = format!(" ({kind})").chars().count();
+            let at = common.name.chars().count();
+            common.label = format!("{} ({kind}){rest}", common.name);
+            for highlight in highlights.iter_mut() {
+                if highlight.start >= at {
+                    highlight.start += added;
+                    highlight.end += added;
+                }
+            }
+        }
+    }
+}
+
+fn place_label(common: &Common, county: bool) -> Option<String> {
+    use crate::address_template::{StateForm, state_form};
+
+    if common.label != common.name {
+        return None;
+    }
+    let Context {
+        locality,
+        district,
+        subregion,
+        region,
+        country,
+        ..
+    } = &common.context;
+    let (town, state, nation) = match common.layer {
+        Layer::Locality | Layer::District | Layer::Place => (false, true, true),
+        Layer::Neighbourhood | Layer::Postcode => (true, true, true),
+        Layer::Region => (false, false, true),
+        _ => return None,
+    };
+    let form = country
+        .as_ref()
+        .and_then(|area| area.code.as_deref())
+        .map_or(StateForm::Unwritten, state_form);
+    let mut parts = vec![common.name.trim().to_string()];
+    let mut push = |area: &Option<ContextArea>, name: Option<&str>| {
+        let Some(area) = area else {
+            return;
+        };
+        let name = name.unwrap_or(&area.name).trim();
+        if area.id != common.id
+            && !name.is_empty()
+            && !parts.iter().any(|part| part.eq_ignore_ascii_case(name))
+        {
+            parts.push(name.to_string());
+        }
+    };
+    if town {
+        push(locality, None);
+    }
+    if county {
+        push(
+            if district.is_some() {
+                district
+            } else {
+                subregion
+            },
+            None,
+        );
+    }
+    if state {
+        let code = region
+            .as_ref()
+            .and_then(|area| area.code.as_deref())
+            .and_then(|code| code.split_once('-'))
+            .map(|(_, code)| code);
+        match form {
+            StateForm::Code => push(region, code),
+            StateForm::Name => push(region, None),
+            StateForm::Unwritten => {}
+        }
+    }
+    if nation {
+        push(country, None);
+    }
+    (parts.len() > 1).then(|| parts.join(LABEL_SEPARATOR))
+}
+
 pub fn localize_reverse(pack: &Reader, collection: &mut ReverseCollection, languages: &Languages) {
     for feature in &mut collection.features {
-        localize_common(pack, &mut feature.properties.common, languages);
+        localize_common(pack, &mut feature.properties.common, languages, false);
     }
 }
 

@@ -827,7 +827,7 @@ fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardColl
                 .is_some_and(|hit| search_key(&hit.record.name) == typed);
             let mut hits = match named_as_typed {
                 true => named,
-                false => nearest_of_category(state, &as_typed, limit, named)?,
+                false => nearest_of_category(state, &as_typed, limit, named, true)?,
             };
             for hit in &mut hits {
                 hit.highlights = Default::default();
@@ -985,11 +985,19 @@ pub(crate) async fn autocomplete(
     State(state): State<AppState>,
     params: Result<Query<AutocompleteParams>, QueryRejection>,
 ) -> Result<Json<ForwardCollection>, Problem> {
+    let mut collection = autocomplete_lookup(state, params).await?;
+    api::place_labels(&mut collection);
+    Ok(Json(collection))
+}
+
+pub(crate) async fn autocomplete_lookup(
+    state: AppState,
+    params: Result<Query<AutocompleteParams>, QueryRejection>,
+) -> Result<ForwardCollection, Problem> {
     let Query(params) = params.map_err(malformed_parameters)?;
     let request = (AUTOCOMPLETE.prepare)(&state, params)?;
     let worker = state.clone();
-    let collection = lookup(&state, move || (AUTOCOMPLETE.answer)(&worker, request)).await?;
-    Ok(Json(collection))
+    lookup(&state, move || (AUTOCOMPLETE.answer)(&worker, request)).await
 }
 
 pub(crate) type AutocompleteRequest = Named<(TextAutocompleteOptions, Option<Layer>)>;
@@ -1039,6 +1047,11 @@ fn autocomplete_answer(state: &AppState, named: AutocompleteRequest) -> Result<F
     let focus = options.focus;
     let languages = named.languages;
     let asked = effective_autocomplete_limit(options.limit);
+    options.limit = asked.max(crate::search::DEFAULT_SEARCH_LIMIT);
+    let caller = match (focus, layer) {
+        (Some([lon, lat]), layer) if layer != Some(Layer::Poi) => caller_at(state, lon, lat)?,
+        _ => crate::search::Caller::default(),
+    };
     let mut collection = loop {
         let limit = effective_autocomplete_limit(options.limit);
         let hits = match layer {
@@ -1050,14 +1063,69 @@ fn autocomplete_answer(state: &AppState, named: AutocompleteRequest) -> Result<F
                 let hits = state.places.autocomplete(&options)?;
                 prefer_poi_names(state, &options, limit, hits)?.0
             }
-            Some(_) => state.searcher.autocomplete(&options)?,
+            Some(Layer::Postcode) => {
+                let hits = state.searcher.postcode_reading(&options)?;
+                match hits.is_empty() {
+                    true => state.searcher.autocomplete(&options)?,
+                    false => hits,
+                }
+            }
+            Some(_) => {
+                let hits = state.searcher.autocomplete(&options)?;
+                crate::search::rank_places(&state.searcher, None, &options, hits, &caller, false)?
+            }
             None => {
-                let named = suggest(&state.searcher, &state.places, &options)?;
-                nearest_of_category(state, &options, limit, named)?
+                let mut placed = state.searcher.postcode_reading(&options)?;
+                let postcode = !placed.is_empty();
+                if !postcode {
+                    placed = state.searcher.place_in_area(&options)?;
+                }
+                let mut named = suggest(&state.searcher, &state.places, &options)?;
+                if named.is_empty() {
+                    named = state.searcher.short_named(&options)?;
+                    named.extend(state.places.short_named(&options)?);
+                }
+                let named = nearest_of_category(state, &options, limit, named, placed.is_empty())?;
+                let ranked = crate::search::rank_places(
+                    &state.searcher,
+                    Some(&state.places),
+                    &options,
+                    named,
+                    &caller,
+                    !placed.is_empty(),
+                )?;
+                let fame = |hit: &TextSearchHit| -> Result<u8> {
+                    Ok(state
+                        .pack
+                        .records()
+                        .prominence(hit.record_id)?
+                        .map_or(0, |prominence| prominence.importance))
+                };
+                let mut placed_fame = 0u8;
+                for hit in &placed {
+                    placed_fame = placed_fame.max(fame(hit)?);
+                }
+                let mut hits = Vec::new();
+                let mut rest = ranked.into_iter().peekable();
+                while let Some(hit) = rest.peek() {
+                    let above = u16::from(placed_fame) + u16::from(crate::search::FAME_GROUP);
+                    if placed.is_empty() || postcode || u16::from(fame(hit)?) < above {
+                        break;
+                    }
+                    hits.extend(rest.next());
+                }
+                for hit in placed.into_iter().chain(rest) {
+                    if !hits.iter().any(|kept| kept.record_id == hit.record_id) {
+                        hits.push(hit);
+                    }
+                }
+                in_typed_town(&options.query, options.focus, &mut hits);
+                hits
             }
         };
         let mut found = api::forward_collection(&state.pack, options.query.clone(), hits)?;
         let held = found.features.len();
+        api::fold_same_places(&mut found.features);
         house::one_per_house(&mut found.features);
         let Some(more) = house::ask_again(
             asked,
@@ -1073,7 +1141,112 @@ fn autocomplete_answer(state: &AppState, named: AutocompleteRequest) -> Result<F
     };
     api::measure_from(&mut collection, focus);
     api::localize_forward(&state.pack, &mut collection, &languages);
+    if languages.is_empty() {
+        api::localize_to_query(&state.pack, &mut collection, &options.query);
+    }
     Ok(collection)
+}
+
+const NEAR_TOWN_M: u64 = 100_000;
+
+fn in_typed_town(query: &str, focus: Option<[f64; 2]>, hits: &mut [TextSearchHit]) {
+    let tokens = crate::search::autocomplete_tokens(query);
+    let Some(number) = tokens
+        .iter()
+        .position(|token| token.bytes().any(|byte| byte.is_ascii_digit()))
+    else {
+        return;
+    };
+    let town = &tokens[number + 1..];
+    if number == 0
+        || town.is_empty()
+        || town
+            .iter()
+            .any(|token| token.bytes().any(|byte| byte.is_ascii_digit()))
+    {
+        return;
+    }
+    let street = tokens[..number].join(" ");
+    let key = |hit: &TextSearchHit| {
+        let address = matches!(hit.record.layer.as_str(), "address" | "interpolation");
+        let street_only = hit.record.layer == "street";
+        let (own, place) = hit
+            .record
+            .label
+            .split_once(", ")
+            .unwrap_or((hit.record.label.as_str(), ""));
+        let address_town = [
+            hit.record.address.locality.as_deref(),
+            hit.record.address.place.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+        let place = search_key(&format!("{place} {address_town}")).unwrap_or_default();
+        let place = place.split_whitespace().collect::<Vec<_>>();
+        let own = search_key(own).unwrap_or_default();
+        let own = own
+            .split_whitespace()
+            .filter(|word| !word.bytes().any(|byte| byte.is_ascii_digit()))
+            .collect::<Vec<_>>();
+        let starts = |words: &[&str]| {
+            town.iter()
+                .all(|typed| words.iter().any(|word| word.starts_with(typed.as_str())))
+        };
+        let near = focus.zip(hit.record.point).map(|([lon, lat], point)| {
+            crate::util::geo::haversine_m(lon, lat, point.lon, point.lat) as u64
+        });
+        (
+            street_only,
+            !((address || street_only) && starts(&place)),
+            near.is_some_and(|metres| metres > NEAR_TOWN_M),
+            !(address && own.join(" ") == street),
+            !(address && starts(&own)),
+        )
+    };
+    hits.sort_by_key(|hit| key(hit));
+}
+
+fn caller_at(state: &AppState, lon: f64, lat: f64) -> Result<crate::search::Caller> {
+    let mut caller = crate::search::Caller::default();
+    for layer in [None, Some(Layer::Neighbourhood), Some(Layer::Locality)] {
+        let Some(found) = state
+            .reverse_geocoder
+            .reverse(GeocodeOptions {
+                layer,
+                ..GeocodeOptions::at(lon, lat)
+            })?
+            .result
+        else {
+            continue;
+        };
+        let mut ids = found.primary_record_id.into_iter().collect::<Vec<_>>();
+        if let Some(context) = found
+            .primary_record_id
+            .map(|id| state.pack.boundary_context(id))
+            .transpose()?
+            .flatten()
+        {
+            ids.extend(
+                context
+                    .admin_context
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.record_id),
+            );
+        }
+        ids.extend(found.evidence.context_record_ids);
+        for id in ids {
+            if caller.country.is_none() {
+                caller.country = state.pack.country_code(id);
+            }
+            if !caller.areas.contains(&id) {
+                caller.areas.push(id);
+            }
+        }
+    }
+    Ok(caller)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1131,11 +1304,13 @@ fn nearest_of_category(
     options: &TextAutocompleteOptions,
     limit: usize,
     named: Vec<TextSearchHit>,
+    typos: bool,
 ) -> Result<Vec<TextSearchHit>> {
     let (named, exact_poi) = prefer_poi_names(state, options, limit, named)?;
     let typo = |kind: &str| category_typo(kind);
     let (request, through_typo) = match categories::of_request(&options.query) {
         Some(request) => (request, false),
+        None if !typos => return Ok(named),
         None => match categories::of_request_with(&options.query, typo) {
             Some(request) => (
                 categories::Request {
@@ -2703,6 +2878,218 @@ pub(crate) mod router_tests {
             .map(|record| writer.write(record, None).expect("write"))
             .collect::<Vec<_>>();
         ids[0]
+    }
+
+    #[tokio::test]
+    async fn autocomplete_names_the_best_known_namesakes_each_by_where_it_lies() {
+        use crate::context::{AdminContextTuple, RecordContext};
+        use crate::parse::lattice::CountryCode;
+        use crate::record::{PlaceLayer, PlaceRecord, Prominence, Record};
+
+        let dir = TempDir::new("autocomplete-namesakes");
+        let pack = dir.join("pack");
+        let mut writer = Writer::create(&pack).expect("writer");
+        let place = |layer, name: &str, id, [lon, lat]: [f64; 2], importance, wikidata| {
+            Record::Place(
+                layer,
+                PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: name.to_string(),
+                    place_type: "city".to_string(),
+                    geometry: point_geometry(lon, lat),
+                    source: SourceProvenance::osm(ObjectType::Node, id),
+                    prominence: Prominence {
+                        importance,
+                        linked: importance > 0,
+                        languages: 0,
+                    },
+                    wikidata,
+                },
+            )
+        };
+        let within = |tiers: &[(PlaceLayer, u64)]| {
+            Some(RecordContext {
+                admin_context: AdminContextTuple::from_tiers(tiers.iter().copied()),
+                ..RecordContext::default()
+            })
+        };
+        let mut codes = std::collections::HashMap::new();
+        let mut subdivisions = std::collections::HashMap::new();
+        let mut country = |writer: &mut Writer, name, id, code: &str, at| {
+            let record = writer
+                .write(&place(PlaceLayer::Country, name, id, at, 0, None), None)
+                .expect("country");
+            codes.insert(record, CountryCode::parse(code).expect("code"));
+            record
+        };
+        let us = country(&mut writer, "United States", 1, "US", [-98.0, 39.0]);
+        let ca = country(&mut writer, "Canada", 2, "CA", [-100.0, 56.0]);
+        let gb = country(&mut writer, "United Kingdom", 3, "GB", [-2.0, 54.0]);
+        let mut region = |writer: &mut Writer, name, id, code: &str, nation, at| {
+            let record = writer
+                .write(
+                    &place(PlaceLayer::Region, name, id, at, 0, None),
+                    within(&[(PlaceLayer::Country, nation)]),
+                )
+                .expect("region");
+            subdivisions.insert(record, code.to_string());
+            record
+        };
+        let ontario = region(&mut writer, "Ontario", 4, "CA-ON", ca, [-85.0, 50.0]);
+        let kentucky = region(&mut writer, "Kentucky", 5, "US-KY", us, [-85.0, 37.5]);
+        let hampshire = region(&mut writer, "New Hampshire", 6, "US-NH", us, [-71.5, 43.7]);
+        let virginia = region(&mut writer, "West Virginia", 7, "US-WV", us, [-80.5, 38.6]);
+        let england = region(&mut writer, "England", 8, "GB-ENG", gb, [-1.5, 52.5]);
+        for (name, id, at, importance, wikidata, nation, state) in [
+            ("London", 10, [-0.1277, 51.5074], 169, Some(84), gb, england),
+            ("London", 11, [-81.25, 42.98], 144, Some(92561), ca, ontario),
+            ("London", 12, [-81.24, 42.95], 144, Some(92561), ca, ontario),
+            (
+                "London",
+                13,
+                [-84.08, 37.13],
+                118,
+                Some(3_061_911),
+                us,
+                kentucky,
+            ),
+            (
+                "Londonderry",
+                14,
+                [-71.37, 42.87],
+                114,
+                Some(2_304_585),
+                us,
+                hampshire,
+            ),
+            (
+                "London",
+                15,
+                [-81.37, 38.19],
+                77,
+                Some(6_669_736),
+                us,
+                virginia,
+            ),
+        ] {
+            writer
+                .write(
+                    &place(PlaceLayer::Locality, name, id, at, importance, wikidata),
+                    within(&[(PlaceLayer::Country, nation), (PlaceLayer::Region, state)]),
+                )
+                .expect("locality");
+        }
+        writer.set_country_codes(codes);
+        writer.set_subdivision_codes(subdivisions);
+        writer.finish().expect("finish");
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let found = send(router, request("GET", "/autocomplete?q=London"))
+            .await
+            .json();
+        let labels = found["features"]
+            .as_array()
+            .expect("features")
+            .iter()
+            .map(|feature| feature["properties"]["label"].as_str().expect("label"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "London, United Kingdom",
+                "London, ON, Canada",
+                "London, KY, United States",
+                "Londonderry, NH, United States",
+                "London, WV, United States",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn autocomplete_writes_a_state_as_a_code_a_name_or_not_at_all() {
+        use crate::context::{AdminContextTuple, RecordContext};
+        use crate::parse::lattice::CountryCode;
+        use crate::record::{PlaceLayer, PlaceRecord, Prominence, Record};
+
+        let dir = TempDir::new("autocomplete-state-forms");
+        let pack = dir.join("pack");
+        let mut writer = Writer::create(&pack).expect("writer");
+        let place = |layer, name: &str, id, [lon, lat]: [f64; 2]| {
+            Record::Place(
+                layer,
+                PlaceRecord {
+                    alt_names: Vec::new(),
+                    name: name.to_string(),
+                    place_type: "city".to_string(),
+                    geometry: point_geometry(lon, lat),
+                    source: SourceProvenance::osm(ObjectType::Node, id),
+                    prominence: Prominence {
+                        importance: 100,
+                        linked: true,
+                        languages: 0,
+                    },
+                    wikidata: None,
+                },
+            )
+        };
+        let within = |tiers: &[(PlaceLayer, u64)]| {
+            Some(RecordContext {
+                admin_context: AdminContextTuple::from_tiers(tiers.iter().copied()),
+                ..RecordContext::default()
+            })
+        };
+        let mut codes = std::collections::HashMap::new();
+        let mut subdivisions = std::collections::HashMap::new();
+        for (country, nation, state, code, lon) in [
+            ("United States", "US", "Kentucky", "US-KY", -85.0),
+            ("India", "IN", "Maharashtra", "IN-MH", 75.0),
+            ("France", "FR", "Bretagne", "FR-BRE", 0.0),
+        ] {
+            let id = (lon as i64 + 1000) * 10;
+            let nation_record = writer
+                .write(&place(PlaceLayer::Country, country, id, [lon, 40.0]), None)
+                .expect("country");
+            codes.insert(nation_record, CountryCode::parse(nation).expect("code"));
+            let region = writer
+                .write(
+                    &place(PlaceLayer::Region, state, id + 1, [lon, 41.0]),
+                    within(&[(PlaceLayer::Country, nation_record)]),
+                )
+                .expect("region");
+            subdivisions.insert(region, code.to_string());
+            writer
+                .write(
+                    &place(PlaceLayer::Locality, "Rivertown", id + 2, [lon, 42.0]),
+                    within(&[
+                        (PlaceLayer::Country, nation_record),
+                        (PlaceLayer::Region, region),
+                    ]),
+                )
+                .expect("locality");
+        }
+        writer.set_country_codes(codes);
+        writer.set_subdivision_codes(subdivisions);
+        writer.finish().expect("finish");
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let found = send(router, request("GET", "/autocomplete?q=Rivertown"))
+            .await
+            .json();
+        let mut labels = found["features"]
+            .as_array()
+            .expect("features")
+            .iter()
+            .map(|feature| feature["properties"]["label"].as_str().expect("label"))
+            .collect::<Vec<_>>();
+        labels.sort_unstable();
+        assert_eq!(
+            labels,
+            [
+                "Rivertown, France",
+                "Rivertown, KY, United States",
+                "Rivertown, Maharashtra, India",
+            ]
+        );
     }
 
     #[tokio::test]

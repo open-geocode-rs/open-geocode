@@ -1,0 +1,16 @@
+# An airport by its code or by its city.
+# query	focus	top	expect	note
+jfk		1	poi@40.641,-73.778~3
+lax		1	poi@33.942,-118.408~3
+cdg		1	poi@49.010,2.548~4
+heathrow		1	poi@51.470,-0.454~4
+schiphol		1	poi@52.327,4.742~1.5:luchthaven | poi@52.327,4.742~1.5:airport
+changi		3	poi@1.364,103.991~4
+narita		3	poi@35.772,140.393~4
+ohare	-87.630,41.878	1	poi@41.974,-87.907~4
+toronto airport		1	poi@43.677,-79.624~4
+pearson airport	-79.383,43.653	1	poi@43.677,-79.624~4
+berlin airport		1	poi@52.366,13.503~5
+dxb		1	poi@25.253,55.364~4
+london airport		1	poi@51.470,-0.454~5	
+paris airport		1	poi@49.009,2.548~5	

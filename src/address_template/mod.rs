@@ -11,7 +11,7 @@
 
 pub(crate) mod lines;
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::OnceLock};
 
 const TEMPLATES: &str = include_str!("templates.tsv");
 
@@ -156,5 +156,76 @@ mod tests {
         let table = table(str::to_string);
         assert!(table.contains_key("ZZ"));
         assert!(table.keys().all(|code| code.len() == 2));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateForm {
+    Code,
+    Name,
+    Unwritten,
+}
+
+pub(crate) fn state_form(country: &str) -> StateForm {
+    static FORMS: OnceLock<BTreeMap<String, StateForm>> = OnceLock::new();
+    let forms = FORMS.get_or_init(|| {
+        table(str::to_string)
+            .into_iter()
+            .map(|(code, nodes)| (code, form_of(&nodes)))
+            .collect()
+    });
+    forms
+        .get(&country.to_ascii_uppercase())
+        .or_else(|| forms.get("ZZ"))
+        .copied()
+        .unwrap_or(StateForm::Unwritten)
+}
+
+fn form_of(nodes: &[Node<String>]) -> StateForm {
+    let state = |field: &str| matches!(field, "state" | "state_code" | "state_district");
+    for node in nodes {
+        match node {
+            Node::Field(field) if field == "state_code" => return StateForm::Code,
+            Node::Field(field) if field == "state" => return StateForm::Name,
+            Node::First(alternatives)
+                if alternatives.iter().flatten().all(|node| match node {
+                    Node::Field(field) => state(field),
+                    _ => true,
+                }) =>
+            {
+                let first = alternatives.iter().flatten().find_map(|node| match node {
+                    Node::Field(field) => Some(field.as_str()),
+                    _ => None,
+                });
+                match first {
+                    Some("state_code") => return StateForm::Code,
+                    Some("state") => return StateForm::Name,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    StateForm::Unwritten
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn a_country_writes_its_state_as_its_addresses_do() {
+        for (country, form) in [
+            ("US", StateForm::Code),
+            ("CA", StateForm::Code),
+            ("AU", StateForm::Code),
+            ("IN", StateForm::Name),
+            ("JP", StateForm::Name),
+            ("GB", StateForm::Unwritten),
+            ("FR", StateForm::Unwritten),
+            ("DE", StateForm::Unwritten),
+        ] {
+            assert_eq!(state_form(country), form, "{country}");
+        }
     }
 }
