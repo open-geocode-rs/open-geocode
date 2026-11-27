@@ -5,7 +5,7 @@ use std::{
     ops::{Bound, Range},
     path::Path,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -14,10 +14,13 @@ use levenshtein_automata::{DFA, Distance, SINK_STATE};
 use serde::Serialize;
 use structured::{Place, StructuredIndex};
 use tantivy::{
-    DocAddress, DocId, DocSet, IndexReader, Score, Searcher, SegmentReader, Term,
-    collector::{ScoreSegmentTweaker, ScoreTweaker, TopDocs},
+    DocAddress, DocId, DocSet, IndexReader, ReloadPolicy, Score, Searcher, SegmentReader, Term,
+    collector::{Collector, ScoreSegmentTweaker, ScoreTweaker, TopDocs},
     columnar::{Column, StrColumn},
+    directory::{OwnedBytes, RamDirectory},
+    fastfield::{AliveBitSet, write_alive_bitset},
     index::SegmentId,
+    indexer::merge_filtered_segments,
     postings::SegmentPostings,
     query::{
         BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, Occur, PhrasePrefixQuery,
@@ -79,6 +82,38 @@ pub struct TextSearcher {
     budget: Duration,
     structured: Option<Arc<StructuredIndex>>,
     segments: Arc<Vec<(SegmentId, DocId, DocId)>>,
+    famed: Arc<OnceLock<Famed>>,
+    completions: Arc<Mutex<HashMap<(Field, String), Completions>>>,
+    expansion_ends: Arc<Mutex<HashMap<(Field, String), ExpansionEnd>>>,
+}
+
+type Completions = Option<(Vec<String>, bool)>;
+
+type ExpansionEnd = Option<Term>;
+
+const COMPLETIONS_KEPT: usize = 1 << 16;
+
+struct Famed {
+    reader: IndexReader,
+    columns: HashMap<SegmentId, SegmentColumns>,
+    statistics: Searcher,
+}
+
+struct Corpus<'a> {
+    searcher: Searcher,
+    columns: &'a HashMap<SegmentId, SegmentColumns>,
+    statistics: Option<&'a Searcher>,
+}
+
+impl Corpus<'_> {
+    fn search<C: Collector>(&self, query: &dyn Query, collector: &C) -> tantivy::Result<C::Fruit> {
+        match self.statistics {
+            Some(statistics) => self
+                .searcher
+                .search_with_statistics_provider(query, collector, statistics),
+            None => self.searcher.search(query, collector),
+        }
+    }
 }
 
 impl fmt::Debug for TextSearcher {
@@ -106,6 +141,29 @@ struct SegmentColumns {
     name_words: Column<u64>,
     place_rank: Column<u64>,
     prominence: Column<u64>,
+}
+
+impl SegmentColumns {
+    fn of(segment: &SegmentReader) -> tantivy::Result<Self> {
+        let fast_fields = segment.fast_fields();
+        Ok(Self {
+            record_id: fast_fields.u64("record_id")?,
+            record_count: fast_fields.u64(RECORD_COUNT_FIELD)?,
+            house_number: fast_fields.u64(HOUSE_NUMBER_FIELD)?,
+            interpolation_start: fast_fields.u64(INTERPOLATION_START_FIELD)?,
+            interpolation_end: fast_fields.u64(INTERPOLATION_END_FIELD)?,
+            rank_postcode: fast_fields.str(RANK_POSTCODE_FIELD)?,
+            area_postcode: fast_fields.str(AREA_POSTCODE_FIELD)?,
+            country_code: fast_fields.str(COUNTRY_CODE_FIELD)?,
+            min_lon: fast_fields.i64(MIN_LON_FIELD)?,
+            min_lat: fast_fields.i64(MIN_LAT_FIELD)?,
+            max_lon: fast_fields.i64(MAX_LON_FIELD)?,
+            max_lat: fast_fields.i64(MAX_LAT_FIELD)?,
+            name_words: fast_fields.u64(NAME_WORDS_FIELD)?,
+            place_rank: fast_fields.u64(PLACE_RANK_FIELD)?,
+            prominence: fast_fields.u64(PROMINENCE_FIELD)?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -311,27 +369,7 @@ impl TextSearcher {
         for segment in reader.searcher().segment_readers() {
             let base = segments.last().map_or(0, |(_, _, end)| *end);
             segments.push((segment.segment_id(), base, base + segment.max_doc()));
-            let fast_fields = segment.fast_fields();
-            columns.insert(
-                segment.segment_id(),
-                SegmentColumns {
-                    record_id: fast_fields.u64("record_id")?,
-                    record_count: fast_fields.u64(RECORD_COUNT_FIELD)?,
-                    house_number: fast_fields.u64(HOUSE_NUMBER_FIELD)?,
-                    interpolation_start: fast_fields.u64(INTERPOLATION_START_FIELD)?,
-                    interpolation_end: fast_fields.u64(INTERPOLATION_END_FIELD)?,
-                    rank_postcode: fast_fields.str(RANK_POSTCODE_FIELD)?,
-                    area_postcode: fast_fields.str(AREA_POSTCODE_FIELD)?,
-                    country_code: fast_fields.str(COUNTRY_CODE_FIELD)?,
-                    min_lon: fast_fields.i64(MIN_LON_FIELD)?,
-                    min_lat: fast_fields.i64(MIN_LAT_FIELD)?,
-                    max_lon: fast_fields.i64(MAX_LON_FIELD)?,
-                    max_lat: fast_fields.i64(MAX_LAT_FIELD)?,
-                    name_words: fast_fields.u64(NAME_WORDS_FIELD)?,
-                    place_rank: fast_fields.u64(PLACE_RANK_FIELD)?,
-                    prominence: fast_fields.u64(PROMINENCE_FIELD)?,
-                },
-            );
+            columns.insert(segment.segment_id(), SegmentColumns::of(segment)?);
         }
         let confidence = confidence::Model::load(&pack)?;
         let ranker = Ranker::load(&pack)?;
@@ -349,7 +387,130 @@ impl TextSearcher {
             budget: SEARCH_BUDGET,
             structured,
             segments: Arc::new(segments),
+            famed: Arc::new(OnceLock::new()),
+            completions: Arc::default(),
+            expansion_ends: Arc::default(),
         })
+    }
+
+    /// Returns how many famed documents the copy holds, 0 when no copy was made.
+    pub fn prepare_famed(&self) -> Result<u64> {
+        let searcher = self.reader.searcher();
+        let index = searcher.index();
+        let segments = index.searchable_segments()?;
+        if segments.len() != 1 {
+            return Ok(0);
+        }
+        let mut alive = Vec::with_capacity(segments.len());
+        let mut kept = 0;
+        for segment in &segments {
+            let reader = searcher
+                .segment_readers()
+                .iter()
+                .find(|reader| reader.segment_id() == segment.id())
+                .ok_or_else(|| Error::Inconsistent("text index segment has no reader".into()))?;
+            let prominence = &self
+                .columns
+                .get(&segment.id())
+                .ok_or_else(|| Error::Inconsistent("text index segment has no fast fields".into()))?
+                .prominence;
+            let mut famed = tantivy_common::BitSet::with_max_value(reader.max_doc());
+            for doc in reader.doc_ids_alive() {
+                if prominence.first(doc).unwrap_or_default() >> 8 > 0 {
+                    famed.insert(doc);
+                    kept += 1;
+                }
+            }
+            let mut bytes = Vec::new();
+            write_alive_bitset(&famed, &mut bytes)?;
+            alive.push(Some(AliveBitSet::open(OwnedBytes::new(bytes))));
+        }
+        if kept == 0 {
+            return Ok(0);
+        }
+        let index = merge_filtered_segments(
+            &segments,
+            index.settings().clone(),
+            alive,
+            RamDirectory::create(),
+        )?;
+        let reader: IndexReader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        let columns = reader
+            .searcher()
+            .segment_readers()
+            .iter()
+            .map(|segment| Ok((segment.segment_id(), SegmentColumns::of(segment)?)))
+            .collect::<tantivy::Result<_>>()?;
+        let _ = self.famed.set(Famed {
+            reader,
+            columns,
+            statistics: searcher,
+        });
+        Ok(kept)
+    }
+
+    fn expansion_end(&self, field: Field, prefix: &str) -> Result<Option<Term>> {
+        if self.famed.get().is_none() {
+            return Ok(None);
+        }
+        let key = (field, prefix.to_string());
+        if let Some(found) = self
+            .expansion_ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+        {
+            return Ok(found.clone());
+        }
+        let searcher = self.reader.searcher();
+        let index = searcher.segment_reader(0).inverted_index(field)?;
+        let mut stream = index.terms().range().ge(prefix.as_bytes()).into_stream()?;
+        let mut seen = 0;
+        let mut last = None;
+        while seen < AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS
+            && stream.advance()
+            && stream.key().starts_with(prefix.as_bytes())
+        {
+            seen += 1;
+            last = Some(stream.key().to_vec());
+        }
+        let end = match seen == AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS {
+            true => last
+                .and_then(|last| String::from_utf8(last).ok())
+                .map(|last| Term::from_field_text(field, &last)),
+            false => None,
+        };
+        let mut kept = self
+            .expansion_ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if kept.len() >= COMPLETIONS_KEPT {
+            kept.clear();
+        }
+        kept.insert(key, end.clone());
+        Ok(end)
+    }
+
+    fn corpus(&self) -> Corpus<'_> {
+        Corpus {
+            searcher: self.reader.searcher(),
+            columns: &self.columns,
+            statistics: None,
+        }
+    }
+
+    fn famed_corpus(&self) -> Corpus<'_> {
+        match self.famed.get() {
+            Some(famed) => Corpus {
+                searcher: famed.reader.searcher(),
+                columns: &famed.columns,
+                statistics: Some(&famed.statistics),
+            },
+            None => self.corpus(),
+        }
     }
 
     pub fn places(&self) -> Self {
@@ -1917,15 +2078,34 @@ impl TextSearcher {
                 .any(|hit| name_starts_as(&hit.record.name, &tokens, false))
         {
             for hit in self.famous_as(options, &tokens, &[Completion::AllWords])? {
-                let words = self
+                let last = tokens.len() - 1;
+                let mut areas = Vec::new();
+                if let Some(context) = self.pack.boundary_context(hit.record_id)? {
+                    for entry in context.admin_context.entries() {
+                        if let Some(name) =
+                            search_key(&self.pack.record_summary(entry.record_id)?.name)
+                        {
+                            areas.extend(autocomplete_query_tokens(&name));
+                        }
+                    }
+                }
+                let all = self
                     .names_of(hit.record_id, &hit.record.name)?
                     .iter()
-                    .flat_map(|name| autocomplete_query_tokens(name))
-                    .collect::<Vec<_>>();
-                let last = tokens.len() - 1;
-                let all = tokens.iter().enumerate().all(|(at, typed)| {
-                    words.iter().any(|word| types_word(typed, word, at == last))
-                });
+                    .any(|name| {
+                        let words = autocomplete_query_tokens(name);
+                        let named = |at: usize, typed: &String| {
+                            words.iter().any(|word| types_word(typed, word, at == last))
+                        };
+                        tokens
+                            .iter()
+                            .enumerate()
+                            .any(|(at, typed)| named(at, typed))
+                            && tokens.iter().enumerate().all(|(at, typed)| {
+                                named(at, typed)
+                                    || areas.iter().any(|word| types_word(typed, word, at == last))
+                            })
+                    });
                 if all && !hits.iter().any(|held| held.record_id == hit.record_id) {
                     hits.push(hit);
                 }
@@ -2087,9 +2267,24 @@ impl TextSearcher {
             typed_words: u8::try_from(tokens.len()).unwrap_or(u8::MAX),
             ..Ranking::default()
         };
-        let mut hits = self.ranked_hits(&query, &ranking, FAME_WINDOW, &mut |hit| {
-            Ok(filters.admit(hit) && reach::is_famed(&hit.record.layer))
-        })?;
+        let window = rank_window(FAME_WINDOW);
+        let famed = self.famed_corpus();
+        let mut top_docs = self.top_documents(&famed, &query, &ranking, window)?;
+        let corpus = match top_docs.len() < window && famed.statistics.is_some() {
+            true => {
+                let full = self.corpus();
+                top_docs = self.top_documents(&full, &query, &ranking, window)?;
+                full
+            }
+            false => famed,
+        };
+        let mut hits = self.rank_documents(
+            &corpus.searcher,
+            top_docs,
+            &ranking,
+            FAME_WINDOW,
+            &mut |hit| Ok(filters.admit(hit) && reach::is_famed(&hit.record.layer)),
+        )?;
         let highlighter =
             highlight::Highlighter::new(Completion::CommonCompletions, None, tokens, true);
         for hit in &mut hits {
@@ -6895,7 +7090,11 @@ impl TextSearcher {
                 clauses.push((Occur::Must, whole));
             }
             Completion::InOrder => {
-                clauses.push((Occur::Must, autocomplete_subject_query(subject, words)));
+                let last = self.expansion_end(subject, &words[words.len() - 1])?;
+                clauses.push((
+                    Occur::Must,
+                    autocomplete_subject_query(subject, words, last),
+                ));
             }
             Completion::CommonCompletions => {
                 let (completions, cut) = &subject_completions;
@@ -7004,11 +7203,29 @@ impl TextSearcher {
         Ok(Some(Box::new(BooleanQuery::new(clauses))))
     }
 
-    fn common_completions(
-        &self,
-        field: Field,
-        prefix: &str,
-    ) -> Result<Option<(Vec<String>, bool)>> {
+    fn common_completions(&self, field: Field, prefix: &str) -> Result<Completions> {
+        let key = (field, prefix.to_string());
+        if let Some(found) = self
+            .completions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+        {
+            return Ok(found.clone());
+        }
+        let found = self.scan_completions(field, prefix)?;
+        let mut kept = self
+            .completions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if kept.len() >= COMPLETIONS_KEPT {
+            kept.clear();
+        }
+        kept.insert(key, found.clone());
+        Ok(found)
+    }
+
+    fn scan_completions(&self, field: Field, prefix: &str) -> Result<Completions> {
         let searcher = self.reader.searcher();
         let mut used = HashMap::<Vec<u8>, u64>::new();
         for segment in searcher.segment_readers() {
@@ -7061,7 +7278,11 @@ impl TextSearcher {
             Typed::Whole => {}
             Typed::Prefix => alternatives.push((
                 Occur::Should,
-                autocomplete_subject_query(field, std::slice::from_ref(&word.to_string())),
+                autocomplete_subject_query(
+                    field,
+                    std::slice::from_ref(&word.to_string()),
+                    self.expansion_end(field, word).ok().flatten(),
+                ),
             )),
             Typed::Completions(completions) => {
                 for completion in completions {
@@ -7490,34 +7711,52 @@ impl TextSearcher {
         limit: usize,
         accept: &mut impl FnMut(&TextSearchHit) -> Result<bool>,
     ) -> Result<Vec<TextSearchHit>> {
-        let searcher = self.reader.searcher();
-        let window = limit
-            .saturating_mul(RANK_WINDOW_FACTOR)
-            .min(MAX_RANK_WINDOW)
-            .max(limit);
+        self.ranked_hits_in(&self.corpus(), query, ranking, limit, accept)
+    }
+
+    fn ranked_hits_in(
+        &self,
+        corpus: &Corpus,
+        query: &dyn Query,
+        ranking: &Ranking,
+        limit: usize,
+        accept: &mut impl FnMut(&TextSearchHit) -> Result<bool>,
+    ) -> Result<Vec<TextSearchHit>> {
+        let top_docs = self.top_documents(corpus, query, ranking, rank_window(limit))?;
+        self.rank_documents(&corpus.searcher, top_docs, ranking, limit, accept)
+    }
+
+    fn top_documents(
+        &self,
+        corpus: &Corpus,
+        query: &dyn Query,
+        ranking: &Ranking,
+        window: usize,
+    ) -> Result<Vec<(RankKey, DocAddress)>> {
+        let searcher = &corpus.searcher;
         let mut scored = match ranking.near_first || ranking.fame_first {
             true => Vec::new(),
-            false => searcher.search(query, &TopDocs::with_limit(window))?,
+            false => corpus.search(query, &TopDocs::with_limit(window))?,
         };
         let tie = |scored: &[(Score, DocAddress)], window: usize| {
             scored.len() == window && window > 1 && scored[window - 1].0 == scored[window - 2].0
         };
         if tie(&scored, window) && window < TIE_WINDOW {
-            scored = searcher.search(query, &TopDocs::with_limit(TIE_WINDOW))?;
+            scored = corpus.search(query, &TopDocs::with_limit(TIE_WINDOW))?;
         }
         let top_docs = if ranking.near_first || ranking.fame_first || tie(&scored, TIE_WINDOW) {
             let keys = RankKeys {
                 ranking,
-                columns: &self.columns,
+                columns: corpus.columns,
                 pack: &self.pack,
             };
-            searcher.search(query, &TopDocs::with_limit(window).tweak_score(keys))?
+            corpus.search(query, &TopDocs::with_limit(window).tweak_score(keys))?
         } else {
-            let mut top_docs = self.keyed_documents(&searcher, scored, ranking)?;
+            let mut top_docs = self.keyed_documents(searcher, scored, ranking)?;
             top_docs.truncate(window);
             top_docs
         };
-        self.rank_documents(&searcher, top_docs, ranking, limit, accept)
+        Ok(top_docs)
     }
 
     fn keyed_documents(
@@ -8228,8 +8467,10 @@ impl TextSearcher {
     }
 
     fn segment_columns(&self, searcher: &Searcher, segment_ord: u32) -> Result<&SegmentColumns> {
+        let segment = searcher.segment_reader(segment_ord).segment_id();
         self.columns
-            .get(&searcher.segment_reader(segment_ord).segment_id())
+            .get(&segment)
+            .or_else(|| self.famed.get()?.columns.get(&segment))
             .ok_or_else(|| Error::Inconsistent("text index segment has no fast fields".into()))
     }
 
@@ -11469,22 +11710,38 @@ fn autocomplete_query_tokens(query_text: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-fn autocomplete_subject_query(field: Field, tokens: &[String]) -> Box<dyn Query> {
+const fn rank_window(limit: usize) -> usize {
+    let window = limit.saturating_mul(RANK_WINDOW_FACTOR);
+    let window = if window < MAX_RANK_WINDOW {
+        window
+    } else {
+        MAX_RANK_WINDOW
+    };
+    if window > limit { window } else { limit }
+}
+
+fn autocomplete_subject_query(
+    field: Field,
+    tokens: &[String],
+    last: Option<Term>,
+) -> Box<dyn Query> {
     let mut head = tokens
         .iter()
         .map(|token| Term::from_field_text(field, token))
         .collect::<Vec<_>>();
     let prefix = head.pop().expect("an autocomplete query has a word");
     if head.is_empty() {
+        if let Some(last) = last {
+            return Box::new(RangeQuery::new(
+                Bound::Included(prefix),
+                Bound::Included(last),
+            ));
+        }
         let mut query = PhrasePrefixQuery::new(vec![prefix]);
         query.set_max_expansions(AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS);
         return Box::new(query);
     }
-    Box::new(PhrasePrefix::new(
-        head,
-        prefix,
-        AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS,
-    ))
+    Box::new(PhrasePrefix::new(head, prefix, AUTOCOMPLETE_PREFIX_MAX_EXPANSIONS).ending_at(last))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -12864,6 +13121,46 @@ mod tests {
 
     static PLACES: LazyLock<TempDir> = LazyLock::new(|| corpus("search-places", write_places));
 
+    const FAMED_TOWNS: usize = rank_window(FAME_WINDOW) + 8;
+
+    static FAMED: LazyLock<TempDir> = LazyLock::new(|| corpus("search-famed", write_famed_towns));
+
+    fn famed_town(at: usize) -> String {
+        format!("Velmora {at:03}")
+    }
+
+    fn write_famed_towns(writer: &mut Writer) {
+        use crate::record::{PlaceLayer, PlaceRecord, Prominence, Record};
+
+        for at in 0..FAMED_TOWNS {
+            let importance = u8::try_from(40 + at).expect("importance fits a byte");
+            writer
+                .write(
+                    &Record::Place(
+                        PlaceLayer::Locality,
+                        PlaceRecord {
+                            alt_names: Vec::new(),
+                            name: famed_town(at),
+                            place_type: "town".to_string(),
+                            geometry: point_geometry(10.0 + at as f64 / 100.0, 50.0),
+                            source: SourceProvenance::osm(
+                                ObjectType::Node,
+                                i64::try_from(7_000 + at).expect("id"),
+                            ),
+                            prominence: Prominence {
+                                importance,
+                                linked: true,
+                                languages: 0,
+                            },
+                            wikidata: Some(u32::try_from(9_000 + at).expect("item")),
+                        },
+                    ),
+                    None,
+                )
+                .expect("town");
+        }
+    }
+
     fn write_places(writer: &mut Writer) {
         use crate::{
             context::AdminContextTuple,
@@ -13513,6 +13810,106 @@ mod tests {
             ["osm:node:403"],
             "the Rome nearest the caller"
         );
+    }
+
+    #[test]
+    fn famous_places_read_from_the_famed_copy_match_the_whole_index() {
+        let searcher = TextSearcher::open(&*PLACES).expect("searcher");
+        let places = searcher.places();
+        let famous = |searcher: &TextSearcher, query: &str| {
+            let options = TextAutocompleteOptions {
+                query: query.to_string(),
+                limit: DEFAULT_SEARCH_LIMIT,
+                layer: None,
+                countries: Vec::new(),
+                focus: None,
+                bbox: None,
+            };
+            searcher
+                .famous_places(&options, true)
+                .expect("famous places")
+                .into_iter()
+                .map(|hit| hit.record_id)
+                .collect::<Vec<_>>()
+        };
+        let queries = [
+            "Ro",
+            "Rom",
+            "Rome",
+            "Lag",
+            "Lagos",
+            "Col",
+            "Colosseum",
+            "Rom ita",
+        ];
+        let whole = queries
+            .iter()
+            .map(|query| (famous(&searcher, query), famous(&places, query)))
+            .collect::<Vec<_>>();
+        assert!(whole.iter().any(|(addresses, _)| !addresses.is_empty()));
+        assert!(searcher.prepare_famed().expect("famed copy") > 0);
+        let copied = queries
+            .iter()
+            .map(|query| (famous(&searcher, query), famous(&places, query)))
+            .collect::<Vec<_>>();
+        assert_eq!(copied, whole);
+    }
+
+    #[test]
+    fn a_famed_copy_that_fills_the_window_answers_as_the_whole_index() {
+        let searcher = TextSearcher::open(&*FAMED).expect("searcher");
+        let options = TextAutocompleteOptions {
+            query: "Velmora".to_string(),
+            limit: DEFAULT_SEARCH_LIMIT,
+            layer: None,
+            countries: Vec::new(),
+            focus: None,
+            bbox: None,
+        };
+        let names = |searcher: &TextSearcher| {
+            searcher
+                .famous_places(&options, true)
+                .expect("famous places")
+                .into_iter()
+                .map(|hit| hit.record.name)
+                .collect::<Vec<_>>()
+        };
+        let whole = names(&searcher);
+        assert_eq!(
+            searcher.prepare_famed().expect("famed copy"),
+            FAMED_TOWNS as u64
+        );
+        let famed = searcher.famed_corpus();
+        let query = [Completion::CommonCompletions, Completion::InOrder]
+            .into_iter()
+            .find_map(|completion| {
+                searcher
+                    .autocomplete_query(
+                        completion,
+                        None,
+                        &["velmora".to_string()],
+                        true,
+                        &Filters::new(None, &[], None),
+                    )
+                    .expect("query")
+            })
+            .expect("a query");
+        let ranking = Ranking {
+            fame_first: true,
+            typed_words: 1,
+            ..Ranking::default()
+        };
+        assert_eq!(
+            searcher
+                .top_documents(&famed, &*query, &ranking, rank_window(FAME_WINDOW))
+                .expect("famed window")
+                .len(),
+            rank_window(FAME_WINDOW),
+            "the copy fills the window, so the whole index is not read"
+        );
+        let copied = names(&searcher);
+        assert_eq!(copied, whole);
+        assert_eq!(copied.first(), Some(&famed_town(FAMED_TOWNS - 1)));
     }
 
     #[test]

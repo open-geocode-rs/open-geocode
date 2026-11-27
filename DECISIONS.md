@@ -218,6 +218,40 @@ TRAIN_SHARDS is 4 and MIN_TRAIN_ROWS is 1,000.
 
 ## Search
 
+### Famous-place searches read a copy of the famed documents first
+
+Where. `TextSearcher::prepare_famed`, `TextSearcher::famous_as`, `TextSearcher::expansion_end` and `Corpus` in `src/search/mod.rs`, `PhrasePrefix::ending_at` in `src/search/phrase_prefix.rs`, and the `famed` thread in `AppState::open` in `src/http/server.rs`.
+
+At server start a background thread copies the documents whose fame is above 0 into an in-memory index, 2,227,162 of the planet's 677,624,140.
+A famous-place search reads the copy first, scored with the whole index's statistics.
+A prefix expands in the copy to the same last word it expands to in the whole index.
+When the copy fills the rank window, the whole index would fill it with the same documents, since fame sorts first, so the search stops there.
+When it does not, the search reads the whole index, as before the copy existed.
+The copy is made only when the text index is one segment, and until it is ready every search reads the whole index.
+
+Rejected.
+
+- **Read only the copy.** Chain stores carry fame only on their brand, so every Tim Hortons store has fame 0, and `Tim Ho` near Toronto lost them to Bangladesh.
+- **Let the copy expand prefixes from its own words.** Its dictionary is smaller, so the first 1,024 words after `st` reach further, and it found places the whole index never reached.
+- **A famed filter clause on the whole index.** The postings of every expanded word are still walked, so it was no faster.
+- **Run the famous searches on parallel threads.** One request got faster, but at 32 requests at once throughput fell from 113 to 92 per second, as the threads queued for the shared pool.
+- **A hand-built table of famous names.** It would have to repeat tokenising, other word forms, typos and the context field, and drift from the index.
+
+Evidence.
+
+Every famous-place search that read the copy over 2,904 keystrokes returned the same documents as the whole index, to the last digit of rounding in the score.
+
+### Prefix completion lists are kept per field and prefix
+
+Where. `TextSearcher::common_completions`, `TextSearcher::scan_completions` and `COMPLETIONS_KEPT` in `src/search/mod.rs`.
+
+The completions of a prefix are read from the term dictionary once and kept, since the index never changes while the server runs.
+At COMPLETIONS_KEPT prefixes the store is emptied and starts again.
+
+Rejected.
+
+- **Keep whole answers.** Each stage of a search has a 300 ms budget, so under load an answer can come back cut short, and keeping it would serve the cut answer to everyone after.
+
 ### A flat or unit scores nothing and only breaks ties
 
 Where. `TextSearcher::house_number_query`, `QueryPlan::from_tagged` and `TieBreak` in `src/search/mod.rs`.
@@ -572,6 +606,23 @@ Rejected.
   One fixed character still keeps the dictionary walk to one branch.
 
 ## Ranking
+
+### Words in any order match within one name and the areas it lies in
+
+Where. The `Completion::AllWords` stage of `TextSearcher::famous_places` in `src/search/mod.rs`.
+
+A famous place found with the typed words in any order is kept when one of its names takes at least one typed word, and every typed word starts a word of that name or of the own name of an area it lies in.
+
+Rejected.
+
+- **Any typed word in any of the place's names.** A place carries names in many languages, so `Tim Ho` matched Bangladesh by `tim` in the Malay `Pakistan Timur` and `ho` in the Vietnamese `Cộng hoà`, and Bangladesh outranked every Tim Hortons.
+- **Area names in every language.** `Tim Ho` then matched Cengkareng Timur in Jakarta by `ho` in another language's name of one of its areas.
+- **Words of the place's label.** A POI's label holds its street address, so `high street oxford` matched Belvidere High School on Oxford Street.
+- **The first typed word in the place's own name.** `Paris 7` then lost the 7e Arrondissement, whose own name holds no Paris.
+
+Evidence.
+
+`Tim Ho` gives Tim Hortons Iceplex, not Bangladesh, `den ha` gives Den Haag, not Algeria, `manhattan, new` gives Manhattan, New York, and `london ont` gives London, ON.
 
 ### Answer choice reorders only on house number on the road
 
