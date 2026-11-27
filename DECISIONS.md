@@ -611,15 +611,18 @@ Rejected.
 
 Where. The `Completion::AllWords` stage of `TextSearcher::famous_places` in `src/search/mod.rs`.
 
-A famous place found with the typed words in any order is kept when one of its names takes the first typed word, and every other typed word starts a word of that name, of its label or of an area it lies in.
+A famous place found with the typed words in any order is kept when one of its names takes at least one typed word, and every typed word starts a word of that name or of the own name of an area it lies in.
 
 Rejected.
 
 - **Any typed word in any of the place's names.** A place carries names in many languages, so `Tim Ho` matched Bangladesh by `tim` in the Malay `Pakistan Timur` and `ho` in the Vietnamese `Cộng hoà`, and Bangladesh outranked every Tim Hortons.
+- **Area names in every language.** `Tim Ho` then matched Cengkareng Timur in Jakarta by `ho` in another language's name of one of its areas.
+- **Words of the place's label.** A POI's label holds its street address, so `high street oxford` matched Belvidere High School on Oxford Street.
+- **The first typed word in the place's own name.** `Paris 7` then lost the 7e Arrondissement, whose own name holds no Paris.
 
 Evidence.
 
-`Tim Ho` gives Tim Hortons Iceplex and Tim Ho Wan, not Bangladesh, `den ha` gives Den Haag, not Algeria, and `IV, To` gives the lake IV.-tó, not Iran.
+`Tim Ho` gives Tim Hortons Iceplex, not Bangladesh, `den ha` gives Den Haag, not Algeria, `manhattan, new` gives Manhattan, New York, and `london ont` gives London, ON.
 
 ### Answer choice reorders only on house number on the road
 

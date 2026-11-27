@@ -2079,14 +2079,14 @@ impl TextSearcher {
         {
             for hit in self.famous_as(options, &tokens, &[Completion::AllWords])? {
                 let last = tokens.len() - 1;
-                let mut areas = autocomplete_query_tokens(&hit.record.label);
+                let mut areas = Vec::new();
                 if let Some(context) = self.pack.boundary_context(hit.record_id)? {
                     for entry in context.admin_context.entries() {
-                        areas.extend(
-                            self.pack
-                                .language_names(entry.record_id)
-                                .flat_map(autocomplete_query_tokens),
-                        );
+                        if let Some(name) =
+                            search_key(&self.pack.record_summary(entry.record_id)?.name)
+                        {
+                            areas.extend(autocomplete_query_tokens(&name));
+                        }
                     }
                 }
                 let all = self
@@ -2097,7 +2097,10 @@ impl TextSearcher {
                         let named = |at: usize, typed: &String| {
                             words.iter().any(|word| types_word(typed, word, at == last))
                         };
-                        named(0, &tokens[0])
+                        tokens
+                            .iter()
+                            .enumerate()
+                            .any(|(at, typed)| named(at, typed))
                             && tokens.iter().enumerate().all(|(at, typed)| {
                                 named(at, typed)
                                     || areas.iter().any(|word| types_word(typed, word, at == last))
@@ -11707,11 +11710,14 @@ fn autocomplete_query_tokens(query_text: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-fn rank_window(limit: usize) -> usize {
-    limit
-        .saturating_mul(RANK_WINDOW_FACTOR)
-        .min(MAX_RANK_WINDOW)
-        .max(limit)
+const fn rank_window(limit: usize) -> usize {
+    let window = limit.saturating_mul(RANK_WINDOW_FACTOR);
+    let window = if window < MAX_RANK_WINDOW {
+        window
+    } else {
+        MAX_RANK_WINDOW
+    };
+    if window > limit { window } else { limit }
 }
 
 fn autocomplete_subject_query(
@@ -13115,6 +13121,46 @@ mod tests {
 
     static PLACES: LazyLock<TempDir> = LazyLock::new(|| corpus("search-places", write_places));
 
+    const FAMED_TOWNS: usize = rank_window(FAME_WINDOW) + 8;
+
+    static FAMED: LazyLock<TempDir> = LazyLock::new(|| corpus("search-famed", write_famed_towns));
+
+    fn famed_town(at: usize) -> String {
+        format!("Velmora {at:03}")
+    }
+
+    fn write_famed_towns(writer: &mut Writer) {
+        use crate::record::{PlaceLayer, PlaceRecord, Prominence, Record};
+
+        for at in 0..FAMED_TOWNS {
+            let importance = u8::try_from(40 + at).expect("importance fits a byte");
+            writer
+                .write(
+                    &Record::Place(
+                        PlaceLayer::Locality,
+                        PlaceRecord {
+                            alt_names: Vec::new(),
+                            name: famed_town(at),
+                            place_type: "town".to_string(),
+                            geometry: point_geometry(10.0 + at as f64 / 100.0, 50.0),
+                            source: SourceProvenance::osm(
+                                ObjectType::Node,
+                                i64::try_from(7_000 + at).expect("id"),
+                            ),
+                            prominence: Prominence {
+                                importance,
+                                linked: true,
+                                languages: 0,
+                            },
+                            wikidata: Some(u32::try_from(9_000 + at).expect("item")),
+                        },
+                    ),
+                    None,
+                )
+                .expect("town");
+        }
+    }
+
     fn write_places(writer: &mut Writer) {
         use crate::{
             context::AdminContextTuple,
@@ -13807,6 +13853,63 @@ mod tests {
             .map(|query| (famous(&searcher, query), famous(&places, query)))
             .collect::<Vec<_>>();
         assert_eq!(copied, whole);
+    }
+
+    #[test]
+    fn a_famed_copy_that_fills_the_window_answers_as_the_whole_index() {
+        let searcher = TextSearcher::open(&*FAMED).expect("searcher");
+        let options = TextAutocompleteOptions {
+            query: "Velmora".to_string(),
+            limit: DEFAULT_SEARCH_LIMIT,
+            layer: None,
+            countries: Vec::new(),
+            focus: None,
+            bbox: None,
+        };
+        let names = |searcher: &TextSearcher| {
+            searcher
+                .famous_places(&options, true)
+                .expect("famous places")
+                .into_iter()
+                .map(|hit| hit.record.name)
+                .collect::<Vec<_>>()
+        };
+        let whole = names(&searcher);
+        assert_eq!(
+            searcher.prepare_famed().expect("famed copy"),
+            FAMED_TOWNS as u64
+        );
+        let famed = searcher.famed_corpus();
+        let query = [Completion::CommonCompletions, Completion::InOrder]
+            .into_iter()
+            .find_map(|completion| {
+                searcher
+                    .autocomplete_query(
+                        completion,
+                        None,
+                        &["velmora".to_string()],
+                        true,
+                        &Filters::new(None, &[], None),
+                    )
+                    .expect("query")
+            })
+            .expect("a query");
+        let ranking = Ranking {
+            fame_first: true,
+            typed_words: 1,
+            ..Ranking::default()
+        };
+        assert_eq!(
+            searcher
+                .top_documents(&famed, &*query, &ranking, rank_window(FAME_WINDOW))
+                .expect("famed window")
+                .len(),
+            rank_window(FAME_WINDOW),
+            "the copy fills the window, so the whole index is not read"
+        );
+        let copied = names(&searcher);
+        assert_eq!(copied, whole);
+        assert_eq!(copied.first(), Some(&famed_town(FAMED_TOWNS - 1)));
     }
 
     #[test]
