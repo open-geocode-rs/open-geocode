@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -162,6 +162,34 @@ pub(crate) fn header_bbox(input: &Path) -> Result<Option<[f64; 4]>> {
         })),
         BlobDecode::OsmData(_) | BlobDecode::Unknown(_) => Ok(None),
     }
+}
+
+pub(super) fn overture_bounds(inputs: &[PathBuf]) -> Result<Vec<[f64; 4]>> {
+    let mut bounds = Vec::new();
+    for input in inputs {
+        let [west, south, east, north] = header_bbox(input)?.ok_or_else(|| {
+            Error::BadInput(format!(
+                "--overture needs a bounding box in the OSM header of {}",
+                input.display()
+            ))
+        })?;
+        if ![-180.0..=180.0, -90.0..=90.0, -180.0..=180.0, -90.0..=90.0]
+            .into_iter()
+            .zip([west, south, east, north])
+            .all(|(range, value)| range.contains(&value))
+        {
+            return Err(Error::BadInput(format!(
+                "{} has an invalid bounding box",
+                input.display()
+            )));
+        }
+        if west <= east {
+            bounds.push([west, south, east, north]);
+        } else {
+            bounds.extend([[west, south, 180.0, north], [-180.0, south, east, north]]);
+        }
+    }
+    Ok(bounds)
 }
 
 pub(crate) fn input_bytes(input: &Path) -> Result<u64> {

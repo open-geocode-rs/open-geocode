@@ -990,6 +990,8 @@ impl App {
                 force: self.force,
                 leftover: Leftover::Resume,
                 openaddresses: self.openaddresses && self.openaddresses_data().is_some(),
+                overture: false,
+                overture_verified: None,
                 tiger: false,
             },
             Arc::clone(&self.home),

@@ -27,7 +27,7 @@ fn key(object_type: ObjectType, object_id: i64) -> Option<[u8; 8]> {
         ObjectType::Node => 0,
         ObjectType::Way => 1,
         ObjectType::Relation => 2,
-        ObjectType::Row => return None,
+        ObjectType::Row => 3,
     };
     let number = u64::try_from(object_id)
         .ok()
@@ -35,7 +35,7 @@ fn key(object_type: ObjectType, object_id: i64) -> Option<[u8; 8]> {
     Some((kind << 62 | number).to_le_bytes())
 }
 
-/// `Ok(None)`: a well-formed id the catalogue never holds (imported row,
+/// `Ok(None)`: a well-formed id the catalogue never holds (OpenAddresses row,
 /// derived postcode).
 pub fn parse(id: &str) -> Result<Option<(ObjectType, i64)>> {
     let malformed =
@@ -45,6 +45,11 @@ pub fn parse(id: &str) -> Result<Option<(ObjectType, i64)>> {
     else {
         return Err(malformed());
     };
+    if dataset == "overture" && kind == "places" {
+        return uuid::Uuid::parse_str(number)
+            .map(|id| Some((ObjectType::Row, crate::record::gers_object_id(&id))))
+            .map_err(|_| malformed());
+    }
     if dataset != crate::record::OSM_DATASET {
         return Ok(None);
     }
@@ -290,6 +295,27 @@ impl Catalogue {
         })))
     }
 
+    /// Find a place, area or street by its external ID.
+    pub fn find_id(&self, records: &records::Reader, source_id: &str) -> Result<Vec<RecordId>> {
+        let Some((object_type, object_id)) = parse(source_id)? else {
+            return Ok(Vec::new());
+        };
+        let found = self.find(records, object_type, object_id)?;
+        if object_type != ObjectType::Row {
+            return Ok(found);
+        }
+        let Some(requested) = gers_uuid(source_id.trim()) else {
+            return Ok(Vec::new());
+        };
+        let mut exact = Vec::new();
+        for id in found {
+            if gers_uuid(&records.summary(id)?.id) == Some(requested) {
+                exact.push(id);
+            }
+        }
+        Ok(exact)
+    }
+
     pub fn find(
         &self,
         records: &records::Reader,
@@ -354,6 +380,10 @@ impl Catalogue {
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
+}
+
+fn gers_uuid(id: &str) -> Option<uuid::Uuid> {
+    uuid::Uuid::parse_str(id.strip_prefix(crate::licences::OVERTURE_PREFIX)?).ok()
 }
 
 #[cfg(test)]

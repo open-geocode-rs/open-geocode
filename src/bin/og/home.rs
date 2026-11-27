@@ -198,6 +198,8 @@ pub(crate) struct BuildRecord {
     pub pack_format: u32,
     #[serde(default)]
     pub openaddresses: bool,
+    #[serde(default)]
+    pub overture: bool,
 }
 
 const ESTIMATE_RANGE: f64 = 4.0;
@@ -220,6 +222,7 @@ pub(crate) fn estimate(
         .filter(|record| {
             record.pack_format == open_geocode::pack::PACK_SCHEMA_VERSION
                 && record.openaddresses == openaddresses
+                && !record.overture
         })
         .filter(|record| distance(record) <= ESTIMATE_RANGE.ln())
         .min_by(|a, b| distance(a).total_cmp(&distance(b)))?;

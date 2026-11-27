@@ -1286,11 +1286,28 @@ Evidence.
 8 B per needed node plus 0.13 B per id, against 21 B per reference written twice by the sort approach.
 About one node in seven is needed.
 
-### POI duplicates merge on exact keys, never on distance
+### Import Overture Places through DuckDB and resolve matches against OSM
+
+Where. `current_release`, `query`, and `RawPlace::place` in `src/builder/places/overture.rs`, `Place` and `Identity` in `src/builder/places/mod.rs`, `overture_bounds` in `src/builder/osm/pbf.rs`, `same_imported_place` in `src/builder/osm/poi.rs`, `Run::import_overture` in `src/builder/osm.rs`, `Writer::write` in `src/pack/record_store.rs`, and `Catalogue::find_id` in `src/pack/ids.rs`.
+
+`--overture` reads the current supported Places release through DuckDB. The query projects the fields OG uses and uses the source extracts' bounds to prune the scan. OG admits only reviewed provider and licence combinations and carries the notices and the original GERS ID in the Pack.
+
+The raw confidence floor is 0.80 with a 0.77 Foursquare exception. A 16-area sample of release 2026-11-18.0 found 34,468 eligible Foursquare-rooted POIs at exactly 0.77. Seattle kept 69% of eligible Foursquare-rooted candidates at 0.80, while each sampled area outside the US kept none. A release-specific review must confirm the normalized name and pin within 15 meters, or the record must come from an AllThePlaces store locator with an address and a POI name containing its brand. The Seattle sample included unbranded municipal inventory such as maintenance sites classified as parks and branch records with only a neighbourhood as a name. Other contributing datasets can appear only as field provenance and may share upstream records, so their presence cannot establish an independent confirmation.
+
+An exact coordinate with 25 or more rows of differing names requires individual review. The check covers the raw rows, including those removed by the category and confidence filters. This catches registered-office piles even when some entries resemble restaurants or reach high confidence. Reviews can admit genuine co-located places individually. The Pack build report counts records rejected for shared pins and missing corroboration.
+
+Overture records can match an OG POI when the normalized primary names and categories agree and the outline, address, or phone corroborates the match. A shared brand Wikidata ID within 15 meters also corroborates the match when the house and unit numbers agree wherever both sources state them and the other identifiers do not conflict. This covers equivalent street spellings and helps avoid two pins for one branch. The existing OSM record wins. Keeping that record's fields together makes its attribution and ID consistent.
+Imported Places have searchable name, category and locality. Their supplied address is result metadata. The Seattle baseline's rooftop result for 1000 4th Avenue fell behind an address-range estimate when imported Places entered the address index and parser training. Keeping Places out of those inputs preserves the address corpus.
+
+DuckDB already reads GeoParquet for the region catalog. The native Apache Parquet reader considered for the builder pulled in a dependency the current Cargo licence policy rejects and another flagged by the advisory check. Reusing DuckDB keeps the existing Cargo dependency graph.
+
+The Linux release size check permits growth of up to 1%. The Overture build with the plain OpenAddresses licence catalog grew by 1.087%. The binary embeds a compressed copy of the licence catalog, using the same zstd decoder and source parity check as the category catalog.
+
+### OSM POI duplicates merge on exact keys
 
 Where. `resolve`, `one_place` and `conflict` in `src/builder/osm/poi.rs`.
 
-Entity resolution for POIs is blocked by name and uses exact keys only.
+Entity resolution for OSM POIs is blocked by name and uses exact keys only. Overture matches follow the rules in the preceding decision.
 Two records are one place when nothing conflicts and one rule holds.
 The rules are the same Wikidata item, or the same kind with one point inside the other's outline, or the same kind and address, or the same kind drawn with a shared node (a canal in pieces).
 A shared Wikidata item alone is not enough.

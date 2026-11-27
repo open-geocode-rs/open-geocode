@@ -95,6 +95,12 @@ pub struct Fingerprint {
     pub addresses: Option<String>,
     #[serde(default)]
     pub tiger: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overture_policy: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overture_verified: Option<FileStamp>,
     #[serde(default)]
     pub timezones: Option<FileStamp>,
     pub imported: Vec<FileStamp>,
@@ -116,6 +122,9 @@ impl Fingerprint {
             input_sources: input_sources.to_vec(),
             addresses,
             tiger: false,
+            overture: None,
+            overture_policy: None,
+            overture_verified: None,
             timezones: None,
             imported: Vec::new(),
         })
@@ -159,6 +168,20 @@ impl Fingerprint {
                 self.addresses.as_deref().unwrap_or("nothing"),
                 now.addresses.as_deref().unwrap_or("nothing")
             ));
+        }
+        if self.overture != now.overture {
+            out.push(format!(
+                "Overture release changed from {:?} to {:?}",
+                self.overture, now.overture
+            ));
+        }
+        if self.overture_policy != now.overture_policy {
+            out.push("the Overture publication policy changed".into());
+        }
+        match (&self.overture_verified, &now.overture_verified) {
+            (Some(was), Some(is)) => was.differences(is, "Overture verification file", &mut out),
+            (None, None) => {}
+            _ => out.push("the --overture-verified option changed".into()),
         }
         if self.tiger != now.tiger {
             out.push("the --tiger option changed".into());

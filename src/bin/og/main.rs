@@ -113,6 +113,14 @@ enum Command {
         #[arg(long)]
         openaddresses: bool,
 
+        /// Add openly licensed Overture Maps places. Needs duckdb on PATH.
+        #[arg(long)]
+        overture: bool,
+
+        /// Read reviewed Overture place locations for this release.
+        #[arg(long, value_name = "JSON", requires = "overture")]
+        overture_verified: Option<PathBuf>,
+
         /// Enrich U.S. results with TIGER address ranges and Census codes.
         #[arg(long)]
         tiger: bool,
@@ -146,6 +154,8 @@ fn main() -> Result<()> {
             fresh,
             download,
             openaddresses,
+            overture,
+            overture_verified,
             tiger,
         }) => {
             let memory_budget_bytes = memory_budget_mb
@@ -167,6 +177,8 @@ fn main() -> Result<()> {
                     },
                     download,
                     openaddresses,
+                    overture,
+                    overture_verified,
                     tiger,
                 },
             )
@@ -206,7 +218,6 @@ fn serve_options(pack: PathBuf, bind: SocketAddr) -> ServeOptions {
     }
 }
 
-#[derive(Clone, Copy)]
 struct Flags {
     memory_budget_bytes: Option<usize>,
     scratch_budget_bytes: Option<u64>,
@@ -214,6 +225,8 @@ struct Flags {
     leftover: Leftover,
     download: bool,
     openaddresses: bool,
+    overture: bool,
+    overture_verified: Option<PathBuf>,
     tiger: bool,
 }
 
@@ -225,6 +238,8 @@ fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result
         leftover,
         download,
         openaddresses,
+        overture,
+        overture_verified,
         tiger,
     } = flags;
     let tree = regions::tree();
@@ -278,6 +293,8 @@ fn build(home: Home, ids: &[String], name: Option<&str>, flags: Flags) -> Result
         force,
         leftover,
         openaddresses,
+        overture,
+        overture_verified,
         tiger,
     };
     let pack = request.pack.clone();
@@ -626,6 +643,8 @@ mod tests {
             force: false,
             leftover: open_geocode::builder::Leftover::Refuse,
             openaddresses: false,
+            overture: false,
+            overture_verified: None,
             tiger: false,
         };
         let progress = crate::job::Progress::of(&request);

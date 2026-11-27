@@ -1,6 +1,7 @@
 pub mod addresses;
 pub mod memory;
 pub mod osm;
+mod places;
 pub mod plan;
 pub mod progress;
 pub mod qrank;

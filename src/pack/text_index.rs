@@ -762,7 +762,13 @@ impl Document {
             builder.add_optional_autocomplete_text(Some(&brand.name));
         }
         if let Some(address) = &poi.address {
-            builder.address(address);
+            if poi.source.gers().is_some() {
+                builder.add_optional_context_text(address.locality.as_deref());
+                builder.add_optional_context_text(address.region.as_deref());
+                builder.add_optional_context_text(address.country.as_deref());
+            } else {
+                builder.address(address);
+            }
         }
         builder
     }

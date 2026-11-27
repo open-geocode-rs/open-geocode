@@ -122,6 +122,9 @@ impl Sampler {
     /// Offer record `id`, which lies in the country record `country`. Offers
     /// come in record order, so the sample depends on the input alone.
     pub fn offer(&mut self, id: RecordId, country: Option<RecordId>, record: &Record) {
+        if matches!(record, Record::Poi(poi) if poi.source.gers().is_some()) {
+            return;
+        }
         self.add(country, Draw::Layer(record.layer()), id);
         if is_block_address(record) {
             self.add(country, Draw::BlockAddress, id);

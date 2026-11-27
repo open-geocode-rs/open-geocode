@@ -107,6 +107,8 @@ pub(crate) struct BuildRequest {
     pub force: bool,
     pub leftover: Leftover,
     pub openaddresses: bool,
+    pub overture: bool,
+    pub overture_verified: Option<PathBuf>,
     pub tiger: bool,
 }
 
@@ -485,6 +487,8 @@ fn run(
         } else {
             0
         },
+        overture: request.overture,
+        overture_verified: request.overture_verified.clone(),
         tiger: request.tiger,
         ..BuildOsmOptions::default()
     };
@@ -516,6 +520,7 @@ fn run(
             finished_at,
             pack_format: open_geocode::pack::PACK_SCHEMA_VERSION,
             openaddresses: request.openaddresses,
+            overture: request.overture,
         })?;
     }
     Ok(Built {

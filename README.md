@@ -135,6 +135,36 @@ Ontario's 2 million addresses build in about a minute on a 24-core machine, then
 `GET /version` returns the server version and the Pack it serves: content id, schema version, and which og version built it and when.
 Add `--openaddresses` to `og build` to merge in OpenAddresses points (needs an API token in `OA_TOKEN`).
 
+Add `--overture` to either build command for Overture Maps Places. Install the
+[DuckDB CLI 2.0 or later](https://duckdb.org/install/) on PATH. The same option
+works for regional extracts and the planet.
+
+```sh
+og build --region planet --overture
+```
+
+The build reads the current supported Overture release within the OSM input's
+header bounds. It screens
+named POIs in supported categories with approved source licences and a raw
+confidence of at least 0.80 (0.77 for individually reviewed Foursquare listings). To enter the Pack, a POI
+needs either a first-party AllThePlaces store location with a numbered address
+and a POI name containing its brand, or a reviewed location supplied with
+`--overture-verified`. Closed POIs are excluded. Pins with 25 or more records
+and at least two distinct names require
+individual review. Confirmed duplicates keep the OSM record. Overture Places
+contributes POIs only. `open-geocode pack inspect`
+shows the data notices and accepts `--id overture:places:<GERS UUID>`.
+Serve Overture Packs with a release that supports Overture Places.
+
+Both build commands accept `--overture-verified FILE` alongside `--overture`.
+The JSON file contains the exact Overture `release` and a `places` array.
+Each entry has an Overture GERS UUID in `id`, the verified `name`, the verified
+coordinates in `lon` and `lat`, and an HTTP(S) source URL in `evidence`. Add
+an entry after checking that the public venue is open at that location against
+a current official source or two independent sources. The builder checks the
+name and a 15-meter pin tolerance. It uses the evidence file at build time
+and publishes the approved Overture record under its original licences.
+
 This version reads Pack schema 11. Deploy it with a schema-11 Pack built by
 this version. Existing schema-10 Packs require rebuilding before the upgrade.
 
