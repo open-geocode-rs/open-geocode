@@ -58,6 +58,8 @@ pub struct BuilderReport {
     pub qrank: Option<QRankReport>,
     #[serde(default)]
     pub timezones: Option<TimezoneReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overture: Option<super::osm::OvertureReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

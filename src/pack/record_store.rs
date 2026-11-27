@@ -42,6 +42,7 @@ pub const SECTION_DATASETS: &str = "records/datasets";
 pub const SECTION_STRINGS: &str = "records/strings";
 pub const RECORDS_VERSION: u32 = 15;
 const PREVIOUS_RECORDS_VERSION: u32 = 14;
+const OVERTURE_RECORDS_VERSION: u32 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogueId {
@@ -187,6 +188,7 @@ pub struct Header {
     source_kind: SourceKind,
     source_value: u64,
     dataset: Option<u32>,
+    gers: Option<u32>,
 }
 
 impl Header {
@@ -671,11 +673,19 @@ impl Writer {
             }),
         );
         put_u64(out, source_value);
-        if let Record::Address(record) = record
-            && let Some(dataset) = imported_dataset(record)
-        {
-            let id = self.dataset_id(dataset)?;
-            put_u64(out, u64::from(id));
+        match record {
+            Record::Address(record) if record.source.object_type == ObjectType::Row => {
+                put_u64(out, u64::from(self.dataset_id(&record.source.dataset)?));
+            }
+            Record::Poi(record) if record.source.object_type == ObjectType::Row => {
+                let gers = record
+                    .source
+                    .gers()
+                    .ok_or(Error::Decode("imported POI has no GERS ID"))?;
+                put_u64(out, u64::from(self.dataset_id(&record.source.dataset)?));
+                put_u64(out, u64::from(self.strings.id(gers)?));
+            }
+            _ => {}
         }
 
         match record {
@@ -989,17 +999,22 @@ impl Writer {
         self.strings.bytes.flush()?;
         self.strings.ends.flush()?;
 
-        pack.begin(SECTION_INDEX, RECORDS_VERSION)?;
+        let version = if self
+            .datasets
+            .iter()
+            .any(|name| name.starts_with(crate::licences::OVERTURE_PREFIX))
+        {
+            OVERTURE_RECORDS_VERSION
+        } else {
+            RECORDS_VERSION
+        };
+        pack.begin(SECTION_INDEX, version)?;
         pack.write_all(&self.record_count.to_le_bytes())?;
         std::io::copy(&mut File::open(self.block_offsets.get_ref().path())?, pack)?;
         pack.write_all(&self.blocks_len.to_le_bytes())?;
         pack.end()?;
 
-        pack.add_file(
-            SECTION_BLOCKS,
-            RECORDS_VERSION,
-            self.blocks.get_ref().path(),
-        )?;
+        pack.add_file(SECTION_BLOCKS, version, self.blocks.get_ref().path())?;
 
         let mut datasets = Vec::new();
         put_u64(&mut datasets, self.datasets.len() as u64);
@@ -1015,10 +1030,10 @@ impl Writer {
                 None => datasets.push(0),
             }
         }
-        pack.add(SECTION_DATASETS, RECORDS_VERSION, &datasets)?;
+        pack.add(SECTION_DATASETS, version, &datasets)?;
 
         let strings = &self.strings;
-        pack.begin(SECTION_STRINGS, RECORDS_VERSION)?;
+        pack.begin(SECTION_STRINGS, version)?;
         pack.write_all(&(strings.segments.len() as u64).to_le_bytes())?;
         for (first_record, first_string) in &strings.segments {
             pack.write_all(&first_record.to_le_bytes())?;
@@ -1047,14 +1062,13 @@ pub struct Reader {
 
 impl Reader {
     pub fn open(container: &Container) -> Result<Self> {
-        let version = if container
+        let version = match container
             .sections()
             .get(SECTION_BLOCKS)
-            .is_some_and(|section| section.version == PREVIOUS_RECORDS_VERSION)
+            .map(|section| section.version)
         {
-            PREVIOUS_RECORDS_VERSION
-        } else {
-            RECORDS_VERSION
+            Some(version @ (PREVIOUS_RECORDS_VERSION | OVERTURE_RECORDS_VERSION)) => version,
+            _ => RECORDS_VERSION,
         };
         let index = container.section(SECTION_INDEX, version)?;
         let blocks = container.section(SECTION_BLOCKS, version)?;
@@ -1183,6 +1197,10 @@ impl Reader {
             }
             Layer::Poi => {
                 let poi = self.poi_fields(&header, &mut fields)?;
+                let mut source = header.provenance(&self.datasets)?;
+                if let Some(gers) = header.gers {
+                    source.set_gers(self.string(header.strings, gers)?.to_owned());
+                }
                 Record::Poi(PoiRecord {
                     name: poi.name.to_string(),
                     alt_names: poi.alt_names,
@@ -1190,7 +1208,7 @@ impl Reader {
                     address: poi.address,
                     geometry: geometry(&mut fields)?,
                     location_precision,
-                    source: header.provenance(&self.datasets)?,
+                    source,
                     prominence: poi.prominence,
                     wikidata: poi.wikidata,
                     brand: poi.brand,
@@ -1288,7 +1306,6 @@ impl Reader {
             }
             Layer::Poi => {
                 let poi = self.poi_fields(&header, &mut fields)?;
-                let (object_type, object_id) = header.object()?;
                 brand.clone_from(&poi.brand);
                 if let Some(details) = poi.details {
                     (contact, opening_hours) = (details.contact, details.opening_hours);
@@ -1301,7 +1318,12 @@ impl Reader {
                     stated = Address::from(address);
                 }
                 (
-                    crate::labels::osm_record_id(object_type, object_id),
+                    match header.gers {
+                        Some(gers) => {
+                            format!("overture:places:{}", self.string(header.strings, gers)?)
+                        }
+                        None => header.record_id(&self.datasets)?,
+                    },
                     poi.name.to_string(),
                     crate::labels::poi_label(poi.name, poi.address.as_ref(), None),
                 )
@@ -1649,8 +1671,7 @@ impl Reader {
             let street = header.layer == Layer::Street;
             let place = header.layer == Layer::Poi || header.layer.place_layer().is_some();
             if !(place || street)
-                || header.dataset.is_some()
-                || header.source_kind == SourceKind::Other
+                || (header.source_kind == SourceKind::Other && header.gers.is_none())
             {
                 continue;
             }
@@ -1868,6 +1889,7 @@ impl Reader {
                 },
                 source_value: zigzag(object_id),
                 dataset: anchor_header.dataset,
+                gers: None,
             },
             fields,
             continued: Some(Continued { number, unit }),
@@ -2555,7 +2577,11 @@ fn plain_header(
     };
     let source_value = get_u64(&mut body)?;
     let source_kind = source_kind_of(tag);
-    let dataset = (layer == Layer::Address && source_kind == SourceKind::Other)
+    let imported = source_kind == SourceKind::Other;
+    let dataset = (imported && matches!(layer, Layer::Address | Layer::Poi))
+        .then(|| get_u32(&mut body))
+        .transpose()?;
+    let gers = (imported && layer == Layer::Poi)
         .then(|| get_u32(&mut body))
         .transpose()?;
     Ok((
@@ -2571,6 +2597,7 @@ fn plain_header(
             source_kind,
             source_value,
             dataset,
+            gers,
         },
         body,
     ))

@@ -5287,6 +5287,9 @@ impl TextSearcher {
             _ => None,
         };
         let record = records.record(record_id)?;
+        if matches!(&record, Record::Poi(poi) if poi.source.gers().is_some()) {
+            return Ok(structured::Keyed::default());
+        }
         let postcode_keys = |postcode: &str, names: &mut Vec<String>| {
             let Some(key) = search_key(postcode) else {
                 return;

@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, builder::TypedValueParser};
 use serde_json::Value;
 
 use open_geocode::{
@@ -219,6 +219,15 @@ enum PackCommand {
         /// them at all stay out.
         #[arg(long)]
         openaddresses_non_commercial: bool,
+
+        /// Add openly licensed Overture Maps places. Needs duckdb on PATH.
+        #[arg(long)]
+        overture: bool,
+
+        /// Read reviewed Overture place locations for this release.
+        #[arg(long, value_name = "JSON", requires = "overture",
+              value_parser = clap::builder::PathBufValueParser::new().map(PathBuf::into_boxed_path))]
+        overture_verified: Option<Box<Path>>,
 
         /// Enrich U.S. results with TIGER address ranges and Census codes.
         #[arg(long)]
@@ -648,6 +657,8 @@ async fn main() -> Result<()> {
             openaddresses,
             openaddresses_zip,
             openaddresses_non_commercial,
+            overture,
+            overture_verified,
             tiger,
             address_files,
             qrank,
@@ -668,6 +679,8 @@ async fn main() -> Result<()> {
                 addresses,
                 qrank,
                 timezones,
+                overture,
+                overture_verified: overture_verified.map(PathBuf::from),
                 tiger,
                 memory_budget_bytes: memory_budget_mb
                     .map(|mb| usize::try_from(mb << 20))
@@ -987,11 +1000,15 @@ fn inspect_pack(
     } else if let Some(layer) = layer {
         serde_json::to_value(reader.records_json_by_layer(&layer, limit)?)?
     } else {
-        serde_json::json!({
+        let mut info = serde_json::json!({
             "path": reader.path().display().to_string(),
             "manifest": reader.manifest(),
             "sections": reader.section_sizes(),
-        })
+        });
+        if let Some(notices) = reader.overture_notices()? {
+            info["overture_notices"] = Value::String(notices);
+        }
+        info
     };
 
     write_json(&output)
@@ -1005,10 +1022,10 @@ fn inspect_record_by_source_id_json(
     let Some(catalogue) = Catalogue::open(reader.container())? else {
         bail!("this Pack has no id catalogue: rebuild it, or inspect by --row");
     };
-    let Some((object_type, object_id)) = ids::parse(source_id)? else {
+    if ids::parse(source_id)?.is_none() {
         bail!("only places and areas are found by id; {source_id} is neither");
-    };
-    let found = catalogue.find(reader.records(), object_type, object_id)?;
+    }
+    let found = catalogue.find_id(reader.records(), source_id)?;
     match found.as_slice() {
         [] => bail!("no place, area or street has id {source_id}"),
         [record_id] => inspect_record_json(reader, *record_id, include_context),

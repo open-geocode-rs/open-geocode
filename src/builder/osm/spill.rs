@@ -1502,6 +1502,9 @@ fn encode_source(out: &mut Vec<u8>, source: &SourceProvenance) {
     put_i64(out, source.object_id);
     if source.object_type == ObjectType::Row {
         put_str(out, &source.dataset);
+        if let Some(gers) = source.gers() {
+            put_str(out, gers);
+        }
     }
 }
 
@@ -1512,7 +1515,11 @@ fn decode_source(input: &mut &[u8]) -> Result<SourceProvenance> {
         2 => ObjectType::Relation,
         3 => {
             let row = get_i64(input)?;
-            return Ok(SourceProvenance::imported(get_string(input)?, row));
+            let mut source = SourceProvenance::imported(get_string(input)?, row);
+            if source.dataset.starts_with(crate::licences::OVERTURE_PREFIX) {
+                source.set_gers(get_string(input)?);
+            }
+            return Ok(source);
         }
         _ => return Err(Error::Decode("unknown spilled object type")),
     };

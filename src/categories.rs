@@ -465,18 +465,21 @@ mod tests {
     }
 
     #[test]
-    fn the_compressed_catalog_is_current() {
+    fn the_compressed_catalogs_are_current() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("catalog");
-        let text = std::fs::read(root.join("categories.json")).expect("catalog");
-        let path = root.join("categories.json.zst");
-        if std::env::var_os("OG_UPDATE_CONTRACT").is_some() {
-            let compressed = zstd::encode_all(&text[..], 19).expect("compress");
-            std::fs::write(&path, &compressed).expect("write");
+        for catalog in ["categories.json", "licences.json"] {
+            let text = std::fs::read(root.join(catalog)).expect("catalog");
+            let path = root.join(format!("{catalog}.zst"));
+            if std::env::var_os("OG_UPDATE_CONTRACT").is_some() {
+                let compressed = zstd::encode_all(&text[..], 19).expect("compress");
+                std::fs::write(&path, &compressed).expect("write");
+            }
+            let current = std::fs::read(&path).unwrap_or_default();
+            assert!(
+                zstd::decode_all(&current[..]).is_ok_and(|current| current == text),
+                "{} is stale; run OG_UPDATE_CONTRACT=1 cargo test the_compressed_catalogs_are_current",
+                path.display()
+            );
         }
-        let current = std::fs::read(&path).unwrap_or_default();
-        assert!(
-            zstd::decode_all(&current[..]).is_ok_and(|current| current == text),
-            "catalog/categories.json.zst is stale; run OG_UPDATE_CONTRACT=1 cargo test"
-        );
     }
 }

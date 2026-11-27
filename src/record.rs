@@ -1040,6 +1040,9 @@ impl Serialize for PlaceRecord {
 
 impl PoiRecord {
     pub fn id(&self) -> String {
+        if let Some(gers) = self.source.gers() {
+            return format!("overture:places:{gers}");
+        }
         labels::record_id(
             &self.source.dataset,
             self.source.object_type,
@@ -1153,7 +1156,22 @@ fn serialize_alt_names<S: SerializeStruct>(
 
 pub const OSM_DATASET: &str = "osm";
 
+pub(crate) fn gers_object_id(id: &uuid::Uuid) -> i64 {
+    (xxhash_rust::xxh3::xxh3_64(id.as_bytes()) & ((1 << 62) - 1)) as i64
+}
+
 impl SourceProvenance {
+    pub(crate) fn gers(&self) -> Option<&str> {
+        if self.object_type != ObjectType::Row {
+            return None;
+        }
+        self.tags.as_ref()?.get("gers").map(String::as_str)
+    }
+
+    pub(crate) fn set_gers(&mut self, gers: String) {
+        self.tags = Some(BTreeMap::from([("gers".into(), gers)]));
+    }
+
     pub fn imported(dataset: impl Into<String>, row: i64) -> Self {
         Self {
             dataset: dataset.into(),

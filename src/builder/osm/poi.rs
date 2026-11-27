@@ -237,9 +237,11 @@ pub(crate) fn resolve(mut places: Vec<Place>) -> Vec<PoiRecord> {
     };
     places.sort_by(|left, right| {
         let (left, right) = (&left.record, &right.record);
-        right
-            .prominence
-            .cmp(&left.prominence)
+        left.source
+            .gers()
+            .is_some()
+            .cmp(&right.source.gers().is_some())
+            .then(right.prominence.cmp(&left.prominence))
             .then(drawn(right).cmp(&drawn(left)))
             .then(left.source.object_type.cmp(&right.source.object_type))
             .then(left.source.object_id.cmp(&right.source.object_id))
@@ -281,12 +283,25 @@ pub(crate) fn resolve(mut places: Vec<Place>) -> Vec<PoiRecord> {
                     .map(|leader| leader.data)
             }))
             .collect::<Vec<_>>();
+        if place.record.source.gers().is_some() {
+            let [lon, lat] = point;
+            let width = (0.001 / lat.to_radians().cos().abs()).min(180.0);
+            for lon in [lon - 360.0, lon, lon + 360.0] {
+                if !(-180.0 - width..=180.0 + width).contains(&lon) {
+                    continue;
+                }
+                let bounds =
+                    AABB::from_corners([lon - width, lat - 0.001], [lon + width, lat + 0.001]);
+                near.extend(points.locate_in_envelope(bounds).map(|leader| leader.data));
+            }
+        }
         near.sort_unstable();
         near.dedup();
         match near
             .into_iter()
             .find(|&leader| one_place(&leaders[leader], &place, point))
         {
+            Some(_) if place.record.source.gers().is_some() => {}
             Some(at) => {
                 let leader = &mut leaders[at];
                 let unaddressed = leader.record.address.is_none();
@@ -335,6 +350,9 @@ pub(crate) fn resolve(mut places: Vec<Place>) -> Vec<PoiRecord> {
 }
 
 fn one_place(leader: &Place, member: &Place, point: [f64; 2]) -> bool {
+    if member.record.source.gers().is_some() {
+        return same_imported_place(leader, member, point);
+    }
     if conflict(leader, member) {
         return false;
     }
@@ -362,6 +380,60 @@ fn one_place(leader: &Place, member: &Place, point: [f64; 2]) -> bool {
             .any(|node| leader.identity.nodes.binary_search(node).is_ok())
     };
     ((kind || item) && within()) || (kind && (addressed() || touch()))
+}
+
+fn same_imported_place(leader: &Place, member: &Place, [lon, lat]: [f64; 2]) -> bool {
+    let (own, theirs) = (&leader.record, &member.record);
+    if own.source.gers().is_some() && own.source.gers() == theirs.source.gers() {
+        return true;
+    }
+    if own.category != theirs.category {
+        return false;
+    }
+    let distance = point_of(own)
+        .map(|[own_lon, own_lat]| crate::util::geo::haversine_m(own_lon, own_lat, lon, lat));
+    let brand_id = |record: &PoiRecord| record.brand.as_ref().and_then(|brand| brand.wikidata);
+    let shared_brand = brand_id(own).is_some_and(|id| brand_id(theirs) == Some(id));
+    let different_branch = own
+        .address
+        .as_ref()
+        .zip(theirs.address.as_ref())
+        .is_some_and(|(own, theirs)| {
+            !own.number.eq_ignore_ascii_case(&theirs.number)
+                || own
+                    .unit
+                    .as_deref()
+                    .zip(theirs.unit.as_deref())
+                    .is_some_and(|(a, b)| !a.eq_ignore_ascii_case(b))
+        });
+    if shared_brand && !different_branch && distance.is_some_and(|metres| metres <= 15.0) {
+        return true;
+    }
+    if conflict(leader, member) {
+        return false;
+    }
+    if leader
+        .identity
+        .outline
+        .as_deref()
+        .is_some_and(|outline| containment::covers(outline, lon, lat))
+    {
+        return true;
+    }
+    if !distance.is_some_and(|metres| metres <= 75.0) {
+        return false;
+    }
+    let same_phone = leader
+        .identity
+        .phones
+        .iter()
+        .any(|phone| phone.len() >= 7 && member.identity.phones.contains(phone));
+    same_phone
+        || own
+            .address
+            .as_ref()
+            .zip(theirs.address.as_ref())
+            .is_some_and(|(a, b)| same_address(a, b))
 }
 
 fn conflict(leader: &Place, member: &Place) -> bool {
@@ -632,23 +704,8 @@ pub(crate) fn emit_poi(candidate: &PoiCandidate, out: &mut Emitted) {
                 nodes.dedup();
                 nodes
             },
-            websites: values(tags, WEBSITE_KEYS, |value| {
-                let value = value.to_lowercase();
-                let value = value
-                    .strip_prefix("https://")
-                    .or_else(|| value.strip_prefix("http://"))
-                    .unwrap_or(&value);
-                let value = value.strip_prefix("www.").unwrap_or(value);
-                Some(value.trim_end_matches('/').to_string())
-            }),
-            phones: values(tags, PHONE_KEYS, |value| {
-                let digits = value
-                    .chars()
-                    .filter(char::is_ascii_digit)
-                    .collect::<Vec<_>>();
-                let tail = &digits[digits.len().saturating_sub(9)..];
-                Some(tail.iter().collect())
-            }),
+            websites: values(tags, WEBSITE_KEYS, normalized_website),
+            phones: values(tags, PHONE_KEYS, normalized_phone),
             refs: values(tags, &["ref"], search_key),
         },
     });
@@ -669,6 +726,25 @@ fn values(
     values.sort_unstable();
     values.dedup();
     values
+}
+
+pub(super) fn normalized_website(value: &str) -> Option<String> {
+    let value = value.to_lowercase();
+    let value = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .unwrap_or(&value);
+    let value = value.strip_prefix("www.").unwrap_or(value);
+    Some(value.trim_end_matches('/').to_string())
+}
+
+pub(super) fn normalized_phone(value: &str) -> Option<String> {
+    let digits = value
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<Vec<_>>();
+    let tail = &digits[digits.len().saturating_sub(9)..];
+    Some(tail.iter().collect())
 }
 
 fn poi_name(tags: &BTreeMap<String, String>) -> Option<String> {

@@ -144,9 +144,68 @@ struct Row {
     attribution_name: Option<String>,
 }
 
+pub(crate) const OVERTURE_PREFIX: &str = "overture:places:";
+
+pub(crate) const OVERTURE_NOTICES: &str = concat!(
+    "Contains Overture Maps Foundation Places data. Open Geocode selected categories, normalized fields, and removed duplicates.\n",
+    "https://docs.overturemaps.org/attribution/#places\n\n",
+    include_str!("../catalog/overture-notices/CDLA-Permissive-2.0.txt"),
+    "\n\n",
+    include_str!("../catalog/overture-notices/Foursquare-NOTICE.txt"),
+    "\n",
+    include_str!("../LICENSE"),
+    "\n\n",
+    include_str!("../catalog/overture-notices/CC0-1.0.txt"),
+);
+
+pub(crate) fn overture_source(dataset: &str, licence: &str) -> Option<&'static str> {
+    let expected = match dataset {
+        "Foursquare" => "Apache-2.0",
+        "AllThePlaces" => "CC0-1.0",
+        "meta" | "Microsoft" | "PinMeTo" | "Krick" | "RenderSEO" | "DAC" | "BrightQuery"
+        | "Birdeye" | "Uberall" | "OpenTravel" | "Overture" | "Overture-signals" => {
+            "CDLA-Permissive-2.0"
+        }
+        _ => return None,
+    };
+    (licence == expected).then_some(expected)
+}
+
+fn overture(dataset: &str) -> Option<Licence> {
+    let sources = dataset.strip_prefix(OVERTURE_PREFIX)?;
+    let mut terms = sources
+        .split('+')
+        .map(|name| {
+            ["Apache-2.0", "CC0-1.0", "CDLA-Permissive-2.0"]
+                .into_iter()
+                .find_map(|terms| overture_source(name, terms))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    terms.sort_unstable();
+    terms.dedup();
+    let credit = sources
+        .split('+')
+        .filter(|name| !matches!(*name, "Overture" | "Overture-signals"))
+        .map(|name| if name == "meta" { "Meta" } else { name })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(Licence {
+        name: terms.join(" AND "),
+        url: Some("https://docs.overturemaps.org/attribution/#places".into()),
+        attribution: Some(if credit.is_empty() {
+            "Overture Maps Foundation".into()
+        } else {
+            format!("Overture Maps Foundation, {credit}")
+        }),
+    })
+}
+
 pub fn of(dataset: &str) -> Option<Licence> {
     if dataset == OSM_DATASET {
         return Some(osm());
+    }
+    if dataset.starts_with(OVERTURE_PREFIX) {
+        return overture(dataset);
     }
     let path = dataset.strip_prefix(DATASET_PREFIX)?;
     openaddresses().get(path).cloned()
@@ -155,8 +214,9 @@ pub fn of(dataset: &str) -> Option<Licence> {
 fn catalog() -> &'static Catalog {
     static CATALOG: OnceLock<Catalog> = OnceLock::new();
     CATALOG.get_or_init(|| {
-        serde_json::from_str(include_str!("../catalog/licences.json"))
-            .expect("catalog/licences.json is a licence catalog")
+        let text = zstd::decode_all(&include_bytes!("../catalog/licences.json.zst")[..])
+            .expect("catalog/licences.json.zst is zstd");
+        serde_json::from_slice(&text).expect("catalog/licences.json is a licence catalog")
     })
 }
 

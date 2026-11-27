@@ -52,6 +52,7 @@ pub const REJECTIONS_FILE: &str = "rejections.jsonl";
 pub const BUILD_REPORT_FILE: &str = "build-report.json";
 pub const PACK_SCHEMA_VERSION: u32 = 11;
 
+pub(crate) const OVERTURE_NOTICES_SECTION: &str = "overture/notices";
 const MANIFEST_SECTION: &str = "manifest";
 const MANIFEST_VERSION: u32 = 1;
 const POSTCODE_ADDRESSES_SECTION: &str = "postcode_addresses";
@@ -735,6 +736,7 @@ impl Writer {
         std::thread::scope(|scope| {
             let named = scope.spawn(move || -> Result<()> {
                 for (offset, (names, (_, context))) in names.into_iter().zip(placed).enumerate() {
+                    let Some(names) = names else { continue };
                     let context = context.as_ref().filter(|context| !context.is_area_list());
                     if let Some(context) = context
                         && names.is_place()
@@ -1491,6 +1493,21 @@ impl Reader {
         &self.records
     }
 
+    /// Notices and licence texts for Overture data in this Pack.
+    pub fn overture_notices(&self) -> Result<Option<String>> {
+        if !self
+            .container
+            .sections()
+            .contains_key(OVERTURE_NOTICES_SECTION)
+        {
+            return Ok(None);
+        }
+        let bytes = self.container.section(OVERTURE_NOTICES_SECTION, 1)?;
+        String::from_utf8(bytes.as_slice().to_vec())
+            .map(Some)
+            .map_err(|_| Error::Decode("Overture notices are not UTF-8"))
+    }
+
     pub fn section_sizes(&self) -> BTreeMap<String, u64> {
         self.container
             .sections()
@@ -1673,7 +1690,8 @@ impl BatchPreparer {
                         &self.postcode_areas,
                         country,
                     ),
-                    names: RecordNames::of(&record),
+                    names: (!matches!(&record, Record::Poi(poi) if poi.source.gers().is_some()))
+                        .then(|| RecordNames::of(&record)),
                     record,
                     context,
                 })
@@ -1712,7 +1730,7 @@ struct PreparedRecord {
     record: Record,
     context: Option<RecordContext>,
     document: text_index::Prepared,
-    names: RecordNames,
+    names: Option<RecordNames>,
 }
 
 fn is_script_subtag(subtag: &str) -> bool {

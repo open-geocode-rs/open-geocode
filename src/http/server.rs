@@ -734,7 +734,7 @@ pub(crate) enum PlacesRequest {
     Text(TextSearchOptions),
     Ids {
         catalogue: Arc<Catalogue>,
-        ids: Vec<(ObjectType, i64)>,
+        ids: Vec<String>,
     },
 }
 
@@ -841,19 +841,15 @@ fn places_answer(state: &AppState, request: PlacesRequest) -> Result<ForwardColl
     };
     let records = state.pack.records();
     let mut hits = Vec::new();
-    for (object_type, object_id) in &ids {
-        for record_id in catalogue.find(records, *object_type, *object_id)? {
+    for id in &ids {
+        for record_id in catalogue.find_id(records, id)? {
             hits.push(TextSearchHit::of_record(
                 record_id,
                 state.pack.record_summary(record_id)?,
             ));
         }
     }
-    let asked = ids
-        .iter()
-        .map(|(kind, id)| labels::osm_record_id(*kind, *id))
-        .collect::<Vec<_>>();
-    api::forward_collection(&state.pack, asked.join(","), hits)
+    api::forward_collection(&state.pack, ids.join(","), hits)
 }
 
 fn no_ids() -> Problem {
@@ -861,7 +857,7 @@ fn no_ids() -> Problem {
         .with_invalid_params(vec![InvalidParam::new("ids", "empty")])
 }
 
-fn place_ids(ids: &str, max: usize) -> Result<Vec<(ObjectType, i64)>, Problem> {
+fn place_ids(ids: &str, max: usize) -> Result<Vec<String>, Problem> {
     let ids = ids
         .split(',')
         .map(str::trim)
@@ -880,14 +876,18 @@ fn place_ids(ids: &str, max: usize) -> Result<Vec<(ObjectType, i64)>, Problem> {
     let parsed = ids
         .into_iter()
         .map(|id| {
-            ids::parse(id).map_err(|_| {
+            let parsed = ids::parse(id).map_err(|_| {
                 Problem::malformed_parameter(format!(
                     "{id:?} is no record id, such as osm:node:123"
                 ))
                 .with_invalid_params(vec![InvalidParam::new("ids", "not a record id")])
-            })
+            })?;
+            Ok(parsed.map(|(kind, number)| match kind {
+                ObjectType::Row => id.to_ascii_lowercase(),
+                _ => labels::osm_record_id(kind, number),
+            }))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, Problem>>()?;
     Ok(parsed.into_iter().flatten().collect())
 }
 

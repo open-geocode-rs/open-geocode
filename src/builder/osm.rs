@@ -10,8 +10,10 @@ mod emitted;
 mod geometry;
 mod interpolation;
 mod locations;
+mod overture;
 mod pbf;
 mod place;
+pub use overture::Report as OvertureReport;
 mod poi;
 mod postcode;
 mod scan;
@@ -129,6 +131,8 @@ pub struct BuildOsmOptions {
     pub imported_rows: u64,
     pub qrank: Option<PathBuf>,
     pub timezones: Option<PathBuf>,
+    pub overture: bool,
+    pub overture_verified: Option<PathBuf>,
     pub tiger: bool,
 }
 
@@ -149,6 +153,8 @@ impl Default for BuildOsmOptions {
             imported_rows: 0,
             qrank: None,
             timezones: None,
+            overture: false,
+            overture_verified: None,
             tiger: false,
         }
     }
@@ -170,12 +176,19 @@ impl fmt::Debug for BuildOsmOptions {
             .field("addresses", &self.addresses)
             .field("qrank", &self.qrank)
             .field("timezones", &self.timezones)
+            .field("overture", &self.overture)
+            .field("overture_verified", &self.overture_verified)
             .field("tiger", &self.tiger)
             .finish_non_exhaustive()
     }
 }
 
 pub fn plan_osm_build(options: &BuildOsmOptions) -> Result<BuildPlan> {
+    if options.overture_verified.is_some() && !options.overture {
+        return Err(Error::BadInput(
+            "--overture-verified requires --overture".into(),
+        ));
+    }
     if options.inputs.is_empty() {
         return Err(Error::BadInput(
             "a build needs at least one input".to_string(),
@@ -507,13 +520,24 @@ impl<'a> Run<'a> {
                 .as_ref()
                 .map(|source| format!("{source:?}")),
         )?;
+        let leftover = settle_leftovers(options)?;
         fingerprint.tiger = options.tiger;
+        fingerprint.overture_policy = options.overture.then_some(overture::PUBLICATION_POLICY);
+        fingerprint.overture_verified = options
+            .overture_verified
+            .as_deref()
+            .map(crate::builder::resume::FileStamp::of)
+            .transpose()?;
+        if options.overture && leftover.is_none() {
+            overture::bounds_of(&options.inputs)?;
+            fingerprint.overture = Some(overture::latest_release()?);
+        }
         fingerprint.timezones = options
             .timezones
             .as_deref()
             .map(crate::builder::resume::FileStamp::of)
             .transpose()?;
-        match settle_leftovers(options)? {
+        match leftover {
             Some(found) => Self::resume(options, plan, fingerprint, &found),
             None => {
                 if options.leftover == Leftover::Resume {
@@ -679,6 +703,15 @@ impl<'a> Run<'a> {
                 )
                 .into(),
             ));
+        }
+        if options.overture {
+            fingerprint.overture =
+                Some(manifest.fingerprint.overture.clone().ok_or_else(|| {
+                    Error::BadOptions(
+                        "the stopped build did not use --overture; pass --fresh to change it"
+                            .into(),
+                    )
+                })?);
         }
         let differences = manifest.fingerprint.differences(&fingerprint);
         if !differences.is_empty() {
@@ -879,6 +912,7 @@ impl<'a> Run<'a> {
             Step::Contexts => self.order_contexts(),
             Step::Streets => {
                 self.join_streets()?;
+                self.import_overture()?;
                 self.resolve_places()
             }
             Step::AddressBook => self.write_address_book(),
@@ -1506,6 +1540,42 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
+    fn import_overture(&mut self) -> Result<()> {
+        let Some(release) = self.fingerprint.overture.as_deref() else {
+            return Ok(());
+        };
+        let bounds = overture::bounds_of(&self.options.inputs)?;
+        let verified = if let Some(stamp) = &self.fingerprint.overture_verified {
+            let verified = overture::VerifiedPlaces::load(&stamp.path, release)?;
+            if *stamp != crate::builder::resume::FileStamp::of(&stamp.path)? {
+                return Err(Error::BadInput(
+                    "the Overture verification file changed during the build".into(),
+                ));
+            }
+            verified
+        } else {
+            overture::VerifiedPlaces::default()
+        };
+        let progress = &self.progress;
+        let build = &mut self.build;
+        let report = overture::import(
+            release,
+            &bounds,
+            self.scratch.path(),
+            &verified,
+            || progress.check(),
+            |place| build.push_place(place),
+        )?;
+        if report.unknown_licence > 0 {
+            self.options.observer.warned(&format!(
+                "Overture {release}: left out {} Places rows without approved source licences",
+                report.unknown_licence
+            ));
+        }
+        build.report.overture = Some(report);
+        Ok(())
+    }
+
     fn resolve_places(&mut self) -> Result<()> {
         let phase = Instant::now();
         let places = self
@@ -1516,7 +1586,7 @@ impl<'a> Run<'a> {
         self.sorted
             .insert("places".to_string(), sorter_report(&places));
         let records = open(&mut self.build.records, "records")?;
-        let merged = resolve_places(places, records, &mut self.build.seq)?;
+        let merged = resolve_places(places, records, &mut self.build.seq, &mut self.build.report)?;
         self.build.report.accepted.places_merged = merged;
         self.build.report.phases.street_join_ms += phase.elapsed().as_millis();
         Ok(())
@@ -2049,6 +2119,18 @@ impl<'a> Run<'a> {
         let structured = Instant::now();
         crate::structured::add_to(&mut sealed, &scratch, &self.memory, self.budget)?;
         crate::ids::add_to(&mut sealed, &scratch, &self.memory, self.budget)?;
+        if self
+            .build
+            .report
+            .overture
+            .as_ref()
+            .is_some_and(|report| report.kept > 0)
+        {
+            let notices = crate::licences::OVERTURE_NOTICES.as_bytes();
+            let section = crate::pack::OVERTURE_NOTICES_SECTION;
+            sealed.add_section(section, 1, notices)?;
+            stats.sections.insert(section.into(), notices.len() as u64);
+        }
         if self.options.tiger {
             let counties = tiger::counties_for_pack(&sealed.path(), &self.options.pack)?;
             let sections =
@@ -2588,13 +2670,29 @@ fn resolve_places(
     places: ExternalSorter<PendingNamed>,
     records: &mut ExternalSorter<PendingRecord>,
     seq: &mut u64,
+    report: &mut BuilderReport,
 ) -> Result<u64> {
     let mut merged = 0;
+    let mut retained = 0;
+    let mut imported = 0;
     let mut flush = |group: &mut Vec<poi::Place>| -> Result<()> {
         let count = group.len();
+        if report.overture.is_some() {
+            imported += group
+                .iter()
+                .filter(|place| place.record.source.gers().is_some())
+                .count() as u64;
+        }
         let resolved = poi::resolve(std::mem::take(group));
         merged += (count - resolved.len()) as u64;
         for place in resolved {
+            if place.source.gers().is_some() {
+                retained += 1;
+                if !report.datasets.contains(&place.source.dataset) {
+                    report.datasets.push(place.source.dataset.clone());
+                }
+                report.accept_poi(&place);
+            }
             let [lon, lat] = Record::Poi(place.clone())
                 .display_point()
                 .ok_or_else(|| Error::BadGeometry(format!("place {} has no point", place.id())))?;
@@ -2619,6 +2717,10 @@ fn resolve_places(
         group.push(pending.into_place());
     }
     flush(&mut group)?;
+    if let Some(overture) = report.overture.as_mut() {
+        overture.kept = retained;
+        overture.duplicates = imported - retained;
+    }
     Ok(merged)
 }
 
