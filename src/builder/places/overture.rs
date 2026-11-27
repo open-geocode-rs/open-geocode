@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     io::{BufRead, BufReader},
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Stdio},
     sync::{
         LazyLock,
@@ -23,12 +23,12 @@ use crate::{
     util::{fold::search_key, geo::haversine_m},
 };
 
-use super::poi::{self, Identity, Place};
+use super::{Identity, Place, normalized_phone, normalized_website};
 
 const STAC: &str = "https://stac.overturemaps.org/";
 const ASSETS: &str = "https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com/";
 const CALENDAR: &str = "https://docs.overturemaps.org/release-calendar.json";
-pub(super) const PUBLICATION_POLICY: u8 = 4;
+pub(in crate::builder) const PUBLICATION_POLICY: u8 = 4;
 const SHARED_PIN_MIN_ROWS: u32 = 25;
 const VERIFIED_PIN_TOLERANCE_M: f64 = 15.0;
 
@@ -87,7 +87,7 @@ struct Asset {
     href: String,
 }
 
-pub(super) fn latest_release() -> Result<String> {
+pub(in crate::builder) fn latest_release() -> Result<String> {
     let status = Command::new("duckdb")
         .args(["-no-agent", "-version"])
         .stdin(Stdio::null())
@@ -147,34 +147,6 @@ fn json<T: serde::de::DeserializeOwned>(agent: &ureq::Agent, url: &str) -> Resul
 
 fn intersects(a: &[f64; 4], b: &[f64; 4]) -> bool {
     a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1]
-}
-
-pub(super) fn bounds_of(inputs: &[PathBuf]) -> Result<Vec<[f64; 4]>> {
-    let mut bounds = Vec::new();
-    for input in inputs {
-        let [west, south, east, north] = super::pbf::header_bbox(input)?.ok_or_else(|| {
-            Error::BadInput(format!(
-                "--overture needs a bounding box in the OSM header of {}",
-                input.display()
-            ))
-        })?;
-        if ![-180.0..=180.0, -90.0..=90.0, -180.0..=180.0, -90.0..=90.0]
-            .into_iter()
-            .zip([west, south, east, north])
-            .all(|(range, value)| range.contains(&value))
-        {
-            return Err(Error::BadInput(format!(
-                "{} has an invalid bounding box",
-                input.display()
-            )));
-        }
-        if west <= east {
-            bounds.push([west, south, east, north]);
-        } else {
-            bounds.extend([[west, south, 180.0, north], [-180.0, south, east, north]]);
-        }
-    }
-    Ok(bounds)
 }
 
 fn assets(
@@ -324,7 +296,7 @@ fn read_places(
     })
 }
 
-pub(super) fn import(
+pub(in crate::builder) fn import(
     release: &str,
     bounds: &[[f64; 4]],
     scratch: &Path,
@@ -349,7 +321,7 @@ pub(super) fn import(
 }
 
 #[derive(Default)]
-pub(super) struct VerifiedPlaces(BTreeMap<uuid::Uuid, Verification>);
+pub(in crate::builder) struct VerifiedPlaces(BTreeMap<uuid::Uuid, Verification>);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -369,7 +341,7 @@ struct Verification {
 }
 
 impl VerifiedPlaces {
-    pub(super) fn load(path: &Path, release: &str) -> Result<Self> {
+    pub(in crate::builder) fn load(path: &Path, release: &str) -> Result<Self> {
         let failed = |error: &dyn std::fmt::Display| {
             Error::BadInput(format!(
                 "Overture verification file {}: {error}",
@@ -669,13 +641,13 @@ impl RawPlace {
             phones: self
                 .phone
                 .as_deref()
-                .and_then(poi::normalized_phone)
+                .and_then(normalized_phone)
                 .into_iter()
                 .collect(),
             websites: self
                 .website
                 .as_deref()
-                .and_then(poi::normalized_website)
+                .and_then(normalized_website)
                 .into_iter()
                 .collect(),
             ..Identity::default()
@@ -771,6 +743,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
+        builder::osm::resolve_pois,
         pack::{
             Reader, Writer,
             ids::{self, Catalogue},
@@ -999,10 +972,10 @@ mod tests {
         let mut osm = imported.clone();
         osm.record.source = SourceProvenance::osm(ObjectType::Node, 42);
         osm.record.alt_names.clear();
-        let similar = poi::resolve(vec![imported.clone(), osm.clone()]);
+        let similar = resolve_pois(vec![imported.clone(), osm.clone()]);
         assert_eq!(similar, [osm.record.clone()]);
         osm.identity.phones.clear();
-        assert_eq!(poi::resolve(vec![imported, osm]).len(), 2);
+        assert_eq!(resolve_pois(vec![imported, osm]).len(), 2);
     }
 
     #[test]
@@ -1044,11 +1017,11 @@ mod tests {
             osm.identity = leader;
             let mut imported = imported.clone();
             imported.identity = member;
-            assert_eq!(poi::resolve(vec![imported, osm.clone()]).len(), 2);
+            assert_eq!(resolve_pois(vec![imported, osm.clone()]).len(), 2);
         }
-        assert_eq!(poi::normalized_phone("n/a"), None);
+        assert_eq!(normalized_phone("n/a"), None);
         assert_eq!(
-            poi::normalized_phone("+1 (206) 555-0111").as_deref(),
+            normalized_phone("+1 (206) 555-0111").as_deref(),
             Some("065550111")
         );
     }
@@ -1065,11 +1038,11 @@ mod tests {
         address.street = Some("South St".into());
         address.unit = Some("1".into());
         assert_eq!(
-            poi::resolve(vec![imported.clone(), osm.clone()]),
+            resolve_pois(vec![imported.clone(), osm.clone()]),
             [osm.record.clone()]
         );
         imported.record.address.as_mut().unwrap().unit = Some("2".into());
-        assert_eq!(poi::resolve(vec![imported, osm]).len(), 2);
+        assert_eq!(resolve_pois(vec![imported, osm]).len(), 2);
     }
 
     #[test]

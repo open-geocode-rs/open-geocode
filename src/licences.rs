@@ -159,7 +159,11 @@ pub(crate) const OVERTURE_NOTICES: &str = concat!(
 );
 
 pub(crate) fn overture_source(dataset: &str, licence: &str) -> Option<&'static str> {
-    let expected = match dataset {
+    overture_licence(dataset).filter(|expected| *expected == licence)
+}
+
+fn overture_licence(dataset: &str) -> Option<&'static str> {
+    Some(match dataset {
         "Foursquare" => "Apache-2.0",
         "AllThePlaces" => "CC0-1.0",
         "meta" | "Microsoft" | "PinMeTo" | "Krick" | "RenderSEO" | "DAC" | "BrightQuery"
@@ -167,19 +171,14 @@ pub(crate) fn overture_source(dataset: &str, licence: &str) -> Option<&'static s
             "CDLA-Permissive-2.0"
         }
         _ => return None,
-    };
-    (licence == expected).then_some(expected)
+    })
 }
 
 fn overture(dataset: &str) -> Option<Licence> {
     let sources = dataset.strip_prefix(OVERTURE_PREFIX)?;
     let mut terms = sources
         .split('+')
-        .map(|name| {
-            ["Apache-2.0", "CC0-1.0", "CDLA-Permissive-2.0"]
-                .into_iter()
-                .find_map(|terms| overture_source(name, terms))
-        })
+        .map(overture_licence)
         .collect::<Option<Vec<_>>>()?;
     terms.sort_unstable();
     terms.dedup();

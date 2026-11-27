@@ -1288,7 +1288,7 @@ About one node in seven is needed.
 
 ### Import Overture Places through DuckDB and resolve matches against OSM
 
-Where. `current_release`, `query`, and `RawPlace::place` in `src/builder/osm/overture.rs`, `same_imported_place` in `src/builder/osm/poi.rs`, `Run::import_overture` in `src/builder/osm.rs`, `Writer::write` in `src/pack/record_store.rs`, and `Catalogue::find_id` in `src/pack/ids.rs`.
+Where. `current_release`, `query`, and `RawPlace::place` in `src/builder/places/overture.rs`, `Place` and `Identity` in `src/builder/places/mod.rs`, `overture_bounds` in `src/builder/osm/pbf.rs`, `same_imported_place` in `src/builder/osm/poi.rs`, `Run::import_overture` in `src/builder/osm.rs`, `Writer::write` in `src/pack/record_store.rs`, and `Catalogue::find_id` in `src/pack/ids.rs`.
 
 `--overture` reads the current supported Places release through DuckDB. The query projects the fields OG uses and uses the source extracts' bounds to prune the scan. OG admits only reviewed provider and licence combinations and carries the notices and the original GERS ID in the Pack.
 

@@ -4,6 +4,7 @@ use crate::error::{Error, Result};
 use geojson::{Geometry, GeometryValue};
 
 use crate::{
+    builder::places::{Identity, Place},
     extsort::Spill,
     parse::lattice::CountryCode,
     record::{
@@ -22,11 +23,7 @@ use crate::{
     },
 };
 
-use super::{
-    book::Entry,
-    boundary::ContextOrigin,
-    poi::{Identity, Place},
-};
+use super::{book::Entry, boundary::ContextOrigin};
 
 const COORDINATE_SCALE: f64 = 10_000_000.0;
 

@@ -10,11 +10,12 @@ mod emitted;
 mod geometry;
 mod interpolation;
 mod locations;
-mod overture;
 mod pbf;
 mod place;
-pub use overture::Report as OvertureReport;
 mod poi;
+pub use super::places::overture::Report as OvertureReport;
+#[cfg(test)]
+pub(super) use poi::resolve as resolve_pois;
 mod postcode;
 mod scan;
 mod slash;
@@ -48,6 +49,7 @@ use crate::{
     alloc,
     builder::{
         addresses::{self, AddressFile, AddressSource},
+        places::{Identity, Place, overture},
         plan::{BuildPlan, ItemCounts, Scanned, plan_build_holding},
         progress::{BuildObserver, BuildStage, Progress, TerminalObserver},
         qrank::QRank,
@@ -529,7 +531,7 @@ impl<'a> Run<'a> {
             .map(crate::builder::resume::FileStamp::of)
             .transpose()?;
         if options.overture && leftover.is_none() {
-            overture::bounds_of(&options.inputs)?;
+            pbf::overture_bounds(&options.inputs)?;
             fingerprint.overture = Some(overture::latest_release()?);
         }
         fingerprint.timezones = options
@@ -1544,7 +1546,7 @@ impl<'a> Run<'a> {
         let Some(release) = self.fingerprint.overture.as_deref() else {
             return Ok(());
         };
-        let bounds = overture::bounds_of(&self.options.inputs)?;
+        let bounds = pbf::overture_bounds(&self.options.inputs)?;
         let verified = if let Some(stamp) = &self.fingerprint.overture_verified {
             let verified = overture::VerifiedPlaces::load(&stamp.path, release)?;
             if *stamp != crate::builder::resume::FileStamp::of(&stamp.path)? {
@@ -2348,7 +2350,7 @@ impl Build {
         Ok(())
     }
 
-    fn push_place(&mut self, place: poi::Place) -> Result<()> {
+    fn push_place(&mut self, place: Place) -> Result<()> {
         self.seq += 1;
         open(&mut self.places, "places")?.push(PendingNamed::place(place, self.seq - 1)?)
     }
@@ -2382,9 +2384,9 @@ impl Build {
                 .push(PendingNamed::new(street, self.seq - 1)?);
         }
         if let Record::Poi(record) = record {
-            return self.push_place(poi::Place {
+            return self.push_place(Place {
                 record,
-                identity: poi::Identity::default(),
+                identity: Identity::default(),
             });
         }
         let [lon, lat] = record.display_point().ok_or_else(|| {
@@ -2675,7 +2677,7 @@ fn resolve_places(
     let mut merged = 0;
     let mut retained = 0;
     let mut imported = 0;
-    let mut flush = |group: &mut Vec<poi::Place>| -> Result<()> {
+    let mut flush = |group: &mut Vec<Place>| -> Result<()> {
         let count = group.len();
         if report.overture.is_some() {
             imported += group

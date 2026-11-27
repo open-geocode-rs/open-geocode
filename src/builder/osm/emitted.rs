@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
 
-use super::{poi::Place, spill::PendingAddress};
+use super::spill::PendingAddress;
 use crate::{
-    builder::report::{BuilderReport, CandidateIssue},
+    builder::{
+        places::Place,
+        report::{BuilderReport, CandidateIssue},
+    },
     error::Result,
     record::{ObjectType, Record, RejectedRecord, SourceProvenance},
 };

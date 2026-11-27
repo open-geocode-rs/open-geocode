@@ -11,6 +11,7 @@ use rstar::{
 use serde::Deserialize;
 
 use crate::{
+    builder::places::{Identity, Place, normalized_phone, normalized_website},
     record::{
         AddressComponents, AddressRecord, Brand, Contact, Entrance, LocationPrecision, ObjectType,
         PoiDetails, PoiRecord, Record, SourceProvenance, point_geometry,
@@ -203,21 +204,6 @@ pub(crate) fn count_left_out(tags: &BTreeMap<String, String>, drawn: Drawn, out:
     if let Some((key, value)) = tags.iter().find(|(key, _)| kinds.contains(key.as_str())) {
         out.report.leave_out_place(key, value);
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Identity {
-    pub outline: Option<Vec<u8>>,
-    pub nodes: Vec<i64>,
-    pub websites: Vec<String>,
-    pub phones: Vec<String>,
-    pub refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Place {
-    pub record: PoiRecord,
-    pub identity: Identity,
 }
 
 pub(crate) fn outline(geometry: &MultiPolygon<f64>) -> Vec<u8> {
@@ -735,25 +721,6 @@ fn values(
     values.sort_unstable();
     values.dedup();
     values
-}
-
-pub(super) fn normalized_website(value: &str) -> Option<String> {
-    let value = value.to_lowercase();
-    let value = value
-        .strip_prefix("https://")
-        .or_else(|| value.strip_prefix("http://"))
-        .unwrap_or(&value);
-    let value = value.strip_prefix("www.").unwrap_or(value);
-    Some(value.trim_end_matches('/').to_string())
-}
-
-pub(super) fn normalized_phone(value: &str) -> Option<String> {
-    let digits = value
-        .chars()
-        .filter(char::is_ascii_digit)
-        .collect::<Vec<_>>();
-    let tail = &digits[digits.len().saturating_sub(9)..];
-    (!tail.is_empty()).then(|| tail.iter().collect())
 }
 
 fn poi_name(tags: &BTreeMap<String, String>) -> Option<String> {
