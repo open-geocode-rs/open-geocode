@@ -14,6 +14,7 @@ pub(super) struct PhrasePrefix {
     head: Vec<Term>,
     prefix: Term,
     max_expansions: u32,
+    last: Option<Term>,
 }
 
 impl PhrasePrefix {
@@ -27,7 +28,13 @@ impl PhrasePrefix {
             head,
             prefix,
             max_expansions,
+            last: None,
         }
+    }
+
+    pub(super) fn ending_at(mut self, last: Option<Term>) -> Self {
+        self.last = last;
+        self
     }
 }
 
@@ -47,8 +54,11 @@ impl Query for PhrasePrefix {
             )));
         }
         let bm25 = match enable_scoring {
-            EnableScoring::Enabled { searcher, .. } if self.head.len() > 1 => {
-                Some(Bm25Weight::for_terms(searcher, &self.head)?)
+            EnableScoring::Enabled {
+                statistics_provider,
+                ..
+            } if self.head.len() > 1 => {
+                Some(Bm25Weight::for_terms(statistics_provider, &self.head)?)
             }
             _ => None,
         };
@@ -92,6 +102,11 @@ impl PhrasePrefixWeight {
         while (suffixes.len() as u32) < self.query.max_expansions
             && stream.advance()
             && stream.key().starts_with(prefix)
+            && self
+                .query
+                .last
+                .as_ref()
+                .is_none_or(|last| stream.key() <= last.serialized_value_bytes())
         {
             suffixes.push(index.read_postings_from_terminfo(
                 stream.value(),

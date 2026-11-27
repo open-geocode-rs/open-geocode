@@ -115,6 +115,20 @@ impl AppState {
         crate::categories::load();
         crate::parse::lattice::postcode::Table::global();
         let searcher = TextSearcher::from_pack(Arc::clone(&pack))?;
+        let famed = searcher.clone();
+        std::thread::Builder::new()
+            .name("famed".into())
+            .spawn(move || {
+                crate::resources::lower_this_thread();
+                let started = std::time::Instant::now();
+                match famed.prepare_famed() {
+                    Ok(kept) => eprintln!(
+                        "Famous places ready: {kept} documents in {:.1} s",
+                        started.elapsed().as_secs_f64()
+                    ),
+                    Err(error) => eprintln!("Famous places not prepared: {error}"),
+                }
+            })?;
         let reverse_geocoder = PackReverseGeocoder::from_pack(Arc::clone(&pack))?;
         let catalogue = Catalogue::open(pack.container())?;
         let batch_pool = ThreadPoolBuilder::new()
@@ -3003,6 +3017,73 @@ pub(crate) mod router_tests {
                 "London, WV, United States",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn autocomplete_does_not_match_typed_words_across_names_in_other_languages() {
+        use crate::record::{PlaceLayer, PlaceRecord, Prominence, Record};
+
+        let dir = TempDir::new("autocomplete-across-names");
+        let pack = dir.join("pack");
+        let mut writer = Writer::create(&pack).expect("writer");
+        let place = |layer, name: &str, alt_names: &[&str], id, importance| {
+            Record::Place(
+                layer,
+                PlaceRecord {
+                    alt_names: alt_names.iter().map(|name| name.to_string()).collect(),
+                    name: name.to_string(),
+                    place_type: "country".to_string(),
+                    geometry: point_geometry(90.0, 24.0),
+                    source: SourceProvenance::osm(ObjectType::Relation, id),
+                    prominence: Prominence {
+                        importance,
+                        linked: true,
+                        languages: 0,
+                    },
+                    wikidata: Some(902),
+                },
+            )
+        };
+        writer
+            .write(
+                &place(
+                    PlaceLayer::Country,
+                    "Bangladesh",
+                    &["Pakistan Timur", "Cộng hoà Nhân dân Bangladesh"],
+                    1,
+                    200,
+                ),
+                None,
+            )
+            .expect("country");
+        let restaurant = crate::record::PoiRecord {
+            alt_names: Vec::new(),
+            name: "Tim Ho Wan".to_string(),
+            category: "amenity:restaurant".to_string(),
+            address: None,
+            geometry: point_geometry(103.85, 1.29),
+            location_precision: LocationPrecision::Point,
+            source: SourceProvenance::osm(ObjectType::Node, 2),
+            prominence: Default::default(),
+            wikidata: None,
+            brand: None,
+            details: None,
+            aliases: Vec::new(),
+        };
+        writer.write(&restaurant.into(), None).expect("poi");
+        writer.finish().expect("finish");
+        let router = build_router(state_for(&pack, true), None, None);
+
+        let found = send(router, request("GET", "/autocomplete?q=Tim%20Ho"))
+            .await
+            .json();
+        let names = found["features"]
+            .as_array()
+            .expect("features")
+            .iter()
+            .map(|feature| feature["properties"]["name"].as_str().expect("name"))
+            .collect::<Vec<_>>();
+        assert_eq!(names.first(), Some(&"Tim Ho Wan"), "{names:?}");
     }
 
     #[tokio::test]

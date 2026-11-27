@@ -2025,6 +2025,7 @@ dependencies = [
  "signal-hook 0.4.6",
  "stable_deref_trait",
  "tantivy",
+ "tantivy-common",
  "tantivy-fst",
  "thiserror 2.0.21",
  "tokio",
