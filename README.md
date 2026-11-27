@@ -146,7 +146,7 @@ og build --region planet --overture
 The build reads the current supported Overture release within the OSM input's
 header bounds. It screens
 named POIs in supported categories with approved source licences and a raw
-confidence of at least 0.80 (0.77 for Foursquare). To enter the Pack, a POI
+confidence of at least 0.80 (0.77 for individually reviewed Foursquare listings). To enter the Pack, a POI
 needs either a first-party AllThePlaces store location with a numbered address
 and a POI name containing its brand, or a reviewed location supplied with
 `--overture-verified`. Closed POIs are excluded. Pins with 25 or more records

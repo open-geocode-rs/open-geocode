@@ -4,7 +4,10 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc::{self, RecvTimeoutError},
+    sync::{
+        LazyLock,
+        mpsc::{self, RecvTimeoutError},
+    },
     time::Duration,
 };
 
@@ -25,7 +28,7 @@ use super::poi::{self, Identity, Place};
 const STAC: &str = "https://stac.overturemaps.org/";
 const ASSETS: &str = "https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com/";
 const CALENDAR: &str = "https://docs.overturemaps.org/release-calendar.json";
-pub(super) const PUBLICATION_POLICY: u8 = 3;
+pub(super) const PUBLICATION_POLICY: u8 = 4;
 const SHARED_PIN_MIN_ROWS: u32 = 25;
 const VERIFIED_PIN_TOLERANCE_M: f64 = 15.0;
 
@@ -103,16 +106,16 @@ fn current_release(calendar: Calendar) -> Result<String> {
     calendar
         .releases
         .into_iter()
-        .filter_map(|r| Some((r.data_version, r.schema_version?)))
-        .max()
-        .filter(|(release, schema)| {
-            schema == "v2.0.0"
-                && release.len() == 12
+        .filter(|release| {
+            release.schema_version.as_deref() == Some("v2.0.0")
+                && release.data_version.len() == 12
                 && release
+                    .data_version
                     .bytes()
                     .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'.'))
         })
-        .map(|(release, _)| release)
+        .map(|release| release.data_version)
+        .max()
         .ok_or_else(|| {
             Error::BadInput(
                 "Overture has no current Places release with supported schema v2.0.0".into(),
@@ -512,6 +515,44 @@ fn dataset(sources: &[Source]) -> Option<String> {
 }
 
 impl RawAddress {
+    fn has_building_number(&self) -> bool {
+        static NUMBERED: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(concat!(
+                r"(?xi)",
+                r"^\p{Nd}+(?:[-/]\p{Nd}+)*\p{L}?(?:\s+|\s*,\s*)\p{L}",
+                r"|[\p{Han}\p{Hiragana}\p{Katakana}].*\p{Nd}+(?:[\p{Pd}ー]\p{Nd}+|丁目\s*\p{Nd}+|番(?:地|号|$))",
+            ))
+            .expect("building number patterns are valid")
+        });
+        static TRAILING: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(
+                r"(?i)(\p{L}+)\.?(?:\s+|\s*,\s*)(?:(?:nro\.|no\.|n[°º]|#)\s*)?\p{Nd}+(?:[-/]\p{Nd}+)*\p{L}?$",
+            )
+                .expect("trailing building number pattern is valid")
+        });
+        let Some(address) = self.freeform.as_deref().map(str::trim) else {
+            return false;
+        };
+        if !address.chars().any(char::is_alphabetic) {
+            return false;
+        }
+        NUMBERED.is_match(address)
+            || address
+                .match_indices(',')
+                .map(|(end, _)| &address[..end])
+                .chain(std::iter::once(address))
+                .take(2)
+                .any(|prefix| {
+                    TRAILING.captures(prefix.trim()).is_some_and(|number| {
+                        ![
+                            "airport", "terminal", "gate", "floor", "level", "unit", "suite", "box",
+                        ]
+                        .iter()
+                        .any(|part| number[1].eq_ignore_ascii_case(part))
+                    })
+                })
+    }
+
     fn components(self) -> Option<AddressComponents> {
         let country = self
             .country
@@ -579,14 +620,9 @@ impl RawPlace {
             report.unknown_licence += 1;
             return None;
         };
-        let minimum = if sources.iter().any(|source| source.root_is("Foursquare")) {
-            0.77
-        } else {
-            0.80
-        };
         if !self
             .confidence
-            .is_some_and(|score| (minimum..=1.0).contains(&score))
+            .is_some_and(|score| (0.77..=1.0).contains(&score))
             || !matches!(self.operating_status.as_deref(), None | Some("open"))
         {
             report.closed_or_low_confidence += 1;
@@ -602,7 +638,14 @@ impl RawPlace {
             report.invalid += 1;
             return None;
         };
-        if !verified.confirms(&id, &name, lon, lat) {
+        let reviewed = verified.confirms(&id, &name, lon, lat);
+        if self.confidence.is_some_and(|score| score < 0.80)
+            && !(reviewed && sources.iter().any(|source| source.root_is("Foursquare")))
+        {
+            report.closed_or_low_confidence += 1;
+            return None;
+        }
+        if !reviewed {
             if self.shared_pin {
                 report.shared_pin += 1;
                 return None;
@@ -616,11 +659,7 @@ impl RawPlace {
                 && self
                     .address
                     .as_ref()
-                    .and_then(|address| address.freeform.as_deref())
-                    .is_some_and(|address| {
-                        address.chars().any(char::is_numeric)
-                            && address.chars().any(char::is_alphabetic)
-                    });
+                    .is_some_and(RawAddress::has_building_number);
             if !store_locator {
                 report.uncorroborated += 1;
                 return None;
@@ -788,11 +827,13 @@ mod tests {
     }
 
     #[test]
-    fn the_release_calendar_includes_unscheduled_schema_versions() {
+    fn the_release_calendar_selects_the_latest_supported_release() {
         let calendar = serde_json::from_value(json!({"releases": [
             {"dataVersion": "2026-10-21.0", "schemaVersion": "v2.0.0"},
             {"dataVersion": "2026-11-18.0", "schemaVersion": "v2.0.0"},
-            {"dataVersion": "2026-12-16.0", "schemaVersion": null}
+            {"dataVersion": "2026-12-16.0", "schemaVersion": null},
+            {"dataVersion": "2027-01-20.0", "schemaVersion": "v3.0.0"},
+            {"dataVersion": "latest", "schemaVersion": "v2.0.0"}
         ]}))
         .unwrap();
         assert_eq!(current_release(calendar).unwrap(), "2026-11-18.0");
@@ -868,6 +909,14 @@ mod tests {
         ]);
         assert!(decode(row.clone(), &mut report).is_some());
         assert!(decode_with(row.clone(), &VerifiedPlaces::default(), &mut report).is_none());
+        row["sources"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"property": "", "dataset": "AllThePlaces", "licence": "CC0-1.0"}));
+        row["brand"] = json!({"names": {"primary": "North Star Cafe"}});
+        row["address"] = json!({"country": "US", "freeform": "10 Pike Street"});
+        assert!(decode_with(row.clone(), &VerifiedPlaces::default(), &mut report).is_none());
+        assert!(decode(row.clone(), &mut report).is_some());
         for (key, value) in [
             ("confidence", json!(0.769)),
             ("names", json!({"primary": "Another Cafe"})),
@@ -892,9 +941,31 @@ mod tests {
         assert!(decode_with(row.clone(), &empty, &mut report).is_none());
         row["brand"] = json!({"names": {"primary": "Star"}});
         assert!(decode_with(row.clone(), &empty, &mut report).is_some());
-        let mut no_street = row.clone();
-        no_street["address"]["freeform"] = json!("Seattle-Tacoma Airport");
-        assert!(decode_with(no_street, &empty, &mut report).is_none());
+        for address in [
+            "Seattle-Tacoma Airport",
+            "Heathrow Airport Terminal 5",
+            "Heathrow Airport, Gate #5",
+        ] {
+            let mut no_street = row.clone();
+            no_street["address"]["freeform"] = json!(address);
+            assert!(
+                decode_with(no_street, &empty, &mut report).is_none(),
+                "{address}"
+            );
+        }
+        for (country, address) in [
+            ("BR", "Rua Gomes de Carvalho 1575"),
+            ("IT", "Via della Valtiera, 5"),
+            ("ID", "Jl. Ahmad Wahid No.235, RT.13"),
+            ("JP", "東京都台東区浅草２－２８－１"),
+        ] {
+            let mut overseas = row.clone();
+            overseas["address"] = json!({"country": country, "freeform": address});
+            assert!(
+                decode_with(overseas, &empty, &mut report).is_some(),
+                "{address}"
+            );
+        }
         let mut unrelated = row.clone();
         unrelated["brand"] = json!({"names": {"primary": "Tar"}});
         assert!(decode_with(unrelated, &empty, &mut report).is_none());
@@ -932,6 +1003,54 @@ mod tests {
         assert_eq!(similar, [osm.record.clone()]);
         osm.identity.phones.clear();
         assert_eq!(poi::resolve(vec![imported, osm]).len(), 2);
+    }
+
+    #[test]
+    fn conflicting_contact_fields_keep_addressless_branches_separate() {
+        let mut row = feature();
+        row["brand"] = json!({"names": {"primary": "North Star Cafe"}, "wikidata": "Q123"});
+        let imported = decode(row, &mut Report::default()).unwrap();
+        let mut osm = imported.clone();
+        osm.record.source = SourceProvenance::osm(ObjectType::Node, 42);
+        for (leader, member) in [
+            (
+                Identity {
+                    phones: vec!["123456789".into()],
+                    ..Identity::default()
+                },
+                imported.identity.clone(),
+            ),
+            (
+                Identity {
+                    websites: vec!["example.org/branch-a".into()],
+                    ..Identity::default()
+                },
+                Identity {
+                    websites: vec!["example.org/branch-b".into()],
+                    ..Identity::default()
+                },
+            ),
+            (
+                Identity {
+                    refs: vec!["1234".into()],
+                    ..Identity::default()
+                },
+                Identity {
+                    refs: vec!["5678".into()],
+                    ..Identity::default()
+                },
+            ),
+        ] {
+            osm.identity = leader;
+            let mut imported = imported.clone();
+            imported.identity = member;
+            assert_eq!(poi::resolve(vec![imported, osm.clone()]).len(), 2);
+        }
+        assert_eq!(poi::normalized_phone("n/a"), None);
+        assert_eq!(
+            poi::normalized_phone("+1 (206) 555-0111").as_deref(),
+            Some("065550111")
+        );
     }
 
     #[test]
@@ -1017,5 +1136,10 @@ mod tests {
         assert_eq!(hits[0].record.id, id);
         let catalogue = Catalogue::open(pack.container()).unwrap().unwrap();
         assert_eq!(catalogue.find_id(pack.records(), &id).unwrap(), [0]);
+        let compact = format!(
+            "overture:places:{}",
+            GERS.replace('-', "").to_ascii_uppercase()
+        );
+        assert_eq!(catalogue.find_id(pack.records(), &compact).unwrap(), [0]);
     }
 }

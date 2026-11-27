@@ -304,13 +304,12 @@ impl Catalogue {
         if object_type != ObjectType::Row {
             return Ok(found);
         }
+        let Some(requested) = gers_uuid(source_id.trim()) else {
+            return Ok(Vec::new());
+        };
         let mut exact = Vec::new();
         for id in found {
-            if records
-                .summary(id)?
-                .id
-                .eq_ignore_ascii_case(source_id.trim())
-            {
+            if gers_uuid(&records.summary(id)?.id) == Some(requested) {
                 exact.push(id);
             }
         }
@@ -381,6 +380,10 @@ impl Catalogue {
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
+}
+
+fn gers_uuid(id: &str) -> Option<uuid::Uuid> {
+    uuid::Uuid::parse_str(id.strip_prefix(crate::licences::OVERTURE_PREFIX)?).ok()
 }
 
 #[cfg(test)]

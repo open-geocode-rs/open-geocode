@@ -387,7 +387,7 @@ fn same_imported_place(leader: &Place, member: &Place, [lon, lat]: [f64; 2]) -> 
     if own.source.gers().is_some() && own.source.gers() == theirs.source.gers() {
         return true;
     }
-    if own.category != theirs.category {
+    if own.category != theirs.category || conflicting_identifiers(leader, member) {
         return false;
     }
     let distance = point_of(own)
@@ -409,7 +409,7 @@ fn same_imported_place(leader: &Place, member: &Place, [lon, lat]: [f64; 2]) -> 
     if shared_brand && !different_branch && distance.is_some_and(|metres| metres <= 15.0) {
         return true;
     }
-    if conflict(leader, member) {
+    if conflicting_addresses(own, theirs) {
         return false;
     }
     if leader
@@ -437,14 +437,23 @@ fn same_imported_place(leader: &Place, member: &Place, [lon, lat]: [f64; 2]) -> 
 }
 
 fn conflict(leader: &Place, member: &Place) -> bool {
+    conflicting_addresses(&leader.record, &member.record) || conflicting_identifiers(leader, member)
+}
+
+fn conflicting_addresses(own: &PoiRecord, theirs: &PoiRecord) -> bool {
+    own.address
+        .as_ref()
+        .zip(theirs.address.as_ref())
+        .is_some_and(|(own, theirs)| !same_address(own, theirs))
+}
+
+fn conflicting_identifiers(leader: &Place, member: &Place) -> bool {
     let (own, theirs) = (&leader.record, &member.record);
-    let addresses = own.address.as_ref().zip(theirs.address.as_ref());
     let items = own.wikidata.zip(theirs.wikidata);
     let disjoint = |own: &[String], theirs: &[String]| {
         !own.is_empty() && !theirs.is_empty() && !own.iter().any(|value| theirs.contains(value))
     };
-    addresses.is_some_and(|(own, theirs)| !same_address(own, theirs))
-        || items.is_some_and(|(own, theirs)| own != theirs)
+    items.is_some_and(|(own, theirs)| own != theirs)
         || disjoint(&leader.identity.websites, &member.identity.websites)
         || disjoint(&leader.identity.phones, &member.identity.phones)
         || disjoint(&leader.identity.refs, &member.identity.refs)
@@ -744,7 +753,7 @@ pub(super) fn normalized_phone(value: &str) -> Option<String> {
         .filter(char::is_ascii_digit)
         .collect::<Vec<_>>();
     let tail = &digits[digits.len().saturating_sub(9)..];
-    Some(tail.iter().collect())
+    (!tail.is_empty()).then(|| tail.iter().collect())
 }
 
 fn poi_name(tags: &BTreeMap<String, String>) -> Option<String> {
